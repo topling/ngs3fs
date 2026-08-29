@@ -294,3 +294,8 @@ from the socket. The known Content-Length accounts for those externally
 consumed bytes, so there is no second parse, `MSG_PEEK`, `tee(2)`, or protected
 shadow span. Chunked and EOF-delimited bodies remain correct but use the copied
 fallback because their framing is interleaved with payload bytes.
+
+## License
+
+ngs3fs is licensed under the GNU Affero General Public License v3.0. See
+[LICENSE](LICENSE).
