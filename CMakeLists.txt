@@ -14,12 +14,29 @@ option(NGS3FS_ENABLE_SANITIZERS "Enable ASan and UBSan" OFF)
 option(NGS3FS_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 option(NGS3FS_BUILD_BENCHMARKS "Build latency benchmark tools" ON)
 set(TOPLING_ZIP_SOURCE_DIR
-  "/home/leipeng/osc/toplingdb/sideplugin/topling-zip"
-  CACHE PATH "Path to the topling-zip source tree")
+  "" CACHE PATH "Path to an external topling-zip source tree")
+
+if(TOPLING_ZIP_SOURCE_DIR)
+  message(STATUS "Using external topling-zip: ${TOPLING_ZIP_SOURCE_DIR}")
+else()
+  include(FetchContent)
+  FetchContent_Declare(ngs3fs_topling_zip
+    GIT_REPOSITORY https://github.com/topling/topling-zip.git
+    GIT_TAG 60d2c9a3b37249ceef04b608ef7dd4402ec44553
+    GIT_SUBMODULES boost-include
+    GIT_SUBMODULES_RECURSE TRUE)
+  FetchContent_GetProperties(ngs3fs_topling_zip)
+  if(NOT ngs3fs_topling_zip_POPULATED)
+    message(STATUS "TOPLING_ZIP_SOURCE_DIR is unset; cloning topling-zip")
+    FetchContent_Populate(ngs3fs_topling_zip)
+  endif()
+  set(TOPLING_ZIP_SOURCE_DIR "${ngs3fs_topling_zip_SOURCE_DIR}")
+endif()
 
 if(NOT EXISTS "${TOPLING_ZIP_SOURCE_DIR}/src/terark/sso.hpp" OR
    NOT EXISTS "${TOPLING_ZIP_SOURCE_DIR}/src/terark/gold_hash_map.hpp" OR
-   NOT EXISTS "${TOPLING_ZIP_SOURCE_DIR}/src/terark/hash_common.cpp")
+   NOT EXISTS "${TOPLING_ZIP_SOURCE_DIR}/src/terark/hash_common.cpp" OR
+   NOT EXISTS "${TOPLING_ZIP_SOURCE_DIR}/boost-include/boost/current_function.hpp")
   message(FATAL_ERROR "required Topling headers or sources not found under TOPLING_ZIP_SOURCE_DIR")
 endif()
 

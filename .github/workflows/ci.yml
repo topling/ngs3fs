@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out ngs3fs
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            cmake \
+            curl \
+            libfuse3-dev \
+            libssl-dev \
+            ninja-build \
+            xz-utils
+
+      - name: Bootstrap, build, and test
+        run: ./scripts/bootstrap.sh
+
+      - name: Verify automatic topling-zip clone
+        run: |
+          source_dir=build/dev/_deps/ngs3fs_topling_zip-src
+          test -f "${source_dir}/src/terark/sso.hpp"
+          test -f "${source_dir}/src/terark/gold_hash_map.hpp"
+          test -f "${source_dir}/src/terark/hash_common.cpp"
+          test -f "${source_dir}/boost-include/boost/current_function.hpp"
