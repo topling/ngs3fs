@@ -529,6 +529,7 @@ class Http2Client final : public HttpClient {
   size_t upload_length = kUnknownBodyLength;
   size_t upload_sent = 0;
   uint32_t maximum_frame_size = 16U * 1024U;
+  int callback_errno = 0;
   bool reconnect_required = false;
   bool tls = false;
 
@@ -640,6 +641,9 @@ class Http2Client final : public HttpClient {
           self.socket.get(),
           std::span(reinterpret_cast<const std::byte*>(data), length));
       return static_cast<ssize_t>(length);
+    } catch (const std::system_error& error) {
+      self.callback_errno = error.code().value();
+      return NGHTTP2_ERR_CALLBACK_FAILURE;
     } catch (...) {
       return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
@@ -694,6 +698,9 @@ class Http2Client final : public HttpClient {
       upload.remaining -= length;
       upload.sent += length;
       return 0;
+    } catch (const std::system_error& error) {
+      self.callback_errno = error.code().value();
+      return NGHTTP2_ERR_CALLBACK_FAILURE;
     } catch (...) {
       return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
@@ -746,8 +753,13 @@ class Http2Client final : public HttpClient {
   }
 
   void flush() {
+    callback_errno = 0;
     const int result = nghttp2_session_send(session.get());
     if (result != 0) {
+      if (callback_errno != 0) {
+        throw std::system_error(callback_errno, std::generic_category(),
+                                "send(HTTP/2)");
+      }
       throw_nghttp2(result, "nghttp2_session_send");
     }
   }
@@ -2358,8 +2370,13 @@ std::unique_ptr<HttpClient> HttpClient::connect(
 
   auto h2 = std::make_unique<Http2Client>(
       connect_tcp(host, port), authority, std::string(host), port);
-  if (h2->probe_server()) {
-    return h2;
+  try {
+    if (h2->probe_server()) {
+      return h2;
+    }
+  } catch (const std::system_error&) {
+    // A HTTP/1.1-only peer may reset the connection as soon as it sees the
+    // HTTP/2 preface. Reconnect below and use HTTP/1.1.
   }
   return std::make_unique<Http1Client>(
       connect_tcp(host, port), std::move(authority), std::string(host), port);
