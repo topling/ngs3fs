@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
@@ -327,6 +328,11 @@ void configure_blocking_socket(int fd, int io_timeout_ms) {
                    sizeof(timeout)) != 0) {
     throw std::system_error(errno, std::generic_category(),
                             "setsockopt(socket timeout)");
+  }
+  const int one = 1;
+  if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "setsockopt(TCP_NODELAY)");
   }
 }
 
