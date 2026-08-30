@@ -1,0 +1,12 @@
+diff --git a/common/rc b/common/rc
+index 66258f82..9dbe5af2 100644
+--- a/common/rc
++++ b/common/rc
+@@ -1765,5 +1765,6 @@ _fs_type()
+     #
+     _df_device $1 | $AWK_PROG '{ print $2 }' | \
+         sed -e 's/nfs4/nfs/' -e 's/fuse.glusterfs/glusterfs/' \
+-            -e 's/fuse.ceph-fuse/ceph-fuse/'
++            -e 's/fuse.ceph-fuse/ceph-fuse/' \
++            -e 's/fuse\..*/fuse/'
+ }

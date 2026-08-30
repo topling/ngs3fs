@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check out ngs3fs
         uses: actions/checkout@v7
@@ -25,23 +25,57 @@ jobs:
           ref: 3b25c1d39620b4b0f445c3e3b042edc4a6e4c6b3
           path: upstream/libfuse
 
+      - name: Check out Linux kernel filesystem tests
+        run: |
+          mkdir -p upstream/xfstests
+          git -C upstream/xfstests init
+          git -C upstream/xfstests remote add origin \
+            https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
+          git -C upstream/xfstests fetch --depth 1 origin \
+            56c410ad0f69da5b13c5807bc47b4876dcfa02b2
+          git -C upstream/xfstests checkout --detach FETCH_HEAD
+          test "$(git -C upstream/xfstests rev-parse HEAD)" = \
+            56c410ad0f69da5b13c5807bc47b4876dcfa02b2
+          git -C upstream/xfstests apply \
+            "$GITHUB_WORKSPACE/scripts/xfstests-fuse-subtype.patch"
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             build-essential \
+            acl \
+            attr \
+            automake \
+            bc \
             cmake \
             curl \
             fuse3 \
+            gawk \
             kmod \
+            libacl1-dev \
+            libaio-dev \
+            libcap-dev \
             libfuse3-dev \
+            libgdbm-compat-dev \
+            libgdbm-dev \
+            libtool \
+            libtool-bin \
+            liburing-dev \
             libssl-dev \
             ninja-build \
+            psmisc \
             python3 \
+            uuid-dev \
+            xfslibs-dev \
+            xfsprogs \
             xz-utils
 
       - name: Bootstrap, build, and test
         run: ./scripts/bootstrap.sh
+
+      - name: Build Linux kernel filesystem tests
+        run: make -C upstream/xfstests -j2
 
       - name: Verify automatic topling-zip clone
         run: |
@@ -77,3 +111,13 @@ jobs:
           ./scripts/test_libfuse_cases.sh \
             "$GITHUB_WORKSPACE/upstream/libfuse" \
             "$GITHUB_WORKSPACE/build/libfuse-cases"
+
+      - name: Run filtered xfstests correctness and stress cases
+        env:
+          NGS3FS_XFSTESTS_STRESS_JOBS: 8
+          NGS3FS_XFSTESTS_STRESS_OPERATIONS: 500
+        run: |
+          sudo --preserve-env=NGS3FS_XFSTESTS_STRESS_JOBS,NGS3FS_XFSTESTS_STRESS_OPERATIONS \
+            ./scripts/test_xfstests.sh \
+            "$GITHUB_WORKSPACE/upstream/xfstests" \
+            "$GITHUB_WORKSPACE/build/xfstests"

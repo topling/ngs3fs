@@ -186,6 +186,28 @@ ctest --preset dev --output-on-failure
 ./build/dev/ngs3fs --self-test
 ```
 
+## Filesystem correctness and stress tests
+
+CI builds the Linux kernel filesystem test suite (`xfstests`) at pinned commit
+`56c410ad0f69da5b13c5807bc47b4876dcfa02b2` and runs it as root against a real
+ngs3fs FUSE mount backed by VersityGW. The small compatibility patch
+`scripts/xfstests-fuse-subtype.patch` makes the upstream harness recognize
+`fuse.ngs3fs` as its generic `fuse` filesystem type.
+
+The correctness allowlist is `generic/001` and `generic/245`. Together they
+cover sequential data creation and copying, byte-for-byte read verification,
+unlink, directory operations, rename, and rejection of a rename onto a
+non-empty directory. The stress phase uses the suite's own `ltp/fsstress` with
+all defaults disabled, then enables only `creat`, `getattr`, `getdents`,
+`mkdir`, `read`, `readv`, `rename`, `rnoreplace`, `rmdir`, `stat`, and
+`unlink`. CI runs eight worker processes with 500 operations each.
+
+Tests that require a scratch block device, random or overwriting writes,
+`O_RDWR`, truncate, writable mmap, hard or symbolic links, xattrs, locks,
+special files, direct I/O, or persistence across fsync/remount are excluded
+because those operations are outside the ngs3fs contract. They are not run as
+expected failures.
+
 ## Mount a bucket or prefix
 
 The endpoint may speak HTTP/2 prior knowledge or HTTP/1.1; detection is
