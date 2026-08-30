@@ -42,7 +42,6 @@ endpoint="http://127.0.0.1:$port"
 server_pid=
 ngs3fs_pid=
 perf_pid=
-perf_stat_pid=
 profile_first_line=0
 profile_last_line=0
 profile_get_requests=0
@@ -52,10 +51,6 @@ cleanup() {
   if [[ -n "$perf_pid" ]]; then
     kill -INT "$perf_pid" 2>/dev/null
     wait "$perf_pid" 2>/dev/null
-  fi
-  if [[ -n "$perf_stat_pid" ]]; then
-    kill -INT "$perf_stat_pid" 2>/dev/null
-    wait "$perf_stat_pid" 2>/dev/null
   fi
   if mountpoint -q "$mount_dir"; then
     fusermount3 -u "$mount_dir"
@@ -186,16 +181,22 @@ LD_LIBRARY_PATH=$perf_lib "$perf" record -F "$perf_frequency" \
   --call-graph dwarf,16384 -p "$ngs3fs_pid" \
   -o "$run_dir/perf.data" -- sleep 3600 &
 perf_pid=$!
-LD_LIBRARY_PATH=$perf_lib "$perf" stat --no-big-num -x, \
-  -e "$perf_stat_events" -p "$ngs3fs_pid" \
-  -o "$run_dir/perf-stat.csv" -- sleep 3600 &
-perf_stat_pid=$!
 sleep 0.2
 if [[ "$workload" = mmap ]]; then
-  "$bench" "$mount_dir/$object" "$bytes" "$iterations" 17825792 \
-    >"$run_dir/mmap.jsonl"
+  LD_LIBRARY_PATH=$perf_lib "$perf" stat --no-big-num -x, \
+    -e "$perf_stat_events" -p "$ngs3fs_pid" \
+    -o "$run_dir/perf-stat.csv" -- \
+    "$bench" "$mount_dir/$object" "$bytes" "$iterations" 17825792 \
+      >"$run_dir/mmap.jsonl"
 else
-  run_random_read "$random_operations" "$run_dir/random-read.txt"
+  LD_LIBRARY_PATH=$perf_lib "$perf" stat --no-big-num -x, \
+    -e "$perf_stat_events" -p "$ngs3fs_pid" \
+    -o "$run_dir/perf-stat.csv" -- \
+    "$random_bench" -R "${random_advice_args[@]}" \
+      -d "$mount_dir/random-read" \
+      -f "$random_files" -t "$random_threads" -n "$random_operations" \
+      -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed" \
+      >"$run_dir/random-read.txt"
 fi
 profile_last_line=$(wc -l <"$run_dir/versity-access.log")
 if ((profile_last_line > profile_first_line)); then
@@ -207,9 +208,6 @@ fi
 kill -INT "$perf_pid" 2>/dev/null || true
 wait "$perf_pid" 2>/dev/null || true
 perf_pid=
-kill -INT "$perf_stat_pid" 2>/dev/null || true
-wait "$perf_stat_pid" 2>/dev/null || true
-perf_stat_pid=
 
 LD_LIBRARY_PATH=$perf_lib "$perf" script -i "$run_dir/perf.data" \
   >"$run_dir/perf.script"

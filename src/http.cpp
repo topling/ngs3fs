@@ -335,7 +335,8 @@ ReceiveResult ExternalDataIngress::receive_one(
     int data_pipe_write_fd, size_t max_payload_bytes,
     int32_t expected_stream_id,
     std::span<const std::byte> frame_prefix) {
-  if (session == nullptr || socket_fd < 0 || data_pipe_write_fd < 0 ||
+  if (session == nullptr || socket_fd < 0 ||
+      (data_pipe_write_fd < 0 && max_payload_bytes != 0) ||
       expected_stream_id < 0 || header_ready_ ||
       frame_prefix.size() > kFrameHeaderSize) {
     throw std::invalid_argument("invalid external DATA ingress argument");
@@ -1311,10 +1312,11 @@ RangeResponse Http2Client::request_no_body(
         make_header(sso_view(value.name), sso_view(value.value)));
   }
 
-  Pipe response_pipe = Pipe::create();
+  const bool head = method == "HEAD";
+  Pipe response_pipe = head ? Pipe() : Pipe::create();
   ActiveRequest request;
-  request.destination    = &response_pipe;
-  request.max_body_bytes = max_response_body;
+  request.destination    = head ? nullptr : &response_pipe;
+  request.max_body_bytes = head ? 0 : max_response_body;
   request.response.headers.reserve(16);
   const int stream_id = nghttp2_submit_request(
       session.get(), nullptr, headers.data(), headers.size(), nullptr,
@@ -1333,7 +1335,7 @@ RangeResponse Http2Client::request_no_body(
       const size_t shadow_before = request.shadow_callback_bytes;
       const ReceiveResult received = ingress.receive_one(
           session.get(), socket.get(),
-          response_pipe.write_fd(),
+          head ? -1 : response_pipe.write_fd(),
           request.max_body_bytes - request.response.body_bytes,
           request.stream_id);
       if (received.spliced_payload !=
@@ -1347,6 +1349,9 @@ RangeResponse Http2Client::request_no_body(
       }
       const size_t appended = request.response.body_bytes - before;
       if (appended != 0) {
+        if (head) {
+          throw std::runtime_error("HTTP/2 HEAD returned a response body");
+        }
         const size_t old_size = request.response.body.size();
         request.response.body.resize(old_size + appended);
         read_all(response_pipe.read_fd(),
@@ -1593,14 +1598,13 @@ void build_request_head(
 
 class ResponseParser {
  public:
-  ResponseParser(Response& response, Pipe& destination,
+  ResponseParser(Response& response, Pipe* destination,
                  size_t max_body_bytes, bool head_response,
-                 bool capture_headers,
-                 std::vector<std::byte>* captured_body)
+                 bool capture_headers)
       : response_(response),
         destination_(destination),
         max_body_bytes_(max_body_bytes),
-        captured_body_(captured_body),
+        captured_body_(destination == nullptr ? &response.body : nullptr),
         head_response_(head_response) {
     static const llhttp_settings_t capture_settings = [] {
       llhttp_settings_t settings;
@@ -1748,7 +1752,7 @@ class ResponseParser {
         memcpy(value.captured_body_->data() + old_size,
                bytes.data(), bytes.size());
       } else {
-        write_all(value.destination_.write_fd(), bytes);
+        write_all(value.destination_->write_fd(), bytes);
       }
       value.response_.fallback_copied_bytes += length;
       value.response_.body_bytes += length;
@@ -1808,7 +1812,7 @@ class ResponseParser {
   }
 
   Response& response_;
-  Pipe& destination_;
+  Pipe* destination_;
   size_t max_body_bytes_;
   std::vector<std::byte>* captured_body_;
   llhttp_t parser_{};
@@ -1898,11 +1902,10 @@ class Http1Client final : public HttpClient {
     }
   }
 
-  Response receive_response(std::string_view method, Pipe& destination,
+  Response receive_response(std::string_view method, Pipe* destination,
                             size_t max_body_bytes, uint64_t wire_start_ns,
                             bool capture_headers,
-                            bool measure_transport,
-                            bool capture_body) {
+                            bool measure_transport) {
     std::array<std::byte, kHttp1ReadSize> buf;
     size_t begin = 0;
     size_t end   = 0;
@@ -1912,7 +1915,7 @@ class Http1Client final : public HttpClient {
       response.wire_start_ns = wire_start_ns;
       ResponseParser parser(
           response, destination, max_body_bytes, method == "HEAD",
-          capture_headers, capture_body ? &response.body : nullptr);
+          capture_headers);
 
       size_t header_bytes = 0;
       while (!parser.headers_complete()) {
@@ -1978,11 +1981,11 @@ class Http1Client final : public HttpClient {
           }
           if (buffered != 0) {
             const std::span bytes = std::span(buf).subspan(begin, buffered);
-            if (capture_body) {
+            if (destination == nullptr) {
               response.body.insert(response.body.end(),
                                    bytes.begin(), bytes.end());
             } else {
-              write_all(destination.write_fd(), bytes);
+              write_all(destination->write_fd(), bytes);
             }
             response.body_bytes += buffered;
             response.fallback_copied_bytes += buffered;
@@ -1991,7 +1994,7 @@ class Http1Client final : public HttpClient {
             end   = 0;
           }
           if (remaining != 0) {
-            if (capture_body) {
+            if (destination == nullptr) {
               const size_t old_size = response.body.size();
               response.body.resize(old_size + remaining);
               size_t received = 0;
@@ -2016,7 +2019,7 @@ class Http1Client final : public HttpClient {
               response.fallback_copied_bytes += remaining;
             } else {
               response.externally_spliced_bytes = splice_exact(
-                  socket.get(), destination.write_fd(), remaining,
+                  socket.get(), destination->write_fd(), remaining,
                   SPLICE_F_MOVE | SPLICE_F_MORE,
                   &response.transport_splice_calls);
               response.body_bytes += remaining;
@@ -2076,11 +2079,10 @@ class Http1Client final : public HttpClient {
                          std::span<const Header> headers,
                          std::optional<size_t> content_length,
                          int source_fd, uint64_t source_offset,
-                         Pipe& response_pipe,
+                         Pipe* response_pipe,
                          size_t max_response_body,
                          bool capture_headers,
                          bool measure_transport,
-                         bool capture_body,
                          std::span<const Header> generated_headers = {},
                          bool trusted_headers = false) {
     if (request_active) {
@@ -2107,7 +2109,7 @@ class Http1Client final : public HttpClient {
       }
       Response response = receive_response(
           method, response_pipe, max_response_body, wire_start_ns,
-          capture_headers, measure_transport, capture_body);
+          capture_headers, measure_transport);
       response.externally_sent_bytes = sent;
       request_active = false;
       return response;
@@ -2160,8 +2162,8 @@ Response Http1Client::get_range(
           : std::span<const Header>(generated_accept_header);
 
   return perform("GET", path, extra_headers, std::nullopt, -1, 0,
-                 destination, length, capture_headers,
-                 measure_transport, false, generated_headers, true);
+                 &destination, length, capture_headers,
+                 measure_transport, generated_headers, true);
 }
 
 Response Http1Client::put_from_fd(
@@ -2176,11 +2178,9 @@ Response Http1Client::put_from_fd(
     }
   }
 
-  Pipe response_pipe = Pipe::create();
-  const size_t max_response_body = response_pipe.capacity();
   Response response = perform(
       "PUT", path, extra_headers, length, source_fd, source_offset,
-      response_pipe, max_response_body, true, false, true);
+      nullptr, kPreferredIoSize, true, false);
   return response;
 }
 
@@ -2306,10 +2306,8 @@ Response Http1Client::finish_upload(size_t max_response_body) {
           std::byte{'\r'}, std::byte{'\n'}};
       send_all(socket.get(), end);
     }
-    Pipe response_pipe = Pipe::create(max_response_body);
     Response response = receive_response(
-        upload_method, response_pipe, max_response_body, 0, true, false,
-        true);
+        upload_method, nullptr, max_response_body, 0, true, false);
     response.externally_sent_bytes = upload_sent;
     request_active = false;
     upload_chunked = false;
@@ -2339,13 +2337,12 @@ Response Http1Client::request_no_body(
   if (method.empty() || max_response_body == 0) {
     throw std::invalid_argument("invalid bodyless HTTP/1.1 request");
   }
-  Pipe response_pipe = Pipe::create();
   const bool needs_content_length =
       method == "PUT" || method == "POST" || method == "PATCH";
   Response response = perform(
       method, path, extra_headers,
       needs_content_length ? std::optional<size_t>(0) : std::nullopt,
-      -1, 0, response_pipe, max_response_body, true, false, true);
+      -1, 0, nullptr, max_response_body, true, false);
   return response;
 }
 

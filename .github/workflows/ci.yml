@@ -263,6 +263,7 @@ jobs:
             build/profiles/github-*-advice/ngs3fs.log
             build/profiles/github-*-advice/versity.log
             build/profiles/github-*-advice/perf.folded
+            build/profiles/github-*-advice/perf-stat.csv
             build/profiles/github-*-advice/perf-self.txt
             build/profiles/github-*-advice/perf-self-flat.txt
             build/profiles/github-*-advice/perf-inclusive.txt
