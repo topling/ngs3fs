@@ -41,6 +41,9 @@ endpoint="http://127.0.0.1:$port"
 server_pid=
 ngs3fs_pid=
 perf_pid=
+profile_first_line=0
+profile_last_line=0
+profile_get_requests=0
 
 cleanup() {
   set +e
@@ -170,6 +173,7 @@ else
   flame_svg="$run_dir/ngs3fs-random-read.svg"
   flame_html="$run_dir/ngs3fs-random-read-interactive.html"
 fi
+profile_first_line=$(wc -l <"$run_dir/versity-access.log")
 
 LD_LIBRARY_PATH=$perf_lib "$perf" record -F "$perf_frequency" \
   -e "$perf_event" \
@@ -182,6 +186,13 @@ if [[ "$workload" = mmap ]]; then
     >"$run_dir/mmap.jsonl"
 else
   run_random_read "$random_operations" "$run_dir/random-read.txt"
+fi
+profile_last_line=$(wc -l <"$run_dir/versity-access.log")
+if ((profile_last_line > profile_first_line)); then
+  profile_get_requests=$(
+    sed -n "$((profile_first_line + 1)),${profile_last_line}p" \
+      "$run_dir/versity-access.log" | grep -c 's3_GetObject' || true
+  )
 fi
 kill -INT "$perf_pid" 2>/dev/null || true
 wait "$perf_pid" 2>/dev/null || true
@@ -212,5 +223,29 @@ LD_LIBRARY_PATH=$perf_lib "$perf" report --stdio --no-children \
 LD_LIBRARY_PATH=$perf_lib "$perf" report --stdio --no-children \
   --call-graph none --sort dso --percent-limit 0.1 \
   -i "$run_dir/perf.data" >"$run_dir/perf-dso.txt"
+
+if [[ "$workload" = random-read ]]; then
+  bytes_read=
+  elapsed_ns=
+  pread_operations=
+  mmap_operations=
+  for token in $(<"$run_dir/random-read.txt"); do
+    case "$token" in
+      bytes=*) bytes_read=${token#bytes=} ;;
+      elapsed_ns=*) elapsed_ns=${token#elapsed_ns=} ;;
+      pread_operations=*) pread_operations=${token#pread_operations=} ;;
+      mmap_operations=*) mmap_operations=${token#mmap_operations=} ;;
+    esac
+  done
+  printf '%s\n' \
+    'advice,files,threads,operations,pread_operations,mmap_operations,bytes,elapsed_ns,s3_get_requests,perf_event,perf_frequency' \
+    >"$run_dir/profile-summary.csv"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$random_advice" "$random_files" "$random_threads" \
+    "$((random_threads * random_operations))" "$pread_operations" \
+    "$mmap_operations" "$bytes_read" "$elapsed_ns" \
+    "$profile_get_requests" "$perf_event" "$perf_frequency" \
+    >>"$run_dir/profile-summary.csv"
+fi
 
 printf '%s\n' "$run_dir"
