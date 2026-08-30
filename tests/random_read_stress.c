@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -25,6 +26,8 @@ typedef struct {
   size_t      maximum_read;
   size_t      page_size;
   uint64_t    seed;
+  bool        prepare_only;
+  bool        read_only;
 } Config;
 
 typedef struct {
@@ -38,12 +41,15 @@ typedef struct {
 typedef struct {
   Shared* shared;
   size_t  id;
+  uint64_t bytes;
+  size_t   pread_operations;
+  size_t   mmap_operations;
 } Worker;
 
 static void usage(const char* program) {
   fprintf(stderr,
           "usage: %s -d DIR [-f FILES] [-t THREADS] [-n OPERATIONS] "
-          "[-s FILE_SIZE] [-r MAX_READ] [-S SEED]\n",
+          "[-s FILE_SIZE] [-r MAX_READ] [-S SEED] [-p | -R]\n",
           program);
 }
 
@@ -262,6 +268,12 @@ static void* read_worker(void* argument) {
       report_failure(shared, "close", worker->id, file, offset, size);
       break;
     }
+    worker->bytes += size;
+    if (((operation + worker->id) & 1) == 0) {
+      ++worker->pread_operations;
+    } else {
+      ++worker->mmap_operations;
+    }
   }
 
   free(buffer);
@@ -296,6 +308,8 @@ int main(int argc, char** argv) {
       .maximum_read = 256 * 1024,
       .page_size    = 0,
       .seed          = UINT64_C(0x4e47533346535244),
+      .prepare_only  = false,
+      .read_only     = false,
   };
   static const struct option options[] = {
       {"directory", required_argument, NULL, 'd'},
@@ -305,12 +319,14 @@ int main(int argc, char** argv) {
       {"file-size", required_argument, NULL, 's'},
       {"maximum-read", required_argument, NULL, 'r'},
       {"seed", required_argument, NULL, 'S'},
+      {"prepare-only", no_argument, NULL, 'p'},
+      {"read-only", no_argument, NULL, 'R'},
       {"help", no_argument, NULL, 'h'},
       {NULL, 0, NULL, 0},
   };
 
   int option;
-  while ((option = getopt_long(argc, argv, "d:f:t:n:s:r:S:h", options,
+  while ((option = getopt_long(argc, argv, "d:f:t:n:s:r:S:pRh", options,
                                NULL)) != -1) {
     bool valid = true;
     switch (option) {
@@ -321,6 +337,8 @@ int main(int argc, char** argv) {
       case 's': valid = parse_size(optarg, &config.file_size); break;
       case 'r': valid = parse_size(optarg, &config.maximum_read); break;
       case 'S': valid = parse_u64(optarg, &config.seed); break;
+      case 'p': config.prepare_only = true; break;
+      case 'R': config.read_only = true; break;
       case 'h': usage(argv[0]); return 0;
       default: usage(argv[0]); return 2;
     }
@@ -331,7 +349,8 @@ int main(int argc, char** argv) {
   }
   if (config.directory == NULL || optind != argc || config.files < 2 ||
       config.threads == 0 || config.operations == 0 ||
-      config.file_size == 0 || config.maximum_read == 0) {
+      config.file_size == 0 || config.maximum_read == 0 ||
+      (config.prepare_only && config.read_only)) {
     usage(argv[0]);
     return 2;
   }
@@ -341,27 +360,40 @@ int main(int argc, char** argv) {
     return 1;
   }
   config.page_size = (size_t)page_size;
-  if (mkdir(config.directory, 0755) != 0) {
-    fprintf(stderr, "mkdir failed: %s: %s\n", config.directory,
-            strerror(errno));
-    return 1;
-  }
-
-  const size_t prepare_size = config.maximum_read < 256 * 1024
-                                  ? config.maximum_read
-                                  : 256 * 1024;
-  u_char* prepare_buffer = malloc(prepare_size);
-  if (prepare_buffer == NULL) {
-    fprintf(stderr, "prepare buffer allocation failed\n");
-    return 1;
-  }
-  for (size_t file = 0; file != config.files; ++file) {
-    if (!create_file(&config, file, prepare_buffer, prepare_size)) {
-      free(prepare_buffer);
+  if (!config.read_only) {
+    if (mkdir(config.directory, 0755) != 0) {
+      fprintf(stderr, "mkdir failed: %s: %s\n", config.directory,
+              strerror(errno));
+      return 1;
+    }
+    const size_t prepare_size = config.maximum_read < 256 * 1024
+                                    ? config.maximum_read
+                                    : 256 * 1024;
+    u_char* prepare_buffer = malloc(prepare_size);
+    if (prepare_buffer == NULL) {
+      fprintf(stderr, "prepare buffer allocation failed\n");
+      return 1;
+    }
+    for (size_t file = 0; file != config.files; ++file) {
+      if (!create_file(&config, file, prepare_buffer, prepare_size)) {
+        free(prepare_buffer);
+        return 1;
+      }
+    }
+    free(prepare_buffer);
+  } else {
+    struct stat status;
+    if (stat(config.directory, &status) != 0 || !S_ISDIR(status.st_mode)) {
+      fprintf(stderr, "read-only directory is unavailable: %s\n",
+              config.directory);
       return 1;
     }
   }
-  free(prepare_buffer);
+  if (config.prepare_only) {
+    printf("random-read preparation passed: files=%zu file_size=%zu\n",
+           config.files, config.file_size);
+    return 0;
+  }
 
   Shared shared = {
       .config    = &config,
@@ -392,6 +424,12 @@ int main(int argc, char** argv) {
       break;
     }
   }
+  struct timespec start;
+  struct timespec finish;
+  if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+    fprintf(stderr, "clock_gettime failed: %s\n", strerror(errno));
+    atomic_store_explicit(&shared.failed, 1, memory_order_relaxed);
+  }
   pthread_mutex_lock(&shared.mutex);
   shared.start = true;
   pthread_cond_broadcast(&shared.condition);
@@ -405,20 +443,43 @@ int main(int argc, char** argv) {
       atomic_store_explicit(&shared.failed, 1, memory_order_relaxed);
     }
   }
+  if (clock_gettime(CLOCK_MONOTONIC, &finish) != 0) {
+    fprintf(stderr, "clock_gettime failed: %s\n", strerror(errno));
+    atomic_store_explicit(&shared.failed, 1, memory_order_relaxed);
+  }
+  uint64_t bytes = 0;
+  size_t pread_operations = 0;
+  size_t mmap_operations = 0;
+  for (size_t i = 0; i != created; ++i) {
+    bytes += workers[i].bytes;
+    pread_operations += workers[i].pread_operations;
+    mmap_operations += workers[i].mmap_operations;
+  }
   free(threads);
   free(workers);
 
   const bool passed = atomic_load_explicit(&shared.failed,
                                             memory_order_relaxed) == 0;
-  if (passed && !remove_files(&config)) {
+  if (passed && !config.read_only && !remove_files(&config)) {
     return 1;
   }
   if (!passed) {
     return 1;
   }
+  uint64_t elapsed_ns =
+      (uint64_t)(finish.tv_sec - start.tv_sec) * UINT64_C(1000000000);
+  if (finish.tv_nsec >= start.tv_nsec) {
+    elapsed_ns += (uint64_t)(finish.tv_nsec - start.tv_nsec);
+  } else {
+    elapsed_ns -= (uint64_t)(start.tv_nsec - finish.tv_nsec);
+  }
   printf("random-read stress passed: access=pread,mmap files=%zu threads=%zu "
-         "operations=%zu file_size=%zu maximum_read=%zu seed=%llu\n",
-         config.files, config.threads, config.operations, config.file_size,
+         "operations=%zu pread_operations=%zu mmap_operations=%zu "
+         "bytes=%llu elapsed_ns=%llu file_size=%zu maximum_read=%zu "
+         "seed=%llu\n",
+         config.files, config.threads, config.operations, pread_operations,
+         mmap_operations, (unsigned long long)bytes,
+         (unsigned long long)elapsed_ns, config.file_size,
          config.maximum_read, (unsigned long long)config.seed);
   return 0;
 }

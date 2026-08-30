@@ -296,6 +296,28 @@ the leader-only and 10 ms quantization errors of `/proc/PID/stat`. Run it with
 enough privilege to raise the mount BDI read-ahead when evaluating the default
 256 KiB setting; the unprivileged fallback is reported explicitly.
 
+The same script can reuse the concurrent multi-file random-read stress as a
+comparison workload. It prepares identical deterministic objects directly in
+the backend, warms the backend before each client, validates every byte, and
+records wall time, all-thread daemon CPU, and S3 GET count in
+`random-read-summary.csv`. Run isolated samples with a fresh VersityGW and
+backend per client to avoid connection and server-lifetime order effects:
+
+```sh
+sudo env WORKLOAD=random-read CLIENT=ngs3fs PORT=17081 \
+  ./scripts/compare_goofys.sh build/e2e/random-read-ngs3fs
+sudo env WORKLOAD=random-read CLIENT=goofys PORT=17082 \
+  ./scripts/compare_goofys.sh build/e2e/random-read-goofys
+```
+
+`CLIENT=both` is available for a quick paired run; `ORDER=reverse` swaps its
+order. `RANDOM_READ_FILES`, `RANDOM_READ_THREADS`,
+`RANDOM_READ_OPERATIONS`, `RANDOM_READ_FILE_SIZE`, `RANDOM_READ_MAXIMUM`, and
+`RANDOM_READ_SEED` override the defaults. The workload deliberately applies
+`POSIX_FADV_RANDOM` and `MADV_RANDOM`, so it measures random access with kernel
+read-ahead disabled; a client-side user-space read-ahead policy remains part of
+the client being compared.
+
 ## nghttp2 receive invariant
 
 For unpadded DATA, the payload is spliced to the destination pipe before
