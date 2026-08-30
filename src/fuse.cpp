@@ -201,7 +201,7 @@ class HttpPool {
   void release(size_t i) noexcept {
     slots_[i]->busy.store(false, std::memory_order_release);
     released_.fetch_add(1, std::memory_order_release);
-    released_.notify_all();
+    released_.notify_one();
   }
 
   std::vector<std::unique_ptr<Slot>> slots_;
@@ -5914,7 +5914,10 @@ int run(int argc, char** argv) {
                   << "; falling back to kernel value "
                   << state.config.read_ahead_size << " bytes\n";
       }
-      result = fuse_session_loop_mt(session, nullptr);
+      fuse_loop_config loop_config{};
+      loop_config.clone_fd         = 1;
+      loop_config.max_idle_threads = 10;
+      result = fuse_session_loop_mt(session, &loop_config);
       fuse_session_unmount(session);
     } else {
       std::cerr << "failed to mount " << options.mountpoint << ": "

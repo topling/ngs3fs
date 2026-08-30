@@ -14,6 +14,7 @@ max_connections=${MAX_CONNECTIONS:-8}
 bytes=${BYTES:-1048576}
 perf_event=${PERF_EVENT:-cycles:u}
 perf_frequency=${PERF_FREQUENCY:-4000}
+perf_stat_events=${PERF_STAT_EVENTS:-task-clock,context-switches,cpu-migrations,page-faults,cycles:u,cycles:k,instructions:u,instructions:k}
 random_files=${RANDOM_READ_FILES:-32}
 random_threads=${RANDOM_READ_THREADS:-16}
 random_operations=${RANDOM_READ_OPERATIONS:-128}
@@ -41,6 +42,7 @@ endpoint="http://127.0.0.1:$port"
 server_pid=
 ngs3fs_pid=
 perf_pid=
+perf_stat_pid=
 profile_first_line=0
 profile_last_line=0
 profile_get_requests=0
@@ -50,6 +52,10 @@ cleanup() {
   if [[ -n "$perf_pid" ]]; then
     kill -INT "$perf_pid" 2>/dev/null
     wait "$perf_pid" 2>/dev/null
+  fi
+  if [[ -n "$perf_stat_pid" ]]; then
+    kill -INT "$perf_stat_pid" 2>/dev/null
+    wait "$perf_stat_pid" 2>/dev/null
   fi
   if mountpoint -q "$mount_dir"; then
     fusermount3 -u "$mount_dir"
@@ -180,6 +186,10 @@ LD_LIBRARY_PATH=$perf_lib "$perf" record -F "$perf_frequency" \
   --call-graph dwarf,16384 -p "$ngs3fs_pid" \
   -o "$run_dir/perf.data" -- sleep 3600 &
 perf_pid=$!
+LD_LIBRARY_PATH=$perf_lib "$perf" stat --no-big-num -x, \
+  -e "$perf_stat_events" -p "$ngs3fs_pid" \
+  -o "$run_dir/perf-stat.csv" -- sleep 3600 &
+perf_stat_pid=$!
 sleep 0.2
 if [[ "$workload" = mmap ]]; then
   "$bench" "$mount_dir/$object" "$bytes" "$iterations" 17825792 \
@@ -197,6 +207,9 @@ fi
 kill -INT "$perf_pid" 2>/dev/null || true
 wait "$perf_pid" 2>/dev/null || true
 perf_pid=
+kill -INT "$perf_stat_pid" 2>/dev/null || true
+wait "$perf_stat_pid" 2>/dev/null || true
+perf_stat_pid=
 
 LD_LIBRARY_PATH=$perf_lib "$perf" script -i "$run_dir/perf.data" \
   >"$run_dir/perf.script"
