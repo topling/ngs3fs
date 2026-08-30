@@ -269,7 +269,6 @@ int main() {
              downloaded.fallback_copied_bytes ==
          expected_download.size());
   assert(downloaded.transport_splice_calls != 0);
-  assert(downloaded.transport_splice_calls <= 4);
   assert(downloaded.headers.at("etag") == "\"h1-etag\"");
   std::vector<std::byte> actual_download(expected_download.size());
   read_all(download_pipe.read_fd(), actual_download);
@@ -325,5 +324,41 @@ int main() {
   assert(metadata.body_bytes == 0);
   assert(metadata.headers.at("content-length") == "131072");
   assert(metadata.headers.at("x-amz-version-id") == "version-1");
+
+  server.join();
+  std::jthread stalled_server([&] {
+    UniqueFd probe = accept_one(listener.get());
+    std::array<std::byte, 24> client_magic{};
+    read_all(probe.get(), client_magic);
+    send_text(probe.get(),
+              "HTTP/1.1 505 HTTP Version Not Supported\r\n"
+              "content-length: 0\r\nconnection: close\r\n\r\n");
+    finish_probe_response(probe.get());
+    probe.reset();
+
+    UniqueFd socket = accept_one(listener.get());
+    const std::string get = read_request_head(socket.get(), "stalled GET");
+    assert(get.starts_with("GET /bucket/stalled HTTP/1.1\r\n"));
+    send_text(socket.get(),
+              "HTTP/1.1 206 Partial Content\r\n"
+              "content-length: 4096\r\n\r\n");
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+  });
+
+  auto stalled_client = HttpClient::connect(
+      "127.0.0.1", port, "mock-s3", false, 100);
+  Pipe stalled_pipe = Pipe::create();
+  const auto timeout_start = std::chrono::steady_clock::now();
+  bool timed_out = false;
+  try {
+    stalled_client->get_range(
+        "/bucket/stalled", 0, 4096, stalled_pipe);
+  } catch (const std::exception&) {
+    timed_out = true;
+  }
+  const auto timeout_elapsed = std::chrono::steady_clock::now() -
+                               timeout_start;
+  assert(timed_out);
+  assert(timeout_elapsed < std::chrono::milliseconds(800));
   return 0;
 }

@@ -153,10 +153,106 @@ int main() {
           "TLS response body mismatch");
   client.reset();
   server.join();
-  ::close(listener);
-  ::unlink(certificate_path.c_str());
-  ::rmdir(directory);
   if (server_error) {
     std::rethrow_exception(server_error);
   }
+
+  server_error = nullptr;
+  std::thread stalled_server([&] {
+    try {
+      UniqueFd accepted(
+          ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC));
+      require(accepted.get() >= 0, "stalled accept failed");
+      std::unique_ptr<SSL, decltype(&SSL_free)> ssl(
+          SSL_new(server_context.get()), SSL_free);
+      require(ssl != nullptr && SSL_set_fd(ssl.get(), accepted.get()) == 1,
+              "stalled server SSL setup failed");
+      require(SSL_accept(ssl.get()) == 1, "stalled SSL_accept failed");
+      std::array<char, 4096> request{};
+      require(SSL_read(ssl.get(), request.data(), request.size()) > 0,
+              "stalled server SSL_read failed");
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    } catch (...) {
+      server_error = std::current_exception();
+    }
+  });
+
+  std::unique_ptr<HttpClient> stalled_client = HttpClient::connect(
+      "127.0.0.1", ntohs(address.sin_port), "127.0.0.1", true, 100);
+  const auto timeout_start = std::chrono::steady_clock::now();
+  bool timed_out = false;
+  try {
+    stalled_client->request_no_body("GET", "/stalled");
+  } catch (const std::exception&) {
+    timed_out = true;
+  }
+  const auto timeout_elapsed = std::chrono::steady_clock::now() -
+                               timeout_start;
+  require(timed_out, "stalled TLS request did not time out");
+  require(timeout_elapsed < std::chrono::milliseconds(800),
+          "stalled TLS timeout waited for peer close");
+  stalled_server.join();
+  if (server_error) {
+    std::rethrow_exception(server_error);
+  }
+
+  server_error = nullptr;
+  std::thread recovery_server([&] {
+    try {
+      UniqueFd accepted(
+          ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC));
+      require(accepted.get() >= 0, "recovery accept failed");
+      std::unique_ptr<SSL, decltype(&SSL_free)> ssl(
+          SSL_new(server_context.get()), SSL_free);
+      require(ssl != nullptr && SSL_set_fd(ssl.get(), accepted.get()) == 1,
+              "recovery server SSL setup failed");
+      require(SSL_accept(ssl.get()) == 1, "recovery SSL_accept failed");
+      std::array<char, 4096> request{};
+      require(SSL_read(ssl.get(), request.data(), request.size()) > 0,
+              "recovery server SSL_read failed");
+      static constexpr std::string_view first_response =
+          "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+      require(SSL_write(ssl.get(), first_response.data(),
+                        int(first_response.size())) ==
+                  int(first_response.size()),
+              "recovery server first SSL_write failed");
+      require(SSL_read(ssl.get(), request.data(), request.size()) > 0,
+              "idle reuse server SSL_read failed");
+      static constexpr std::string_view second_response =
+          "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+          "Connection: close\r\n\r\nok";
+      require(SSL_write(ssl.get(), second_response.data(),
+                        int(second_response.size())) ==
+                  int(second_response.size()),
+              "recovery server second SSL_write failed");
+      SSL_shutdown(ssl.get());
+    } catch (...) {
+      server_error = std::current_exception();
+    }
+  });
+
+  const Response recovered =
+      stalled_client->request_no_body("GET", "/recovered");
+  require(recovered.status == 200, "TLS recovery status mismatch");
+  require(recovered.body.size() == 2 &&
+              std::to_integer<char>(recovered.body[0]) == 'o' &&
+              std::to_integer<char>(recovered.body[1]) == 'k',
+          "TLS recovery body mismatch");
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  const Response idle_reused =
+      stalled_client->request_no_body("GET", "/idle-reused");
+  require(idle_reused.status == 200, "idle TLS reuse status mismatch");
+  require(idle_reused.body.size() == 2 &&
+              std::to_integer<char>(idle_reused.body[0]) == 'o' &&
+              std::to_integer<char>(idle_reused.body[1]) == 'k',
+          "idle TLS reuse body mismatch");
+  stalled_client.reset();
+  recovery_server.join();
+  if (server_error) {
+    std::rethrow_exception(server_error);
+  }
+
+  ::close(listener);
+  ::unlink(certificate_path.c_str());
+  ::rmdir(directory);
 }

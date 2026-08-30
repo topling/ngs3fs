@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <errno.h>
 #include <ctype.h>
@@ -44,19 +45,41 @@ struct SslDeleter {
   }
 };
 
+uint64_t tls_monotonic_ns() noexcept {
+  timespec value{};
+  if (::clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
+    return 0;
+  }
+  return uint64_t(value.tv_sec) * 1'000'000'000ULL +
+         uint64_t(value.tv_nsec);
+}
+
 class TlsTunnel {
  public:
   TlsTunnel(std::unique_ptr<SSL_CTX, SslContextDeleter> context,
             std::unique_ptr<SSL, SslDeleter> ssl,
-            UniqueFd remote, UniqueFd local)
+            UniqueFd remote, UniqueFd local, int io_timeout_ms)
       : context_(std::move(context)),
         ssl_(std::move(ssl)),
         remote_(std::move(remote)),
         local_(std::move(local)),
+        timeout_ns_(uint64_t(io_timeout_ms) * 1'000'000ULL),
         thread_([this](std::stop_token stop) { run(stop); }) {}
 
   TlsTunnel(const TlsTunnel&) = delete;
   TlsTunnel& operator=(const TlsTunnel&) = delete;
+
+  uint64_t begin_request() noexcept {
+    const uint64_t id = next_request_id_.fetch_add(
+        1, std::memory_order_relaxed);
+    active_request_id_.store(id, std::memory_order_release);
+    return id;
+  }
+
+  void end_request(uint64_t id) noexcept {
+    active_request_id_.compare_exchange_strong(
+        id, 0, std::memory_order_acq_rel, std::memory_order_acquire);
+  }
 
  private:
   static bool would_block(SSL* ssl, int result) noexcept {
@@ -72,6 +95,30 @@ class TlsTunnel {
     }
   }
 
+  bool request_timed_out(uint64_t& id, uint64_t& since) noexcept {
+    uint64_t active = active_request_id_.load(std::memory_order_acquire);
+    if (active == 0) {
+      id    = 0;
+      since = 0;
+      return false;
+    }
+    const uint64_t now = tls_monotonic_ns();
+    if (now == 0) {
+      return false;
+    }
+    if (active != id || since == 0) {
+      id    = active;
+      since = now;
+      return false;
+    }
+    if (now - since < timeout_ns_) {
+      return false;
+    }
+    return active_request_id_.compare_exchange_strong(
+        active, 0, std::memory_order_acq_rel,
+        std::memory_order_acquire);
+  }
+
   void run(std::stop_token stop) noexcept {
     try {
       make_nonblocking(remote_.get());
@@ -83,12 +130,15 @@ class TlsTunnel {
       size_t tls_begin   = 0;
       size_t tls_end     = 0;
       bool local_eof     = false;
+      bool timed_out     = false;
+      uint64_t request_id    = 0;
+      uint64_t stalled_since = 0;
       while (!stop.stop_requested()) {
         bool progress = false;
         if (tls_begin != tls_end) {
-          const ssize_t written = ::write(
+          const ssize_t written = ::send(
               local_.get(), tls_to_clear.data() + tls_begin,
-              tls_end - tls_begin);
+              tls_end - tls_begin, MSG_NOSIGNAL);
           if (written > 0) {
             tls_begin += size_t(written);
             progress = true;
@@ -148,7 +198,12 @@ class TlsTunnel {
           break;
         }
         if (progress) {
+          stalled_since = 0;
           continue;
+        }
+        if (request_timed_out(request_id, stalled_since)) {
+          timed_out = true;
+          break;
         }
         const short local_events = short(
             ((!local_eof && clear_end == 0) ? POLLIN : 0) |
@@ -164,7 +219,14 @@ class TlsTunnel {
           break;
         }
       }
-      SSL_shutdown(ssl_.get());
+      if (timed_out) {
+        std::cerr << "TLS tunnel timed out after "
+                  << timeout_ns_ / 1'000'000ULL
+                  << " ms without I/O progress\n";
+        ::shutdown(remote_.get(), SHUT_RDWR);
+      } else {
+        SSL_shutdown(ssl_.get());
+      }
       ::shutdown(local_.get(), SHUT_RDWR);
     } catch (const std::exception& error) {
       ::shutdown(local_.get(), SHUT_RDWR);
@@ -176,7 +238,33 @@ class TlsTunnel {
   std::unique_ptr<SSL, SslDeleter> ssl_;
   UniqueFd remote_;
   UniqueFd local_;
+  const uint64_t timeout_ns_;
+  std::atomic<uint64_t> next_request_id_{1};
+  std::atomic<uint64_t> active_request_id_{0};
   std::jthread thread_;
+};
+
+class TlsRequestTimer {
+ public:
+  explicit TlsRequestTimer(std::shared_ptr<TlsTunnel> tunnel)
+      : tunnel_(std::move(tunnel)) {
+    if (tunnel_) {
+      request_id_ = tunnel_->begin_request();
+    }
+  }
+
+  ~TlsRequestTimer() {
+    if (tunnel_) {
+      tunnel_->end_request(request_id_);
+    }
+  }
+
+  TlsRequestTimer(const TlsRequestTimer&) = delete;
+  TlsRequestTimer& operator=(const TlsRequestTimer&) = delete;
+
+ private:
+  std::shared_ptr<TlsTunnel> tunnel_;
+  uint64_t request_id_ = 0;
 };
 
 struct TlsConnection {
@@ -185,8 +273,10 @@ struct TlsConnection {
   bool http2 = false;
 };
 
-TlsConnection connect_tls(std::string_view host, uint16_t port) {
-  UniqueFd remote = connect_tcp(host, port);
+TlsConnection connect_tls(std::string_view host, uint16_t port,
+                          int io_timeout_ms = kRequestIoTimeoutMs) {
+  UniqueFd remote = connect_tcp(
+      host, port, kConnectTimeoutMs, io_timeout_ms);
   std::unique_ptr<SSL_CTX, SslContextDeleter> context(
       SSL_CTX_new(TLS_client_method()));
   if (!context) {
@@ -242,9 +332,10 @@ TlsConnection connect_tls(std::string_view host, uint16_t port) {
   }
   UniqueFd application(pair[0]);
   UniqueFd tunnel_end(pair[1]);
+  set_socket_receive_timeout(application.get(), io_timeout_ms);
   auto tunnel = std::make_shared<TlsTunnel>(
       std::move(context), std::move(ssl), std::move(remote),
-      std::move(tunnel_end));
+      std::move(tunnel_end), io_timeout_ms);
   return TlsConnection{
       .socket = std::move(application),
       .tunnel = std::move(tunnel),
@@ -456,7 +547,8 @@ class Http2Client final : public HttpClient {
                        std::string request_authority,
                        std::string reconnect_host = {},
                        uint16_t reconnect_port = 0,
-                       std::shared_ptr<TlsTunnel> connected_tunnel = {});
+                       std::shared_ptr<TlsTunnel> connected_tunnel = {},
+                       int connected_io_timeout_ms = kRequestIoTimeoutMs);
 
   RangeResponse get_range(std::string_view path, uint64_t offset,
                           size_t length, Pipe& destination,
@@ -519,6 +611,7 @@ class Http2Client final : public HttpClient {
   std::string authority;
   std::string host;
   uint16_t port = 0;
+  int io_timeout_ms = kRequestIoTimeoutMs;
   std::unique_ptr<nghttp2_session_callbacks, Http2CallbacksDeleter> callbacks;
   std::unique_ptr<nghttp2_option, Http2OptionDeleter> option;
   std::unique_ptr<nghttp2_session, Http2SessionDeleter> session;
@@ -533,6 +626,7 @@ class Http2Client final : public HttpClient {
   int callback_errno = 0;
   bool reconnect_required = false;
   bool tls = false;
+  uint64_t tls_upload_request_id = 0;
 
   void initialize_session() {
     nghttp2_session_callbacks* raw_callbacks = nullptr;
@@ -775,12 +869,14 @@ Http2Client::Http2Client(UniqueFd connected_socket,
                          std::string request_authority,
                          std::string reconnect_host,
                          uint16_t reconnect_port,
-                         std::shared_ptr<TlsTunnel> connected_tunnel)
+                         std::shared_ptr<TlsTunnel> connected_tunnel,
+                         int connected_io_timeout_ms)
     : tunnel(std::move(connected_tunnel)),
       socket(std::move(connected_socket)),
       authority(std::move(request_authority)),
       host(std::move(reconnect_host)),
       port(reconnect_port),
+      io_timeout_ms(connected_io_timeout_ms),
       tls(tunnel != nullptr) {
   Pipe probe = Pipe::create(kPreferredIoSize);
   maximum_frame_size = uint32_t(std::clamp<size_t>(
@@ -801,7 +897,7 @@ void Http2Client::ensure_ready() {
   UniqueFd connected;
   std::shared_ptr<TlsTunnel> connected_tunnel;
   if (tls) {
-    TlsConnection transport = connect_tls(host, port);
+    TlsConnection transport = connect_tls(host, port, io_timeout_ms);
     if (!transport.http2) {
       throw std::runtime_error(
           "TLS reconnect changed protocol from HTTP/2");
@@ -809,7 +905,8 @@ void Http2Client::ensure_ready() {
     connected = std::move(transport.socket);
     connected_tunnel = std::move(transport.tunnel);
   } else {
-    connected = connect_tcp(host, port);
+    connected = connect_tcp(
+        host, port, kConnectTimeoutMs, io_timeout_ms);
   }
   socket.reset();
   tunnel.reset();
@@ -879,6 +976,8 @@ RangeResponse Http2Client::get_range(std::string_view path, uint64_t offset,
     headers.push_back(
         make_header(sso_view(value.name), sso_view(value.value)));
   }
+
+  TlsRequestTimer tls_timer(tunnel);
 
   ActiveRequest request;
   request.destination       = &destination;
@@ -964,6 +1063,8 @@ RangeResponse Http2Client::put_from_fd(std::string_view path,
     headers.push_back(
         make_header(sso_view(value.name), sso_view(value.value)));
   }
+
+  TlsRequestTimer tls_timer(tunnel);
 
   Pipe response_pipe = Pipe::create();
   UploadSource upload{
@@ -1098,6 +1199,9 @@ void Http2Client::begin_upload(
   upload_length                      = content_length;
   upload_sent                        = 0;
   active                             = upload_request.get();
+  if (tunnel) {
+    tls_upload_request_id = tunnel->begin_request();
+  }
   try {
     flush();
   } catch (...) {
@@ -1266,6 +1370,10 @@ Response Http2Client::finish_upload(size_t max_response_body) {
     upload_response = Pipe();
     upload_length   = kUnknownBodyLength;
     upload_sent     = 0;
+    if (tls_upload_request_id != 0) {
+      tunnel->end_request(tls_upload_request_id);
+      tls_upload_request_id = 0;
+    }
     return response;
   } catch (...) {
     cancel_upload();
@@ -1274,6 +1382,10 @@ Response Http2Client::finish_upload(size_t max_response_body) {
 }
 
 void Http2Client::cancel_upload() noexcept {
+  if (tls_upload_request_id != 0) {
+    tunnel->end_request(tls_upload_request_id);
+    tls_upload_request_id = 0;
+  }
   active = nullptr;
   upload_request.reset();
   upload_response = Pipe();
@@ -1311,6 +1423,8 @@ RangeResponse Http2Client::request_no_body(
     headers.push_back(
         make_header(sso_view(value.name), sso_view(value.value)));
   }
+
+  TlsRequestTimer tls_timer(tunnel);
 
   const bool head = method == "HEAD";
   Pipe response_pipe = head ? Pipe() : Pipe::create();
@@ -1396,23 +1510,23 @@ bool Http2Client::probe_server() {
         ::recv(socket.get(), received_prefix.data(),
                received_prefix.size(), MSG_WAITALL);
     if (received == 0) {
-      set_socket_receive_timeout(socket.get(), kRequestIoTimeoutMs);
+      set_socket_receive_timeout(socket.get(), io_timeout_ms);
       return false;
     }
     if (received < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        set_socket_receive_timeout(socket.get(), kRequestIoTimeoutMs);
+        set_socket_receive_timeout(socket.get(), io_timeout_ms);
         return false;
       }
       throw std::system_error(errno, std::generic_category(),
                               "recv(HTTP/2 probe)");
     }
     if (received != static_cast<ssize_t>(prefix.size())) {
-      set_socket_receive_timeout(socket.get(), kRequestIoTimeoutMs);
+      set_socket_receive_timeout(socket.get(), io_timeout_ms);
       return false;
     }
     if (std::equal(prefix.begin(), prefix.end(), received_prefix.begin())) {
-      set_socket_receive_timeout(socket.get(), kRequestIoTimeoutMs);
+      set_socket_receive_timeout(socket.get(), io_timeout_ms);
       return false;
     }
 
@@ -1421,11 +1535,11 @@ bool Http2Client::probe_server() {
         session.get(), socket.get(), sink.write_fd(),
         sink.capacity(), 0, received_prefix);
     flush();
-    set_socket_receive_timeout(socket.get(), kRequestIoTimeoutMs);
+    set_socket_receive_timeout(socket.get(), io_timeout_ms);
     return frame.header.type == NGHTTP2_SETTINGS &&
            frame.header.stream_id == 0;
   } catch (...) {
-    set_socket_receive_timeout(socket.get(), kRequestIoTimeoutMs);
+    set_socket_receive_timeout(socket.get(), io_timeout_ms);
     throw;
   }
 }
@@ -1449,8 +1563,6 @@ void Http2Client::consume(const RangeResponse& response) {
 // HTTP/1.1 client.
 constexpr size_t kMaxResponseHeaderBytes = 64U * 1024U;
 constexpr size_t kHttp1ReadSize = 1024;
-constexpr size_t kHttp1SpliceBatch = 64U * 1024U;
-constexpr size_t kHttp1BatchedSpliceMinimum = 128U * 1024U;
 
 [[noreturn]] void http1_throw_errno(const char* operation);
 
@@ -1465,71 +1577,6 @@ uint64_t http1_monotonic_ns() {
   }
   return static_cast<uint64_t>(value.tv_sec) * 1'000'000'000ULL +
          static_cast<uint64_t>(value.tv_nsec);
-}
-
-size_t http1_splice_body(int source, int destination, size_t length,
-                         size_t* calls) {
-  if (length < kHttp1BatchedSpliceMinimum) {
-    return splice_exact(source, destination, length,
-                        SPLICE_F_MOVE | SPLICE_F_MORE, calls);
-  }
-
-  int lowat = int(kHttp1SpliceBatch);
-  if (::setsockopt(source, SOL_SOCKET, SO_RCVLOWAT,
-                   &lowat, sizeof(lowat)) != 0) {
-    return splice_exact(source, destination, length,
-                        SPLICE_F_MOVE | SPLICE_F_MORE, calls);
-  }
-
-  size_t done = 0;
-  try {
-    while (done != length) {
-      const size_t remaining = length - done;
-      const int wanted = int(std::min(remaining, kHttp1SpliceBatch));
-      if (wanted != lowat) {
-        lowat = wanted;
-        if (::setsockopt(source, SOL_SOCKET, SO_RCVLOWAT,
-                         &lowat, sizeof(lowat)) != 0) {
-          http1_throw_errno("setsockopt(SO_RCVLOWAT)");
-        }
-      }
-
-      pollfd pfd{.fd = source, .events = POLLIN, .revents = 0};
-      int n;
-      do {
-        n = ::poll(&pfd, 1, kRequestIoTimeoutMs);
-      } while (n < 0 && errno == EINTR);
-      if (n == 0) {
-        throw std::system_error(ETIMEDOUT, std::generic_category(),
-                                "poll(HTTP/1.1 body)");
-      }
-      if (n < 0) {
-        http1_throw_errno("poll(HTTP/1.1 body)");
-      }
-      if ((pfd.revents & POLLNVAL) != 0) {
-        throw std::system_error(EBADF, std::generic_category(),
-                                "poll(HTTP/1.1 body)");
-      }
-
-      if (calls != nullptr) {
-        ++*calls;
-      }
-      done += splice_some(
-          source, nullptr, destination, remaining,
-          SPLICE_F_MOVE | SPLICE_F_MORE);
-    }
-  } catch (...) {
-    const int one = 1;
-    ::setsockopt(source, SOL_SOCKET, SO_RCVLOWAT, &one, sizeof(one));
-    throw;
-  }
-
-  const int one = 1;
-  if (::setsockopt(source, SOL_SOCKET, SO_RCVLOWAT,
-                   &one, sizeof(one)) != 0) {
-    http1_throw_errno("setsockopt(SO_RCVLOWAT restore)");
-  }
-  return done;
 }
 
 ssostr<32> ascii_lower(const ssostr<32>& value) {
@@ -1897,12 +1944,14 @@ class Http1Client final : public HttpClient {
  public:
   Http1Client(UniqueFd connected_socket, std::string request_authority,
               std::string reconnect_host = {}, uint16_t reconnect_port = 0,
-              std::shared_ptr<TlsTunnel> connected_tunnel = {})
+              std::shared_ptr<TlsTunnel> connected_tunnel = {},
+              int connected_io_timeout_ms = kRequestIoTimeoutMs)
       : tunnel(std::move(connected_tunnel)),
         socket(std::move(connected_socket)),
         authority(std::move(request_authority)),
         host(std::move(reconnect_host)),
         port(reconnect_port),
+        io_timeout_ms(connected_io_timeout_ms),
         tls(tunnel != nullptr) {}
 
   Response get_range(std::string_view path, uint64_t offset,
@@ -1943,8 +1992,10 @@ class Http1Client final : public HttpClient {
   std::string request_head;
   std::string upload_method;
   uint16_t port = 0;
+  int io_timeout_ms = kRequestIoTimeoutMs;
   bool request_active = false;
   bool upload_chunked = false;
+  uint64_t tls_upload_request_id = 0;
   size_t upload_sent = 0;
   size_t upload_length = kUnknownBodyLength;
   bool tls = false;
@@ -1957,7 +2008,7 @@ class Http1Client final : public HttpClient {
       throw std::runtime_error("HTTP/1.1 connection is not reusable");
     }
     if (tls) {
-      TlsConnection transport = connect_tls(host, port);
+      TlsConnection transport = connect_tls(host, port, io_timeout_ms);
       if (transport.http2) {
         throw std::runtime_error(
             "TLS reconnect changed protocol from HTTP/1.1");
@@ -1965,7 +2016,8 @@ class Http1Client final : public HttpClient {
       tunnel = std::move(transport.tunnel);
       socket = std::move(transport.socket);
     } else {
-      socket = connect_tcp(host, port);
+      socket = connect_tcp(
+          host, port, kConnectTimeoutMs, io_timeout_ms);
     }
   }
 
@@ -2085,8 +2137,9 @@ class Http1Client final : public HttpClient {
               response.body_bytes += remaining;
               response.fallback_copied_bytes += remaining;
             } else {
-              response.externally_spliced_bytes = http1_splice_body(
+              response.externally_spliced_bytes = splice_exact(
                   socket.get(), destination->write_fd(), remaining,
+                  SPLICE_F_MOVE | SPLICE_F_MORE,
                   &response.transport_splice_calls);
               response.body_bytes += remaining;
             }
@@ -2157,6 +2210,7 @@ class Http1Client final : public HttpClient {
     request_active = true;
     try {
       ensure_connected();
+      TlsRequestTimer tls_timer(tunnel);
       build_request_head(request_head, method, path, authority,
                          generated_headers, headers, content_length, false,
                          trusted_headers);
@@ -2259,6 +2313,9 @@ void Http1Client::begin_upload(
   request_active = true;
   try {
     ensure_connected();
+    if (tunnel) {
+      tls_upload_request_id = tunnel->begin_request();
+    }
     const bool fixed_length = content_length != kUnknownBodyLength;
     const std::optional<size_t> length = fixed_length
                                              ? std::optional(content_length)
@@ -2380,6 +2437,10 @@ Response Http1Client::finish_upload(size_t max_response_body) {
     upload_method.clear();
     upload_sent   = 0;
     upload_length = kUnknownBodyLength;
+    if (tls_upload_request_id != 0) {
+      tunnel->end_request(tls_upload_request_id);
+      tls_upload_request_id = 0;
+    }
     return response;
   } catch (...) {
     cancel_upload();
@@ -2388,6 +2449,10 @@ Response Http1Client::finish_upload(size_t max_response_body) {
 }
 
 void Http1Client::cancel_upload() noexcept {
+  if (tls_upload_request_id != 0) {
+    tunnel->end_request(tls_upload_request_id);
+    tls_upload_request_id = 0;
+  }
   request_active = false;
   upload_chunked = false;
   upload_method.clear();
@@ -2414,25 +2479,27 @@ Response Http1Client::request_no_body(
 
 // HTTP/2-preferred protocol selection.
 std::unique_ptr<HttpClient> HttpClient::connect(
-    std::string_view host, uint16_t port, std::string authority, bool tls) {
+    std::string_view host, uint16_t port, std::string authority, bool tls,
+    int io_timeout_ms) {
   if (authority.empty()) {
     authority = std::string(host) + ':' + std::to_string(port);
   }
 
   if (tls) {
-    TlsConnection transport = connect_tls(host, port);
+    TlsConnection transport = connect_tls(host, port, io_timeout_ms);
     if (transport.http2) {
       return std::make_unique<Http2Client>(
           std::move(transport.socket), authority, std::string(host), port,
-          std::move(transport.tunnel));
+          std::move(transport.tunnel), io_timeout_ms);
     }
     return std::make_unique<Http1Client>(
         std::move(transport.socket), std::move(authority), std::string(host),
-        port, std::move(transport.tunnel));
+        port, std::move(transport.tunnel), io_timeout_ms);
   }
 
   auto h2 = std::make_unique<Http2Client>(
-      connect_tcp(host, port), authority, std::string(host), port);
+      connect_tcp(host, port, kConnectTimeoutMs, io_timeout_ms), authority,
+      std::string(host), port, std::shared_ptr<TlsTunnel>{}, io_timeout_ms);
   try {
     if (h2->probe_server()) {
       return h2;
@@ -2442,5 +2509,7 @@ std::unique_ptr<HttpClient> HttpClient::connect(
     // HTTP/2 preface. Reconnect below and use HTTP/1.1.
   }
   return std::make_unique<Http1Client>(
-      connect_tcp(host, port), std::move(authority), std::string(host), port);
+      connect_tcp(host, port, kConnectTimeoutMs, io_timeout_ms),
+      std::move(authority), std::string(host), port,
+      std::shared_ptr<TlsTunnel>{}, io_timeout_ms);
 }

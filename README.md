@@ -17,15 +17,21 @@ multi-file namespace. It remains experimental rather than production-ready.
   while an HTTP/1.x response or close causes a clean reconnect using llhttp
   v9.4.3. A silent probe is bounded to one second. GOAWAY or a failed HTTP/2
   connection triggers protocol detection again before the next request.
-  Protocol selection is not exposed as a mount option.
+  Protocol selection is not exposed as a mount option. Established plain TCP
+  sockets use 30-second send and receive timeouts, including socket-to-pipe
+  `splice(2)` waits.
 - HTTPS uses the system trust store, verifies the endpoint hostname, sends SNI,
   and negotiates HTTP/2 or HTTP/1.1 with ALPN. Port 443 enables TLS
-  automatically; `-S/--tls` enables it on any port.
+  automatically; `-S/--tls` enables it on any port. Active TLS requests have
+  a 30-second no-I/O-progress timeout; timeout discards the connection and the
+  next request reconnects. Idle keep-alive connections are not timed out.
 - HTTP/1.1 response headers are scanned once by llhttp. For a fixed-length
   response, llhttp pauses at the header boundary, body bytes already returned
   by that `recv(2)` are copied once into the transport pipe, and the remainder
-  is spliced from the socket. Chunked and EOF-delimited responses are strictly
-  parsed by llhttp and use a bounded copied fallback.
+  is requested from `splice(2)` at its full remaining length; kernel short
+  returns are retried without an artificial batching threshold. Chunked and
+  EOF-delimited responses are strictly parsed by llhttp and use a bounded
+  copied fallback.
 - Range GET payload path:
 
   ```text
@@ -167,6 +173,15 @@ multi-file namespace. It remains experimental rather than production-ready.
   write scheduler and retained-memory budget are mount-global. Bulk transfers
   use at most `max-connections - 1`, reserving one connection for reads and
   control requests.
+
+## TODO
+
+- Linux FUSE can currently merge the folios required by the caller with
+  speculative readahead folios into one `FUSE_READ`. A reply cannot complete
+  incrementally, so the caller may wait for that whole merged request. When
+  kernel FUSE supports splitting at the synchronous/asynchronous readahead
+  boundary, use it so the caller can return while later readahead requests
+  continue in the background. Do not add userspace readahead as a workaround.
 
 ## Build in WSL
 
