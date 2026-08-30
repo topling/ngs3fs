@@ -1494,19 +1494,11 @@ void authorization_headers_for_credentials(
       });
 }
 
-std::string session_xml_text(std::string_view xml,
-                             std::string_view name) {
-  const std::string open = '<' + std::string(name) + '>';
-  const std::string close = "</" + std::string(name) + '>';
-  const size_t begin = xml.find(open);
-  if (begin == std::string_view::npos) {
-    return {};
-  }
-  const size_t value = begin + open.size();
-  const size_t end = xml.find(close, value);
-  return end == std::string_view::npos
-             ? std::string{}
-             : std::string(xml.substr(value, end - value));
+std::string_view response_xml(const Response& response) noexcept {
+  const char* data = response.body.empty()
+                         ? ""
+                         : reinterpret_cast<const char*>(response.body.data());
+  return std::string_view(data, response.body.size());
 }
 
 void ensure_express_session(State& state) {
@@ -1548,13 +1540,17 @@ void ensure_express_session(State& state) {
       throw std::runtime_error("CreateSession failed with status " +
                                std::to_string(response.status));
     }
-    const std::string body(
-        reinterpret_cast<const char*>(response.body.data()),
-        response.body.size());
-    credentials.access_key_id = session_xml_text(body, "AccessKeyId");
+    S3Xml xml(response_xml(response), "CreateSession");
+    const tinyxml2::XMLElement& root =
+        xml.result_root("CreateSessionResult");
+    const tinyxml2::XMLElement& values =
+        xml.required_child(root, "Credentials");
+    credentials.access_key_id =
+        xml.required_text(values, "AccessKeyId");
     credentials.secret_access_key =
-        session_xml_text(body, "SecretAccessKey");
-    credentials.session_token = session_xml_text(body, "SessionToken");
+        xml.required_text(values, "SecretAccessKey");
+    credentials.session_token =
+        xml.required_text(values, "SessionToken");
     if (credentials.access_key_id.empty() ||
         credentials.secret_access_key.empty() ||
         credentials.session_token.empty()) {
@@ -1983,98 +1979,6 @@ std::string query_path(std::string_view path, std::string_view query) {
   return result;
 }
 
-std::string response_text(const Response& response) {
-  return std::string(
-      reinterpret_cast<const char*>(response.body.data()),
-      response.body.size());
-}
-
-std::string xml_text(std::string_view xml, std::string_view name) {
-  const std::string open = '<' + std::string(name) + '>';
-  const std::string close = "</" + std::string(name) + '>';
-  const size_t begin = xml.find(open);
-  if (begin == std::string_view::npos) {
-    return {};
-  }
-  const size_t value = begin + open.size();
-  const size_t end = xml.find(close, value);
-  if (end == std::string_view::npos) {
-    return {};
-  }
-  return std::string(xml.substr(value, end - value));
-}
-
-std::string xml_decode(std::string_view text) {
-  const auto append_code_point = [](std::string& output, uint32_t value) {
-    if (value >= 0xd800 && value <= 0xdfff) {
-      throw std::runtime_error("invalid XML surrogate in ListObjectsV2");
-    }
-    if (value <= 0x7f) {
-      output.push_back(char(value));
-    } else if (value <= 0x7ff) {
-      output.push_back(char(0xc0 | (value >> 6)));
-      output.push_back(char(0x80 | (value & 0x3f)));
-    } else if (value <= 0xffff) {
-      output.push_back(char(0xe0 | (value >> 12)));
-      output.push_back(char(0x80 | ((value >> 6) & 0x3f)));
-      output.push_back(char(0x80 | (value & 0x3f)));
-    } else if (value <= 0x10ffff) {
-      output.push_back(char(0xf0 | (value >> 18)));
-      output.push_back(char(0x80 | ((value >> 12) & 0x3f)));
-      output.push_back(char(0x80 | ((value >> 6) & 0x3f)));
-      output.push_back(char(0x80 | (value & 0x3f)));
-    } else {
-      throw std::runtime_error("invalid XML code point in ListObjectsV2");
-    }
-  };
-  std::string result;
-  result.reserve(text.size());
-  size_t p = 0;
-  while (p < text.size()) {
-    if (text[p] != '&') {
-      result.push_back(text[p++]);
-      continue;
-    }
-    const size_t end = text.find(';', p + 1);
-    if (end == std::string_view::npos) {
-      throw std::runtime_error("invalid XML entity in ListObjectsV2");
-    }
-    const std::string_view entity = text.substr(p, end - p + 1);
-    if (entity == "&amp;") {
-      result.push_back('&');
-    } else if (entity == "&lt;") {
-      result.push_back('<');
-    } else if (entity == "&gt;") {
-      result.push_back('>');
-    } else if (entity == "&quot;") {
-      result.push_back('"');
-    } else if (entity == "&apos;") {
-      result.push_back('\'');
-    } else if (entity.starts_with("&#") && entity.size() > 3) {
-      std::string_view digits = entity.substr(2, entity.size() - 3);
-      int base = 10;
-      if (!digits.empty() && (digits.front() == 'x' ||
-                              digits.front() == 'X')) {
-        digits.remove_prefix(1);
-        base = 16;
-      }
-      uint32_t value = 0;
-      const auto parsed = std::from_chars(
-          digits.data(), digits.data() + digits.size(), value, base);
-      if (digits.empty() || parsed.ec != std::errc{} ||
-          parsed.ptr != digits.data() + digits.size()) {
-        throw std::runtime_error(
-            "invalid numeric XML entity in ListObjectsV2");
-      }
-      append_code_point(result, value);
-    } else {
-      throw std::runtime_error("unsupported XML entity in ListObjectsV2");
-    }
-    p = end + 1;
-  }
-  return result;
-}
-
 unsigned hex_value(char ch) {
   if (ch >= '0' && ch <= '9') {
     return unsigned(ch - '0');
@@ -2129,25 +2033,60 @@ struct ListedPage {
   bool truncated = false;
 };
 
-template<class Function>
-void for_each_xml_block(std::string_view xml, std::string_view name,
-                        Function function) {
-  const std::string open  = '<' + std::string(name) + '>';
-  const std::string close = "</" + std::string(name) + '>';
-  size_t p = 0;
-  for (;;) {
-    const size_t begin = xml.find(open, p);
-    if (begin == std::string_view::npos) {
-      return;
-    }
-    const size_t value = begin + open.size();
-    const size_t end   = xml.find(close, value);
-    if (end == std::string_view::npos) {
-      throw std::runtime_error("truncated ListObjectsV2 XML");
-    }
-    function(xml.substr(value, end - value));
-    p = end + close.size();
+struct ListedXmlPage {
+  std::vector<ListedObject> objects;
+  std::vector<std::string> prefixes;
+  std::string token;
+  bool truncated = false;
+};
+
+std::string_view trim_xml_space(std::string_view value) noexcept {
+  while (!value.empty() && isspace(u_char(value.front()))) {
+    value.remove_prefix(1);
   }
+  while (!value.empty() && isspace(u_char(value.back()))) {
+    value.remove_suffix(1);
+  }
+  return value;
+}
+
+ListedXmlPage parse_list_xml(const Response& response,
+                             const char* operation) {
+  S3Xml xml(response_xml(response), operation);
+  const tinyxml2::XMLElement& root =
+      xml.result_root("ListBucketResult");
+  ListedXmlPage page;
+  page.objects.reserve(kDirectoryListLimit);
+  page.prefixes.reserve(kDirectoryListLimit);
+  for (const tinyxml2::XMLElement* child = root.FirstChildElement();
+       child != nullptr; child = child->NextSiblingElement()) {
+    if (S3Xml::named(*child, "Contents")) {
+      ListedObject object;
+      object.key = percent_decode(xml.required_text(*child, "Key"));
+      const std::string size = xml.required_text(*child, "Size");
+      if (!parse_unsigned(trim_xml_space(size), object.size)) {
+        throw std::runtime_error(
+            std::string(operation) + " returned invalid Size");
+      }
+      object.etag = xml.optional_text(*child, "ETag");
+      const std::string modified =
+          xml.optional_text(*child, "LastModified");
+      if (!modified.empty()) {
+        object.mtime = parse_s3_mtime(trim_xml_space(modified));
+      }
+      page.objects.push_back(std::move(object));
+    } else if (S3Xml::named(*child, "CommonPrefixes")) {
+      page.prefixes.push_back(
+          percent_decode(xml.required_text(*child, "Prefix")));
+    }
+  }
+  page.truncated = xml.required_bool(root, "IsTruncated");
+  page.token = xml.optional_text(root, "NextContinuationToken");
+  if (page.truncated && page.token.empty()) {
+    throw std::runtime_error(
+        std::string(operation) + " omitted NextContinuationToken");
+  }
+  return page;
 }
 
 ListedPage list_directory_page(State& state, std::string_view prefix,
@@ -2171,13 +2110,13 @@ ListedPage list_directory_page(State& state, std::string_view prefix,
   if (response.status != 200) {
     throw_s3_status(response.status, "ListObjectsV2");
   }
-  const std::string xml = response_text(response);
+  ListedXmlPage listed = parse_list_xml(response, "ListObjectsV2");
   ListedPage page;
   page.children.reserve(kDirectoryListLimit);
-  for_each_xml_block(xml, "Contents", [&](std::string_view block) {
-    const std::string key = percent_decode(xml_decode(xml_text(block, "Key")));
+  for (const ListedObject& object : listed.objects) {
+    const std::string& key = object.key;
     if (!key.starts_with(prefix) || key.size() == prefix.size()) {
-      return;
+      continue;
     }
     std::string_view relative(key.data() + prefix.size(),
                               key.size() - prefix.size());
@@ -2186,47 +2125,33 @@ ListedPage list_directory_page(State& state, std::string_view prefix,
       relative.remove_suffix(1);
     }
     if (!valid_fuse_component(relative)) {
-      return;
-    }
-    uint64_t size = 0;
-    if (!parse_unsigned(xml_decode(xml_text(block, "Size")), size)) {
-      throw std::runtime_error("ListObjectsV2 returned invalid Size");
+      continue;
     }
     ListedChild child;
     child.name.assign(relative);
-    child.size      = size;
+    child.size      = object.size;
     child.directory = marker;
-    const std::string modified =
-        xml_decode(xml_text(block, "LastModified"));
-    if (!modified.empty()) {
-      child.mtime = parse_s3_mtime(modified);
-    }
+    child.mtime     = object.mtime;
     page.children.push_back(std::move(child));
-  });
-  for_each_xml_block(xml, "CommonPrefixes", [&](std::string_view block) {
-    std::string key = percent_decode(xml_decode(xml_text(block, "Prefix")));
+  }
+  for (std::string& key : listed.prefixes) {
     if (!key.starts_with(prefix) ||
         key.size() <= prefix.size() || key.back() != '/') {
-      return;
+      continue;
     }
     key.pop_back();
     const std::string_view relative(
         key.data() + prefix.size(), key.size() - prefix.size());
     if (!valid_fuse_component(relative)) {
-      return;
+      continue;
     }
     ListedChild child;
     child.name.assign(relative);
     child.directory = true;
     page.children.push_back(std::move(child));
-  });
-  page.truncated = xml_text(xml, "IsTruncated") == "true";
-  if (page.truncated) {
-    page.token = xml_decode(xml_text(xml, "NextContinuationToken"));
-    if (page.token.empty()) {
-      throw std::runtime_error("ListObjectsV2 omitted NextContinuationToken");
-    }
   }
+  page.truncated = listed.truncated;
+  page.token     = std::move(listed.token);
   return page;
 }
 
@@ -2267,33 +2192,18 @@ std::vector<ListedObject> list_prefix_objects(State& state,
     if (response.status != 200) {
       throw_s3_status(response.status, "ListObjectsV2 prefix scan");
     }
-    const std::string xml = response_text(response);
-    for_each_xml_block(xml, "Contents", [&](std::string_view block) {
-      ListedObject object;
-      object.key = percent_decode(xml_decode(xml_text(block, "Key")));
+    ListedXmlPage page =
+        parse_list_xml(response, "ListObjectsV2 prefix scan");
+    for (ListedObject& object : page.objects) {
       if (!object.key.starts_with(prefix)) {
-        return;
-      }
-      if (!parse_unsigned(xml_decode(xml_text(block, "Size")), object.size)) {
-        throw std::runtime_error(
-            "ListObjectsV2 prefix scan returned invalid Size");
-      }
-      object.etag = xml_decode(xml_text(block, "ETag"));
-      const std::string modified =
-          xml_decode(xml_text(block, "LastModified"));
-      if (!modified.empty()) {
-        object.mtime = parse_s3_mtime(modified);
+        continue;
       }
       objects.push_back(std::move(object));
-    });
-    if (xml_text(xml, "IsTruncated") != "true") {
+    }
+    if (!page.truncated) {
       break;
     }
-    token = xml_decode(xml_text(xml, "NextContinuationToken"));
-    if (token.empty()) {
-      throw std::runtime_error(
-          "ListObjectsV2 prefix scan omitted NextContinuationToken");
-    }
+    token = std::move(page.token);
   }
   return objects;
 }
@@ -2322,35 +2232,21 @@ void for_each_prefix_page(State& state, std::string_view prefix,
       throw_s3_status(response.status,
                       "ListObjectsV2 streaming prefix scan");
     }
-    const std::string xml = response_text(response);
+    ListedXmlPage listed =
+        parse_list_xml(response, "ListObjectsV2 streaming prefix scan");
     std::vector<ListedObject> page;
-    for_each_xml_block(xml, "Contents", [&](std::string_view block) {
-      ListedObject object;
-      object.key = percent_decode(xml_decode(xml_text(block, "Key")));
+    page.reserve(listed.objects.size());
+    for (ListedObject& object : listed.objects) {
       if (!object.key.starts_with(prefix)) {
-        return;
-      }
-      if (!parse_unsigned(xml_decode(xml_text(block, "Size")), object.size)) {
-        throw std::runtime_error(
-            "ListObjectsV2 streaming scan returned invalid Size");
-      }
-      object.etag = xml_decode(xml_text(block, "ETag"));
-      const std::string modified =
-          xml_decode(xml_text(block, "LastModified"));
-      if (!modified.empty()) {
-        object.mtime = parse_s3_mtime(modified);
+        continue;
       }
       page.push_back(std::move(object));
-    });
+    }
     function(std::move(page));
-    if (xml_text(xml, "IsTruncated") != "true") {
+    if (!listed.truncated) {
       return;
     }
-    token = xml_decode(xml_text(xml, "NextContinuationToken"));
-    if (token.empty()) {
-      throw std::runtime_error(
-          "ListObjectsV2 streaming scan omitted NextContinuationToken");
-    }
+    token = std::move(listed.token);
   }
 }
 
@@ -2370,14 +2266,13 @@ bool prefix_has_objects(State& state, std::string_view prefix) {
   if (response.status != 200) {
     throw_s3_status(response.status, "ListObjectsV2 rename verification");
   }
-  const std::string xml = response_text(response);
-  bool found = false;
-  for_each_xml_block(xml, "Contents", [&](std::string_view block) {
-    const std::string key =
-        percent_decode(xml_decode(xml_text(block, "Key")));
-    found = found || key.starts_with(prefix);
-  });
-  return found;
+  const ListedXmlPage page =
+      parse_list_xml(response, "ListObjectsV2 rename verification");
+  return std::any_of(
+      page.objects.begin(), page.objects.end(),
+      [&](const ListedObject& object) {
+        return object.key.starts_with(prefix);
+      });
 }
 
 InodeBase* allocate_inode(InodeBase* parent, bool directory) {
@@ -3331,7 +3226,10 @@ void ensure_multipart(State& state, OpenHandle& handle) {
                 << " path=" << handle.object_path << '\n';
     }
     require_s3_success(response, "CreateMultipartUpload");
-    std::string upload_id = xml_text(response_text(response), "UploadId");
+    S3Xml xml(response_xml(response), "CreateMultipartUpload");
+    const tinyxml2::XMLElement& root =
+        xml.result_root("InitiateMultipartUploadResult");
+    std::string upload_id = xml.required_text(root, "UploadId");
     if (upload_id.empty()) {
       throw std::runtime_error(
           "CreateMultipartUpload response omitted UploadId");
@@ -3634,11 +3532,10 @@ void complete_multipart(State& state, OpenHandle& handle) {
                             "multipart destination exists");
   }
   require_s3_success(response, "CompleteMultipartUpload");
-  const std::string xml = response_text(response);
-  if (xml.find("<Error>") != std::string::npos) {
-    throw std::runtime_error("CompleteMultipartUpload returned an S3 error");
-  }
-  update_written_metadata(handle, response, xml_text(xml, "ETag"));
+  S3Xml xml(response_xml(response), "CompleteMultipartUpload");
+  const tinyxml2::XMLElement& root =
+      xml.result_root("CompleteMultipartUploadResult");
+  update_written_metadata(handle, response, xml.optional_text(root, "ETag"));
   handle.upload_id.clear();
   handle.part_etags.clear();
 }
@@ -3778,24 +3675,30 @@ bool rename_object_unsupported(const Response& response) {
   if (response.status != 400) {
     return false;
   }
-  const char* data = response.body.empty()
-                         ? ""
-                         : reinterpret_cast<const char*>(response.body.data());
-  const std::string body(data, response.body.size());
-  return body.find("NotImplemented") != std::string::npos ||
-         body.find("InvalidRequest") != std::string::npos || body.empty();
+  if (response.body.empty()) {
+    return true;
+  }
+  S3Xml xml(response_xml(response), "RenameObject capability probe");
+  if (!xml.root_is("Error")) {
+    return false;
+  }
+  const std::string code = xml.required_text(xml.root(), "Code");
+  return code == "NotImplemented" || code == "InvalidRequest";
 }
 
 bool rename_object_source_missing(const Response& response) {
   if (response.status != 400 && response.status != 404) {
     return false;
   }
-  const char* data = response.body.empty()
-                         ? ""
-                         : reinterpret_cast<const char*>(response.body.data());
-  const std::string body(data, response.body.size());
-  return body.find("NoSuchKey") != std::string::npos ||
-         body.find("NoSuchObject") != std::string::npos;
+  if (response.body.empty()) {
+    return false;
+  }
+  S3Xml xml(response_xml(response), "RenameObject capability probe");
+  if (!xml.root_is("Error")) {
+    return false;
+  }
+  const std::string code = xml.required_text(xml.root(), "Code");
+  return code == "NoSuchKey" || code == "NoSuchObject";
 }
 
 std::string rename_client_token() {
@@ -3917,10 +3820,12 @@ void multipart_copy_object(State& state, uint64_t size,
     throw;
   }
   require_s3_success(created, "multipart-copy CreateMultipartUpload");
+  S3Xml created_xml(
+      response_xml(created), "multipart-copy CreateMultipartUpload");
+  const tinyxml2::XMLElement& created_root =
+      created_xml.result_root("InitiateMultipartUploadResult");
   const std::string upload_id =
-      session_xml_text(std::string_view(
-          reinterpret_cast<const char*>(created.body.data()),
-          created.body.size()), "UploadId");
+      created_xml.required_text(created_root, "UploadId");
   if (upload_id.empty()) {
     throw std::runtime_error(
         "multipart-copy CreateMultipartUpload omitted UploadId");
@@ -3969,11 +3874,11 @@ void multipart_copy_object(State& state, uint64_t size,
         return client->request_no_body("PUT", path, request_headers);
       }, "UploadPartCopy");
       require_s3_success(copied, "UploadPartCopy");
-      const std::string body(
-          reinterpret_cast<const char*>(copied.body.data()),
-          copied.body.size());
-      std::string etag = session_xml_text(body, "ETag");
-      if (etag.empty() || body.find("<Error>") != std::string::npos) {
+      S3Xml copied_xml(response_xml(copied), "UploadPartCopy");
+      const tinyxml2::XMLElement& copied_root =
+          copied_xml.result_root("CopyPartResult");
+      std::string etag = copied_xml.required_text(copied_root, "ETag");
+      if (etag.empty()) {
         throw std::runtime_error("UploadPartCopy omitted ETag");
       }
       etags.push_back(std::move(etag));
@@ -4013,13 +3918,9 @@ void multipart_copy_object(State& state, uint64_t size,
                               "multipart-copy destination exists");
     }
     require_s3_success(completed, "multipart-copy completion");
-    const std::string completed_body(
-        reinterpret_cast<const char*>(completed.body.data()),
-        completed.body.size());
-    if (completed_body.find("<Error>") != std::string::npos) {
-      throw std::runtime_error(
-          "multipart-copy completion returned an S3 error");
-    }
+    S3Xml completed_xml(
+        response_xml(completed), "multipart-copy completion");
+    completed_xml.result_root("CompleteMultipartUploadResult");
   } catch (...) {
     if (complete_outcome_unknown) {
       std::cerr << "error: multipart-copy completion outcome unknown: "
@@ -4134,19 +4035,13 @@ void rename_remote_object(State& state, std::string_view key,
       HttpPool::Lease client = state.http->acquire_bulk();
       return client->request_no_body("PUT", destination, request_headers);
     }, "CopyObject rename fallback");
-    const char* copied_data =
-        copied.body.empty()
-            ? ""
-            : reinterpret_cast<const char*>(copied.body.data());
-    const std::string copied_body(copied_data, copied.body.size());
     if (copied.status == 412) {
       throw std::system_error(
           no_replace ? EEXIST : ESTALE, std::generic_category(),
           no_replace ? "CopyObject destination exists"
                      : "CopyObject source changed");
     }
-    if (copied.status != 200 ||
-        copied_body.find("<Error>") != std::string::npos) {
+    if (copied.status != 200) {
       const bool marker_copy_unsupported =
           size == 0 && key.ends_with('/') &&
           (copied.status == 400 || copied.status == 405 ||
@@ -4159,6 +4054,10 @@ void rename_remote_object(State& state, std::string_view key,
       throw std::runtime_error(
           "CopyObject rename fallback failed with status " +
           std::to_string(copied.status));
+    }
+    if (!copied.body.empty()) {
+      S3Xml xml(response_xml(copied), "CopyObject rename fallback");
+      xml.result_root("CopyObjectResult");
     }
   }
 

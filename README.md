@@ -195,7 +195,8 @@ pinned SHA-256 values, and extracts the libfuse3 development packages into
 
 The current build also uses the minimal SSO and hash-map implementation from a
 local topling-zip source checkout selected by `TOPLING_ZIP_SOURCE_DIR`; jemalloc
-is explicitly disabled for that imported code.
+is explicitly disabled for that imported code. CMake fetches the pinned
+TinyXML-2 v11.0.0 release for S3 XML response parsing.
 
 ```sh
 ./scripts/bootstrap.sh

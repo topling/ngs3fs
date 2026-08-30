@@ -3,6 +3,7 @@
 #include "http.hpp"
 
 #include <terark/hash_strmap.hpp>
+#include <tinyxml2.h>
 
 #include <atomic>
 #include <array>
@@ -14,6 +15,46 @@
 #include <string_view>
 #include <time.h>
 #include <utility>
+
+class S3Xml {
+ public:
+  explicit S3Xml(std::string_view xml, std::string_view operation);
+
+  const tinyxml2::XMLElement& root(
+      std::string_view expected = {}) const;
+  const tinyxml2::XMLElement& result_root(
+      std::string_view expected) const;
+  bool root_is(std::string_view name) const noexcept;
+
+  static bool named(const tinyxml2::XMLElement& element,
+                    std::string_view name) noexcept;
+  const tinyxml2::XMLElement* first_child(
+      const tinyxml2::XMLElement& parent,
+      std::string_view name) const noexcept;
+  const tinyxml2::XMLElement* next_sibling(
+      const tinyxml2::XMLElement& element,
+      std::string_view name) const noexcept;
+  const tinyxml2::XMLElement& required_child(
+      const tinyxml2::XMLElement& parent,
+      std::string_view name) const;
+
+  std::string required_text(const tinyxml2::XMLElement& parent,
+                            std::string_view name) const;
+  std::string optional_text(const tinyxml2::XMLElement& parent,
+                            std::string_view name) const;
+  bool required_bool(const tinyxml2::XMLElement& parent,
+                     std::string_view name) const;
+
+ private:
+  const tinyxml2::XMLElement* unique_child(
+      const tinyxml2::XMLElement& parent, std::string_view name,
+      bool required) const;
+  std::string element_text(const tinyxml2::XMLElement& element) const;
+  [[noreturn]] void fail(std::string_view message) const;
+
+  tinyxml2::XMLDocument document_;
+  ssostr<64> operation_;
+};
 
 struct InodeBase;
 struct InodeFile;

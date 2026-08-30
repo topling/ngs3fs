@@ -345,8 +345,9 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     ++state.create_multipart_requests;
     const int submitted = submit_text_response(
         session, connection, frame->hd.stream_id, "200",
-        "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId>"
-        "</InitiateMultipartUploadResult>");
+        "<s3:InitiateMultipartUploadResult xmlns:s3=\"urn:s3\">"
+        "<s3:UploadId>upload&#x2D;1</s3:UploadId>"
+        "</s3:InitiateMultipartUploadResult>");
     return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   if (request.method == "PUT" && frame->hd.type == NGHTTP2_DATA &&
@@ -398,8 +399,9 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     ++state.put_requests;
     const int submitted = submit_text_response(
         session, connection, frame->hd.stream_id, "200",
-        "<CompleteMultipartUploadResult><ETag>\"after-put\"</ETag>"
-        "</CompleteMultipartUploadResult>",
+        "<s3:CompleteMultipartUploadResult xmlns:s3=\"urn:s3\">"
+        "<s3:ETag>&quot;after-put&quot;</s3:ETag>"
+        "</s3:CompleteMultipartUploadResult>",
         state.etag, state.version_id);
     return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
   }
@@ -413,7 +415,8 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       ++state.rename_probe_attempts;
       const int submitted = submit_text_response(
           session, connection, frame->hd.stream_id, "404",
-          "<Error><Code>NoSuchKey</Code></Error>");
+          "<s3:Error xmlns:s3=\"urn:s3\">"
+          "<s3:Code>NoSuchKey</s3:Code></s3:Error>");
       return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     const std::string expected_source =
@@ -507,39 +510,43 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     require(direct, "directory listing omitted delimiter=/");
     require(request.path.find("max-keys=1000") != std::string::npos,
             "directory listing did not request max-keys=1000");
-    std::string xml = "<ListBucketResult>";
+    std::string xml =
+        "<s3:ListBucketResult xmlns:s3=\"urn:s3\">";
     if (state.list_requests == 1) {
       xml += "<!--";
       xml.append(5U * 1024U * 1024U, 'x');
       xml += "-->";
     }
     if (!deep && !second_root_page) {
-      xml += "<IsTruncated>true</IsTruncated>"
-             "<NextContinuationToken>root-page-2</NextContinuationToken>";
-      xml += "<Contents><Key>";
+      xml += "<s3:IsTruncated>1</s3:IsTruncated>"
+             "<s3:NextContinuationToken>root-page&#x2D;2"
+             "</s3:NextContinuationToken>";
+      xml += "<s3:Contents><s3:Key>";
       xml += state.object_key;
-      xml += "</Key><ETag>";
+      xml += "</s3:Key><s3:ETag>";
       xml += state.etag;
-      xml += "</ETag><Size>";
+      xml += "</s3:ETag><s3:Size>";
       xml += std::to_string(state.object.size());
-      xml += "</Size></Contents>";
+      xml += "</s3:Size></s3:Contents>";
       if (state.deep_present) {
-        xml += "<Contents><Key>deep</Key><ETag>\"file\"</ETag>"
-               "<Size>0</Size></Contents>";
+        xml += "<s3:Contents><s3:Key>deep</s3:Key>"
+               "<s3:ETag>\"file\"</s3:ETag>"
+               "<s3:Size>0</s3:Size></s3:Contents>";
       }
     } else {
-      xml += "<IsTruncated>false</IsTruncated>";
+      xml += "<s3:IsTruncated>0</s3:IsTruncated>";
     }
     if (state.deep_present) {
       if (second_root_page) {
-        xml += "<CommonPrefixes><Prefix>deep/</Prefix>"
-               "</CommonPrefixes>";
+        xml += "<s3:CommonPrefixes><s3:Prefix>deep&#47;"
+               "</s3:Prefix></s3:CommonPrefixes>";
       } else if (deep) {
-        xml += "<Contents><Key>deep/child.bin</Key>"
-               "<ETag>\"deep\"</ETag><Size>3</Size></Contents>";
+        xml += "<s3:Contents><s3:Key>deep&#x2F;child.bin</s3:Key>"
+               "<s3:ETag>\"deep\"</s3:ETag>"
+               "<s3:Size>3</s3:Size></s3:Contents>";
       }
     }
-    xml += "</ListBucketResult>";
+    xml += "</s3:ListBucketResult>";
     const int submitted = submit_text_response(
         session, connection, frame->hd.stream_id, "200", xml);
     return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;

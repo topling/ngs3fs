@@ -9,6 +9,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+include(FetchContent)
+
 option(NGS3FS_BUILD_TESTS "Build unit and integration tests" ON)
 option(NGS3FS_ENABLE_SANITIZERS "Enable ASan and UBSan" OFF)
 option(NGS3FS_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
@@ -19,7 +21,6 @@ set(TOPLING_ZIP_SOURCE_DIR
 if(TOPLING_ZIP_SOURCE_DIR)
   message(STATUS "Using external topling-zip: ${TOPLING_ZIP_SOURCE_DIR}")
 else()
-  include(FetchContent)
   FetchContent_Declare(ngs3fs_topling_zip
     GIT_REPOSITORY https://github.com/topling/topling-zip.git
     GIT_TAG 60d2c9a3b37249ceef04b608ef7dd4402ec44553
@@ -64,6 +65,13 @@ include(Dependencies)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto SSL)
 ngs3fs_find_fuse3()
 
+set(tinyxml2_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(ngs3fs_tinyxml2
+  GIT_REPOSITORY https://github.com/leethomason/tinyxml2.git
+  GIT_TAG 11.0.0
+  GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(ngs3fs_tinyxml2)
+
 add_library(ngs3fs_core
   ${TOPLING_ZIP_SOURCE_DIR}/src/terark/hash_common.cpp
   src/http.cpp
@@ -83,6 +91,7 @@ target_link_libraries(ngs3fs_core PUBLIC
   OpenSSL::SSL
   nghttp2_static
   llhttp::llhttp
+  tinyxml2::tinyxml2
 )
 
 if(NGS3FS_BUILD_BENCHMARKS)

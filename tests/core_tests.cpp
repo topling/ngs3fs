@@ -17,6 +17,87 @@
 
 static_assert(sizeof(ssostr<32>) == 32);
 
+template<class Function>
+void assert_throws(Function function) {
+  bool threw = false;
+  try {
+    function();
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void test_s3_xml() {
+  constexpr std::string_view document =
+      "<?xml version=\"1.0\"?>"
+      "<s3:ListBucketResult xmlns:s3=\"urn:s3\">"
+      "<s3:Contents><s3:Key>a&amp;<!-- split -->"
+      "<![CDATA[b]]>&#x43;</s3:Key><s3:Size>7</s3:Size></s3:Contents>"
+      "<s3:IsTruncated> 1 </s3:IsTruncated>"
+      "<s3:NextContinuationToken>next</s3:NextContinuationToken>"
+      "</s3:ListBucketResult>";
+  S3Xml xml(document, "ListObjectsV2");
+  const tinyxml2::XMLElement& root = xml.root("ListBucketResult");
+  const tinyxml2::XMLElement* contents =
+      xml.first_child(root, "Contents");
+  assert(contents != nullptr);
+  assert(xml.required_text(*contents, "Key") == "a&bC");
+  assert(xml.required_text(*contents, "Size") == "7");
+  assert(xml.optional_text(*contents, "ETag").empty());
+  assert(xml.required_bool(root, "IsTruncated"));
+  assert(xml.required_text(root, "NextContinuationToken") == "next");
+  assert(xml.next_sibling(*contents, "Contents") == nullptr);
+
+  assert_throws([] {
+    S3Xml xml("<ListBucketResult><IsTruncated>", "malformed");
+  });
+  assert_throws([] {
+    const std::string text("<Root>ok</Root>\0junk", 20);
+    S3Xml xml(text, "embedded-NUL");
+  });
+  assert_throws([] {
+    S3Xml xml("<Root><Key>a</Key><Key>b</Key></Root>", "duplicate");
+    xml.required_text(xml.root("Root"), "Key");
+  });
+  assert_throws([] {
+    S3Xml xml("<Root><Key><Nested/></Key></Root>", "nested");
+    xml.required_text(xml.root("Root"), "Key");
+  });
+  assert_throws([] {
+    S3Xml xml("<ListBucketResult/>", "missing-pagination");
+    xml.required_bool(xml.root("ListBucketResult"), "IsTruncated");
+  });
+  assert_throws([] {
+    S3Xml xml(
+        "<ListBucketResult><IsTruncated>true</IsTruncated>"
+        "</ListBucketResult>",
+        "missing-token");
+    const tinyxml2::XMLElement& root = xml.root("ListBucketResult");
+    if (xml.required_bool(root, "IsTruncated")) {
+      xml.required_text(root, "NextContinuationToken");
+    }
+  });
+  assert_throws([] {
+    S3Xml xml(
+        "<ListBucketResult><IsTruncated>maybe</IsTruncated>"
+        "</ListBucketResult>",
+        "invalid-pagination");
+    xml.required_bool(xml.root("ListBucketResult"), "IsTruncated");
+  });
+  assert_throws([] {
+    S3Xml xml("<Wrong/>", "wrong-root");
+    xml.root("ListBucketResult");
+  });
+  assert_throws([] {
+    S3Xml xml(
+        "<s3:Error xmlns:s3=\"urn:s3\">"
+        "<s3:Code>InternalError</s3:Code></s3:Error>",
+        "embedded-error");
+    xml.result_root("CompleteMultipartUploadResult");
+  });
+}
+
 void test_ssostr_header_names() {
   const ssostr<32> known("x-amz-rename-source-if-match");
   assert(known.size() == 28);
@@ -281,6 +362,7 @@ void test_s3_mtime() {
 }
 
 int main() {
+  test_s3_xml();
   test_ssostr_header_names();
   test_inode_dentry_slots();
   test_inode_tagged_parent();

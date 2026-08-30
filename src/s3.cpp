@@ -15,6 +15,177 @@
 #include <stdexcept>
 #include <utility>
 
+S3Xml::S3Xml(std::string_view xml, std::string_view operation)
+    : operation_(operation) {
+  if (xml.find('\0') != std::string_view::npos) {
+    fail("returned XML containing a NUL byte");
+  }
+  const tinyxml2::XMLError error = document_.Parse(xml.data(), xml.size());
+  if (error != tinyxml2::XML_SUCCESS) {
+    std::string message = "returned invalid XML";
+    if (const char* detail = document_.ErrorStr();
+        detail != nullptr && *detail != '\0') {
+      message += ": ";
+      message += detail;
+    }
+    fail(message);
+  }
+  if (document_.RootElement() == nullptr) {
+    fail("returned XML without a root element");
+  }
+}
+
+bool S3Xml::named(const tinyxml2::XMLElement& element,
+                  std::string_view name) noexcept {
+  const char* raw = element.Name();
+  if (raw == nullptr) {
+    return false;
+  }
+  std::string_view local(raw);
+  const size_t colon = local.find_last_of(':');
+  if (colon != std::string_view::npos) {
+    local.remove_prefix(colon + 1);
+  }
+  return local == name;
+}
+
+const tinyxml2::XMLElement& S3Xml::root(
+    std::string_view expected) const {
+  const tinyxml2::XMLElement& element = *document_.RootElement();
+  if (!expected.empty() && !named(element, expected)) {
+    std::string message = "returned unexpected XML root <";
+    message += element.Name();
+    message += ">; expected <";
+    message.append(expected);
+    message += '>';
+    fail(message);
+  }
+  return element;
+}
+
+const tinyxml2::XMLElement& S3Xml::result_root(
+    std::string_view expected) const {
+  if (!root_is("Error")) {
+    return root(expected);
+  }
+  const std::string code = optional_text(root(), "Code");
+  fail(code.empty() ? "returned an S3 error"
+                    : "returned S3 error " + code);
+}
+
+bool S3Xml::root_is(std::string_view name) const noexcept {
+  return named(*document_.RootElement(), name);
+}
+
+const tinyxml2::XMLElement* S3Xml::first_child(
+    const tinyxml2::XMLElement& parent,
+    std::string_view name) const noexcept {
+  for (const tinyxml2::XMLElement* child = parent.FirstChildElement();
+       child != nullptr; child = child->NextSiblingElement()) {
+    if (named(*child, name)) {
+      return child;
+    }
+  }
+  return nullptr;
+}
+
+const tinyxml2::XMLElement* S3Xml::next_sibling(
+    const tinyxml2::XMLElement& element,
+    std::string_view name) const noexcept {
+  for (const tinyxml2::XMLElement* next = element.NextSiblingElement();
+       next != nullptr; next = next->NextSiblingElement()) {
+    if (named(*next, name)) {
+      return next;
+    }
+  }
+  return nullptr;
+}
+
+const tinyxml2::XMLElement* S3Xml::unique_child(
+    const tinyxml2::XMLElement& parent, std::string_view name,
+    bool required) const {
+  const tinyxml2::XMLElement* child = first_child(parent, name);
+  if (child == nullptr) {
+    if (required) {
+      std::string message = "response omitted <";
+      message.append(name);
+      message += '>';
+      fail(message);
+    }
+    return nullptr;
+  }
+  if (next_sibling(*child, name) != nullptr) {
+    std::string message = "response repeated <";
+    message.append(name);
+    message += '>';
+    fail(message);
+  }
+  return child;
+}
+
+const tinyxml2::XMLElement& S3Xml::required_child(
+    const tinyxml2::XMLElement& parent, std::string_view name) const {
+  return *unique_child(parent, name, true);
+}
+
+std::string S3Xml::element_text(
+    const tinyxml2::XMLElement& element) const {
+  std::string text;
+  for (const tinyxml2::XMLNode* node = element.FirstChild();
+       node != nullptr; node = node->NextSibling()) {
+    if (node->ToElement() != nullptr) {
+      std::string message = "returned nested XML in <";
+      message += element.Name();
+      message += '>';
+      fail(message);
+    }
+    if (const tinyxml2::XMLText* value = node->ToText()) {
+      text += value->Value();
+    }
+  }
+  return text;
+}
+
+std::string S3Xml::required_text(
+    const tinyxml2::XMLElement& parent, std::string_view name) const {
+  return element_text(*unique_child(parent, name, true));
+}
+
+std::string S3Xml::optional_text(
+    const tinyxml2::XMLElement& parent, std::string_view name) const {
+  const tinyxml2::XMLElement* child = unique_child(parent, name, false);
+  return child == nullptr ? std::string{} : element_text(*child);
+}
+
+bool S3Xml::required_bool(const tinyxml2::XMLElement& parent,
+                          std::string_view name) const {
+  const std::string text = required_text(parent, name);
+  std::string_view value(text);
+  while (!value.empty() && isspace(u_char(value.front()))) {
+    value.remove_prefix(1);
+  }
+  while (!value.empty() && isspace(u_char(value.back()))) {
+    value.remove_suffix(1);
+  }
+  if (value == "true" || value == "1") {
+    return true;
+  }
+  if (value == "false" || value == "0") {
+    return false;
+  }
+  std::string message = "returned invalid boolean in <";
+  message.append(name);
+  message += '>';
+  fail(message);
+}
+
+[[noreturn]] void S3Xml::fail(std::string_view message) const {
+  std::string error(operation_.data(), operation_.size());
+  error += ' ';
+  error.append(message);
+  throw std::runtime_error(error);
+}
+
 Directory::Directory() {
   enable_freelist();
 }
