@@ -41,6 +41,9 @@ multi-file namespace. It remains experimental rather than production-ready.
   Payload bytes do not enter a userspace data buffer. A stock Linux TCP/FUSE
   path still has one kernel copy into the page cache.
 - FUSE remains in cached mode; `direct_io` is never enabled.
+- The preferred application transfer size reported through `statfs.f_bsize`
+  defaults to 256 KiB and is independently configurable with
+  `--io-size`. The allocation-unit field `statfs.f_frsize` remains 4 KiB.
 - Read-ahead defaults to 256 KiB and is controlled by
   `-R/--read-ahead`; raw bytes and KiB/MiB/GiB suffixes are accepted. Before
   FUSE INIT, ngs3fs raises the mount's BDI `read_ahead_kb` when permitted and
@@ -251,7 +254,7 @@ mkdir -p mount
   -e 127.0.0.1 -p 9000 \
   -a bucket.example.test:9000 \
   -b bucket -k optional/raw/prefix \
-  -R 256KiB -T 1000 -I 1000000 \
+  --io-size 256KiB -R 256KiB -T 1000 -I 1000000 \
   -P 8MiB -c 4 -C 8 -B 256MiB \
   -u 1000 -g 1000 -m 0644 -D 0755 \
   -f mount
@@ -260,6 +263,9 @@ mkdir -p mount
 `--prefix` is a raw S3 key prefix; leading slashes are removed and a trailing
 slash is added internally. Omit it to mount the bucket root. Path-style versus
 virtual-hosted requests are inferred from `--authority` and `--bucket`.
+`--io-size` controls only the preferred transfer-size hint returned by
+`statfs(2)` and must be nonzero; it does not change FUSE request sizing or
+kernel read-ahead.
 `--read-ahead` must be page-aligned; `0` disables it. Values above the
 per-request pipe capacity are split by kernel FUSE read limits when kernel BDI
 tuning is available.

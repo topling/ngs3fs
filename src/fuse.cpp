@@ -58,6 +58,7 @@ struct MountConfig {
   Credentials credentials;
   size_t maximum_read_size        = kPreferredIoSize;
   size_t maximum_write_size       = kPreferredIoSize;
+  uint32_t io_size                = kPreferredIoSize;
   uint32_t read_ahead_size        = kPreferredIoSize;
   uint64_t part_size              = 8ULL * 1024ULL * 1024ULL;
   uint64_t max_pinned_memory      = 256ULL * 1024ULL * 1024ULL;
@@ -974,6 +975,7 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
     return false;
   }
 
+  constexpr int io_size_option = 256;
   constexpr option long_options[] = {
       {"endpoint-host", required_argument, nullptr, 'e'},
       {"endpoint-port", required_argument, nullptr, 'p'},
@@ -981,6 +983,7 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       {"bucket", required_argument, nullptr, 'b'},
       {"prefix", required_argument, nullptr, 'k'},
       {"region", required_argument, nullptr, 'r'},
+      {"io-size", required_argument, nullptr, io_size_option},
       {"read-ahead", required_argument, nullptr, 'R'},
       {"dir-cache-timeout", required_argument, nullptr, 'T'},
       {"max-cached-inodes", required_argument, nullptr, 'I'},
@@ -1057,6 +1060,15 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       case 'r':
         config.region = optarg;
         break;
+      case io_size_option: {
+        const uint64_t value = parse_required_size("--io-size");
+        if (value == 0 || value > std::numeric_limits<uint32_t>::max()) {
+          throw std::invalid_argument(
+              "--io-size must be nonzero and at most UINT32_MAX");
+        }
+        config.io_size = static_cast<uint32_t>(value);
+        break;
+      }
       case 'R': {
         const uint64_t value = parse_required_size("--read-ahead");
         const long page_size = ::sysconf(_SC_PAGESIZE);
@@ -5709,11 +5721,12 @@ void ngs3fs_link(fuse_req_t request, fuse_ino_t, fuse_ino_t, const char*) {
 }
 
 void ngs3fs_statfs(fuse_req_t request, fuse_ino_t) {
+  auto& state = *static_cast<State*>(fuse_req_userdata(request));
   struct statvfs status{};
-  constexpr uint64_t block_size = 4096;
-  status.f_bsize   = block_size;
-  status.f_frsize  = block_size;
-  status.f_blocks  = UINT64_MAX / block_size;
+  constexpr uint64_t frsize = 4096;
+  status.f_bsize   = state.config.io_size;
+  status.f_frsize  = frsize;
+  status.f_blocks  = UINT64_MAX / frsize;
   status.f_bfree   = status.f_blocks;
   status.f_bavail  = status.f_blocks;
   status.f_files   = UINT64_MAX;
@@ -5737,6 +5750,8 @@ void print_help() {
       << "  -b, --bucket NAME         S3 bucket (required)\n"
       << "  -k, --prefix PREFIX       optional raw object-key prefix\n"
       << "  -r, --region REGION       SigV4 region (default us-east-1)\n"
+      << "      --io-size BYTES       statfs optimal I/O size; accepts "
+         "KiB/MiB (default 256 KiB)\n"
       << "  -R, --read-ahead BYTES    kernel read-ahead; accepts "
          "KiB/MiB (default 256 KiB)\n"
       << "  -T, --dir-cache-timeout MS\n"

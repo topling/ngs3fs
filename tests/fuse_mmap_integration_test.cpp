@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -834,8 +835,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
     ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
             port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
             uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
-            "0750", "-R", "256KiB", "-I", "1", "-f", mountpoint.data(),
-            static_cast<char*>(nullptr));
+            "0750", "--io-size", "384KiB", "-R", "256KiB", "-I", "1",
+            "-f", mountpoint.data(), static_cast<char*>(nullptr));
     _exit(127);
   }
   return process;
@@ -893,6 +894,17 @@ int main(int argc, char** argv) {
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
+
+    {
+      struct statvfs status{};
+      if (::statvfs(mountpoint.c_str(), &status) != 0) {
+        fail_errno("statvfs mountpoint");
+      }
+      require(status.f_bsize == 384U * 1024U,
+              "configured statfs optimal I/O size was not applied");
+      require(status.f_frsize == 4096,
+              "statfs fragment size must remain 4 KiB");
+    }
 
     UniqueFd file(::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
     if (!file) {

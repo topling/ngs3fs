@@ -143,6 +143,11 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME read_ahead_alignment_test
     COMMAND ngs3fs --read-ahead 257KiB --help)
   set_tests_properties(read_ahead_alignment_test PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME io_size_option_test
+    COMMAND ngs3fs --io-size 1MiB --help)
+  add_test(NAME io_size_zero_test
+    COMMAND ngs3fs --io-size 0 --help)
+  set_tests_properties(io_size_zero_test PROPERTIES WILL_FAIL TRUE)
 
   add_test(NAME write_options_test
     COMMAND ngs3fs --part-size 8MiB --max-uploads 4
