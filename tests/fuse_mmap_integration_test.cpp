@@ -50,6 +50,22 @@ void require(bool condition, std::string_view message) {
   }
 }
 
+template <class Operation>
+void retry_after_fuse_release(const char* name, Operation&& operation) {
+  constexpr size_t kMaxAttempts = 200;
+  for (size_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    if (operation() == 0) {
+      return;
+    }
+    const int error = errno;
+    if (error != EBUSY || attempt + 1 == kMaxAttempts) {
+      errno = error;
+      fail_errno(name);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+}
+
 void write_all(int fd, std::span<const std::byte> bytes) {
   size_t offset = 0;
   while (offset < bytes.size()) {
@@ -1394,9 +1410,9 @@ int main(int argc, char** argv) {
                 errno == EBUSY,
             "rename with an open handle must fail with EBUSY");
     reopened.reset();
-    if (::rename(file_path.c_str(), renamed_path.c_str()) != 0) {
-      fail_errno("rename mounted object");
-    }
+    retry_after_fuse_release("rename mounted object", [&] {
+      return ::rename(file_path.c_str(), renamed_path.c_str());
+    });
     struct stat old_status{};
     errno = 0;
     require(::stat(file_path.c_str(), &old_status) != 0 && errno == ENOENT,
@@ -1408,9 +1424,10 @@ int main(int argc, char** argv) {
     renamed.reset();
 
     const std::string copied_path = mountpoint + "/copied.bin";
-    if (::rename(renamed_path.c_str(), copied_path.c_str()) != 0) {
-      fail_errno("rename mounted object with CopyObject fallback");
-    }
+    retry_after_fuse_release(
+        "rename mounted object with CopyObject fallback", [&] {
+          return ::rename(renamed_path.c_str(), copied_path.c_str());
+        });
     errno = 0;
     require(::stat(renamed_path.c_str(), &old_status) != 0 &&
                 errno == ENOENT,
@@ -1426,9 +1443,9 @@ int main(int argc, char** argv) {
       std::lock_guard state_guard(shared.mutex);
       puts_before_truncate = shared.put_requests;
     }
-    if (::truncate(copied_path.c_str(), 0) != 0) {
-      fail_errno("truncate mounted object");
-    }
+    retry_after_fuse_release("truncate mounted object", [&] {
+      return ::truncate(copied_path.c_str(), 0);
+    });
     struct stat truncated_status{};
     if (::stat(copied_path.c_str(), &truncated_status) != 0) {
       fail_errno("stat truncated mounted object");
