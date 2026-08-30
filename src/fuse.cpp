@@ -4565,6 +4565,7 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
     file->direct_io   = 0;
     file->keep_cache  = 0;
     file->nonseekable = writable ? 1 : 0;
+    file->noflush     = writable ? 0 : 1;
     if (fuse_reply_open(request, file) != 0) {
       std::unique_ptr<OpenHandle> failed_handle(handle_optional(file));
       file->fh = 0;

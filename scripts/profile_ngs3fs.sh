@@ -14,7 +14,19 @@ max_connections=${MAX_CONNECTIONS:-8}
 bytes=${BYTES:-1048576}
 perf_event=${PERF_EVENT:-cycles:u}
 perf_frequency=${PERF_FREQUENCY:-4000}
-perf_stat_events=${PERF_STAT_EVENTS:-task-clock,context-switches,cpu-migrations,page-faults,cycles:u,cycles:k,instructions:u,instructions:k}
+perf_stat_events=${PERF_STAT_EVENTS:-}
+if [[ -z "$perf_stat_events" ]]; then
+  perf_stat_events=task-clock,task-clock:u,task-clock:k
+  perf_stat_events+=,context-switches,cpu-migrations,page-faults
+  perf_stat_events+=,syscalls:sys_enter_splice
+  perf_stat_events+=,syscalls:sys_enter_recvfrom
+  perf_stat_events+=,syscalls:sys_enter_sendto
+  perf_stat_events+=,syscalls:sys_enter_futex
+  perf_stat_events+=,syscalls:sys_enter_writev
+  perf_stat_events+=,syscalls:sys_enter_close
+  perf_stat_events+=,syscalls:sys_enter_pipe2
+  perf_stat_events+=,syscalls:sys_enter_fcntl
+fi
 random_files=${RANDOM_READ_FILES:-32}
 random_threads=${RANDOM_READ_THREADS:-16}
 random_operations=${RANDOM_READ_OPERATIONS:-128}
