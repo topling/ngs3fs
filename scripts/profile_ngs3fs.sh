@@ -5,17 +5,30 @@ set -euo pipefail
 project_dir=$(cd "$(dirname "$0")/.." && pwd)
 run_id=$(date +%Y%m%d-%H%M%S)
 run_dir=${1:-"$project_dir/build/profiles/ngs3fs-$run_id"}
+run_dir=$(realpath -m "$run_dir")
 port=${PORT:-17072}
+workload=${WORKLOAD:-mmap}
 iterations=${ITERATIONS:-3000}
 read_ahead=${READ_AHEAD:-256KiB}
+max_connections=${MAX_CONNECTIONS:-8}
 bytes=${BYTES:-1048576}
+perf_event=${PERF_EVENT:-cycles:u}
+perf_frequency=${PERF_FREQUENCY:-4000}
+random_files=${RANDOM_READ_FILES:-32}
+random_threads=${RANDOM_READ_THREADS:-16}
+random_operations=${RANDOM_READ_OPERATIONS:-128}
+random_file_size=${RANDOM_READ_FILE_SIZE:-4194304}
+random_maximum_read=${RANDOM_READ_MAXIMUM:-262144}
+random_seed=${RANDOM_READ_SEED:-0x4e47533346535244}
+random_advice=${RANDOM_READ_ADVICE:-random}
 
 versitygw="$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64/versitygw"
 ngs3fs=${NGS3FS_BIN:-"$project_dir/build/dev/ngs3fs"}
 bench=${MMAP_BENCH_BIN:-"$project_dir/build/dev/mmap_fault_bench"}
+random_bench=${RANDOM_READ_BENCH_BIN:-"$project_dir/build/dev/random_read_stress"}
 perf_root="$project_dir/build/tools/perf-6.8/root"
-perf="$perf_root/usr/lib/linux-tools-6.8.0-138/perf"
-perf_lib="$perf_root/usr/lib/x86_64-linux-gnu"
+perf=${PERF_BIN:-"$perf_root/usr/lib/linux-tools-6.8.0-138/perf"}
+perf_lib=${PERF_LIB_DIR:-"$perf_root/usr/lib/x86_64-linux-gnu"}
 flamegraph_dir="$project_dir/build/tools/FlameGraph"
 backend="$run_dir/backend"
 bucket=ngs3fs-profile
@@ -78,9 +91,38 @@ wait_for_mount() {
   return 1
 }
 
+run_random_read() {
+  local operations=$1
+  local output=$2
+
+  "$random_bench" -R "${random_advice_args[@]}" \
+    -d "$mount_dir/random-read" \
+    -f "$random_files" -t "$random_threads" -n "$operations" \
+    -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed" \
+    >"$output"
+}
+
 trap cleanup EXIT INT TERM
 
-for binary in "$versitygw" "$ngs3fs" "$bench" "$perf" \
+required_binaries=("$versitygw" "$ngs3fs" "$perf")
+random_advice_args=()
+case "$random_advice" in
+  random) ;;
+  normal) random_advice_args=(-N) ;;
+  *)
+    echo "unsupported random-read advice: $random_advice" >&2
+    exit 2
+    ;;
+esac
+case "$workload" in
+  mmap) required_binaries+=("$bench") ;;
+  random-read) required_binaries+=("$random_bench") ;;
+  *)
+    echo "unsupported workload: $workload" >&2
+    exit 2
+    ;;
+esac
+for binary in "${required_binaries[@]}" \
               "$flamegraph_dir/stackcollapse-perf.pl" \
               "$flamegraph_dir/flamegraph.pl"; do
   if [[ ! -x "$binary" ]]; then
@@ -90,34 +132,57 @@ for binary in "$versitygw" "$ngs3fs" "$bench" "$perf" \
 done
 
 mkdir -p "$backend/$bucket" "$mount_dir"
-dd if=/dev/urandom of="$backend/$bucket/$object" \
-  bs=1M count=256 status=none
-dd if="$backend/$bucket/$object" of=/dev/null bs=8M status=none
+if [[ "$workload" = mmap ]]; then
+  dd if=/dev/urandom of="$backend/$bucket/$object" \
+    bs=1M count=256 status=none
+  dd if="$backend/$bucket/$object" of=/dev/null bs=8M status=none
+else
+  "$random_bench" -p -d "$backend/$bucket/random-read" \
+    -f "$random_files" -t "$random_threads" -n "$random_operations" \
+    -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed"
+fi
 
 ROOT_ACCESS_KEY_ID=$access_key ROOT_SECRET_ACCESS_KEY=$secret_key \
   "$versitygw" --port "127.0.0.1:$port" --keep-alive --quiet \
+    --access-log "$run_dir/versity-access.log" \
     posix "$backend" >"$run_dir/versity.log" 2>&1 &
 server_pid=$!
 wait_for_server
 
 AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
   "$ngs3fs" -f -R "$read_ahead" -e 127.0.0.1 -p "$port" \
+    -C "$max_connections" \
     -a "127.0.0.1:$port" \
     -b "$bucket" "$mount_dir" \
     >"$run_dir/ngs3fs.log" 2>&1 &
 ngs3fs_pid=$!
 wait_for_mount
 
-"$bench" "$mount_dir/$object" "$bytes" 50 17825792 \
-  >"$run_dir/warmup.jsonl"
+if [[ "$workload" = mmap ]]; then
+  "$bench" "$mount_dir/$object" "$bytes" 50 17825792 \
+    >"$run_dir/warmup.jsonl"
+  title="ngs3fs $bytes-byte cold mmap faults"
+  flame_svg="$run_dir/ngs3fs-$bytes.svg"
+  flame_html="$run_dir/ngs3fs-$bytes-interactive.html"
+else
+  run_random_read 8 "$run_dir/warmup.txt"
+  title="ngs3fs concurrent multi-file random reads ($random_advice advice)"
+  flame_svg="$run_dir/ngs3fs-random-read.svg"
+  flame_html="$run_dir/ngs3fs-random-read-interactive.html"
+fi
 
-LD_LIBRARY_PATH=$perf_lib "$perf" record -F 499 -e cycles:u \
+LD_LIBRARY_PATH=$perf_lib "$perf" record -F "$perf_frequency" \
+  -e "$perf_event" \
   --call-graph dwarf,16384 -p "$ngs3fs_pid" \
   -o "$run_dir/perf.data" -- sleep 3600 &
 perf_pid=$!
 sleep 0.2
-"$bench" "$mount_dir/$object" "$bytes" "$iterations" 17825792 \
-  >"$run_dir/mmap.jsonl"
+if [[ "$workload" = mmap ]]; then
+  "$bench" "$mount_dir/$object" "$bytes" "$iterations" 17825792 \
+    >"$run_dir/mmap.jsonl"
+else
+  run_random_read "$random_operations" "$run_dir/random-read.txt"
+fi
 kill -INT "$perf_pid" 2>/dev/null || true
 wait "$perf_pid" 2>/dev/null || true
 perf_pid=
@@ -127,13 +192,13 @@ LD_LIBRARY_PATH=$perf_lib "$perf" script -i "$run_dir/perf.data" \
 "$flamegraph_dir/stackcollapse-perf.pl" "$run_dir/perf.script" \
   >"$run_dir/perf.folded"
 "$flamegraph_dir/flamegraph.pl" --width 1600 \
-  --title "ngs3fs $bytes-byte cold mmap faults" \
-  --subtitle "VersityGW v1.7.0, HTTP/1.1, 499 Hz userspace cycles" \
+  --title "$title" \
+  --subtitle "VersityGW v1.7.0, HTTP/1.1, $perf_frequency Hz $perf_event" \
   --countname samples "$run_dir/perf.folded" \
-  >"$run_dir/ngs3fs-$bytes.svg"
+  >"$flame_svg"
 python3 "$project_dir/bench/build_interactive_flamegraph.py" \
-  "$run_dir/perf.folded" "$run_dir/ngs3fs-$bytes-interactive.html" \
-  --title "ngs3fs $bytes-byte cold mmap faults"
+  "$run_dir/perf.folded" "$flame_html" \
+  --title "$title"
 
 LD_LIBRARY_PATH=$perf_lib "$perf" report --stdio --no-children \
   --percent-limit 0.5 -i "$run_dir/perf.data" \
@@ -141,5 +206,11 @@ LD_LIBRARY_PATH=$perf_lib "$perf" report --stdio --no-children \
 LD_LIBRARY_PATH=$perf_lib "$perf" report --stdio --children \
   --percent-limit 0.5 -i "$run_dir/perf.data" \
   >"$run_dir/perf-inclusive.txt"
+LD_LIBRARY_PATH=$perf_lib "$perf" report --stdio --no-children \
+  --call-graph none --percent-limit 0.15 -i "$run_dir/perf.data" \
+  >"$run_dir/perf-self-flat.txt"
+LD_LIBRARY_PATH=$perf_lib "$perf" report --stdio --no-children \
+  --call-graph none --sort dso --percent-limit 0.1 \
+  -i "$run_dir/perf.data" >"$run_dir/perf-dso.txt"
 
 printf '%s\n' "$run_dir"

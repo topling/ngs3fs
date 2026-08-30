@@ -316,7 +316,24 @@ order. `RANDOM_READ_FILES`, `RANDOM_READ_THREADS`,
 `RANDOM_READ_SEED` override the defaults. The workload deliberately applies
 `POSIX_FADV_RANDOM` and `MADV_RANDOM`, so it measures random access with kernel
 read-ahead disabled; a client-side user-space read-ahead policy remains part of
-the client being compared.
+the client being compared. Set `RANDOM_READ_ADVICE=normal` to retain the same
+random file/offset/length sequence while allowing the kernel's configured
+read-ahead policy.
+
+`scripts/benchmark_random_read.sh` runs both advice modes with isolated,
+alternating ngs3fs/goofys samples and writes an aggregate `samples.csv` plus
+the raw per-sample logs. It drops kernel caches between samples when run with
+enough privilege and removes only the generated backend objects after each
+sample.
+
+The profiler accepts the same workload and advice controls. It produces a
+standard SVG, a searchable/zoomable interactive HTML flame graph, folded
+stacks, and flat/self/inclusive/DSO reports:
+
+```sh
+sudo env WORKLOAD=random-read RANDOM_READ_ADVICE=random PERF_EVENT=cpu-clock \
+  ./scripts/profile_ngs3fs.sh build/profiles/random-advice
+```
 
 ## nghttp2 receive invariant
 

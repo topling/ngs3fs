@@ -133,3 +133,130 @@ jobs:
             ./scripts/test_xfstests.sh \
             "$GITHUB_WORKSPACE/upstream/xfstests" \
             "$GITHUB_WORKSPACE/build/xfstests"
+
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out ngs3fs
+        uses: actions/checkout@v7
+
+      - name: Check out goofys
+        uses: actions/checkout@v7
+        with:
+          repository: kahing/goofys
+          ref: 350ff312abaa1abcf21c5a06e143c7edffe9e2f4
+          path: upstream/goofys
+
+      - name: Check out FlameGraph
+        uses: actions/checkout@v7
+        with:
+          repository: brendangregg/FlameGraph
+          ref: 41fee1f99f9276008b7cd112fca19dc3ea84ac32
+          path: build/tools/FlameGraph
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          cache: false
+
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            cmake \
+            curl \
+            fuse3 \
+            libfuse3-dev \
+            libssl-dev \
+            linux-tools-common \
+            linux-tools-generic \
+            ninja-build \
+            python3
+
+      - name: Build ngs3fs and goofys
+        run: |
+          ./scripts/bootstrap.sh
+          mkdir -p build/tools
+          cd upstream/goofys
+          go build \
+            -ldflags "-X main.Version=$(git rev-parse HEAD)" \
+            -o "$GITHUB_WORKSPACE/build/tools/goofys" .
+
+      - name: Download VersityGW
+        run: |
+          archive=build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64.tar.gz
+          mkdir -p "$(dirname "$archive")"
+          curl --fail --location \
+            https://github.com/versity/versitygw/releases/download/v1.7.0/versitygw_v1.7.0_Linux_x86_64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            dacec530fecaa8776feec0536998dd4bd78036e0d4db0da9b9189d96bb790e03 \
+            "$archive" | sha256sum --check
+          tar -xzf "$archive" -C build/e2e/versitygw
+
+      - name: Enable FUSE and perf
+        run: |
+          sudo modprobe fuse
+          test -c /dev/fuse
+          sudo chmod a+rw /dev/fuse
+          sudo sysctl -w kernel.perf_event_paranoid=-1
+          sudo sysctl -w kernel.kptr_restrict=0
+          perf --version
+
+      - name: Compare concurrent random reads
+        run: |
+          sudo env \
+            GOOFYS_BIN="$GITHUB_WORKSPACE/build/tools/goofys" \
+            BENCHMARK_REPETITIONS=3 \
+            ./scripts/benchmark_random_read.sh \
+            "$GITHUB_WORKSPACE/build/benchmarks/github-random-read"
+
+      - name: Profile strict random advice
+        if: always()
+        run: |
+          sudo env \
+            WORKLOAD=random-read \
+            RANDOM_READ_ADVICE=random \
+            PERF_BIN="$(command -v perf)" \
+            PERF_LIB_DIR= \
+            PERF_EVENT=cpu-clock \
+            PERF_FREQUENCY=4000 \
+            PORT=17650 \
+            ./scripts/profile_ngs3fs.sh \
+            "$GITHUB_WORKSPACE/build/profiles/github-random-advice"
+
+      - name: Profile normal advice
+        if: always()
+        run: |
+          sudo env \
+            WORKLOAD=random-read \
+            RANDOM_READ_ADVICE=normal \
+            PERF_BIN="$(command -v perf)" \
+            PERF_LIB_DIR= \
+            PERF_EVENT=cpu-clock \
+            PERF_FREQUENCY=4000 \
+            PORT=17651 \
+            ./scripts/profile_ngs3fs.sh \
+            "$GITHUB_WORKSPACE/build/profiles/github-normal-advice"
+
+      - name: Upload benchmark and flame graphs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: random-read-benchmark-and-flamegraphs
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            build/benchmarks/github-random-read/**
+            !build/benchmarks/github-random-read/**/backend/**
+            !build/benchmarks/github-random-read/**/mnt-ngs3fs/**
+            !build/benchmarks/github-random-read/**/mnt-goofys/**
+            build/profiles/github-random-advice/**
+            build/profiles/github-normal-advice/**
+            !build/profiles/**/backend/**
+            !build/profiles/**/mnt/**
+            !build/profiles/**/perf.data
+            !build/profiles/**/perf.script

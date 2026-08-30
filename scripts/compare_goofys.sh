@@ -14,16 +14,18 @@ object_mib=${OBJECT_MIB:-256}
 order=${ORDER:-forward}
 metrics=${METRICS:-0}
 read_ahead=${READ_AHEAD:-256KiB}
+max_connections=${MAX_CONNECTIONS:-8}
 random_files=${RANDOM_READ_FILES:-32}
 random_threads=${RANDOM_READ_THREADS:-16}
 random_operations=${RANDOM_READ_OPERATIONS:-128}
 random_file_size=${RANDOM_READ_FILE_SIZE:-4194304}
 random_maximum_read=${RANDOM_READ_MAXIMUM:-262144}
 random_seed=${RANDOM_READ_SEED:-0x4e47533346535244}
+random_advice=${RANDOM_READ_ADVICE:-random}
 
 versitygw="$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64/versitygw"
 ngs3fs=${NGS3FS_BIN:-"$project_dir/build/dev/ngs3fs"}
-goofys=/home/leipeng/.cache/goofys-reference/bin/goofys
+goofys=${GOOFYS_BIN:-/home/leipeng/.cache/goofys-reference/bin/goofys}
 bench=${MMAP_BENCH_BIN:-"$project_dir/build/dev/mmap_fault_bench"}
 random_bench=${RANDOM_READ_BENCH_BIN:-"$project_dir/build/dev/random_read_stress"}
 backend="$run_dir/backend"
@@ -112,6 +114,7 @@ process_cpu_ns() {
 start_ngs3fs() {
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
     "$ngs3fs" -f "${metrics_args[@]}" -R "$read_ahead" \
+      -C "$max_connections" \
       -e 127.0.0.1 -p "$port" \
       -a "127.0.0.1:$port" -b "$bucket" \
       "$ngs3fs_mount" >"$run_dir/ngs3fs.log" 2>&1 &
@@ -221,7 +224,8 @@ run_random_read_case() {
 
   first_line=$(wc -l <"$run_dir/versity-access.log")
   start_ns=$(process_cpu_ns "$daemon_pid")
-  result=$("$random_bench" -R -d "$mount_dir/random-read" \
+  result=$("$random_bench" -R "${random_advice_args[@]}" \
+    -d "$mount_dir/random-read" \
     -f "$random_files" -t "$random_threads" -n "$random_operations" \
     -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed")
   printf '%s\n' "$result" >"$run_dir/$client-random-read-result.txt"
@@ -250,8 +254,9 @@ run_random_read_case() {
     return 1
   fi
   total_operations=$((pread_operations + mmap_operations))
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-    "$client" "$random_files" "$random_threads" "$total_operations" \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$client" "$random_advice" "$max_connections" \
+    "$random_files" "$random_threads" "$total_operations" \
     "$pread_operations" "$mmap_operations" "$bytes" "$elapsed_ns" \
     "$used_ns" "$((used_ns / total_operations))" "$get_requests" \
     >>"$run_dir/random-read-summary.csv"
@@ -282,6 +287,15 @@ run_random_read_client() {
 trap cleanup EXIT INT TERM
 
 required_binaries=("$versitygw" "$ngs3fs" "$goofys")
+random_advice_args=()
+case "$random_advice" in
+  random) ;;
+  normal) random_advice_args=(-N) ;;
+  *)
+    echo "unsupported random-read advice: $random_advice" >&2
+    exit 2
+    ;;
+esac
 case "$workload" in
   mmap) required_binaries+=("$bench") ;;
   random-read) required_binaries+=("$random_bench") ;;
@@ -321,7 +335,7 @@ fi
 
 if [[ "$workload" = random-read ]]; then
   printf '%s\n' \
-    'client,files,threads,operations,pread_operations,mmap_operations,bytes,wall_ns,daemon_cpu_ns,daemon_cpu_ns_per_operation,s3_get_requests' \
+    'client,advice,max_connections,files,threads,operations,pread_operations,mmap_operations,bytes,wall_ns,daemon_cpu_ns,daemon_cpu_ns_per_operation,s3_get_requests' \
     >"$run_dir/random-read-summary.csv"
   case "$client" in
     ngs3fs | goofys) run_random_read_client "$client" ;;

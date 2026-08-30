@@ -28,6 +28,7 @@ typedef struct {
   uint64_t    seed;
   bool        prepare_only;
   bool        read_only;
+  bool        random_advice;
 } Config;
 
 typedef struct {
@@ -49,7 +50,7 @@ typedef struct {
 static void usage(const char* program) {
   fprintf(stderr,
           "usage: %s -d DIR [-f FILES] [-t THREADS] [-n OPERATIONS] "
-          "[-s FILE_SIZE] [-r MAX_READ] [-S SEED] [-p | -R]\n",
+          "[-s FILE_SIZE] [-r MAX_READ] [-S SEED] [-p | -R] [-N]\n",
           program);
 }
 
@@ -209,7 +210,9 @@ static void* read_worker(void* argument) {
       report_failure(shared, "open", worker->id, file, offset, size);
       break;
     }
-    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+    if (config->random_advice) {
+      (void)posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+    }
     if (((operation + worker->id) & 1) == 0) {
       size_t done = 0;
       while (done != size) {
@@ -247,7 +250,9 @@ static void* read_worker(void* argument) {
       if (mapping == MAP_FAILED) {
         report_failure(shared, "mmap", worker->id, file, offset, size);
       } else {
-        (void)madvise(mapping, map_size, MADV_RANDOM);
+        if (config->random_advice) {
+          (void)madvise(mapping, map_size, MADV_RANDOM);
+        }
         const u_char* data = (const u_char*)mapping + displacement;
         for (size_t i = 0; i != size; ++i) {
           if (data[i] != expected_byte(file, offset + i)) {
@@ -310,6 +315,7 @@ int main(int argc, char** argv) {
       .seed          = UINT64_C(0x4e47533346535244),
       .prepare_only  = false,
       .read_only     = false,
+      .random_advice = true,
   };
   static const struct option options[] = {
       {"directory", required_argument, NULL, 'd'},
@@ -321,12 +327,13 @@ int main(int argc, char** argv) {
       {"seed", required_argument, NULL, 'S'},
       {"prepare-only", no_argument, NULL, 'p'},
       {"read-only", no_argument, NULL, 'R'},
+      {"normal-advice", no_argument, NULL, 'N'},
       {"help", no_argument, NULL, 'h'},
       {NULL, 0, NULL, 0},
   };
 
   int option;
-  while ((option = getopt_long(argc, argv, "d:f:t:n:s:r:S:pRh", options,
+  while ((option = getopt_long(argc, argv, "d:f:t:n:s:r:S:pRNh", options,
                                NULL)) != -1) {
     bool valid = true;
     switch (option) {
@@ -339,6 +346,7 @@ int main(int argc, char** argv) {
       case 'S': valid = parse_u64(optarg, &config.seed); break;
       case 'p': config.prepare_only = true; break;
       case 'R': config.read_only = true; break;
+      case 'N': config.random_advice = false; break;
       case 'h': usage(argv[0]); return 0;
       default: usage(argv[0]); return 2;
     }
@@ -473,10 +481,12 @@ int main(int argc, char** argv) {
   } else {
     elapsed_ns -= (uint64_t)(start.tv_nsec - finish.tv_nsec);
   }
-  printf("random-read stress passed: access=pread,mmap files=%zu threads=%zu "
+  printf("random-read stress passed: access=pread,mmap advice=%s "
+         "files=%zu threads=%zu "
          "operations=%zu pread_operations=%zu mmap_operations=%zu "
          "bytes=%llu elapsed_ns=%llu file_size=%zu maximum_read=%zu "
          "seed=%llu\n",
+         config.random_advice ? "random" : "normal",
          config.files, config.threads, config.operations, pread_operations,
          mmap_operations, (unsigned long long)bytes,
          (unsigned long long)elapsed_ns, config.file_size,
