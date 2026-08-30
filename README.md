@@ -199,8 +199,19 @@ cover sequential data creation and copying, byte-for-byte read verification,
 unlink, directory operations, rename, and rejection of a rename onto a
 non-empty directory. The stress phase uses the suite's own `ltp/fsstress` with
 all defaults disabled, then enables only `creat`, `getattr`, `getdents`,
-`mkdir`, `read`, `readv`, `rename`, `rnoreplace`, `rmdir`, `stat`, and
-`unlink`. CI runs eight worker processes with 500 operations each.
+`mkdir`, `rename`, `rnoreplace`, `rmdir`, `stat`, and `unlink`. CI runs eight
+worker processes with 500 operations each.
+
+Because `fsstress` does not import pre-existing files and its supported create
+operation produces empty files, a separate concurrent random-read stress phase
+first writes 32 deterministic 4 MiB files strictly sequentially. Sixteen
+threads then perform 128 reads each, choosing a fresh file, offset, and
+1-byte-to-256-KiB non-aligned length for every operation. Each operation uses
+a new read-only open, exercises close-to-open refresh and page-cache
+invalidation, and alternates between `pread(2)` and read-only `mmap(2)` access.
+Every returned byte is validated. This catches short reads, wrong ranges,
+cross-file mixups, corruption, page-fault failures, and concurrent
+connection/handle failures rather than merely checking syscall return codes.
 
 Tests that require a scratch block device, random or overwriting writes,
 `O_RDWR`, truncate, writable mmap, hard or symbolic links, xattrs, locks,

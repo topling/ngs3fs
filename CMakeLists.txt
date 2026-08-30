@@ -109,6 +109,11 @@ if(NGS3FS_BUILD_TESTS)
   target_compile_options(mounted_e2e_client PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
 
+  add_executable(random_read_stress tests/random_read_stress.c)
+  target_link_libraries(random_read_stress PRIVATE Threads::Threads)
+  target_compile_options(random_read_stress PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+
   add_executable(ngs3fs_core_tests tests/core_tests.cpp)
   target_link_libraries(ngs3fs_core_tests PRIVATE ngs3fs_core)
   add_test(NAME ngs3fs_core_tests COMMAND ngs3fs_core_tests)

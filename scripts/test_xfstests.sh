@@ -24,10 +24,17 @@ versitygw=${VERSITYGW_BIN:-$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Lin
 ngs3fs=${NGS3FS_BIN:-$project_dir/build/dev/ngs3fs}
 check=$xfstests_dir/check
 fsstress=$xfstests_dir/ltp/fsstress
+random_read_stress=$project_dir/build/dev/random_read_stress
 port=${PORT:-17175}
 stress_jobs=${NGS3FS_XFSTESTS_STRESS_JOBS:-8}
 stress_operations=${NGS3FS_XFSTESTS_STRESS_OPERATIONS:-500}
 stress_seed=${NGS3FS_XFSTESTS_STRESS_SEED:-}
+random_read_files=${NGS3FS_RANDOM_READ_FILES:-32}
+random_read_threads=${NGS3FS_RANDOM_READ_THREADS:-16}
+random_read_operations=${NGS3FS_RANDOM_READ_OPERATIONS:-128}
+random_read_file_size=${NGS3FS_RANDOM_READ_FILE_SIZE:-4194304}
+random_read_maximum=${NGS3FS_RANDOM_READ_MAXIMUM:-262144}
+random_read_seed=${NGS3FS_RANDOM_READ_SEED:-0x4e47533346535244}
 backend=$run_dir/backend
 mount_dir=$run_dir/mnt
 access_key=ngs3fs-xfstests
@@ -64,19 +71,26 @@ cleanup() {
 
 trap cleanup EXIT
 
-for file in "$versitygw" "$ngs3fs" "$check" "$fsstress"; do
+for file in "$versitygw" "$ngs3fs" "$check" "$fsstress" \
+            "$random_read_stress"; do
   if [[ ! -e "$file" ]]; then
     echo "missing xfstests dependency: $file" >&2
     exit 1
   fi
 done
 if [[ ! -x "$versitygw" || ! -x "$ngs3fs" || ! -x "$check" ||
-      ! -x "$fsstress" ]]; then
-  echo "VersityGW, ngs3fs, check, and fsstress must be executable" >&2
+      ! -x "$fsstress" || ! -x "$random_read_stress" ]]; then
+  echo "all xfstests executables must be executable" >&2
   exit 1
 fi
 if (( stress_jobs <= 0 || stress_operations <= 0 )); then
   echo "stress jobs and operations must be positive" >&2
+  exit 1
+fi
+if (( random_read_files < 2 || random_read_threads <= 0 ||
+      random_read_operations <= 0 || random_read_file_size <= 0 ||
+      random_read_maximum <= 0 )); then
+  echo "random-read stress parameters are invalid" >&2
   exit 1
 fi
 
@@ -128,9 +142,8 @@ mkdir "$stress_dir"
 
 # fsstress defaults include operations outside the ngs3fs contract. -z clears
 # every default frequency, after which only supported namespace and metadata
-# operations are enabled. read/readv safely exercise files when non-empty ones
-# exist and otherwise no-op; write variants are deliberately excluded because
-# fsstress chooses random offsets.
+# operations are enabled. Its write variants are deliberately excluded because
+# they choose random offsets. Non-empty data reads are covered separately below.
 echo "xfstests fsstress: $stress_jobs workers x $stress_operations operations"
 stress_args=(-z -d "$stress_dir")
 if [[ -n "$stress_seed" ]]; then
@@ -144,8 +157,6 @@ setsid "$fsstress" "${stress_args[@]}" \
   -f getattr=8 \
   -f getdents=8 \
   -f mkdir=4 \
-  -f read=4 \
-  -f readv=4 \
   -f rename=8 \
   -f rnoreplace=4 \
   -f rmdir=4 \
@@ -165,6 +176,22 @@ if ! kill -0 "$ngs3fs_pid" 2>/dev/null; then
 fi
 if ! mountpoint -q "$mount_dir"; then
   echo "ngs3fs did not survive the filtered xfstests workload" >&2
+  exit 1
+fi
+
+printf 'concurrent random-read stress: %s threads, %s files, %s operations per thread\n' \
+  "$random_read_threads" "$random_read_files" "$random_read_operations"
+"$random_read_stress" \
+  -d "$mount_dir/random-read" \
+  -f "$random_read_files" \
+  -t "$random_read_threads" \
+  -n "$random_read_operations" \
+  -s "$random_read_file_size" \
+  -r "$random_read_maximum" \
+  -S "$random_read_seed"
+
+if ! kill -0 "$ngs3fs_pid" 2>/dev/null || ! mountpoint -q "$mount_dir"; then
+  echo "ngs3fs did not survive the concurrent random-read workload" >&2
   exit 1
 fi
 
