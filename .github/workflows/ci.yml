@@ -17,6 +17,13 @@ jobs:
       - name: Check out ngs3fs
         uses: actions/checkout@v7
 
+      - name: Check out libfuse test cases
+        uses: actions/checkout@v7
+        with:
+          repository: libfuse/libfuse
+          ref: 3b25c1d39620b4b0f445c3e3b042edc4a6e4c6b3
+          path: upstream/libfuse
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -24,9 +31,12 @@ jobs:
             build-essential \
             cmake \
             curl \
+            fuse3 \
+            kmod \
             libfuse3-dev \
             libssl-dev \
             ninja-build \
+            python3 \
             xz-utils
 
       - name: Bootstrap, build, and test
@@ -39,3 +49,27 @@ jobs:
           test -f "${source_dir}/src/terark/gold_hash_map.hpp"
           test -f "${source_dir}/src/terark/hash_common.cpp"
           test -f "${source_dir}/boost-include/boost/current_function.hpp"
+
+      - name: Download VersityGW
+        run: |
+          archive=build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64.tar.gz
+          mkdir -p "$(dirname "$archive")"
+          curl --fail --location \
+            https://github.com/versity/versitygw/releases/download/v1.7.0/versitygw_v1.7.0_Linux_x86_64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            dacec530fecaa8776feec0536998dd4bd78036e0d4db0da9b9189d96bb790e03 \
+            "$archive" | sha256sum --check
+          tar -xzf "$archive" -C build/e2e/versitygw
+
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          test -c /dev/fuse
+          sudo chmod a+rw /dev/fuse
+
+      - name: Run libfuse cases against ngs3fs
+        run: |
+          ./scripts/test_libfuse_cases.sh \
+            "$GITHUB_WORKSPACE/upstream/libfuse" \
+            "$GITHUB_WORKSPACE/build/libfuse-cases"
