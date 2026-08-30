@@ -16,7 +16,7 @@ perf_event=${PERF_EVENT:-cycles:u}
 perf_frequency=${PERF_FREQUENCY:-4000}
 perf_stat_events=${PERF_STAT_EVENTS:-}
 if [[ -z "$perf_stat_events" ]]; then
-  perf_stat_events=task-clock,task-clock:u,task-clock:k
+  perf_stat_events=task-clock
   perf_stat_events+=,context-switches,cpu-migrations,page-faults
   perf_stat_events+=,syscalls:sys_enter_splice
   perf_stat_events+=,syscalls:sys_enter_recvfrom
@@ -26,6 +26,8 @@ if [[ -z "$perf_stat_events" ]]; then
   perf_stat_events+=,syscalls:sys_enter_close
   perf_stat_events+=,syscalls:sys_enter_pipe2
   perf_stat_events+=,syscalls:sys_enter_fcntl
+  perf_stat_events+=,syscalls:sys_enter_poll
+  perf_stat_events+=,syscalls:sys_enter_setsockopt
 fi
 random_files=${RANDOM_READ_FILES:-32}
 random_threads=${RANDOM_READ_THREADS:-16}
@@ -57,6 +59,7 @@ perf_pid=
 profile_first_line=0
 profile_last_line=0
 profile_get_requests=0
+profile_head_requests=0
 
 cleanup() {
   set +e
@@ -216,6 +219,10 @@ if ((profile_last_line > profile_first_line)); then
     sed -n "$((profile_first_line + 1)),${profile_last_line}p" \
       "$run_dir/versity-access.log" | grep -c 's3_GetObject' || true
   )
+  profile_head_requests=$(
+    sed -n "$((profile_first_line + 1)),${profile_last_line}p" \
+      "$run_dir/versity-access.log" | grep -c 's3_HeadObject' || true
+  )
 fi
 kill -INT "$perf_pid" 2>/dev/null || true
 wait "$perf_pid" 2>/dev/null || true
@@ -261,13 +268,14 @@ if [[ "$workload" = random-read ]]; then
     esac
   done
   printf '%s\n' \
-    'advice,files,threads,operations,pread_operations,mmap_operations,bytes,elapsed_ns,s3_get_requests,perf_event,perf_frequency' \
+    'advice,files,threads,operations,pread_operations,mmap_operations,bytes,elapsed_ns,s3_get_requests,s3_head_requests,perf_event,perf_frequency' \
     >"$run_dir/profile-summary.csv"
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "$random_advice" "$random_files" "$random_threads" \
     "$((random_threads * random_operations))" "$pread_operations" \
     "$mmap_operations" "$bytes_read" "$elapsed_ns" \
-    "$profile_get_requests" "$perf_event" "$perf_frequency" \
+    "$profile_get_requests" "$profile_head_requests" \
+    "$perf_event" "$perf_frequency" \
     >>"$run_dir/profile-summary.csv"
 fi
 

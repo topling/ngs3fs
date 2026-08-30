@@ -154,12 +154,12 @@ void run_server(ServerInput input) {
   const std::string get = read_request_head(socket.get(), "GET");
   assert(get.starts_with("GET /bucket/key HTTP/1.1\r\n"));
   assert(get.find("host: mock-s3\r\n") != std::string::npos);
-  assert(get.find("range: bytes=0-131071\r\n") != std::string::npos);
+  assert(get.find("range: bytes=0-262143\r\n") != std::string::npos);
   constexpr std::string_view response =
       "HTTP/1.1 103 Early Hints\r\n"
       "link: </metadata>; rel=preload\r\n\r\n"
       "HTTP/1.1 206 Partial Content\r\n"
-      "content-length: 131072\r\n"
+      "content-length: 262144\r\n"
       "etag: \"h1-etag\"\r\n\r\n";
   constexpr size_t prefix = 4096;
   std::vector<std::byte> first(response.size() + prefix);
@@ -236,7 +236,7 @@ int main() {
                        &address_length) == 0);
   const uint16_t port = ntohs(address.sin_port);
 
-  std::vector<std::byte> expected_download(128U * 1024U);
+  std::vector<std::byte> expected_download(256U * 1024U);
   std::vector<std::byte> expected_upload(96U * 1024U);
   std::vector<std::byte> expected_control(384U * 1024U);
   for (size_t i = 0; i < expected_download.size(); ++i) {
@@ -268,6 +268,8 @@ int main() {
   assert(downloaded.externally_spliced_bytes +
              downloaded.fallback_copied_bytes ==
          expected_download.size());
+  assert(downloaded.transport_splice_calls != 0);
+  assert(downloaded.transport_splice_calls <= 4);
   assert(downloaded.headers.at("etag") == "\"h1-etag\"");
   std::vector<std::byte> actual_download(expected_download.size());
   read_all(download_pipe.read_fd(), actual_download);

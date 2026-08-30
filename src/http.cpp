@@ -1449,6 +1449,8 @@ void Http2Client::consume(const RangeResponse& response) {
 // HTTP/1.1 client.
 constexpr size_t kMaxResponseHeaderBytes = 64U * 1024U;
 constexpr size_t kHttp1ReadSize = 1024;
+constexpr size_t kHttp1SpliceBatch = 64U * 1024U;
+constexpr size_t kHttp1BatchedSpliceMinimum = 128U * 1024U;
 
 [[noreturn]] void http1_throw_errno(const char* operation);
 
@@ -1463,6 +1465,71 @@ uint64_t http1_monotonic_ns() {
   }
   return static_cast<uint64_t>(value.tv_sec) * 1'000'000'000ULL +
          static_cast<uint64_t>(value.tv_nsec);
+}
+
+size_t http1_splice_body(int source, int destination, size_t length,
+                         size_t* calls) {
+  if (length < kHttp1BatchedSpliceMinimum) {
+    return splice_exact(source, destination, length,
+                        SPLICE_F_MOVE | SPLICE_F_MORE, calls);
+  }
+
+  int lowat = int(kHttp1SpliceBatch);
+  if (::setsockopt(source, SOL_SOCKET, SO_RCVLOWAT,
+                   &lowat, sizeof(lowat)) != 0) {
+    return splice_exact(source, destination, length,
+                        SPLICE_F_MOVE | SPLICE_F_MORE, calls);
+  }
+
+  size_t done = 0;
+  try {
+    while (done != length) {
+      const size_t remaining = length - done;
+      const int wanted = int(std::min(remaining, kHttp1SpliceBatch));
+      if (wanted != lowat) {
+        lowat = wanted;
+        if (::setsockopt(source, SOL_SOCKET, SO_RCVLOWAT,
+                         &lowat, sizeof(lowat)) != 0) {
+          http1_throw_errno("setsockopt(SO_RCVLOWAT)");
+        }
+      }
+
+      pollfd pfd{.fd = source, .events = POLLIN, .revents = 0};
+      int n;
+      do {
+        n = ::poll(&pfd, 1, kRequestIoTimeoutMs);
+      } while (n < 0 && errno == EINTR);
+      if (n == 0) {
+        throw std::system_error(ETIMEDOUT, std::generic_category(),
+                                "poll(HTTP/1.1 body)");
+      }
+      if (n < 0) {
+        http1_throw_errno("poll(HTTP/1.1 body)");
+      }
+      if ((pfd.revents & POLLNVAL) != 0) {
+        throw std::system_error(EBADF, std::generic_category(),
+                                "poll(HTTP/1.1 body)");
+      }
+
+      if (calls != nullptr) {
+        ++*calls;
+      }
+      done += splice_some(
+          source, nullptr, destination, remaining,
+          SPLICE_F_MOVE | SPLICE_F_MORE);
+    }
+  } catch (...) {
+    const int one = 1;
+    ::setsockopt(source, SOL_SOCKET, SO_RCVLOWAT, &one, sizeof(one));
+    throw;
+  }
+
+  const int one = 1;
+  if (::setsockopt(source, SOL_SOCKET, SO_RCVLOWAT,
+                   &one, sizeof(one)) != 0) {
+    http1_throw_errno("setsockopt(SO_RCVLOWAT restore)");
+  }
+  return done;
 }
 
 ssostr<32> ascii_lower(const ssostr<32>& value) {
@@ -2018,9 +2085,8 @@ class Http1Client final : public HttpClient {
               response.body_bytes += remaining;
               response.fallback_copied_bytes += remaining;
             } else {
-              response.externally_spliced_bytes = splice_exact(
+              response.externally_spliced_bytes = http1_splice_body(
                   socket.get(), destination->write_fd(), remaining,
-                  SPLICE_F_MOVE | SPLICE_F_MORE,
                   &response.transport_splice_calls);
               response.body_bytes += remaining;
             }
