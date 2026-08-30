@@ -24,6 +24,7 @@
 #include <functional>
 #include <future>
 #include <fstream>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -317,20 +318,21 @@ struct OpenHandle {
   std::vector<uint64_t> part_checksum_values;
   std::vector<uint64_t> part_sizes;
   std::unique_ptr<RetainedPart> current_part;
-  uint64_t size             = 0;
-  uint64_t stream_offset    = 0;
-  size_t pending_parts      = 0;
-  unsigned next_part_number = 1;
-  WriteState write_state    = WRITE_OPEN;
-  int write_error           = 0;
-  bool current_reservation  = false;
-  bool multipart_starting   = false;
-  bool multipart_required   = false;
-  bool part_limit_warned    = false;
-  bool write_in_progress    = false;
-  bool writable             = false;
-  bool create_exclusive     = false;
-  bool registered           = false;
+  uint64_t size                = 0;
+  uint64_t stream_offset       = 0;
+  size_t pending_parts         = 0;
+  unsigned next_part_number    = 1;
+  WriteState write_state       = WRITE_OPEN;
+  int write_error              = 0;
+  bool current_reservation     = false;
+  bool multipart_starting      = false;
+  bool multipart_required      = false;
+  bool part_limit_warned       = false;
+  bool write_in_progress       = false;
+  bool writable                = false;
+  bool create_exclusive        = false;
+  bool registered              = false;
+  bool page_cache_store_failed = false;
   std::mutex mutex;
   std::condition_variable condition;
 };
@@ -462,6 +464,7 @@ struct State {
   std::mutex retired_mutex;
   std::mutex open_files_mutex;
   std::mutex cache_mutex;
+  std::mutex session_mutex;
   std::mutex metrics_mutex;
   std::mutex credentials_mutex;
   std::mutex rename_probe_mutex;
@@ -475,6 +478,7 @@ struct State {
   std::vector<BlockedPath> blocked_paths;
   std::unique_ptr<HttpPool> http;
   std::unique_ptr<UploadScheduler> uploads;
+  fuse_session* session = nullptr;
   Credentials express_credentials;
   uint64_t express_expiration_ns   = 0;
   bool express_refreshing          = false;
@@ -492,12 +496,38 @@ struct State {
   bool budget_exhausted            = false;
   bool cache_budget_warned         = false;
   uint64_t cache_warning_ns        = 0;
+  std::atomic<uint64_t> random_read_warning_ns{0};
+  std::atomic<bool> page_cache_store_warned{false};
+  std::atomic<bool> page_cache_invalidate_warned{false};
   bool splice_available            = true;
   bool atomic_o_trunc              = false;
   std::atomic<int> rename_object_support{0};
   std::atomic<int> range_signing_mode{0};
   std::jthread cache_reclaimer;
 };
+
+void invalidate_page_cache(State& state, fuse_ino_t inode) noexcept {
+  int error = 0;
+  {
+    std::lock_guard guard(state.session_mutex);
+    if (state.session == nullptr) {
+      return;
+    }
+    const int result = fuse_lowlevel_notify_inval_inode(
+        state.session, inode, 0, 0);
+    if (result == 0 || result == -ENOENT) {
+      return;
+    }
+    error = -result;
+  }
+  if (!state.page_cache_invalidate_warned.exchange(
+          true, std::memory_order_relaxed)) {
+    fprintf(stderr,
+            "warning: unable to invalidate stale page cache: "
+            "inode=%" PRIu64 ": %s\n",
+            uint64_t(inode), strerror(error));
+  }
+}
 
 bool blocked_path_contains(const State::BlockedPath& blocked,
                            std::string_view path) noexcept {
@@ -795,6 +825,44 @@ uint64_t fuse_thread_cpu_ns() {
   }
   return static_cast<uint64_t>(value.tv_sec) * 1'000'000'000ULL +
          static_cast<uint64_t>(value.tv_nsec);
+}
+
+void warn_random_read(State& state, std::string_view path,
+                      uint64_t file_size, uint64_t offset,
+                      size_t size) noexcept {
+  const size_t read_ahead = std::min(
+      state.config.maximum_read_size,
+      size_t(state.config.read_ahead_size));
+  const size_t threshold = read_ahead / 4;
+  if (file_size < threshold || offset == 0 || size > threshold) {
+    return;
+  }
+
+  const uint64_t now = fuse_monotonic_ns_noexcept();
+  if (now == 0) {
+    return;
+  }
+  constexpr uint64_t interval = 60ULL * 1000ULL * 1000ULL * 1000ULL;
+  uint64_t previous =
+      state.random_read_warning_ns.load(std::memory_order_relaxed);
+  if (previous != 0 && now - previous < interval) {
+    return;
+  }
+  if (!state.random_read_warning_ns.compare_exchange_strong(
+          previous, now, std::memory_order_relaxed)) {
+    return;
+  }
+
+  timespec wall{};
+  (void)::clock_gettime(CLOCK_REALTIME, &wall);
+  fprintf(stderr,
+          "warning: likely random read: time_unix=%" PRIu64
+          ".%09ld path=%.*s offset=%" PRIu64
+          " bytes=%zu; disable POSIX_FADV_RANDOM/MADV_RANDOM "
+          "for this mount to preserve kernel read-ahead\n",
+          uint64_t(wall.tv_sec), wall.tv_nsec,
+          int(path.size()), path.data(),
+          offset, size);
 }
 
 void retry_delay(unsigned attempt) noexcept {
@@ -1814,6 +1882,8 @@ int errno_for_s3_status(int status) noexcept {
 
 struct ObjectMetadata {
   uint64_t size = 0;
+  time_t mtime  = 0;
+  ssostr<32> last_modified;
   std::string etag;
   std::string version_id;
 };
@@ -1839,6 +1909,12 @@ ObjectMetadata head_object(State& state, std::string_view path) {
   if (!parse_unsigned(sso_view(content_length->second), metadata.size)) {
     throw std::runtime_error("S3 HEAD returned invalid content-length");
   }
+  const auto last_modified = response.headers.find("last-modified");
+  if (last_modified == response.headers.end()) {
+    throw std::runtime_error("S3 HEAD omitted Last-Modified");
+  }
+  metadata.last_modified.assign(sso_view(last_modified->second));
+  metadata.mtime = parse_http_mtime(sso_view(metadata.last_modified));
   const auto etag = response.headers.find("etag");
   if (etag != response.headers.end()) {
     assign_string(metadata.etag, etag->second);
@@ -1871,6 +1947,8 @@ bool recover_write_commit(State& state, const OpenHandle& handle,
       response.headers.insert_or_assign(
           ssostr<32>("x-amz-version-id"), ssostr<32>(metadata.version_id));
     }
+    response.headers.insert_or_assign(
+        ssostr<32>("last-modified"), std::move(metadata.last_modified));
     std::cerr << "warning: recovered an ambiguous S3 write commit with "
                  "HeadObject: "
               << handle.object_path << '\n';
@@ -1880,12 +1958,18 @@ bool recover_write_commit(State& state, const OpenHandle& handle,
   }
 }
 
-void refresh_open_metadata(State& state, OpenHandle& handle) {
+bool refresh_open_metadata(State& state, OpenHandle& handle) {
   ObjectMetadata metadata = head_object(state, handle.object_path);
+  const bool keep_cache = handle.item->page_cache_valid() &&
+      handle.item->fsize.load(std::memory_order_relaxed) == metadata.size &&
+      handle.item->mtime.load(std::memory_order_relaxed) == metadata.mtime;
   handle.item->fsize.store(metadata.size, std::memory_order_relaxed);
+  handle.item->mtime.store(metadata.mtime, std::memory_order_relaxed);
+  handle.item->set_page_cache_valid(keep_cache);
   handle.size        = metadata.size;
   handle.etag        = std::move(metadata.etag);
   handle.version_id  = std::move(metadata.version_id);
+  return keep_cache;
 }
 
 void register_open_handle(State& state, fuse_ino_t inode,
@@ -2236,10 +2320,8 @@ ListedXmlPage parse_list_xml(const Response& response,
       }
       object.etag = xml.optional_text(*child, "ETag");
       const std::string modified =
-          xml.optional_text(*child, "LastModified");
-      if (!modified.empty()) {
-        object.mtime = parse_s3_mtime(trim_xml_space(modified));
-      }
+          xml.required_text(*child, "LastModified");
+      object.mtime = parse_s3_mtime(trim_xml_space(modified));
       page.objects.push_back(std::move(object));
     } else if (S3Xml::named(*child, "CommonPrefixes")) {
       page.prefixes.push_back(
@@ -2743,6 +2825,7 @@ fuse_ino_t install_item(State& state, fuse_ino_t parent,
   InodeBase* stale     = nullptr;
   InodeBase* item      = nullptr;
   bool allocated       = false;
+  fuse_ino_t invalidate_inode = 0;
   {
     std::unique_lock guard(children.mutex);
     if (parent_item.detached()) {
@@ -2799,9 +2882,19 @@ fuse_ino_t install_item(State& state, fuse_ino_t parent,
     if (!child.directory && item->regular() &&
         !item->pending() && !item->truncate_pending()) {
       InodeFile& file = static_cast<InodeFile&>(*item);
+      const bool changed = !allocated &&
+          (file.mtime.load(std::memory_order_relaxed) != child.mtime ||
+           file.fsize.load(std::memory_order_relaxed) != child.size);
+      if (changed) {
+        file.set_page_cache_valid(false);
+        invalidate_inode = item_inode(item);
+      }
       file.mtime.store(child.mtime, std::memory_order_relaxed);
       file.fsize.store(child.size, std::memory_order_relaxed);
     }
+  }
+  if (invalidate_inode != 0) {
+    invalidate_page_cache(state, invalidate_inode);
   }
   if (allocated) {
     cache_inode_allocated(state);
@@ -3288,12 +3381,20 @@ void verify_read_checksum(const Response& response, Pipe& pipe,
   }
 }
 
-void update_written_metadata(OpenHandle& handle,
+void update_written_metadata(State& state, OpenHandle& handle,
                              const Response& response,
                              std::string_view body_etag = {}) {
+  time_t mtime;
+  const auto modified = response.headers.find("last-modified");
+  if (modified != response.headers.end()) {
+    mtime = parse_http_mtime(sso_view(modified->second));
+  } else {
+    mtime = head_object(state, handle.object_path).mtime;
+  }
   InodeFile& item = *handle.item;
   item.fsize.store(handle.stream_offset, std::memory_order_relaxed);
-  item.mtime.store(wall_time_seconds(), std::memory_order_relaxed);
+  item.mtime.store(mtime, std::memory_order_relaxed);
+  item.set_page_cache_valid(!handle.page_cache_store_failed);
   item.set_pending(false);
   const auto etag = response.headers.find("etag");
   if (etag != response.headers.end()) {
@@ -3514,6 +3615,57 @@ void send_retained_body(HttpClient& client, std::string_view method,
   }
 }
 
+bool store_page_cache(State& state, const OpenHandle& handle,
+                      RetainedPart& part, uint64_t offset) noexcept {
+  if (part.bytes == 0) {
+    return true;
+  }
+
+  int error = 0;
+  try {
+    const size_t alloc_size = offsetof(fuse_bufvec, buf) +
+        part.segments.size() * sizeof(fuse_buf);
+    auto storage = std::make_unique<std::byte[]>(alloc_size);
+    memset(storage.get(), 0, alloc_size);
+    auto* bufv = reinterpret_cast<fuse_bufvec*>(storage.get());
+    bufv->count = part.segments.size();
+    auto* bufs = reinterpret_cast<fuse_buf*>(
+        storage.get() + offsetof(fuse_bufvec, buf));
+    for (size_t i = 0; i < part.segments.size(); ++i) {
+      bufs[i].size  = part.segments[i].bytes;
+      bufs[i].flags = fuse_buf_flags(
+          FUSE_BUF_IS_FD | FUSE_BUF_FD_RETRY);
+      bufs[i].fd    = part.segments[i].pipe.read_fd();
+    }
+
+    std::lock_guard guard(state.session_mutex);
+    if (state.session == nullptr) {
+      return false;
+    }
+    const int result = fuse_lowlevel_notify_store(
+        state.session, handle.inode, off_t(offset), bufv,
+        FUSE_BUF_SPLICE_MOVE);
+    if (result == 0) {
+      return true;
+    }
+    error = -result;
+  } catch (const std::bad_alloc&) {
+    error = ENOMEM;
+  } catch (...) {
+    error = EIO;
+  }
+
+  if (!state.page_cache_store_warned.exchange(
+          true, std::memory_order_relaxed)) {
+    fprintf(stderr,
+            "warning: unable to retain uploaded data in page cache: "
+            "path=%s offset=%" PRIu64 " bytes=%" PRIu64 ": %s\n",
+            handle.object_path.c_str(), offset, part.bytes,
+            strerror(error));
+  }
+  return false;
+}
+
 void ensure_multipart(State& state, OpenHandle& handle) {
   {
     std::unique_lock guard(handle.mutex);
@@ -3643,6 +3795,7 @@ void upload_part_job(State& state, OpenHandle& handle,
   uint64_t checksum_value  = 0;
   const uint64_t part_size = part->bytes;
   int error_code           = 0;
+  bool cache_store_failed  = false;
   try {
     {
       std::lock_guard guard(handle.mutex);
@@ -3655,6 +3808,9 @@ void upload_part_job(State& state, OpenHandle& handle,
     etag = upload_part(state, handle, *part);
     checksum       = part->checksum.base64;
     checksum_value = part->checksum.integer;
+    cache_store_failed = !store_page_cache(
+        state, handle, *part,
+        uint64_t(part_number - 1) * state.config.part_size);
   } catch (const std::system_error& error) {
     error_code = error.code().value();
   } catch (...) {
@@ -3664,6 +3820,7 @@ void upload_part_job(State& state, OpenHandle& handle,
   release_part_budget(state);
   std::lock_guard guard(handle.mutex);
   if (error_code == 0) {
+    handle.page_cache_store_failed |= cache_store_failed;
     handle.part_etags[part_number - 1] = std::move(etag);
     if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
       handle.part_checksums[part_number - 1] = std::move(checksum);
@@ -3940,7 +4097,7 @@ void complete_multipart(State& state, OpenHandle& handle) {
     if (ambiguous) {
       Response recovered;
       if (recover_write_commit(state, handle, recovered)) {
-        update_written_metadata(handle, recovered);
+        update_written_metadata(state, handle, recovered);
         handle.upload_id.clear();
         handle.part_etags.clear();
         handle.part_checksums.clear();
@@ -3958,7 +4115,7 @@ void complete_multipart(State& state, OpenHandle& handle) {
   if (ambiguous && response.status == 404) {
     Response recovered;
     if (recover_write_commit(state, handle, recovered)) {
-      update_written_metadata(handle, recovered);
+      update_written_metadata(state, handle, recovered);
       handle.upload_id.clear();
       handle.part_etags.clear();
       handle.part_checksums.clear();
@@ -3994,7 +4151,8 @@ void complete_multipart(State& state, OpenHandle& handle) {
     verify_upload_checksum(response, state.config.checksum,
                            checksum, "CompleteMultipartUpload");
   }
-  update_written_metadata(handle, response, xml.optional_text(root, "ETag"));
+  update_written_metadata(
+      state, handle, response, xml.optional_text(root, "ETag"));
   handle.upload_id.clear();
   handle.part_etags.clear();
   handle.part_checksums.clear();
@@ -4038,11 +4196,14 @@ void seal_write(State& state, OpenHandle& handle) {
         }
         throw;
       }
+      if (part && !store_page_cache(state, handle, *part, 0)) {
+        handle.page_cache_store_failed = true;
+      }
       part.reset();
       if (reserved) {
         release_part_budget(state);
       }
-      update_written_metadata(handle, response);
+      update_written_metadata(state, handle, response);
       guard.lock();
     } else {
       if (handle.current_part && handle.current_part->bytes != 0) {
@@ -4669,6 +4830,10 @@ void rename_remote_directory(State& state, std::string_view source_prefix,
 void ngs3fs_init(void* userdata, fuse_conn_info* connection) {
   auto& state = *static_cast<State*>(userdata);
   unsigned int desired = FUSE_CAP_ASYNC_READ | FUSE_CAP_ATOMIC_O_TRUNC;
+  if ((connection->capable & FUSE_CAP_EXPLICIT_INVAL_DATA) != 0) {
+    desired |= FUSE_CAP_EXPLICIT_INVAL_DATA;
+    connection->want &= ~FUSE_CAP_AUTO_INVAL_DATA;
+  }
   if (state.splice_available) {
     desired |= FUSE_CAP_SPLICE_READ | FUSE_CAP_SPLICE_WRITE |
                FUSE_CAP_SPLICE_MOVE;
@@ -4849,7 +5014,7 @@ void ngs3fs_setattr(fuse_req_t request, fuse_ino_t inode,
         truncated.object_path   = object_path;
         truncated.etag          = std::move(metadata.etag);
         const Response response = put_object(state, truncated, nullptr);
-        update_written_metadata(truncated, response);
+        update_written_metadata(state, truncated, response);
         if (!state.atomic_o_trunc) {
           inode_item(state, inode).set_truncate_pending(true);
         }
@@ -4908,8 +5073,9 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
     fuse_reply_err(request, EOPNOTSUPP);
     return;
   }
-  bool registered = false;
+  bool registered      = false;
   bool budget_reserved = false;
+  bool keep_cache      = false;
   InodeFile* registered_item = nullptr;
   std::string registered_path;
   try {
@@ -4932,10 +5098,12 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
     registered_item = handle->item;
     registered      = true;
     if (!writable || !handle->create_exclusive) {
-      refresh_open_metadata(state, *handle);
+      keep_cache = refresh_open_metadata(state, *handle);
     }
 
     if (writable) {
+      handle->item->set_page_cache_valid(false);
+      keep_cache = false;
       if (!reserve_part_budget(state, false)) {
         throw std::system_error(EAGAIN, std::generic_category(),
                                 "pinned write budget exhausted");
@@ -4951,7 +5119,7 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
     // All handles stay buffered. O_RDWR is rejected above, so Linux rejects
     // MAP_SHARED writable mappings without requiring direct I/O.
     file->direct_io   = 0;
-    file->keep_cache  = 0;
+    file->keep_cache  = keep_cache ? 1 : 0;
     file->nonseekable = writable ? 1 : 0;
     file->noflush     = writable ? 0 : 1;
     if (fuse_reply_open(request, file) != 0) {
@@ -5116,6 +5284,8 @@ void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
     }
     const size_t wanted = static_cast<size_t>(
         std::min<uint64_t>(size, object_size - unsigned_offset));
+    warn_random_read(state, handle.object_path, object_size,
+                     unsigned_offset, size);
     const bool report_metrics = state.config.report_metrics;
     const uint64_t fuse_start_ns =
         report_metrics ? fuse_monotonic_ns() : 0;
@@ -6321,7 +6491,15 @@ int run(int argc, char** argv) {
       fuse_loop_config loop_config{};
       loop_config.clone_fd         = 1;
       loop_config.max_idle_threads = 10;
+      {
+        std::lock_guard guard(state.session_mutex);
+        state.session = session;
+      }
       result = fuse_session_loop_mt(session, &loop_config);
+      {
+        std::lock_guard guard(state.session_mutex);
+        state.session = nullptr;
+      }
       fuse_session_unmount(session);
     } else {
       std::cerr << "failed to mount " << options.mountpoint << ": "

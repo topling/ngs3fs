@@ -782,36 +782,14 @@ bool leap_year(unsigned y) noexcept {
   return y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
 }
 
-time_t parse_s3_mtime(std::string_view s) {
-  if (s.size() < 20 || s[4] != '-' || s[7] != '-' ||
-      s[10] != 'T' || s[13] != ':' || s[16] != ':') {
-    throw std::runtime_error("invalid S3 LastModified");
-  }
-  if (s[19] == '.') {
-    if (s.back() != 'Z' || s.size() == 21) {
-      throw std::runtime_error("invalid S3 LastModified fraction");
-    }
-    for (size_t i = 20; i + 1 < s.size(); ++i) {
-      if (!isdigit(u_char(s[i]))) {
-        throw std::runtime_error("invalid S3 LastModified fraction");
-      }
-    }
-  } else if (s.size() != 20 || s[19] != 'Z') {
-    throw std::runtime_error("invalid S3 LastModified timezone");
-  }
-
-  const unsigned y = fixed_decimal(s, 0, 4);
-  const unsigned m = fixed_decimal(s, 5, 2);
-  const unsigned d = fixed_decimal(s, 8, 2);
-  const unsigned h = fixed_decimal(s, 11, 2);
-  const unsigned n = fixed_decimal(s, 14, 2);
-  const unsigned z = fixed_decimal(s, 17, 2);
+time_t utc_time(unsigned y, unsigned m, unsigned d, unsigned h,
+                unsigned n, unsigned z) {
   static constexpr unsigned month_days[] = {
       31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
   if (m == 0 || m > 12 || d == 0 ||
       d > month_days[m - 1] + unsigned(m == 2 && leap_year(y)) ||
       h > 23 || n > 59 || z > 59) {
-    throw std::runtime_error("out-of-range S3 LastModified");
+    throw std::runtime_error("out-of-range Last-Modified");
   }
 
   const int64_t adjusted_year = int64_t(y) - int64_t(m <= 2);
@@ -833,15 +811,64 @@ time_t parse_s3_mtime(std::string_view s) {
   if constexpr (std::numeric_limits<time_t>::is_signed) {
     if (seconds < int64_t(std::numeric_limits<time_t>::min()) ||
         seconds > int64_t(std::numeric_limits<time_t>::max())) {
-      throw std::runtime_error("S3 LastModified is outside time_t");
+      throw std::runtime_error("Last-Modified is outside time_t");
     }
   } else {
     if (seconds < 0 ||
         uint64_t(seconds) > uint64_t(std::numeric_limits<time_t>::max())) {
-      throw std::runtime_error("S3 LastModified is outside time_t");
+      throw std::runtime_error("Last-Modified is outside time_t");
     }
   }
   return time_t(seconds);
+}
+
+time_t parse_s3_mtime(std::string_view s) {
+  if (s.size() < 20 || s[4] != '-' || s[7] != '-' ||
+      s[10] != 'T' || s[13] != ':' || s[16] != ':') {
+    throw std::runtime_error("invalid S3 LastModified");
+  }
+  if (s[19] == '.') {
+    if (s.back() != 'Z' || s.size() == 21) {
+      throw std::runtime_error("invalid S3 LastModified fraction");
+    }
+    for (size_t i = 20; i + 1 < s.size(); ++i) {
+      if (!isdigit(u_char(s[i]))) {
+        throw std::runtime_error("invalid S3 LastModified fraction");
+      }
+    }
+  } else if (s.size() != 20 || s[19] != 'Z') {
+    throw std::runtime_error("invalid S3 LastModified timezone");
+  }
+
+  return utc_time(fixed_decimal(s, 0, 4), fixed_decimal(s, 5, 2),
+                  fixed_decimal(s, 8, 2), fixed_decimal(s, 11, 2),
+                  fixed_decimal(s, 14, 2), fixed_decimal(s, 17, 2));
+}
+
+time_t parse_http_mtime(std::string_view s) {
+  if (s.size() != 29 || s[3] != ',' || s[4] != ' ' || s[7] != ' ' ||
+      s[11] != ' ' || s[16] != ' ' || s[19] != ':' || s[22] != ':' ||
+      s[25] != ' ' || s.substr(26) != "GMT") {
+    throw std::runtime_error("invalid HTTP Last-Modified");
+  }
+  static constexpr std::string_view weekdays[] = {
+      "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+  if (std::find(std::begin(weekdays), std::end(weekdays), s.substr(0, 3)) ==
+      std::end(weekdays)) {
+    throw std::runtime_error("invalid HTTP Last-Modified weekday");
+  }
+  static constexpr std::string_view months[] = {
+      "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  const auto month = std::find(
+      std::begin(months), std::end(months), s.substr(8, 3));
+  if (month == std::end(months)) {
+    throw std::runtime_error("invalid HTTP Last-Modified month");
+  }
+  return utc_time(fixed_decimal(s, 12, 4),
+                  unsigned(month - std::begin(months)) + 1,
+                  fixed_decimal(s, 5, 2), fixed_decimal(s, 17, 2),
+                  fixed_decimal(s, 20, 2), fixed_decimal(s, 23, 2));
 }
 
 // Request-path and CopyObject helpers.

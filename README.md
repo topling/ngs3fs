@@ -59,6 +59,12 @@ multi-file namespace. It remains experimental rather than production-ready.
   when the original Part boundaries are unavailable. A missing or unusable
   response checksum does not fail the read; a checksum mismatch does.
 - FUSE remains in cached mode; `direct_io` is never enabled.
+- After each upload succeeds, `FUSE_NOTIFY_STORE` consumes the retained
+  FD-backed pipe chain into the ordinary kernel page cache, covering partial
+  pages that FUSE write-through mode otherwise discards. Later read opens keep
+  those pages when the object size is unchanged. No userspace data buffer is
+  introduced; the clean pages are never pinned and remain normally
+  reclaimable.
 - The preferred application transfer size reported through `statfs.f_bsize`
   defaults to 256 KiB and is independently configurable with
   `--io-size`. The allocation-unit field `statfs.f_frsize` remains 4 KiB.
@@ -69,6 +75,10 @@ multi-file namespace. It remains experimental rather than production-ready.
   that sysfs write root-only. If raising it is denied, ngs3fs prints a warning
   and falls back to the BDI's current kernel value. There is no userspace
   read-ahead.
+- Likely random reads produce a stderr warning with Unix time, object path,
+  offset, and request size, plus a recommendation to disable
+  `POSIX_FADV_RANDOM`/`MADV_RANDOM`. Detection excludes small objects and EOF
+  tails, and warnings are limited to one per mount per minute.
 - FUSE writeback cache is disabled. Writable mmap, `O_RDWR`, `O_DIRECT`, and
   writers without `O_TRUNC` are rejected. Each writable handle is
   non-seekable and accepts only strictly sequential `FUSE_WRITE` offsets from

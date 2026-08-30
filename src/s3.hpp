@@ -175,6 +175,16 @@ struct InodeFile : InodeBase {
   explicit InodeFile(InodeBase* parent = nullptr) noexcept
       : InodeBase(parent, true) {}
 
+  // expire is a directory-only timestamp. Regular files reuse the same
+  // storage without increasing InodeFile's size.
+  [[nodiscard]] bool page_cache_valid() const noexcept {
+    return expire.load(std::memory_order_acquire) != 0;
+  }
+
+  void set_page_cache_valid(bool value) noexcept {
+    expire.store(value, std::memory_order_release);
+  }
+
   std::atomic<time_t> mtime{0};
   std::atomic<uint64_t> fsize{0};
 };
@@ -373,4 +383,5 @@ void sign_v4_headers(HeaderList& headers, const Credentials& credentials,
 ssostr<32> amz_datetime(int64_t epoch_seconds);
 ssostr<32> amz_datetime_now();
 time_t parse_s3_mtime(std::string_view value);
+time_t parse_http_mtime(std::string_view value);
 std::string uri_encode(std::string_view value, bool preserve_slashes);

@@ -447,6 +447,9 @@ void test_s3_mtime() {
   assert(parse_s3_mtime("1970-01-01T00:00:00Z") == 0);
   assert(parse_s3_mtime("2000-02-29T00:00:00.000Z") == 951782400);
   assert(parse_s3_mtime("2038-01-19T03:14:07.123456Z") == 2147483647);
+  assert(parse_http_mtime("Thu, 01 Jan 1970 00:00:00 GMT") == 0);
+  assert(parse_http_mtime("Tue, 29 Feb 2000 00:00:00 GMT") == 951782400);
+  assert(parse_http_mtime("Tue, 19 Jan 2038 03:14:07 GMT") == 2147483647);
 }
 
 int main() {

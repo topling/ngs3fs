@@ -164,11 +164,14 @@ struct SharedServerState {
   std::string object_key = "mmap.bin";
   std::string etag = "\"before-put\"";
   std::string version_id = "version-1";
+  std::string last_modified = "Sun, 06 Nov 1994 08:49:37 GMT";
+  std::string last_modified_iso = "1994-11-06T08:49:37.000Z";
   int rename_attempts = 0;
   int rename_probe_attempts = 0;
   int active_gets = 0;
   int maximum_active_gets = 0;
   int get_requests = 0;
+  int head_requests = 0;
   int list_requests = 0;
   int put_requests = 0;
   int create_multipart_requests = 0;
@@ -511,6 +514,8 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     state.uploaded_parts.clear();
     state.etag = "\"after-put\"";
     state.version_id = "version-2";
+    state.last_modified = "Tue, 08 Nov 1994 08:49:37 GMT";
+    state.last_modified_iso = "1994-11-08T08:49:37.000Z";
     ++state.complete_multipart_requests;
     ++state.put_requests;
     std::string result =
@@ -618,12 +623,14 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   if (request.method == "HEAD" && frame->hd.type == NGHTTP2_HEADERS) {
+    ++state.head_requests;
     const std::string content_length = std::to_string(state.object.size());
     const std::array response_headers{
         header(":status", "200"),
         header("content-length", content_length),
         header("etag", state.etag),
         header("x-amz-version-id", state.version_id),
+        header("last-modified", state.last_modified),
     };
     const int submitted = nghttp2_submit_response(
         session, frame->hd.stream_id, response_headers.data(),
@@ -657,12 +664,16 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       xml += state.object_key;
       xml += "</s3:Key><s3:ETag>";
       xml += state.etag;
-      xml += "</s3:ETag><s3:Size>";
+      xml += "</s3:ETag><s3:LastModified>";
+      xml += state.last_modified_iso;
+      xml += "</s3:LastModified><s3:Size>";
       xml += std::to_string(state.object.size());
       xml += "</s3:Size></s3:Contents>";
       if (state.deep_present) {
         xml += "<s3:Contents><s3:Key>deep</s3:Key>"
                "<s3:ETag>\"file\"</s3:ETag>"
+               "<s3:LastModified>1994-11-06T08:49:37.000Z"
+               "</s3:LastModified>"
                "<s3:Size>0</s3:Size></s3:Contents>";
       }
     } else {
@@ -675,6 +686,8 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       } else if (deep) {
         xml += "<s3:Contents><s3:Key>deep&#x2F;child.bin</s3:Key>"
                "<s3:ETag>\"deep\"</s3:ETag>"
+               "<s3:LastModified>1994-11-06T08:49:37.000Z"
+               "</s3:LastModified>"
                "<s3:Size>3</s3:Size></s3:Contents>";
       }
     }
@@ -695,6 +708,8 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     state.object = std::move(request.body);
     state.etag = "\"after-put\"";
     state.version_id = "version-2";
+    state.last_modified = "Mon, 07 Nov 1994 08:49:37 GMT";
+    state.last_modified_iso = "1994-11-07T08:49:37.000Z";
     ++state.put_requests;
     const std::string checksum = response_checksum(
         state.checksum, state.object);
@@ -703,6 +718,7 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
         header("content-length", "0"),
         header("etag", state.etag),
         header("x-amz-version-id", state.version_id),
+        header("last-modified", state.last_modified),
         header(checksum_header_name(state.checksum),
                checksum),
     };
@@ -721,6 +737,8 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     state.object.clear();
     state.etag = "\"after-put\"";
     state.version_id = "version-2";
+    state.last_modified = "Mon, 07 Nov 1994 08:49:37 GMT";
+    state.last_modified_iso = "1994-11-07T08:49:37.000Z";
     ++state.put_requests;
     const std::string checksum = response_checksum(state.checksum, {});
     const std::array response_headers{
@@ -728,6 +746,7 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
         header("content-length", "0"),
         header("etag", state.etag),
         header("x-amz-version-id", state.version_id),
+        header("last-modified", state.last_modified),
         header(checksum_header_name(state.checksum),
                checksum),
     };
@@ -1296,9 +1315,16 @@ int main(int argc, char** argv) {
               "fsync unexpectedly published the object");
     }
     const int alias_fd = writer_alias.release();
+    int heads_before_small_commit;
+    {
+      std::lock_guard state_guard(shared.mutex);
+      heads_before_small_commit = shared.head_requests;
+    }
     if (::close(alias_fd) != 0) {
       fail_errno("close duplicated mounted writer");
     }
+    int gets_after_small_write;
+    int checksum_mode_after_small_write;
     {
       std::lock_guard state_guard(shared.mutex);
       require(shared.create_multipart_requests == 0 &&
@@ -1307,6 +1333,10 @@ int main(int argc, char** argv) {
               "small write unexpectedly used multipart upload");
       require(shared.put_requests == 1,
               "flush did not publish one small PutObject");
+      require(shared.head_requests == heads_before_small_commit,
+              "PutObject Last-Modified response triggered a redundant HEAD");
+      gets_after_small_write = shared.get_requests;
+      checksum_mode_after_small_write = shared.checksum_mode_requests;
     }
     UniqueFd visible_after_flush(
         ::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
@@ -1320,13 +1350,11 @@ int main(int argc, char** argv) {
     visible_after_flush.reset();
     {
       std::lock_guard state_guard(shared.mutex);
-      if (checksum == CHECKSUM_CRC64XZ) {
-        require(shared.checksum_mode_requests == 0,
-                "OSS full-object read requested AWS checksum mode");
-      } else {
-        require(shared.checksum_mode_requests != 0,
-                "full-object read did not request checksum mode");
-      }
+      require(shared.get_requests == gets_after_small_write,
+              "read-open discarded page cache left by the local writer");
+      require(shared.checksum_mode_requests ==
+                  checksum_mode_after_small_write,
+              "cached read unexpectedly requested checksum mode");
     }
     if (::fsync(writer.get()) != 0) {
       fail_errno("fsync sealed mounted object");
@@ -1350,6 +1378,34 @@ int main(int argc, char** argv) {
       shared.upload_attempts.clear();
     }
 
+    std::vector<std::byte> external_expected = small_expected;
+    external_expected.front() ^= std::byte{0xff};
+    int gets_before_external_open;
+    {
+      std::lock_guard state_guard(shared.mutex);
+      shared.object = external_expected;
+      shared.etag = "\"external-put\"";
+      shared.version_id = "version-3";
+      shared.last_modified = "Wed, 09 Nov 1994 08:49:37 GMT";
+      shared.last_modified_iso = "1994-11-09T08:49:37.000Z";
+      gets_before_external_open = shared.get_requests;
+    }
+    UniqueFd external_reader(
+        ::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
+    if (!external_reader) {
+      fail_errno("open externally overwritten object");
+    }
+    std::vector<std::byte> external_bytes(external_expected.size());
+    pread_all(external_reader.get(), external_bytes, 0);
+    require(external_bytes == external_expected,
+            "mtime change reused stale locally written page cache");
+    external_reader.reset();
+    {
+      std::lock_guard state_guard(shared.mutex);
+      require(shared.get_requests > gets_before_external_open,
+              "external mtime change did not fetch new object data");
+    }
+
     UniqueFd multipart_writer(
         ::open(file_path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC));
     if (!multipart_writer) {
@@ -1364,7 +1420,13 @@ int main(int argc, char** argv) {
                 std::span(final_expected).subspan(write_offset, length));
       write_offset += length;
     }
+    int heads_before_multipart_commit;
+    {
+      std::lock_guard state_guard(shared.mutex);
+      heads_before_multipart_commit = shared.head_requests;
+    }
     multipart_writer.reset();
+    int gets_after_multipart_write;
     {
       std::lock_guard state_guard(shared.mutex);
       require(shared.create_multipart_requests == 1,
@@ -1377,8 +1439,11 @@ int main(int argc, char** argv) {
       require(shared.complete_multipart_requests == 1 &&
                   shared.put_requests == 1,
               "large write did not complete one multipart upload");
+      require(shared.head_requests == heads_before_multipart_commit + 1,
+              "completion without Last-Modified did not issue one HEAD");
       require(shared.object == final_expected,
               "multipart upload published the wrong bytes");
+      gets_after_multipart_write = shared.get_requests;
     }
 
     UniqueFd reopened(::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
@@ -1404,6 +1469,11 @@ int main(int argc, char** argv) {
                    final_expected.end());
     ::munmap(updated_mapping, final_expected.size());
     require(updated_equal, "reopened mmap does not contain published bytes");
+    {
+      std::lock_guard state_guard(shared.mutex);
+      require(shared.get_requests == gets_after_multipart_write,
+              "multipart read-open discarded locally written page cache");
+    }
     const std::string renamed_path = mountpoint + "/renamed.bin";
     errno = 0;
     require(::rename(file_path.c_str(), renamed_path.c_str()) != 0 &&
