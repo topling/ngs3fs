@@ -1,4 +1,5 @@
 #include "io.hpp"
+#include "s3.hpp"
 
 #include <nghttp2/nghttp2.h>
 
@@ -121,6 +122,11 @@ struct Request {
   std::string copy_source_if_match;
   std::string if_match;
   std::string content_length;
+  std::string checksum_algorithm;
+  std::string checksum_type;
+  std::string checksum_value;
+  std::string checksum_mode;
+  std::string multipart_object_size;
   RequestRange range;
   std::vector<std::byte> body;
 };
@@ -137,6 +143,7 @@ struct ResponseSource {
 
 struct SharedServerState {
   std::mutex mutex;
+  ChecksumAlgorithm checksum = CHECKSUM_XXHASH128;
   std::vector<std::byte> object;
   std::string object_key = "mmap.bin";
   std::string etag = "\"before-put\"";
@@ -151,6 +158,7 @@ struct SharedServerState {
   int create_multipart_requests = 0;
   int upload_part_requests = 0;
   int complete_multipart_requests = 0;
+  int checksum_mode_requests = 0;
   std::map<unsigned, std::vector<std::byte>> uploaded_parts;
   std::map<unsigned, unsigned> upload_attempts;
   bool copy_completed = false;
@@ -246,6 +254,26 @@ int on_header(nghttp2_session*, const nghttp2_frame* frame,
     auto& state = *static_cast<ServerState*>(user_data);
     state.requests[frame->hd.stream_id].content_length.assign(
         reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "x-amz-checksum-algorithm") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].checksum_algorithm.assign(
+        reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "x-amz-checksum-type") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].checksum_type.assign(
+        reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "x-amz-checksum-mode") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].checksum_mode.assign(
+        reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name.starts_with("x-amz-checksum-")) {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].checksum_value.assign(
+        reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "x-amz-mp-object-size") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].multipart_object_size.assign(
+        reinterpret_cast<const char*>(value), value_length);
   }
   return 0;
 }
@@ -283,7 +311,11 @@ int submit_text_response(nghttp2_session* session, ServerState& connection,
                          int32_t stream_id, std::string_view status,
                          std::string_view text,
                          std::string_view etag = {},
-                         std::string_view version = {}) {
+                         std::string_view version = {},
+                         std::string_view checksum_algorithm = {},
+                         std::string_view checksum_type = {},
+                         std::string_view checksum_name = {},
+                         std::string_view checksum_value = {}) {
   auto response = std::make_unique<ResponseSource>();
   response->body.resize(text.size());
   memcpy(response->body.data(), text.data(), text.size());
@@ -293,7 +325,7 @@ int submit_text_response(nghttp2_session* session, ServerState& connection,
   ResponseSource* source = response.get();
   connection.responses[stream_id] = std::move(response);
   std::vector<nghttp2_nv> headers;
-  headers.reserve(5);
+  headers.reserve(8);
   headers.push_back(header(":status", status));
   headers.push_back(header("content-length", source->content_length));
   headers.push_back(header("content-type", "application/xml"));
@@ -302,6 +334,16 @@ int submit_text_response(nghttp2_session* session, ServerState& connection,
   }
   if (!version.empty()) {
     headers.push_back(header("x-amz-version-id", version));
+  }
+  if (!checksum_algorithm.empty()) {
+    headers.push_back(header("x-amz-checksum-algorithm",
+                             checksum_algorithm));
+  }
+  if (!checksum_type.empty()) {
+    headers.push_back(header("x-amz-checksum-type", checksum_type));
+  }
+  if (!checksum_name.empty()) {
+    headers.push_back(header(checksum_name, checksum_value));
   }
   nghttp2_data_provider provider{
       .source = {.ptr = source},
@@ -326,6 +368,25 @@ unsigned request_part_number(std::string_view path) {
   return number;
 }
 
+std::string encoded_checksum(ChecksumAlgorithm algorithm,
+                             std::span<const std::byte> body) {
+  DataChecksum checksum(algorithm);
+  checksum.update(body);
+  const ChecksumValue value = checksum.finish();
+  return std::string(value.base64.data(), value.base64.size());
+}
+
+std::string response_checksum(ChecksumAlgorithm algorithm,
+                              std::span<const std::byte> body) {
+  DataChecksum checksum(algorithm);
+  checksum.update(body);
+  const ChecksumValue value = checksum.finish();
+  if (algorithm == CHECKSUM_CRC64XZ) {
+    return std::to_string(value.integer);
+  }
+  return std::string(value.base64.data(), value.base64.size());
+}
+
 int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
                   void* user_data) {
   if (frame->hd.type != NGHTTP2_HEADERS &&
@@ -342,12 +403,18 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   std::lock_guard state_guard(state.mutex);
   if (request.method == "POST" && frame->hd.type == NGHTTP2_HEADERS &&
       request.path.ends_with("?uploads=")) {
+    require(request.checksum_algorithm == checksum_s3_name(state.checksum),
+            "CreateMultipartUpload used the wrong checksum algorithm");
+    require(request.checksum_type == checksum_multipart_type(state.checksum),
+            "CreateMultipartUpload used the wrong checksum type");
     ++state.create_multipart_requests;
     const int submitted = submit_text_response(
         session, connection, frame->hd.stream_id, "200",
         "<s3:InitiateMultipartUploadResult xmlns:s3=\"urn:s3\">"
         "<s3:UploadId>upload&#x2D;1</s3:UploadId>"
-        "</s3:InitiateMultipartUploadResult>");
+        "</s3:InitiateMultipartUploadResult>", {}, {},
+        checksum_s3_name(state.checksum),
+        checksum_multipart_type(state.checksum));
     return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   if (request.method == "PUT" && frame->hd.type == NGHTTP2_DATA &&
@@ -356,6 +423,12 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
             "UploadPart used the wrong upload ID");
     require(request.content_length == std::to_string(request.body.size()),
             "UploadPart omitted an exact Content-Length");
+    const std::string expected_request_checksum =
+        checksum_is_s3(state.checksum)
+            ? encoded_checksum(state.checksum, request.body)
+            : std::string{};
+    require(request.checksum_value == expected_request_checksum,
+            "UploadPart sent an invalid checksum");
     const unsigned number = request_part_number(request.path);
     const unsigned attempt = ++state.upload_attempts[number];
     if (number == 1 && attempt == 1) {
@@ -371,10 +444,14 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     state.uploaded_parts[number] = std::move(request.body);
     ++state.upload_part_requests;
     const std::string etag = "\"part-" + std::to_string(number) + "\"";
+    const std::string checksum = response_checksum(
+        state.checksum, state.uploaded_parts[number]);
     const std::array response_headers{
         header(":status", "200"),
         header("content-length", "0"),
         header("etag", etag),
+        header(checksum_header_name(state.checksum),
+               checksum),
     };
     const int submitted = nghttp2_submit_response(
         session, frame->hd.stream_id, response_headers.data(),
@@ -387,22 +464,61 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
             "CompleteMultipartUpload omitted an exact Content-Length");
     require(!state.uploaded_parts.empty(),
             "CompleteMultipartUpload had no uploaded parts");
+    const std::string_view xml(
+        reinterpret_cast<const char*>(request.body.data()),
+        request.body.size());
+    const std::string checksum_tag =
+        "<" + std::string(checksum_xml_name(state.checksum)) + ">";
+    if (checksum_multipart_type(state.checksum) == "COMPOSITE") {
+      require(xml.find(checksum_tag) != std::string_view::npos,
+              "CompleteMultipartUpload omitted part checksums");
+    } else {
+      require(xml.find(checksum_tag) == std::string_view::npos,
+              "FULL_OBJECT completion included part checksums");
+    }
     state.object.clear();
     for (auto& [number, part] : state.uploaded_parts) {
       require(number != 0, "invalid stored multipart part number");
       state.object.insert(state.object.end(), part.begin(), part.end());
+    }
+    const std::string complete_checksum =
+        response_checksum(state.checksum, state.object);
+    const bool full_checksum =
+        checksum_multipart_type(state.checksum) == "FULL_OBJECT";
+    if (full_checksum) {
+      require(request.checksum_value == complete_checksum,
+              "CompleteMultipartUpload sent an invalid full checksum");
+      require(request.multipart_object_size ==
+                  std::to_string(state.object.size()),
+              "CompleteMultipartUpload omitted x-amz-mp-object-size");
     }
     state.uploaded_parts.clear();
     state.etag = "\"after-put\"";
     state.version_id = "version-2";
     ++state.complete_multipart_requests;
     ++state.put_requests;
+    std::string result =
+        "<s3:CompleteMultipartUploadResult xmlns:s3=\"urn:s3\">"
+        "<s3:ETag>&quot;after-put&quot;</s3:ETag>";
+    if (full_checksum) {
+      result += "<s3:";
+      result += checksum_xml_name(state.checksum);
+      result += ">";
+      result += complete_checksum;
+      result += "</s3:";
+      result += checksum_xml_name(state.checksum);
+      result += ">";
+    }
+    result += "</s3:CompleteMultipartUploadResult>";
     const int submitted = submit_text_response(
         session, connection, frame->hd.stream_id, "200",
-        "<s3:CompleteMultipartUploadResult xmlns:s3=\"urn:s3\">"
-        "<s3:ETag>&quot;after-put&quot;</s3:ETag>"
-        "</s3:CompleteMultipartUploadResult>",
-        state.etag, state.version_id);
+        result, state.etag, state.version_id, {}, {},
+        state.checksum == CHECKSUM_CRC64XZ
+            ? checksum_header_name(state.checksum)
+            : std::string_view{},
+        state.checksum == CHECKSUM_CRC64XZ
+            ? std::string_view(complete_checksum)
+            : std::string_view{});
     return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   if (request.method == "PUT" && frame->hd.type == NGHTTP2_HEADERS &&
@@ -554,15 +670,25 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   if (request.method == "PUT" && frame->hd.type == NGHTTP2_DATA) {
     require(request.content_length == std::to_string(request.body.size()),
             "PutObject omitted an exact Content-Length");
+    const std::string expected_request_checksum =
+        checksum_is_s3(state.checksum)
+            ? encoded_checksum(state.checksum, request.body)
+            : std::string{};
+    require(request.checksum_value == expected_request_checksum,
+            "PutObject sent an invalid checksum");
     state.object = std::move(request.body);
     state.etag = "\"after-put\"";
     state.version_id = "version-2";
     ++state.put_requests;
+    const std::string checksum = response_checksum(
+        state.checksum, state.object);
     const std::array response_headers{
         header(":status", "200"),
         header("content-length", "0"),
         header("etag", state.etag),
         header("x-amz-version-id", state.version_id),
+        header(checksum_header_name(state.checksum),
+               checksum),
     };
     const int submitted = nghttp2_submit_response(
         session, frame->hd.stream_id, response_headers.data(),
@@ -570,15 +696,24 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   if (request.method == "PUT" && frame->hd.type == NGHTTP2_HEADERS) {
+    const std::string expected_request_checksum =
+        checksum_is_s3(state.checksum)
+            ? encoded_checksum(state.checksum, {})
+            : std::string{};
+    require(request.checksum_value == expected_request_checksum,
+            "empty PutObject sent an invalid checksum");
     state.object.clear();
     state.etag = "\"after-put\"";
     state.version_id = "version-2";
     ++state.put_requests;
+    const std::string checksum = response_checksum(state.checksum, {});
     const std::array response_headers{
         header(":status", "200"),
         header("content-length", "0"),
         header("etag", state.etag),
         header("x-amz-version-id", state.version_id),
+        header(checksum_header_name(state.checksum),
+               checksum),
     };
     const int submitted = nghttp2_submit_response(
         session, frame->hd.stream_id, response_headers.data(),
@@ -609,12 +744,29 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   state.maximum_active_gets =
       std::max(state.maximum_active_gets, state.active_gets);
 
-  const std::array response_headers{
+  const bool complete_object = range.first == 0 &&
+      range.last + 1 == state.object.size();
+  std::string checksum;
+  std::vector<nghttp2_nv> response_headers{
       header(":status", "206"),
       header("content-length", source->content_length),
       header("etag", state.etag),
       header("x-amz-version-id", state.version_id),
   };
+  if (!request.checksum_mode.empty()) {
+    require(request.checksum_mode == "ENABLED" && complete_object,
+            "checksum mode was used for a partial object range");
+    ++state.checksum_mode_requests;
+    checksum = encoded_checksum(state.checksum, state.object);
+    response_headers.push_back(
+        header(checksum_header_name(state.checksum), checksum));
+    response_headers.push_back(
+        header("x-amz-checksum-type", "FULL_OBJECT"));
+  } else if (state.checksum == CHECKSUM_CRC64XZ) {
+    checksum = response_checksum(state.checksum, state.object);
+    response_headers.push_back(
+        header(checksum_header_name(state.checksum), checksum));
+  }
   nghttp2_data_provider provider{
       .source = {.ptr = source},
       .read_callback = read_body,
@@ -830,7 +982,7 @@ std::string make_mountpoint() {
 }
 
 pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
-                   uint16_t port) {
+                   uint16_t port, std::string_view checksum) {
   const std::string port_text = std::to_string(port);
   const std::string uid_text  = std::to_string(::getuid());
   const std::string gid_text  = std::to_string(::getgid());
@@ -843,7 +995,9 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
             port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
             uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
             "0750", "--io-size", "384KiB", "-R", "256KiB", "-I", "1",
-            "-f", mountpoint.data(), static_cast<char*>(nullptr));
+            "--checksum", checksum.data(), "--verify-read-checksum", "-f",
+            mountpoint.data(),
+            static_cast<char*>(nullptr));
     _exit(127);
   }
   return process;
@@ -865,8 +1019,8 @@ void wait_until_mounted(std::string_view file_path, pid_t process) {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::cerr << "missing ngs3fs executable path\n";
+  if (argc < 2 || argc > 3) {
+    std::cerr << "usage: fuse_mmap_integration_test NGS3FS [CHECKSUM]\n";
     return 2;
   }
   if (::access("/dev/fuse", R_OK | W_OK) != 0) {
@@ -876,12 +1030,21 @@ int main(int argc, char** argv) {
 
   std::string mountpoint;
   try {
+    ChecksumAlgorithm checksum = CHECKSUM_XXHASH128;
+    if (argc == 3 &&
+        (!parse_checksum_algorithm(argv[2], checksum) ||
+         (checksum != CHECKSUM_XXHASH128 &&
+          checksum != CHECKSUM_CRC64NVME &&
+          checksum != CHECKSUM_CRC64XZ))) {
+      throw std::invalid_argument(
+          "integration checksum must be xxhash128, crc64nvme, or crc64xz");
+    }
     std::vector<std::byte> expected(512U * 1024U + 37U);
     for (size_t i = 0; i < expected.size(); ++i) {
       expected[i] = static_cast<std::byte>((i * 29U + 7U) & 0xffU);
     }
     std::vector<std::byte> small_expected = expected;
-    small_expected.resize(expected.size() - 8192U - 37U);
+    small_expected.resize(64U * 1024U + 37U);
     for (size_t i = 0; i < small_expected.size(); ++i) {
       small_expected[i] ^= static_cast<std::byte>(0x5aU);
     }
@@ -893,11 +1056,14 @@ int main(int argc, char** argv) {
 
     Listener listener = make_listener();
     SharedServerState shared;
-    shared.object = expected;
+    shared.checksum = checksum;
+    shared.object   = expected;
     std::jthread server(run_server, listener.socket.get(), std::ref(shared));
 
     mountpoint = make_mountpoint();
-    const pid_t process = start_daemon(argv[1], mountpoint, listener.port);
+    const std::string checksum_option(checksum_option_name(checksum));
+    const pid_t process = start_daemon(
+        argv[1], mountpoint, listener.port, checksum_option);
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
@@ -1131,11 +1297,21 @@ int main(int argc, char** argv) {
     if (!visible_after_flush) {
       fail_errno("close-to-open while duplicated writer remains");
     }
-    std::array<std::byte, 1> visible_byte{};
-    pread_all(visible_after_flush.get(), visible_byte, 0);
-    require(visible_byte[0] == small_expected[0],
+    std::vector<std::byte> visible_bytes(small_expected.size());
+    pread_all(visible_after_flush.get(), visible_bytes, 0);
+    require(visible_bytes == small_expected,
             "flush did not expose the completed object");
     visible_after_flush.reset();
+    {
+      std::lock_guard state_guard(shared.mutex);
+      if (checksum == CHECKSUM_CRC64XZ) {
+        require(shared.checksum_mode_requests == 0,
+                "OSS full-object read requested AWS checksum mode");
+      } else {
+        require(shared.checksum_mode_requests != 0,
+                "full-object read did not request checksum mode");
+      }
+    }
     if (::fsync(writer.get()) != 0) {
       fail_errno("fsync sealed mounted object");
     }

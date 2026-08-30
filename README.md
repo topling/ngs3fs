@@ -40,6 +40,24 @@ multi-file namespace. It remains experimental rather than production-ready.
 
   Payload bytes do not enter a userspace data buffer. A stock Linux TCP/FUSE
   path still has one kernel copy into the page cache.
+- `-K/--checksum` defaults to `auto`. Amazon S3 endpoints select XXHASH128;
+  Alibaba OSS endpoints select their native CRC64/XZ response check; unknown
+  S3-compatible endpoints leave checksum selection to the protocol service.
+  Explicit `crc32`, `crc32c`, `crc64nvme`, `sha1`, `sha256`, `md5`,
+  `xxhash64`, `xxhash3`, `xxhash128`, and `sha512` use S3's algorithm-specific
+  checksum headers. `crc64xz` selects the OSS response checksum, while
+  `default` and `none` add no client checksum header. Multipart algorithms
+  that require COMPOSITE checksums carry every Part checksum into completion
+  XML. CRC64NVME uses a FULL_OBJECT checksum combined from the Part CRCs, so
+  completion does not scan the object data again.
+- Read verification is off by default. `--verify-read-checksum` requests and
+  validates a checksum only when one FUSE read covers the complete object and
+  the response checksum covers that same byte sequence. Arbitrary Range GETs
+  are not expanded or copied just to validate a whole-object checksum; S3 has
+  no standard checksum for an arbitrary range, and OSS returns the whole
+  object's CRC64 even for a range response. Composite S3 checksums are skipped
+  when the original Part boundaries are unavailable. A missing or unusable
+  response checksum does not fail the read; a checksum mismatch does.
 - FUSE remains in cached mode; `direct_io` is never enabled.
 - The preferred application transfer size reported through `statfs.f_bsize`
   defaults to 256 KiB and is independently configurable with
@@ -255,6 +273,7 @@ mkdir -p mount
   -e 127.0.0.1 -p 9000 \
   -a bucket.example.test:9000 \
   -b bucket -k optional/raw/prefix \
+  --checksum auto \
   --io-size 256KiB -R 256KiB -T 1000 -I 1000000 \
   -P 8MiB -c 4 -C 8 -B 256MiB \
   -u 1000 -g 1000 -m 0644 -D 0755 \
@@ -267,6 +286,8 @@ virtual-hosted requests are inferred from `--authority` and `--bucket`.
 `--io-size` controls only the preferred transfer-size hint returned by
 `statfs(2)` and must be nonzero; it does not change FUSE request sizing or
 kernel read-ahead.
+`--verify-read-checksum` is intentionally independent of the upload checksum
+selection and is disabled unless explicitly requested.
 `--read-ahead` must be page-aligned; `0` disables it. Values above the
 per-request pipe capacity are split by kernel FUSE read limits when kernel BDI
 tuning is available.

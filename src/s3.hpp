@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <array>
+#include <stddef.h>
 #include <mutex>
 #include <shared_mutex>
 #include <span>
@@ -237,6 +238,62 @@ inline constexpr std::string_view kEmptyPayloadSha256 =
     "e3b0c44298fc1c149afbf4c8996fb924"
     "27ae41e4649b934ca495991b7852b855";
 inline constexpr std::string_view kUnsignedPayload = "UNSIGNED-PAYLOAD";
+
+enum ChecksumAlgorithm {
+  CHECKSUM_AUTO,
+  CHECKSUM_PROTOCOL_DEFAULT,
+  CHECKSUM_NONE,
+  CHECKSUM_CRC32,
+  CHECKSUM_CRC32C,
+  CHECKSUM_CRC64NVME,
+  CHECKSUM_SHA1,
+  CHECKSUM_SHA256,
+  CHECKSUM_MD5,
+  CHECKSUM_XXHASH64,
+  CHECKSUM_XXHASH3,
+  CHECKSUM_XXHASH128,
+  CHECKSUM_SHA512,
+  CHECKSUM_CRC64XZ,
+};
+
+bool ascii_equal_ignore_case(std::string_view first,
+                             std::string_view second) noexcept;
+bool parse_checksum_algorithm(std::string_view text,
+                              ChecksumAlgorithm& algorithm) noexcept;
+std::string_view checksum_option_name(ChecksumAlgorithm algorithm) noexcept;
+std::string_view checksum_s3_name(ChecksumAlgorithm algorithm) noexcept;
+std::string_view checksum_header_name(ChecksumAlgorithm algorithm) noexcept;
+std::string_view checksum_xml_name(ChecksumAlgorithm algorithm) noexcept;
+bool checksum_is_s3(ChecksumAlgorithm algorithm) noexcept;
+std::string_view checksum_multipart_type(
+    ChecksumAlgorithm algorithm) noexcept;
+
+struct ChecksumValue {
+  ssostr<96> base64;
+  uint64_t integer = 0;
+};
+
+ChecksumValue crc64_checksum_value(uint64_t value);
+uint64_t combine_crc64(ChecksumAlgorithm algorithm, uint64_t first,
+                       uint64_t second, uint64_t second_length);
+
+class DataChecksum {
+ public:
+  explicit DataChecksum(ChecksumAlgorithm algorithm);
+
+  DataChecksum(const DataChecksum&) = delete;
+  DataChecksum& operator=(const DataChecksum&) = delete;
+
+  void update(std::span<const std::byte> bytes);
+  ChecksumValue finish();
+
+ private:
+  static constexpr size_t kContextBytes = 1024;
+
+  alignas(64) std::array<std::byte, kContextBytes> context_{};
+  ChecksumAlgorithm algorithm_;
+  bool finished_ = false;
+};
 
 struct Credentials {
   std::string access_key_id;

@@ -47,32 +47,41 @@
 constexpr size_t kMaximumListResponseSize = 8U * 1024U * 1024U;
 constexpr unsigned kDirectoryListLimit    = 1000;
 
+enum ChecksumService {
+  CHECKSUM_SERVICE_UNKNOWN,
+  CHECKSUM_SERVICE_AWS,
+  CHECKSUM_SERVICE_OSS,
+};
+
 struct MountConfig {
   std::string endpoint_host;
-  uint16_t endpoint_port          = 80;
+  uint16_t endpoint_port            = 80;
   std::string authority;
   std::string bucket;
   std::string bucket_path;
   std::string prefix;
-  std::string region              = "us-east-1";
+  std::string region                = "us-east-1";
   Credentials credentials;
-  size_t maximum_read_size        = kPreferredIoSize;
-  size_t maximum_write_size       = kPreferredIoSize;
-  uint32_t io_size                = kPreferredIoSize;
-  uint32_t read_ahead_size        = kPreferredIoSize;
-  uint64_t part_size              = 8ULL * 1024ULL * 1024ULL;
-  uint64_t max_pinned_memory      = 256ULL * 1024ULL * 1024ULL;
-  uint64_t directory_cache_ns     = 1000ULL * 1000ULL * 1000ULL;
-  size_t max_cached_inodes        = 1'000'000;
-  unsigned max_uploads            = 4;
-  unsigned max_connections        = 8;
-  uid_t uid                       = ::getuid();
-  gid_t gid                       = ::getgid();
-  mode_t file_mode                = 0644;
-  mode_t directory_mode           = 0755;
-  bool report_metrics             = false;
-  bool directory_bucket           = false;
-  bool tls                        = false;
+  size_t maximum_read_size          = kPreferredIoSize;
+  size_t maximum_write_size         = kPreferredIoSize;
+  uint32_t io_size                  = kPreferredIoSize;
+  uint32_t read_ahead_size          = kPreferredIoSize;
+  uint64_t part_size                = 8ULL * 1024ULL * 1024ULL;
+  uint64_t max_pinned_memory        = 256ULL * 1024ULL * 1024ULL;
+  uint64_t directory_cache_ns       = 1000ULL * 1000ULL * 1000ULL;
+  size_t max_cached_inodes          = 1'000'000;
+  unsigned max_uploads              = 4;
+  unsigned max_connections          = 8;
+  ChecksumAlgorithm checksum        = CHECKSUM_AUTO;
+  ChecksumService checksum_service  = CHECKSUM_SERVICE_UNKNOWN;
+  uid_t uid                         = ::getuid();
+  gid_t gid                         = ::getgid();
+  mode_t file_mode                  = 0644;
+  mode_t directory_mode             = 0755;
+  bool report_metrics               = false;
+  bool directory_bucket             = false;
+  bool tls                          = false;
+  bool verify_read_checksum         = false;
 };
 
 enum WriteState {
@@ -96,6 +105,7 @@ struct PipeSegment {
 
 struct RetainedPart {
   std::vector<PipeSegment> segments;
+  ChecksumValue checksum;
   uint64_t bytes  = 0;
   unsigned number = 0;
 };
@@ -303,6 +313,9 @@ struct OpenHandle {
   std::string version_id;
   std::string upload_id;
   std::vector<std::string> part_etags;
+  std::vector<ssostr<96>> part_checksums;
+  std::vector<uint64_t> part_checksum_values;
+  std::vector<uint64_t> part_sizes;
   std::unique_ptr<RetainedPart> current_part;
   uint64_t size             = 0;
   uint64_t stream_offset    = 0;
@@ -976,6 +989,7 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   }
 
   constexpr int io_size_option = 256;
+  constexpr int verify_read_checksum_option = 257;
   constexpr option long_options[] = {
       {"endpoint-host", required_argument, nullptr, 'e'},
       {"endpoint-port", required_argument, nullptr, 'p'},
@@ -983,6 +997,9 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       {"bucket", required_argument, nullptr, 'b'},
       {"prefix", required_argument, nullptr, 'k'},
       {"region", required_argument, nullptr, 'r'},
+      {"checksum", required_argument, nullptr, 'K'},
+      {"verify-read-checksum", no_argument, nullptr,
+       verify_read_checksum_option},
       {"io-size", required_argument, nullptr, io_size_option},
       {"read-ahead", required_argument, nullptr, 'R'},
       {"dir-cache-timeout", required_argument, nullptr, 'T'},
@@ -1002,7 +1019,7 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       {nullptr, 0, nullptr, 0},
   };
   constexpr std::string_view short_options =
-      "-e:p:a:b:k:r:R:T:I:P:c:C:B:u:g:m:D:MShVdfso:";
+      "-e:p:a:b:k:r:K:R:T:I:P:c:C:B:u:g:m:D:MShVdfso:";
 
   auto add_fuse_short_option = [&](int value) {
     const char argument[] = {'-', static_cast<char>(value), '\0'};
@@ -1059,6 +1076,18 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
         break;
       case 'r':
         config.region = optarg;
+        break;
+      case 'K':
+        if (optarg == nullptr ||
+            !parse_checksum_algorithm(optarg, config.checksum)) {
+          throw std::invalid_argument(
+              "invalid --checksum; expected auto, default, none, crc32, "
+              "crc32c, crc64nvme, sha1, sha256, md5, xxhash64, xxhash3, "
+              "xxhash128, sha512, or crc64xz");
+        }
+        break;
+      case verify_read_checksum_option:
+        config.verify_read_checksum = true;
         break;
       case io_size_option: {
         const uint64_t value = parse_required_size("--io-size");
@@ -1630,6 +1659,128 @@ HeaderList base_authorization_headers(
   return output;
 }
 
+bool contains_ignore_case(std::string_view text,
+                          std::string_view wanted) noexcept {
+  if (wanted.size() > text.size()) {
+    return false;
+  }
+  for (size_t begin = 0; begin <= text.size() - wanted.size(); ++begin) {
+    bool equal = true;
+    for (size_t i = 0; i < wanted.size(); ++i) {
+      if (tolower(u_char(text[begin + i])) !=
+          tolower(u_char(wanted[i]))) {
+        equal = false;
+        break;
+      }
+    }
+    if (equal) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool domain_suffix_ignore_case(std::string_view host,
+                               std::string_view suffix) noexcept {
+  if (host.starts_with('[')) {
+    return false;
+  }
+  const size_t colon = host.rfind(':');
+  if (colon != std::string_view::npos && host.find(':') == colon) {
+    host = host.substr(0, colon);
+  }
+  if (host.ends_with('.')) {
+    host.remove_suffix(1);
+  }
+  if (host.size() < suffix.size()) {
+    return false;
+  }
+  const std::string_view tail = host.substr(host.size() - suffix.size());
+  if (!ascii_equal_ignore_case(tail, suffix)) {
+    return false;
+  }
+  return host.size() == suffix.size() ||
+         host[host.size() - suffix.size() - 1] == '.';
+}
+
+ChecksumService checksum_service_from_response(
+    const Response& response) noexcept {
+  if (response.headers.find("x-oss-request-id") != response.headers.end()) {
+    return CHECKSUM_SERVICE_OSS;
+  }
+  const auto server = response.headers.find("server");
+  if (server != response.headers.end()) {
+    const std::string_view value = sso_view(server->second);
+    if (contains_ignore_case(value, "AliyunOSS")) {
+      return CHECKSUM_SERVICE_OSS;
+    }
+    if (contains_ignore_case(value, "AmazonS3")) {
+      return CHECKSUM_SERVICE_AWS;
+    }
+  }
+  return CHECKSUM_SERVICE_UNKNOWN;
+}
+
+ChecksumService checksum_service_from_host(std::string_view host) noexcept {
+  if (domain_suffix_ignore_case(host, "aliyuncs.com") ||
+      domain_suffix_ignore_case(host, "aliyuncs.com.cn")) {
+    return CHECKSUM_SERVICE_OSS;
+  }
+  if (domain_suffix_ignore_case(host, "amazonaws.com") ||
+      domain_suffix_ignore_case(host, "amazonaws.com.cn")) {
+    return CHECKSUM_SERVICE_AWS;
+  }
+  return CHECKSUM_SERVICE_UNKNOWN;
+}
+
+void configure_checksum(State& state) {
+  ChecksumService service = checksum_service_from_host(
+      state.config.endpoint_host);
+  if (service == CHECKSUM_SERVICE_UNKNOWN) {
+    service = checksum_service_from_host(state.config.authority);
+  }
+  if (state.config.checksum != CHECKSUM_AUTO) {
+    if (service == CHECKSUM_SERVICE_UNKNOWN &&
+        state.config.checksum == CHECKSUM_CRC64XZ) {
+      service = CHECKSUM_SERVICE_OSS;
+    }
+    state.config.checksum_service = service;
+    return;
+  }
+  if (service == CHECKSUM_SERVICE_UNKNOWN) {
+    try {
+      const std::string path = state.config.bucket_path.empty()
+                                   ? "/"
+                                   : state.config.bucket_path;
+      const HeaderList headers = authorization_headers(
+          state, "HEAD", path, {}, kEmptyPayloadSha256);
+      HttpPool::Lease client = state.http->acquire();
+      const Response response = client->request_no_body(
+          "HEAD", path, headers, 4096);
+      service = checksum_service_from_response(response);
+    } catch (const std::exception& error) {
+      std::cerr << "warning: checksum provider probe failed: "
+                << error.what() << '\n';
+    }
+  }
+  switch (service) {
+    case CHECKSUM_SERVICE_AWS:
+      state.config.checksum = CHECKSUM_XXHASH128;
+      std::cerr << "checksum auto selected xxhash128 for Amazon S3\n";
+      break;
+    case CHECKSUM_SERVICE_OSS:
+      state.config.checksum = CHECKSUM_CRC64XZ;
+      std::cerr << "checksum auto selected crc64xz for Alibaba OSS\n";
+      break;
+    case CHECKSUM_SERVICE_UNKNOWN:
+      state.config.checksum = CHECKSUM_PROTOCOL_DEFAULT;
+      std::cerr << "checksum auto selected protocol default because the "
+                   "endpoint did not advertise a known checksum service\n";
+      break;
+  }
+  state.config.checksum_service = service;
+}
+
 int errno_for_s3_status(int status) noexcept {
   switch (status) {
     case 400:
@@ -1871,6 +2022,7 @@ struct AuthorizedRangeRequest {
   std::string versioned_path;
   std::span<const Header> headers;
   bool range_signed = false;
+  bool verify_checksum = false;
 
   std::string_view path() const {
     return versioned_path.empty() ? std::string_view(*base_path)
@@ -1889,6 +2041,7 @@ AuthorizedRangeRequest make_range_request(State& state,
       .versioned_path = {},
       .headers = {},
       .range_signed = false,
+      .verify_checksum = false,
   };
   if (!handle.version_id.empty()) {
     request.versioned_path = handle.object_path;
@@ -1916,12 +2069,18 @@ AuthorizedRangeRequest make_range_request(State& state,
   p = end_result.ptr;
   const bool use_if_match =
       handle.version_id.empty() && !handle.etag.empty();
+  const bool verify_checksum = state.config.verify_read_checksum &&
+      offset == 0 && uint64_t(length) == handle.size;
+  const bool request_checksum = verify_checksum &&
+      state.config.checksum_service != CHECKSUM_SERVICE_OSS;
+  request.verify_checksum = verify_checksum;
   const int signing_mode =
       state.range_signing_mode.load(std::memory_order_relaxed);
   const bool sign_range = state.config.directory_bucket || signing_mode == 2;
   request.range_signed = sign_range;
   const std::array<uint64_t, 2> date = state.date_time.now();
-  const bool cacheable = !state.config.directory_bucket && !sign_range;
+  const bool cacheable = !state.config.directory_bucket && !sign_range &&
+      !request_checksum;
   const bool cache_hit =
       cacheable && worker.authorization_valid &&
       worker.authorization_handle_id == handle.id &&
@@ -1938,7 +2097,7 @@ AuthorizedRangeRequest make_range_request(State& state,
     memcpy(date_text.data() + sizeof(date[0]),
            &date[1], sizeof(date[1]));
     const Header if_match{"if-match", handle.etag};
-    std::array<Header, 2> canonical_headers;
+    std::array<Header, 3> canonical_headers;
     size_t canonical_count = 0;
     if (use_if_match) {
       canonical_headers[canonical_count++] = if_match;
@@ -1946,6 +2105,10 @@ AuthorizedRangeRequest make_range_request(State& state,
     if (sign_range) {
       canonical_headers[canonical_count++] =
           Header{"range", ssostr<32>(range.data(), range_length)};
+    }
+    if (request_checksum) {
+      canonical_headers[canonical_count++] =
+          Header{"x-amz-checksum-mode", "ENABLED"};
     }
     authorization_headers(
         headers, state, "GET", request.path(),
@@ -1955,6 +2118,9 @@ AuthorizedRangeRequest make_range_request(State& state,
     worker.authorization_count = headers.size();
     headers.push_back(
         Header{"range", ssostr<32>(range.data(), range_length)});
+    if (request_checksum) {
+      headers.push_back(Header{"x-amz-checksum-mode", "ENABLED"});
+    }
     if (use_if_match) {
       headers.push_back(if_match);
     }
@@ -2964,6 +3130,164 @@ void append_authorization(std::vector<Header>& headers, State& state,
                  std::make_move_iterator(authorization.end()));
 }
 
+bool checksum_has_digest(ChecksumAlgorithm algorithm) noexcept {
+  return checksum_is_s3(algorithm) || algorithm == CHECKSUM_CRC64XZ;
+}
+
+void checksum_pipe(DataChecksum& checksum, Pipe& copy,
+                   int source_fd, size_t bytes) {
+  std::array<std::byte, kPreferredIoSize> buffer;
+  size_t remaining = bytes;
+  while (remaining != 0) {
+    const size_t wanted = std::min(
+        {remaining, copy.capacity(), buffer.size()});
+    ssize_t result;
+    do {
+      result = ::tee(source_fd, copy.write_fd(), wanted, 0);
+    } while (result < 0 && errno == EINTR);
+    if (result <= 0) {
+      const int error = result == 0 ? ECONNRESET : errno;
+      throw std::system_error(error, std::generic_category(),
+                              "tee(checksum)");
+    }
+    const size_t count = size_t(result);
+    read_all(copy.read_fd(), std::span(buffer).first(count));
+    checksum.update(std::span(buffer).first(count));
+    remaining -= count;
+  }
+}
+
+ChecksumValue retained_checksum(ChecksumAlgorithm algorithm,
+                                const RetainedPart* part) {
+  DataChecksum checksum(algorithm);
+  if (part != nullptr && !part->segments.empty()) {
+    Pipe copy = Pipe::create(kPreferredIoSize);
+    for (const PipeSegment& segment : part->segments) {
+      checksum_pipe(checksum, copy, segment.pipe.read_fd(), segment.bytes);
+    }
+  }
+  return checksum.finish();
+}
+
+void append_upload_checksum(std::vector<Header>& headers,
+                            ChecksumAlgorithm algorithm,
+                            const ChecksumValue& checksum) {
+  if (checksum_is_s3(algorithm)) {
+    headers.push_back(Header{checksum_header_name(algorithm),
+                             checksum.base64});
+  }
+}
+
+void verify_upload_checksum(const Response& response,
+                            ChecksumAlgorithm algorithm,
+                            const ChecksumValue& checksum,
+                            const char* operation) {
+  if (!checksum_has_digest(algorithm)) {
+    return;
+  }
+  const std::string_view name = checksum_header_name(algorithm);
+  const auto header = response.headers.find(name);
+  if (header == response.headers.end()) {
+    throw std::runtime_error(std::string(operation) +
+                             " response omitted " + std::string(name));
+  }
+  if (algorithm == CHECKSUM_CRC64XZ) {
+    uint64_t received = 0;
+    if (!parse_unsigned(sso_view(header->second), received) ||
+        received != checksum.integer) {
+      throw std::runtime_error(std::string(operation) +
+                               " returned a mismatched OSS CRC64");
+    }
+  } else if (sso_view(header->second) != sso_view(checksum.base64)) {
+    throw std::runtime_error(std::string(operation) +
+                             " returned a mismatched S3 checksum");
+  }
+}
+
+bool read_checksum_from_response(const Response& response,
+                                 ChecksumAlgorithm preferred,
+                                 ChecksumAlgorithm& algorithm,
+                                 std::string_view& expected) {
+  const auto type = response.headers.find("x-amz-checksum-type");
+  if (type != response.headers.end() && type->second == "COMPOSITE") {
+    return false;
+  }
+  if (preferred == CHECKSUM_CRC64XZ) {
+    const auto header = response.headers.find(
+        checksum_header_name(CHECKSUM_CRC64XZ));
+    if (header != response.headers.end()) {
+      algorithm = CHECKSUM_CRC64XZ;
+      expected  = sso_view(header->second);
+      return true;
+    }
+  }
+  constexpr std::array algorithms{
+      CHECKSUM_XXHASH128,
+      CHECKSUM_XXHASH3,
+      CHECKSUM_CRC64NVME,
+      CHECKSUM_CRC32C,
+      CHECKSUM_CRC32,
+      CHECKSUM_XXHASH64,
+      CHECKSUM_SHA512,
+      CHECKSUM_SHA256,
+      CHECKSUM_SHA1,
+      CHECKSUM_MD5,
+  };
+  if (checksum_is_s3(preferred)) {
+    const auto header = response.headers.find(
+        checksum_header_name(preferred));
+    if (header != response.headers.end() &&
+        sso_view(header->second).find('-') == std::string_view::npos) {
+      algorithm = preferred;
+      expected  = sso_view(header->second);
+      return true;
+    }
+  }
+  for (const ChecksumAlgorithm candidate : algorithms) {
+    const auto header = response.headers.find(
+        checksum_header_name(candidate));
+    if (header != response.headers.end()) {
+      if (sso_view(header->second).find('-') != std::string_view::npos) {
+        continue;
+      }
+      algorithm = candidate;
+      expected  = sso_view(header->second);
+      return true;
+    }
+  }
+  const auto oss = response.headers.find(
+      checksum_header_name(CHECKSUM_CRC64XZ));
+  if (oss != response.headers.end()) {
+    algorithm = CHECKSUM_CRC64XZ;
+    expected  = sso_view(oss->second);
+    return true;
+  }
+  return false;
+}
+
+void verify_read_checksum(const Response& response, Pipe& pipe,
+                          size_t bytes, ChecksumAlgorithm preferred) {
+  ChecksumAlgorithm algorithm = CHECKSUM_NONE;
+  std::string_view expected;
+  if (!read_checksum_from_response(response, preferred,
+                                   algorithm, expected)) {
+    return;
+  }
+  DataChecksum checksum(algorithm);
+  Pipe copy = Pipe::create(kPreferredIoSize);
+  checksum_pipe(checksum, copy, pipe.read_fd(), bytes);
+  const ChecksumValue actual = checksum.finish();
+  if (algorithm == CHECKSUM_CRC64XZ) {
+    uint64_t received = 0;
+    if (!parse_unsigned(expected, received) ||
+        received != actual.integer) {
+      throw std::runtime_error("GetObject returned a mismatched OSS CRC64");
+    }
+  } else if (expected != sso_view(actual.base64)) {
+    throw std::runtime_error("GetObject returned a mismatched S3 checksum");
+  }
+}
+
 void update_written_metadata(OpenHandle& handle,
                              const Response& response,
                              std::string_view body_etag = {}) {
@@ -3210,8 +3534,16 @@ void ensure_multipart(State& state, OpenHandle& handle) {
     const std::string path = query_path(handle.object_path, "uploads=");
     Response response;
     try {
-      const HeaderList headers = authorization_headers(
-          state, "POST", path, {}, kEmptyPayloadSha256);
+      std::vector<Header> headers;
+      if (checksum_is_s3(state.config.checksum)) {
+        const std::string_view type = checksum_multipart_type(
+            state.config.checksum);
+        headers.push_back(Header{"x-amz-checksum-algorithm",
+                                 checksum_s3_name(state.config.checksum)});
+        headers.push_back(Header{"x-amz-checksum-type", type});
+      }
+      append_authorization(headers, state, "POST", path,
+                           kEmptyPayloadSha256);
       HttpPool::Lease client = state.http->acquire();
       response = client->request_no_body("POST", path, headers);
     } catch (...) {
@@ -3226,6 +3558,20 @@ void ensure_multipart(State& state, OpenHandle& handle) {
                 << " path=" << handle.object_path << '\n';
     }
     require_s3_success(response, "CreateMultipartUpload");
+    if (checksum_is_s3(state.config.checksum)) {
+      const auto algorithm = response.headers.find(
+          "x-amz-checksum-algorithm");
+      const auto type = response.headers.find("x-amz-checksum-type");
+      if (algorithm == response.headers.end() ||
+          sso_view(algorithm->second) !=
+              checksum_s3_name(state.config.checksum) ||
+          type == response.headers.end() ||
+          sso_view(type->second) !=
+              checksum_multipart_type(state.config.checksum)) {
+        throw std::runtime_error(
+            "CreateMultipartUpload did not accept the requested checksum");
+      }
+    }
     S3Xml xml(response_xml(response), "CreateMultipartUpload");
     const tinyxml2::XMLElement& root =
         xml.result_root("InitiateMultipartUploadResult");
@@ -3238,6 +3584,14 @@ void ensure_multipart(State& state, OpenHandle& handle) {
       std::lock_guard guard(handle.mutex);
       handle.upload_id = std::move(upload_id);
       handle.part_etags.reserve(kMaximumMultipartParts);
+      if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
+        handle.part_checksums.reserve(kMaximumMultipartParts);
+      }
+      if (state.config.checksum == CHECKSUM_CRC64NVME ||
+          state.config.checksum == CHECKSUM_CRC64XZ) {
+        handle.part_checksum_values.reserve(kMaximumMultipartParts);
+        handle.part_sizes.reserve(kMaximumMultipartParts);
+      }
       handle.multipart_starting = false;
       handle.condition.notify_all();
     }
@@ -3250,8 +3604,11 @@ void ensure_multipart(State& state, OpenHandle& handle) {
 }
 
 std::string upload_part(State& state, OpenHandle& handle,
-                        const RetainedPart& part) {
+                        RetainedPart& part) {
   ensure_multipart(state, handle);
+  if (checksum_has_digest(state.config.checksum)) {
+    part.checksum = retained_checksum(state.config.checksum, &part);
+  }
   std::string upload_id;
   {
     std::lock_guard guard(handle.mutex);
@@ -3262,12 +3619,15 @@ std::string upload_part(State& state, OpenHandle& handle,
   const std::string path = query_path(handle.object_path, query);
   const Response response = request_with_retries([&] {
     std::vector<Header> headers;
+    append_upload_checksum(headers, state.config.checksum, part.checksum);
     append_authorization(headers, state, "PUT", path, kUnsignedPayload);
     HttpPool::Lease client = state.http->acquire_bulk();
     send_retained_body(client.client(), "PUT", path, headers, part);
     return client->finish_upload();
   }, "UploadPart");
   require_s3_success(response, "UploadPart");
+  verify_upload_checksum(response, state.config.checksum,
+                         part.checksum, "UploadPart");
   const auto etag = response.headers.find("etag");
   if (etag == response.headers.end() || etag->second.empty()) {
     throw std::runtime_error("UploadPart response omitted ETag");
@@ -3279,7 +3639,10 @@ void upload_part_job(State& state, OpenHandle& handle,
                      std::shared_ptr<RetainedPart> part) noexcept {
   const unsigned part_number = part->number;
   std::string etag;
-  int error_code                 = 0;
+  ssostr<96> checksum;
+  uint64_t checksum_value  = 0;
+  const uint64_t part_size = part->bytes;
+  int error_code           = 0;
   try {
     {
       std::lock_guard guard(handle.mutex);
@@ -3290,6 +3653,8 @@ void upload_part_job(State& state, OpenHandle& handle,
       }
     }
     etag = upload_part(state, handle, *part);
+    checksum       = part->checksum.base64;
+    checksum_value = part->checksum.integer;
   } catch (const std::system_error& error) {
     error_code = error.code().value();
   } catch (...) {
@@ -3300,6 +3665,14 @@ void upload_part_job(State& state, OpenHandle& handle,
   std::lock_guard guard(handle.mutex);
   if (error_code == 0) {
     handle.part_etags[part_number - 1] = std::move(etag);
+    if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
+      handle.part_checksums[part_number - 1] = std::move(checksum);
+    }
+    if (state.config.checksum == CHECKSUM_CRC64NVME ||
+        state.config.checksum == CHECKSUM_CRC64XZ) {
+      handle.part_checksum_values[part_number - 1] = checksum_value;
+      handle.part_sizes[part_number - 1] = part_size;
+    }
   } else {
     fail_write(handle, error_code);
   }
@@ -3316,6 +3689,14 @@ void submit_part(State& state, OpenHandle& handle,
   const unsigned number     = handle.next_part_number;
   const bool multipart      = handle.multipart_required;
   handle.part_etags.resize(number);
+  if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
+    handle.part_checksums.resize(number);
+  }
+  if (state.config.checksum == CHECKSUM_CRC64NVME ||
+      state.config.checksum == CHECKSUM_CRC64XZ) {
+    handle.part_checksum_values.resize(number);
+    handle.part_sizes.resize(number);
+  }
   part->number              = number;
   handle.next_part_number   = number + 1;
   handle.multipart_required = true;
@@ -3330,6 +3711,14 @@ void submit_part(State& state, OpenHandle& handle,
     handle.next_part_number   = number;
     handle.multipart_required = multipart;
     handle.part_etags.resize(number - 1);
+    if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
+      handle.part_checksums.resize(number - 1);
+    }
+    if (state.config.checksum == CHECKSUM_CRC64NVME ||
+        state.config.checksum == CHECKSUM_CRC64XZ) {
+      handle.part_checksum_values.resize(number - 1);
+      handle.part_sizes.resize(number - 1);
+    }
     throw;
   }
 }
@@ -3399,23 +3788,62 @@ void record_memory_fallback(State& state, size_t bytes) noexcept {
   }
 }
 
-std::string complete_body(const OpenHandle& handle) {
+std::string complete_body(const OpenHandle& handle,
+                          ChecksumAlgorithm algorithm) {
   std::string body;
-  body.reserve(64 + handle.part_etags.size() * 96);
+  body.reserve(64 + handle.part_etags.size() * 144);
   body += "<CompleteMultipartUpload>";
+  const std::string_view checksum_name =
+      checksum_multipart_type(algorithm) == "COMPOSITE"
+          ? checksum_xml_name(algorithm)
+          : std::string_view{};
   for (size_t i = 0; i < handle.part_etags.size(); ++i) {
     body += "<Part><PartNumber>";
     body += std::to_string(i + 1);
     body += "</PartNumber><ETag>";
     body += handle.part_etags[i];
-    body += "</ETag></Part>";
+    body += "</ETag>";
+    if (!checksum_name.empty()) {
+      body.push_back('<');
+      body.append(checksum_name);
+      body.push_back('>');
+      body.append(sso_view(handle.part_checksums[i]));
+      body += "</";
+      body.append(checksum_name);
+      body.push_back('>');
+    }
+    body += "</Part>";
   }
   body += "</CompleteMultipartUpload>";
   return body;
 }
 
+ChecksumValue combined_multipart_checksum(const OpenHandle& handle,
+                                           ChecksumAlgorithm algorithm) {
+  if (handle.part_checksum_values.empty() ||
+      handle.part_checksum_values.size() != handle.part_sizes.size()) {
+    throw std::logic_error("multipart CRC64 part metadata is incomplete");
+  }
+  uint64_t value = handle.part_checksum_values.front();
+  uint64_t size  = handle.part_sizes.front();
+  for (size_t i = 1; i < handle.part_checksum_values.size(); ++i) {
+    value = combine_crc64(algorithm, value,
+                          handle.part_checksum_values[i],
+                          handle.part_sizes[i]);
+    size += handle.part_sizes[i];
+  }
+  if (size != handle.stream_offset) {
+    throw std::logic_error("multipart CRC64 byte count is inconsistent");
+  }
+  return crc64_checksum_value(value);
+}
+
 Response put_object(State& state, OpenHandle& handle,
                     const RetainedPart* part) {
+  ChecksumValue checksum;
+  if (checksum_has_digest(state.config.checksum)) {
+    checksum = retained_checksum(state.config.checksum, part);
+  }
   bool ambiguous = false;
   try {
     Response response = request_with_retries([&] {
@@ -3427,6 +3855,7 @@ Response put_object(State& state, OpenHandle& handle,
       } else if (handle.create_exclusive) {
         headers.push_back(Header{"if-none-match", "*"});
       }
+      append_upload_checksum(headers, state.config.checksum, checksum);
       const bool empty = part == nullptr || part->bytes == 0;
       append_authorization(headers, state, "PUT", handle.object_path,
                            empty ? kEmptyPayloadSha256 : kUnsignedPayload);
@@ -3452,6 +3881,8 @@ Response put_object(State& state, OpenHandle& handle,
                               "PutObject destination exists");
     }
     require_s3_success(response, "PutObject");
+    verify_upload_checksum(response, state.config.checksum,
+                           checksum, "PutObject");
     return response;
   } catch (...) {
     if (ambiguous) {
@@ -3472,10 +3903,21 @@ void complete_multipart(State& state, OpenHandle& handle) {
   const std::string path = query_path(
       handle.object_path,
       "uploadId=" + uri_encode(handle.upload_id, false));
-  const std::string body = complete_body(handle);
+  const std::string body = complete_body(handle, state.config.checksum);
+  const bool crc64 = state.config.checksum == CHECKSUM_CRC64NVME ||
+                     state.config.checksum == CHECKSUM_CRC64XZ;
+  const ChecksumValue checksum = crc64
+      ? combined_multipart_checksum(handle, state.config.checksum)
+      : ChecksumValue{};
   std::vector<Header> headers{
       Header{"content-type", "application/xml"},
   };
+  if (state.config.checksum == CHECKSUM_CRC64NVME) {
+    headers.push_back(Header{checksum_header_name(state.config.checksum),
+                             checksum.base64});
+    headers.push_back(Header{"x-amz-mp-object-size",
+                             std::to_string(handle.stream_offset)});
+  }
   if (!handle.etag.empty()) {
     headers.push_back(Header{"if-match", handle.etag});
   } else if (handle.create_exclusive) {
@@ -3501,6 +3943,9 @@ void complete_multipart(State& state, OpenHandle& handle) {
         update_written_metadata(handle, recovered);
         handle.upload_id.clear();
         handle.part_etags.clear();
+        handle.part_checksums.clear();
+        handle.part_checksum_values.clear();
+        handle.part_sizes.clear();
         return;
       }
       std::cerr << "error: CompleteMultipartUpload commit outcome unknown: "
@@ -3516,6 +3961,9 @@ void complete_multipart(State& state, OpenHandle& handle) {
       update_written_metadata(handle, recovered);
       handle.upload_id.clear();
       handle.part_etags.clear();
+      handle.part_checksums.clear();
+      handle.part_checksum_values.clear();
+      handle.part_sizes.clear();
       return;
     }
     std::cerr << "error: CompleteMultipartUpload commit outcome unknown: "
@@ -3535,9 +3983,23 @@ void complete_multipart(State& state, OpenHandle& handle) {
   S3Xml xml(response_xml(response), "CompleteMultipartUpload");
   const tinyxml2::XMLElement& root =
       xml.result_root("CompleteMultipartUploadResult");
+  if (state.config.checksum == CHECKSUM_CRC64NVME) {
+    const std::string received = xml.required_text(
+        root, checksum_xml_name(state.config.checksum));
+    if (received != sso_view(checksum.base64)) {
+      throw std::runtime_error(
+          "CompleteMultipartUpload returned a mismatched S3 checksum");
+    }
+  } else if (state.config.checksum == CHECKSUM_CRC64XZ) {
+    verify_upload_checksum(response, state.config.checksum,
+                           checksum, "CompleteMultipartUpload");
+  }
   update_written_metadata(handle, response, xml.optional_text(root, "ETag"));
   handle.upload_id.clear();
   handle.part_etags.clear();
+  handle.part_checksums.clear();
+  handle.part_checksum_values.clear();
+  handle.part_sizes.clear();
 }
 
 void seal_write(State& state, OpenHandle& handle) {
@@ -3610,10 +4072,25 @@ void seal_write(State& state, OpenHandle& handle) {
                                 std::generic_category(),
                                 "multipart upload failed");
       }
-      for (const std::string& etag : handle.part_etags) {
-        if (etag.empty()) {
+      for (size_t i = 0; i < handle.part_etags.size(); ++i) {
+        if (handle.part_etags[i].empty()) {
           throw std::system_error(EIO, std::generic_category(),
                                   "multipart upload omitted a part ETag");
+        }
+        if (checksum_multipart_type(state.config.checksum) == "COMPOSITE" &&
+            (i >= handle.part_checksums.size() ||
+             handle.part_checksums[i].empty())) {
+          throw std::system_error(
+              EIO, std::generic_category(),
+              "multipart upload omitted a part checksum");
+        }
+        if ((state.config.checksum == CHECKSUM_CRC64NVME ||
+             state.config.checksum == CHECKSUM_CRC64XZ) &&
+            (i >= handle.part_checksum_values.size() ||
+             i >= handle.part_sizes.size() || handle.part_sizes[i] == 0)) {
+          throw std::system_error(
+              EIO, std::generic_category(),
+              "multipart upload omitted CRC64 part metadata");
         }
       }
       guard.unlock();
@@ -4663,7 +5140,8 @@ void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
                                unsigned_offset, wanted);
         response = client.get_range(
             range_request.path(), unsigned_offset, wanted, pipe,
-            range_request.headers, false, report_metrics);
+            range_request.headers, range_request.verify_checksum,
+            report_metrics);
         if (response.status == 403 && !state.config.directory_bucket &&
             !range_request.range_signed && attempt != 3) {
           int expected = 0;
@@ -4733,6 +5211,10 @@ void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
       throw std::runtime_error(
           "unexpected S3 range response bytes=" +
           std::to_string(response.body_bytes));
+    }
+    if (state.config.verify_read_checksum && unsigned_offset == 0 &&
+        uint64_t(wanted) == object_size) {
+      verify_read_checksum(response, pipe, wanted, state.config.checksum);
     }
 
     fuse_bufvec buffers = FUSE_BUFVEC_INIT(wanted);
@@ -5649,6 +6131,12 @@ void print_help() {
       << "  -b, --bucket NAME         S3 bucket (required)\n"
       << "  -k, --prefix PREFIX       optional raw object-key prefix\n"
       << "  -r, --region REGION       SigV4 region (default us-east-1)\n"
+      << "  -K, --checksum ALGORITHM  upload checksum: auto, default, none, "
+         "crc32, crc32c, crc64nvme, sha1, sha256, md5, xxhash64, "
+         "xxhash3, xxhash128, sha512, crc64xz (default auto)\n"
+      << "      --verify-read-checksum\n"
+         "                             verify usable full-response checksums "
+         "(default off)\n"
       << "      --io-size BYTES       statfs optimal I/O size; accepts "
          "KiB/MiB (default 256 KiB)\n"
       << "  -R, --read-ahead BYTES    kernel read-ahead; accepts "
@@ -5785,6 +6273,7 @@ int run(int argc, char** argv) {
   try {
     State state(std::move(config));
     state.splice_available = splice_available;
+    configure_checksum(state);
     fuse_lowlevel_ops ops{};
     ops.init         = ngs3fs_init;
     ops.forget       = ngs3fs_forget;

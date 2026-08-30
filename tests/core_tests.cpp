@@ -232,6 +232,94 @@ void test_s3_control_paths() {
       "s3.example:9000", "bucket"));
 }
 
+ChecksumValue checksum_of(ChecksumAlgorithm algorithm,
+                          std::string_view text, size_t split) {
+  DataChecksum checksum(algorithm);
+  const auto bytes = std::span(
+      reinterpret_cast<const std::byte*>(text.data()), text.size());
+  checksum.update(bytes.first(split));
+  checksum.update(bytes.subspan(split));
+  return checksum.finish();
+}
+
+void test_data_checksums() {
+  ChecksumAlgorithm parsed = CHECKSUM_AUTO;
+  assert(parse_checksum_algorithm("XXHash128", parsed));
+  assert(parsed == CHECKSUM_XXHASH128);
+  assert(parse_checksum_algorithm("crc64-xz", parsed));
+  assert(parsed == CHECKSUM_CRC64XZ);
+  assert(!parse_checksum_algorithm("crc128", parsed));
+  assert(checksum_s3_name(CHECKSUM_XXHASH128) == "XXHASH128");
+  assert(checksum_header_name(CHECKSUM_CRC64XZ) ==
+         "x-oss-hash-crc64ecma");
+  assert(checksum_xml_name(CHECKSUM_SHA512) == "ChecksumSHA512");
+  assert(checksum_multipart_type(CHECKSUM_CRC64NVME) == "FULL_OBJECT");
+  assert(checksum_multipart_type(CHECKSUM_XXHASH128) == "COMPOSITE");
+
+  constexpr std::string_view text = "123456789";
+  const ChecksumValue crc32 = checksum_of(CHECKSUM_CRC32, text, 4);
+  const ChecksumValue crc32c = checksum_of(CHECKSUM_CRC32C, text, 5);
+  const ChecksumValue nvme = checksum_of(CHECKSUM_CRC64NVME, text, 3);
+  const ChecksumValue xz = checksum_of(CHECKSUM_CRC64XZ, text, 7);
+  assert(crc32.integer == 0xcbf43926);
+  assert(sso_view(crc32.base64) == "y/Q5Jg==");
+  assert(crc32c.integer == 0xe3069283);
+  assert(sso_view(crc32c.base64) == "4waSgw==");
+  assert(nvme.integer == 0xae8b14860a799888);
+  assert(sso_view(nvme.base64) == "rosUhgp5mIg=");
+  assert(xz.integer == 0x995dc9bbdf1939fa);
+  assert(sso_view(xz.base64) == "mV3Ju98ZOfo=");
+  assert(crc64_checksum_value(nvme.integer).base64 == nvme.base64);
+  assert(sso_view(checksum_of(CHECKSUM_MD5, text, 4).base64) ==
+         "JfnnlDI7RTiF9RgfG2JNCw==");
+  assert(sso_view(checksum_of(CHECKSUM_SHA1, text, 4).base64) ==
+         "98O8HYCOBHMq32eZZczDTKeuNEE=");
+  assert(sso_view(checksum_of(CHECKSUM_SHA256, text, 4).base64) ==
+         "FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU=");
+  assert(sso_view(checksum_of(CHECKSUM_SHA512, text, 4).base64) ==
+         "2eZ2LdHI6vbWGzxhkvxAjU1tXxF20MKRabwk5xw/J0rSf81YEbMT1oH35V7A"
+         "LXPUmclUVba1u1A6z1dPuo/+hQ==");
+  assert(sso_view(checksum_of(CHECKSUM_XXHASH64, text, 4).base64) ==
+         "jLhB20DmroM=");
+  assert(sso_view(checksum_of(CHECKSUM_XXHASH3, text, 4).base64) ==
+         "ctyxi2ehff8=");
+  assert(sso_view(checksum_of(CHECKSUM_XXHASH128, text, 4).base64) ==
+         "MxGUd+3l3NXpcWQnaB1YYA==");
+
+  for (const ChecksumAlgorithm algorithm :
+       {CHECKSUM_CRC64NVME, CHECKSUM_CRC64XZ}) {
+    const ChecksumValue whole = checksum_of(algorithm, text, 3);
+    for (size_t split = 0; split <= text.size(); ++split) {
+      const std::string_view first_text = text.substr(0, split);
+      const std::string_view second_text = text.substr(split);
+      const ChecksumValue first = checksum_of(
+          algorithm, first_text, first_text.size() / 2);
+      const ChecksumValue second = checksum_of(
+          algorithm, second_text, second_text.size() / 2);
+      assert(combine_crc64(algorithm, first.integer, second.integer,
+                           second_text.size()) == whole.integer);
+    }
+  }
+
+  constexpr std::array algorithms{
+      CHECKSUM_CRC32,
+      CHECKSUM_CRC32C,
+      CHECKSUM_CRC64NVME,
+      CHECKSUM_SHA1,
+      CHECKSUM_SHA256,
+      CHECKSUM_MD5,
+      CHECKSUM_XXHASH64,
+      CHECKSUM_XXHASH3,
+      CHECKSUM_XXHASH128,
+      CHECKSUM_SHA512,
+      CHECKSUM_CRC64XZ,
+  };
+  for (const ChecksumAlgorithm algorithm : algorithms) {
+    assert(checksum_of(algorithm, text, 0).base64 ==
+           checksum_of(algorithm, text, 4).base64);
+  }
+}
+
 void test_aws_sigv4_reference_vector() {
   const Credentials credentials{
       .access_key_id = "AKIAIOSFODNN7EXAMPLE",
@@ -368,6 +456,7 @@ int main() {
   test_inode_tagged_parent();
   test_pipe_splice();
   test_s3_control_paths();
+  test_data_checksums();
   test_aws_sigv4_reference_vector();
   test_amz_datetime();
   test_s3_mtime();

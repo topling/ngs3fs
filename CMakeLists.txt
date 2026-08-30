@@ -72,6 +72,19 @@ FetchContent_Declare(ngs3fs_tinyxml2
   GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(ngs3fs_tinyxml2)
 
+FetchContent_Declare(ngs3fs_xxhash
+  URL https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.3.tar.gz
+  URL_HASH SHA256=aae608dfe8213dfd05d909a57718ef82f30722c392344583d3f39050c7f29a80
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_GetProperties(ngs3fs_xxhash)
+if(NOT ngs3fs_xxhash_POPULATED)
+  FetchContent_Populate(ngs3fs_xxhash)
+endif()
+add_library(ngs3fs_xxhash STATIC
+  "${ngs3fs_xxhash_SOURCE_DIR}/xxhash.c")
+target_include_directories(ngs3fs_xxhash SYSTEM PUBLIC
+  "${ngs3fs_xxhash_SOURCE_DIR}")
+
 add_library(ngs3fs_core
   ${TOPLING_ZIP_SOURCE_DIR}/src/terark/hash_common.cpp
   src/http.cpp
@@ -92,6 +105,7 @@ target_link_libraries(ngs3fs_core PUBLIC
   nghttp2_static
   llhttp::llhttp
   tinyxml2::tinyxml2
+  ngs3fs_xxhash
 )
 
 if(NGS3FS_BUILD_BENCHMARKS)
@@ -146,6 +160,12 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME fuse_mmap_integration_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>)
   set_tests_properties(fuse_mmap_integration_test PROPERTIES TIMEOUT 60)
+  add_test(NAME fuse_crc64nvme_integration_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs> crc64nvme)
+  set_tests_properties(fuse_crc64nvme_integration_test PROPERTIES TIMEOUT 60)
+  add_test(NAME fuse_oss_crc64_integration_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs> crc64xz)
+  set_tests_properties(fuse_oss_crc64_integration_test PROPERTIES TIMEOUT 60)
 
   add_test(NAME read_ahead_option_test
     COMMAND ngs3fs -R 1MiB --help)
@@ -157,6 +177,11 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME io_size_zero_test
     COMMAND ngs3fs --io-size 0 --help)
   set_tests_properties(io_size_zero_test PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME checksum_options_test
+    COMMAND ngs3fs --checksum xxhash128 --verify-read-checksum --help)
+  add_test(NAME checksum_invalid_test
+    COMMAND ngs3fs --checksum not-a-checksum --help)
+  set_tests_properties(checksum_invalid_test PROPERTIES WILL_FAIL TRUE)
 
   add_test(NAME write_options_test
     COMMAND ngs3fs --part-size 8MiB --max-uploads 4
