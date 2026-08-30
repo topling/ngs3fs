@@ -13,6 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Check out ngs3fs
         uses: actions/checkout@v7
@@ -68,7 +69,10 @@ jobs:
           test -c /dev/fuse
           sudo chmod a+rw /dev/fuse
 
-      - name: Run libfuse cases against ngs3fs
+      - name: Run libfuse functional and stress cases against ngs3fs
+        env:
+          NGS3FS_STRESS_JOBS: 8
+          NGS3FS_STRESS_ITERATIONS: 20
         run: |
           ./scripts/test_libfuse_cases.sh \
             "$GITHUB_WORKSPACE/upstream/libfuse" \

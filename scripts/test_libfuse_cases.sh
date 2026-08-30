@@ -21,6 +21,8 @@ checks=$libfuse_dir/test/cases/lib/checks.py
 test_syscalls_source=$libfuse_dir/test/test_syscalls.c
 readdir_inode_source=$libfuse_dir/test/readdir_inode.c
 port=${PORT:-17174}
+stress_jobs=${NGS3FS_STRESS_JOBS:-8}
+stress_iterations=${NGS3FS_STRESS_ITERATIONS:-20}
 backend=$run_dir/backend
 backend_prefix=$backend/ngs3fs-libfuse/data
 mount_dir=$run_dir/mnt
@@ -65,6 +67,10 @@ for file in "$versitygw" "$ngs3fs" "$checks" \
 done
 if [[ ! -x "$versitygw" || ! -x "$ngs3fs" ]]; then
   echo "VersityGW and ngs3fs must be executable" >&2
+  exit 1
+fi
+if (( stress_jobs <= 0 || stress_iterations <= 0 )); then
+  echo "stress jobs and iterations must be positive" >&2
   exit 1
 fi
 
@@ -146,4 +152,51 @@ done <<'EOF'
 12:seekdir
 EOF
 
+stress_worker() {
+  local worker=$1
+  local iteration
+  trap - EXIT
+  for ((iteration = 1; iteration <= stress_iterations; ++iteration)); do
+    python3 "$checks" fuse_test_unlink "$mount_dir"
+    python3 "$checks" fuse_test_mkdir "$mount_dir"
+    python3 "$checks" fuse_test_rmdir "$mount_dir"
+    python3 "$checks" fuse_test_open_read "$backend_prefix" "$mount_dir"
+    python3 "$checks" fuse_test_open_write "$backend_prefix" "$mount_dir"
+    python3 "$checks" fuse_test_readdir "$backend_prefix" "$mount_dir" \
+      --inode-check nonzero
+  done
+  printf 'libfuse stress worker %d passed %d iterations\n' \
+    "$worker" "$stress_iterations"
+}
+
+echo "libfuse parallel stress: $stress_jobs workers x $stress_iterations iterations"
+stress_start=$SECONDS
+stress_pids=()
+for ((worker = 1; worker <= stress_jobs; ++worker)); do
+  stress_worker "$worker" &
+  stress_pids+=("$!")
+done
+stress_failed=0
+for pid in "${stress_pids[@]}"; do
+  if ! wait "$pid"; then
+    stress_failed=1
+  fi
+done
+if (( stress_failed != 0 )); then
+  echo "parallel libfuse stress failed" >&2
+  exit 1
+fi
+
+echo "libfuse syscall stress: $stress_iterations iterations"
+for ((iteration = 1; iteration <= stress_iterations; ++iteration)); do
+  for number in 1 8 9 10 12; do
+    "$test_bin_dir/test_syscalls" "$mount_dir" "$number"
+  done
+done
+
+if ! kill -0 "$ngs3fs_pid" 2>/dev/null || ! mountpoint -q "$mount_dir"; then
+  echo "ngs3fs did not survive the libfuse stress workload" >&2
+  exit 1
+fi
+printf 'libfuse stress passed in %d seconds\n' "$((SECONDS - stress_start))"
 printf 'libfuse cases passed; logs: %s\n' "$run_dir"
