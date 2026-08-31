@@ -1573,6 +1573,7 @@ void Http2Client::consume(const RangeResponse& response) {
 // HTTP/1.1 client.
 constexpr size_t kMaxResponseHeaderBytes = 64U * 1024U;
 constexpr size_t kHttp1ReadSize = 1024;
+constexpr int kHttp1CoalesceTimeoutMs = 5'000;
 
 [[noreturn]] void http1_throw_errno(const char* operation);
 
@@ -1587,6 +1588,143 @@ uint64_t http1_monotonic_ns() {
   }
   return static_cast<uint64_t>(value.tv_sec) * 1'000'000'000ULL +
          static_cast<uint64_t>(value.tv_nsec);
+}
+
+bool http1_low_water_preflight(std::string& error) noexcept {
+  error.clear();
+  try {
+    UniqueFd socket(::socket(
+        AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP));
+    if (!socket) {
+      throw std::system_error(errno, std::generic_category(),
+                              "socket(SO_RCVLOWAT preflight)");
+    }
+
+    int value = 2;
+    if (::setsockopt(socket.get(), SOL_SOCKET, SO_RCVLOWAT,
+                     &value, sizeof(value)) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "setsockopt(SO_RCVLOWAT preflight)");
+    }
+    int actual = 0;
+    socklen_t size = sizeof(actual);
+    if (::getsockopt(socket.get(), SOL_SOCKET, SO_RCVLOWAT,
+                     &actual, &size) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "getsockopt(SO_RCVLOWAT preflight)");
+    }
+    if (size != sizeof(actual) || actual != value) {
+      error = "SO_RCVLOWAT value was not retained";
+      return false;
+    }
+
+    value = 1;
+    if (::setsockopt(socket.get(), SOL_SOCKET, SO_RCVLOWAT,
+                     &value, sizeof(value)) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "setsockopt(SO_RCVLOWAT restore preflight)");
+    }
+    actual = 0;
+    size = sizeof(actual);
+    if (::getsockopt(socket.get(), SOL_SOCKET, SO_RCVLOWAT,
+                     &actual, &size) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "getsockopt(SO_RCVLOWAT restore preflight)");
+    }
+    if (size != sizeof(actual) || actual != value) {
+      error = "SO_RCVLOWAT default value was not restored";
+      return false;
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    error = exception.what();
+    return false;
+  }
+}
+
+class ReceiveLowWater {
+ public:
+  explicit ReceiveLowWater(UniqueFd& socket) noexcept : socket_(socket) {}
+
+  ReceiveLowWater(const ReceiveLowWater&) = delete;
+  ReceiveLowWater& operator=(const ReceiveLowWater&) = delete;
+
+  ~ReceiveLowWater() { restore(); }
+
+  bool set(size_t bytes) noexcept {
+    if (bytes == 0 || bytes > size_t(INT_MAX)) {
+      return false;
+    }
+    const int value = int(bytes);
+    active_ = ::setsockopt(socket_.get(), SOL_SOCKET, SO_RCVLOWAT,
+                           &value, sizeof(value)) == 0;
+    return active_;
+  }
+
+  bool restore() noexcept {
+    if (!active_) {
+      return true;
+    }
+    active_ = false;
+    const int value = 1;
+    if (::setsockopt(socket_.get(), SOL_SOCKET, SO_RCVLOWAT,
+                     &value, sizeof(value)) == 0) {
+      return true;
+    }
+    const int error = errno;
+    socket_.reset();
+    errno = error;
+    return false;
+  }
+
+ private:
+  UniqueFd& socket_;
+  bool active_ = false;
+};
+
+bool coalesce_body(UniqueFd& socket, size_t bytes, int io_timeout_ms) {
+  if (bytes == 0) {
+    return false;
+  }
+
+  const int timeout_ms = std::min(io_timeout_ms, kHttp1CoalesceTimeoutMs);
+  const uint64_t deadline = http1_monotonic_ns() +
+                            uint64_t(timeout_ms) * 1'000'000ULL;
+  ReceiveLowWater low_water(socket);
+  if (!low_water.set(bytes)) {
+    return false;
+  }
+
+  int result;
+  for (;;) {
+    const uint64_t now = http1_monotonic_ns();
+    if (now >= deadline) {
+      result = 0;
+      break;
+    }
+    const uint64_t left_ns = deadline - now;
+    const int left_ms = int(std::min<uint64_t>(
+        (left_ns + 999'999ULL) / 1'000'000ULL, uint64_t(INT_MAX)));
+    pollfd descriptor{
+        .fd = socket.get(),
+        .events = POLLIN,
+        .revents = 0,
+    };
+    result = ::poll(&descriptor, 1, left_ms);
+    if (result >= 0 || errno != EINTR) {
+      break;
+    }
+  }
+
+  const int poll_error = result < 0 ? errno : 0;
+  if (!low_water.restore()) {
+    http1_throw_errno("setsockopt(SO_RCVLOWAT restore)");
+  }
+  if (result < 0) {
+    errno = poll_error;
+    http1_throw_errno("poll(HTTP/1.1 body)");
+  }
+  return true;
 }
 
 ssostr<32> ascii_lower(const ssostr<32>& value) {
@@ -1956,7 +2094,8 @@ class Http1Client final : public HttpClient {
               std::string reconnect_host = {}, uint16_t reconnect_port = 0,
               std::shared_ptr<TlsTunnel> connected_tunnel = {},
               int connected_io_timeout_ms = kRequestIoTimeoutMs,
-              int connected_connect_timeout_ms = kConnectTimeoutMs)
+              int connected_connect_timeout_ms = kConnectTimeoutMs,
+              bool receive_low_water_available = true)
       : tunnel(std::move(connected_tunnel)),
         socket(std::move(connected_socket)),
         authority(std::move(request_authority)),
@@ -1964,7 +2103,8 @@ class Http1Client final : public HttpClient {
         port(reconnect_port),
         io_timeout_ms(connected_io_timeout_ms),
         connect_timeout_ms(connected_connect_timeout_ms),
-        tls(tunnel != nullptr) {}
+        tls(tunnel != nullptr),
+        low_water_available(receive_low_water_available) {}
 
   Response get_range(std::string_view path, uint64_t offset,
                      size_t length, Pipe& destination,
@@ -2012,6 +2152,7 @@ class Http1Client final : public HttpClient {
   size_t upload_sent = 0;
   size_t upload_length = kUnknownBodyLength;
   bool tls = false;
+  bool low_water_available = true;
 
   void ensure_connected() {
     if (socket) {
@@ -2151,6 +2292,10 @@ class Http1Client final : public HttpClient {
               response.body_bytes += remaining;
               response.fallback_copied_bytes += remaining;
             } else {
+              if (!tls && low_water_available) {
+                response.low_water_used =
+                    coalesce_body(socket, remaining, io_timeout_ms);
+              }
               response.externally_spliced_bytes = splice_exact(
                   socket.get(), destination->write_fd(), remaining,
                   SPLICE_F_MOVE | SPLICE_F_MORE,
@@ -2494,7 +2639,8 @@ Response Http1Client::request_no_body(
 // HTTP/2-preferred protocol selection.
 std::unique_ptr<HttpClient> HttpClient::connect(
     std::string_view host, uint16_t port, std::string authority, bool tls,
-    int io_timeout_ms, int connect_timeout_ms, int probe_timeout_ms) {
+    int io_timeout_ms, int connect_timeout_ms, int probe_timeout_ms,
+    bool http1_low_water_available) {
   if (authority.empty()) {
     authority = std::string(host) + ':' + std::to_string(port);
   }
@@ -2511,7 +2657,7 @@ std::unique_ptr<HttpClient> HttpClient::connect(
     return std::make_unique<Http1Client>(
         std::move(transport.socket), std::move(authority), std::string(host),
         port, std::move(transport.tunnel), io_timeout_ms,
-        connect_timeout_ms);
+        connect_timeout_ms, http1_low_water_available);
   }
 
   auto h2 = std::make_unique<Http2Client>(
@@ -2529,5 +2675,6 @@ std::unique_ptr<HttpClient> HttpClient::connect(
   return std::make_unique<Http1Client>(
       connect_tcp(host, port, connect_timeout_ms, io_timeout_ms),
       std::move(authority), std::string(host), port,
-      std::shared_ptr<TlsTunnel>{}, io_timeout_ms, connect_timeout_ms);
+      std::shared_ptr<TlsTunnel>{}, io_timeout_ms, connect_timeout_ms,
+      http1_low_water_available);
 }

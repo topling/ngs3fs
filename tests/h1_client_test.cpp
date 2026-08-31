@@ -154,13 +154,16 @@ void run_server(ServerInput input) {
   const std::string get = read_request_head(socket.get(), "GET");
   assert(get.starts_with("GET /bucket/key HTTP/1.1\r\n"));
   assert(get.find("host: mock-s3\r\n") != std::string::npos);
-  assert(get.find("range: bytes=0-262143\r\n") != std::string::npos);
-  constexpr std::string_view response =
+  const std::string expected_range =
+      "range: bytes=0-" + std::to_string(input.download.size() - 1) +
+      "\r\n";
+  assert(get.find(expected_range) != std::string::npos);
+  const std::string response =
       "HTTP/1.1 103 Early Hints\r\n"
       "link: </metadata>; rel=preload\r\n\r\n"
       "HTTP/1.1 206 Partial Content\r\n"
-      "content-length: 262144\r\n"
-      "etag: \"h1-etag\"\r\n\r\n";
+      "content-length: " + std::to_string(input.download.size()) +
+      "\r\netag: \"h1-etag\"\r\n\r\n";
   constexpr size_t prefix = 4096;
   std::vector<std::byte> first(response.size() + prefix);
   memcpy(first.data(), response.data(), response.size());
@@ -236,7 +239,12 @@ int main() {
                        &address_length) == 0);
   const uint16_t port = ntohs(address.sin_port);
 
-  std::vector<std::byte> expected_download(256U * 1024U);
+  std::string low_water_error;
+  const bool low_water_available =
+      http1_low_water_preflight(low_water_error);
+  assert(low_water_available || !low_water_error.empty());
+
+  std::vector<std::byte> expected_download(512U * 1024U);
   std::vector<std::byte> expected_upload(96U * 1024U);
   std::vector<std::byte> expected_control(384U * 1024U);
   for (size_t i = 0; i < expected_download.size(); ++i) {
@@ -258,8 +266,10 @@ int main() {
                                   .upload = expected_upload,
                                   .control = expected_control});
 
-  auto client = HttpClient::connect("127.0.0.1", port, "mock-s3");
-  auto download_pipe = Pipe::create();
+  auto client = HttpClient::connect(
+      "127.0.0.1", port, "mock-s3", false, kRequestIoTimeoutMs,
+      kConnectTimeoutMs, kProtocolProbeTimeoutMs, low_water_available);
+  auto download_pipe = Pipe::create(expected_download.size());
   const auto downloaded = client->get_range(
       "/bucket/key", 0, expected_download.size(), download_pipe);
   assert(downloaded.status == 206);
@@ -268,7 +278,8 @@ int main() {
   assert(downloaded.externally_spliced_bytes +
              downloaded.fallback_copied_bytes ==
          expected_download.size());
-  assert(downloaded.transport_splice_calls != 0);
+  assert(downloaded.transport_splice_calls >= 1);
+  assert(downloaded.low_water_used == low_water_available);
   assert(downloaded.headers.at("etag") == "\"h1-etag\"");
   std::vector<std::byte> actual_download(expected_download.size());
   read_all(download_pipe.read_fd(), actual_download);
@@ -326,6 +337,71 @@ int main() {
   assert(metadata.headers.at("x-amz-version-id") == "version-1");
 
   server.join();
+
+  std::vector<std::byte> delayed_body(64U * 1024U);
+  for (size_t i = 0; i < delayed_body.size(); ++i) {
+    delayed_body[i] = std::byte((i * 31U + 13U) & 0xffU);
+  }
+  std::jthread delayed_server([&] {
+    UniqueFd probe = accept_one(listener.get());
+    std::array<std::byte, 24> client_magic{};
+    read_all(probe.get(), client_magic);
+    send_text(probe.get(),
+              "HTTP/1.1 505 HTTP Version Not Supported\r\n"
+              "content-length: 0\r\nconnection: close\r\n\r\n");
+    finish_probe_response(probe.get());
+    probe.reset();
+
+    UniqueFd socket = accept_one(listener.get());
+    const std::string get = read_request_head(socket.get(), "delayed GET");
+    assert(get.starts_with("GET /bucket/delayed HTTP/1.1\r\n"));
+    const std::string response =
+        "HTTP/1.1 206 Partial Content\r\ncontent-length: " +
+        std::to_string(delayed_body.size()) + "\r\n\r\n";
+    constexpr size_t prefix = 4096;
+    std::vector<std::byte> first(response.size() + prefix);
+    memcpy(first.data(), response.data(), response.size());
+    memcpy(first.data() + response.size(), delayed_body.data(), prefix);
+    write_all(socket.get(), first);
+    std::this_thread::sleep_for(std::chrono::milliseconds(
+        low_water_available ? 350 : 100));
+    write_all(socket.get(), std::span(delayed_body).subspan(prefix));
+
+    const std::string head = read_request_head(socket.get(), "delayed HEAD");
+    assert(head.starts_with("HEAD /bucket/delayed HTTP/1.1\r\n"));
+    send_text(socket.get(),
+              "HTTP/1.1 200 OK\r\n"
+              "content-length: 65536\r\n\r\n");
+
+    const std::string close = read_request_head(socket.get(), "closing HEAD");
+    assert(close.starts_with("HEAD /bucket/delayed-close HTTP/1.1\r\n"));
+    send_text(socket.get(),
+              "HTTP/1.1 200 OK\r\n"
+              "content-length: 0\r\n"
+              "connection: close\r\n\r\n");
+  });
+
+  auto delayed_client = HttpClient::connect(
+      "127.0.0.1", port, "mock-s3", false, 250,
+      kConnectTimeoutMs, kProtocolProbeTimeoutMs, low_water_available);
+  Pipe delayed_pipe = Pipe::create(delayed_body.size());
+  const Response delayed = delayed_client->get_range(
+      "/bucket/delayed", 0, delayed_body.size(), delayed_pipe);
+  assert(delayed.transport_splice_calls >= 2);
+  assert(delayed.low_water_used == low_water_available);
+  std::vector<std::byte> actual_delayed(delayed_body.size());
+  read_all(delayed_pipe.read_fd(), actual_delayed);
+  assert(actual_delayed == delayed_body);
+  const Response delayed_head = delayed_client->request_no_body(
+      "HEAD", "/bucket/delayed");
+  assert(delayed_head.status == 200);
+  assert(delayed_head.body_bytes == 0);
+  const Response closing_head = delayed_client->request_no_body(
+      "HEAD", "/bucket/delayed-close");
+  assert(closing_head.status == 200);
+  assert(closing_head.body_bytes == 0);
+  delayed_server.join();
+
   std::jthread stalled_server([&] {
     UniqueFd probe = accept_one(listener.get());
     std::array<std::byte, 24> client_magic{};
@@ -346,7 +422,8 @@ int main() {
   });
 
   auto stalled_client = HttpClient::connect(
-      "127.0.0.1", port, "mock-s3", false, 100);
+      "127.0.0.1", port, "mock-s3", false, 100,
+      kConnectTimeoutMs, kProtocolProbeTimeoutMs, false);
   Pipe stalled_pipe = Pipe::create();
   const auto timeout_start = std::chrono::steady_clock::now();
   bool timed_out = false;

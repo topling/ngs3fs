@@ -88,6 +88,7 @@ struct MountConfig {
   bool directory_bucket             = false;
   bool tls                          = false;
   bool verify_read_checksum         = false;
+  bool http1_low_water_available    = true;
 };
 
 enum WriteState {
@@ -174,7 +175,8 @@ class HttpPool {
               config.endpoint_host, config.endpoint_port,
               config.authority, config.tls, config.request_timeout_ms,
               config.connect_timeout_ms,
-              config.protocol_probe_timeout_ms);
+              config.protocol_probe_timeout_ms,
+              config.http1_low_water_available);
         } catch (...) {
           errors[i] = std::current_exception();
         }
@@ -1711,7 +1713,8 @@ void ensure_express_session(State& state) {
         state.config.endpoint_host, state.config.endpoint_port,
         state.config.authority, state.config.tls,
         state.config.request_timeout_ms, state.config.connect_timeout_ms,
-        state.config.protocol_probe_timeout_ms);
+        state.config.protocol_probe_timeout_ms,
+        state.config.http1_low_water_available);
     const Response response = client->request_no_body(
         "GET", "/?session", headers, kMaximumListResponseSize);
     if (response.status != 200) {
@@ -6550,6 +6553,15 @@ int run(int argc, char** argv) {
     std::cerr
         << "warning: splice(2) preflight failed: " << splice_error
         << "; FD-backed FUSE writes will use the copied fallback\n";
+  }
+  std::string low_water_error;
+  config.http1_low_water_available =
+      http1_low_water_preflight(low_water_error);
+  if (!config.http1_low_water_available) {
+    fprintf(stderr,
+            "warning: SO_RCVLOWAT preflight failed: %s; "
+            "HTTP/1.1 reads will use immediate splice\n",
+            low_water_error.c_str());
   }
   std::cerr
       << "warning: fsync is intentionally non-durable; only the first flush "

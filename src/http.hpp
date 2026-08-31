@@ -34,6 +34,7 @@ struct Response {
   uint64_t wire_start_ns = 0;
   uint64_t wire_last_data_ns = 0;
   bool requires_consume = false;
+  bool low_water_used = false;
   terark::gold_hash_map<ssostr<32>, ssostr<32>> headers;
   std::vector<std::byte> body;
 };
@@ -52,6 +53,8 @@ struct ReceiveResult {
 
 inline constexpr size_t kDefaultShadowSpanSize = 256U * 1024U;
 inline constexpr size_t kUnknownBodyLength = SIZE_MAX;
+
+bool http1_low_water_preflight(std::string& error) noexcept;
 
 class ExternalDataIngress {
  public:
@@ -98,7 +101,8 @@ class HttpClient {
       std::string authority = {}, bool tls = false,
       int io_timeout_ms = kRequestIoTimeoutMs,
       int connect_timeout_ms = kConnectTimeoutMs,
-      int probe_timeout_ms = kProtocolProbeTimeoutMs);
+      int probe_timeout_ms = kProtocolProbeTimeoutMs,
+      bool http1_low_water_available = true);
 
   virtual ~HttpClient() = default;
 

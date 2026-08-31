@@ -28,10 +28,14 @@ multi-file namespace. It remains experimental rather than production-ready.
 - HTTP/1.1 response headers are scanned once by llhttp. For a fixed-length
   response, llhttp pauses at the header boundary, body bytes already returned
   by that `recv(2)` are copied once into the transport pipe, and the remainder
-  is requested from `splice(2)` at its full remaining length; kernel short
-  returns are retried without an artificial batching threshold. Chunked and
-  EOF-delimited responses are strictly parsed by llhttp and use a bounded
-  copied fallback.
+  is requested from `splice(2)` at its full remaining length. Cleartext
+  HTTP/1.1 uses `SO_RCVLOWAT` plus a bounded `poll(2)` to coalesce arrivals
+  before that splice; kernel short returns are still retried without an
+  artificial batching threshold. A mount-time set/read-back/restore preflight
+  records whether `SO_RCVLOWAT` is usable. Failure prints one warning and
+  retains the old immediate-splice behavior without retrying the failed socket
+  option on every read. Chunked and EOF-delimited responses are strictly
+  parsed by llhttp and use a bounded copied fallback.
 - Range GET payload path:
 
   ```text
