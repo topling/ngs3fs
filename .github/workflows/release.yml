@@ -45,7 +45,6 @@ jobs:
           cpack --config ../release/CPackConfig.cmake -G DEB
           test -n "$(find . -maxdepth 1 -name 'ngs3fs-*.tar.gz' -print -quit)"
           test -n "$(find . -maxdepth 1 -name 'ngs3fs_*.deb' -print -quit)"
-          sha256sum ngs3fs-*.tar.gz ngs3fs_*.deb >SHA256SUMS
 
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@v0.24.2
@@ -55,6 +54,12 @@ jobs:
           output-file: build/packages/ngs3fs.spdx.json
           upload-artifact: false
           upload-release-assets: false
+
+      - name: Generate checksums
+        run: |
+          cd build/packages
+          sha256sum ngs3fs-*.tar.gz ngs3fs_*.deb ngs3fs.spdx.json \
+            >SHA256SUMS
 
       - name: Upload package evidence
         uses: actions/upload-artifact@v7
