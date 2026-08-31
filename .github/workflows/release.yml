@@ -50,9 +50,11 @@ jobs:
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@v0.24.2
         with:
-          path: build/release/ngs3fs
+          file: build/release/ngs3fs
           format: spdx-json
           output-file: build/packages/ngs3fs.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
 
       - name: Upload package evidence
         uses: actions/upload-artifact@v7
