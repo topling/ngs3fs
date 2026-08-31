@@ -5,7 +5,7 @@ set -euo pipefail
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 libfuse_dir=$(realpath "${1:?usage: $0 LIBFUSE_SOURCE_DIR [RUN_DIR]}")
 if (( $# >= 2 )); then
-  run_dir=$2
+  run_dir=$(realpath -m "$2")
   if [[ -e "$run_dir" ]]; then
     echo "run directory already exists: $run_dir" >&2
     exit 1
@@ -17,6 +17,12 @@ fi
 
 versitygw=${VERSITYGW_BIN:-$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64/versitygw}
 ngs3fs=${NGS3FS_BIN:-$project_dir/build/dev/ngs3fs}
+goofys=${GOOFYS_BIN:-}
+client=${NGS3FS_TEST_CLIENT:-ngs3fs}
+skip_cases=${NGS3FS_LIBFUSE_SKIP:-}
+if [[ -z "$goofys" ]]; then
+  goofys=$(command -v goofys || true)
+fi
 checks=$libfuse_dir/test/cases/lib/checks.py
 test_syscalls_source=$libfuse_dir/test/test_syscalls.c
 readdir_inode_source=$libfuse_dir/test/readdir_inode.c
@@ -24,14 +30,30 @@ port=${PORT:-17174}
 stress_jobs=${NGS3FS_STRESS_JOBS:-8}
 stress_iterations=${NGS3FS_STRESS_ITERATIONS:-20}
 backend=$run_dir/backend
-backend_prefix=$backend/ngs3fs-libfuse/data
+bucket=ngs3fs-libfuse
+prefix=data
+backend_prefix=$backend/$bucket/$prefix
 mount_dir=$run_dir/mnt
 test_bin_dir=$run_dir/libfuse-test-bin
 access_key=ngs3fs-libfuse
 secret_key=ngs3fs-libfuse-secret
 endpoint=http://127.0.0.1:$port
 server_pid=
-ngs3fs_pid=
+client_pid=
+client_log=$run_dir/$client.log
+
+case $client in
+  ngs3fs)
+    client_binary=$ngs3fs
+    ;;
+  goofys)
+    client_binary=$goofys
+    ;;
+  *)
+    echo "NGS3FS_TEST_CLIENT must be ngs3fs or goofys" >&2
+    exit 2
+    ;;
+esac
 
 cleanup() {
   status=$?
@@ -39,34 +61,38 @@ cleanup() {
   if mountpoint -q "$mount_dir"; then
     fusermount3 -u "$mount_dir"
   fi
-  if [[ -n "$ngs3fs_pid" ]]; then
-    kill "$ngs3fs_pid" 2>/dev/null
-    wait "$ngs3fs_pid" 2>/dev/null
+  if [[ -n "$client_pid" ]]; then
+    kill "$client_pid" 2>/dev/null
+    wait "$client_pid" 2>/dev/null
   fi
   if [[ -n "$server_pid" ]]; then
     kill "$server_pid" 2>/dev/null
     wait "$server_pid" 2>/dev/null
   fi
   if (( status != 0 )); then
-    echo "===== ngs3fs log =====" >&2
-    sed -n '1,240p' "$run_dir/ngs3fs.log" >&2
+    echo "===== $client log =====" >&2
+    if [[ -f "$client_log" ]]; then
+      sed -n '1,240p' "$client_log" >&2
+    fi
     echo "===== VersityGW log =====" >&2
-    sed -n '1,240p' "$run_dir/versitygw.log" >&2
+    if [[ -f "$run_dir/versitygw.log" ]]; then
+      sed -n '1,240p' "$run_dir/versitygw.log" >&2
+    fi
   fi
   exit "$status"
 }
 
 trap cleanup EXIT
 
-for file in "$versitygw" "$ngs3fs" "$checks" \
+for file in "$versitygw" "$client_binary" "$checks" \
             "$test_syscalls_source" "$readdir_inode_source"; do
   if [[ ! -e "$file" ]]; then
     echo "missing libfuse test dependency: $file" >&2
     exit 1
   fi
 done
-if [[ ! -x "$versitygw" || ! -x "$ngs3fs" ]]; then
-  echo "VersityGW and ngs3fs must be executable" >&2
+if [[ ! -x "$versitygw" || ! -x "$client_binary" ]]; then
+  echo "VersityGW and $client must be executable" >&2
   exit 1
 fi
 if (( stress_jobs <= 0 || stress_iterations <= 0 )); then
@@ -101,30 +127,44 @@ if ! curl --silent --output /dev/null "$endpoint/"; then
   exit 1
 fi
 
-AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
-  "$ngs3fs" -f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port" \
-    -b ngs3fs-libfuse -k data -T 0 -m 0644 -D 0755 "$mount_dir" \
-    >"$run_dir/ngs3fs.log" 2>&1 &
-ngs3fs_pid=$!
+if [[ $client == ngs3fs ]]; then
+  AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
+    "$ngs3fs" -f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port" \
+      -b "$bucket" -k "$prefix" -T 0 -m 0644 -D 0755 "$mount_dir" \
+      >"$client_log" 2>&1 &
+else
+  AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
+    "$goofys" -f --endpoint "$endpoint/" --region us-east-1 \
+      "$bucket:$prefix" "$mount_dir" >"$client_log" 2>&1 &
+fi
+client_pid=$!
 
 for ((attempt = 0; attempt != 100; ++attempt)); do
   if mountpoint -q "$mount_dir"; then
     break
   fi
-  if ! kill -0 "$ngs3fs_pid" 2>/dev/null; then
-    echo "ngs3fs exited before mounting" >&2
+  if ! kill -0 "$client_pid" 2>/dev/null; then
+    echo "$client exited before mounting" >&2
     exit 1
   fi
   sleep 0.1
 done
 if ! mountpoint -q "$mount_dir"; then
-  echo "ngs3fs did not mount" >&2
+  echo "$client did not mount" >&2
   exit 1
 fi
 
 export FUSE_TEST_BIN_DIR=$test_bin_dir
 
+case_skipped() {
+  [[ " $skip_cases " == *" $1 "* ]]
+}
+
 run_check() {
+  if case_skipped "$1"; then
+    echo "libfuse check skipped: $1"
+    return
+  fi
   echo "libfuse check: $1"
   python3 "$checks" "$@"
 }
@@ -142,6 +182,10 @@ run_check fuse_test_readdir "$backend_prefix" "$mount_dir" \
 run_check fuse_test_statvfs "$mount_dir"
 
 while IFS=: read -r number name; do
+  if case_skipped "$name"; then
+    echo "libfuse test_syscalls skipped: $number $name"
+    continue
+  fi
   echo "libfuse test_syscalls: $number $name"
   "$test_bin_dir/test_syscalls" "$mount_dir" "$number"
 done <<'EOF'
@@ -157,13 +201,25 @@ stress_worker() {
   local iteration
   trap - EXIT
   for ((iteration = 1; iteration <= stress_iterations; ++iteration)); do
-    python3 "$checks" fuse_test_unlink "$mount_dir"
-    python3 "$checks" fuse_test_mkdir "$mount_dir"
-    python3 "$checks" fuse_test_rmdir "$mount_dir"
-    python3 "$checks" fuse_test_open_read "$backend_prefix" "$mount_dir"
-    python3 "$checks" fuse_test_open_write "$backend_prefix" "$mount_dir"
-    python3 "$checks" fuse_test_readdir "$backend_prefix" "$mount_dir" \
-      --inode-check nonzero
+    if ! case_skipped fuse_test_unlink; then
+      python3 "$checks" fuse_test_unlink "$mount_dir"
+    fi
+    if ! case_skipped fuse_test_mkdir; then
+      python3 "$checks" fuse_test_mkdir "$mount_dir"
+    fi
+    if ! case_skipped fuse_test_rmdir; then
+      python3 "$checks" fuse_test_rmdir "$mount_dir"
+    fi
+    if ! case_skipped fuse_test_open_read; then
+      python3 "$checks" fuse_test_open_read "$backend_prefix" "$mount_dir"
+    fi
+    if ! case_skipped fuse_test_open_write; then
+      python3 "$checks" fuse_test_open_write "$backend_prefix" "$mount_dir"
+    fi
+    if ! case_skipped fuse_test_readdir; then
+      python3 "$checks" fuse_test_readdir "$backend_prefix" "$mount_dir" \
+        --inode-check nonzero
+    fi
   done
   printf 'libfuse stress worker %d passed %d iterations\n' \
     "$worker" "$stress_iterations"
@@ -189,14 +245,23 @@ fi
 
 echo "libfuse syscall stress: $stress_iterations iterations"
 for ((iteration = 1; iteration <= stress_iterations; ++iteration)); do
-  for number in 1 8 9 10 12; do
+  while IFS=: read -r number name; do
+    if case_skipped "$name"; then
+      continue
+    fi
     "$test_bin_dir/test_syscalls" "$mount_dir" "$number"
-  done
+  done <<'EOF'
+1:create
+8:mkdir
+9:rename-file
+10:rename-directory
+12:seekdir
+EOF
 done
 
-if ! kill -0 "$ngs3fs_pid" 2>/dev/null || ! mountpoint -q "$mount_dir"; then
-  echo "ngs3fs did not survive the libfuse stress workload" >&2
+if ! kill -0 "$client_pid" 2>/dev/null || ! mountpoint -q "$mount_dir"; then
+  echo "$client did not survive the libfuse stress workload" >&2
   exit 1
 fi
 printf 'libfuse stress passed in %d seconds\n' "$((SECONDS - stress_start))"
-printf 'libfuse cases passed; logs: %s\n' "$run_dir"
+printf 'libfuse cases passed for %s; logs: %s\n' "$client" "$run_dir"

@@ -266,6 +266,33 @@ special files, direct I/O, or persistence across fsync/remount are excluded
 because those operations are outside the ngs3fs contract. They are not run as
 expected failures.
 
+The same libfuse and filtered xfstests drivers can mount goofys instead of
+ngs3fs, keeping the VersityGW backend, object prefix, workload, and validation
+identical. Set `GOOFYS_BIN` when the binary is not on `PATH`.
+`NGS3FS_LIBFUSE_SKIP` is a space-separated list of libfuse case names; it is
+useful for finishing the remaining stress workload after reproducing a known
+failure, but skipped cases are printed and never counted as passes.
+
+```sh
+NGS3FS_TEST_CLIENT=goofys GOOFYS_BIN=/path/to/goofys \
+  ./scripts/test_libfuse_cases.sh /path/to/libfuse build/libfuse-goofys
+
+NGS3FS_TEST_CLIENT=goofys \
+NGS3FS_LIBFUSE_SKIP=rename-directory \
+GOOFYS_BIN=/path/to/goofys \
+  ./scripts/test_libfuse_cases.sh /path/to/libfuse \
+    build/libfuse-goofys-remaining
+
+sudo env NGS3FS_TEST_CLIENT=goofys GOOFYS_BIN=/path/to/goofys \
+  ./scripts/test_xfstests.sh /path/to/xfstests build/xfstests-goofys
+```
+
+The xfstests driver uses the client's real FUSE mount source so upstream
+`check` does not attempt to invoke the wrong mount helper. After every workload
+and correctness case has run, a goofys `DirectoryObjectContainsData` response
+is reported as a test failure even though `fsstress` itself permits individual
+filesystem operations to fail.
+
 ## Mount a bucket or prefix
 
 The endpoint may speak HTTP/2 prior knowledge or HTTP/1.1; detection is

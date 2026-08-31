@@ -10,7 +10,7 @@ fi
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 xfstests_dir=$(realpath "${1:?usage: $0 XFSTESTS_SOURCE_DIR [RUN_DIR]}")
 if (( $# >= 2 )); then
-  run_dir=$2
+  run_dir=$(realpath -m "$2")
   if [[ -e "$run_dir" ]]; then
     echo "run directory already exists: $run_dir" >&2
     exit 1
@@ -22,6 +22,11 @@ fi
 
 versitygw=${VERSITYGW_BIN:-$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64/versitygw}
 ngs3fs=${NGS3FS_BIN:-$project_dir/build/dev/ngs3fs}
+goofys=${GOOFYS_BIN:-}
+client=${NGS3FS_TEST_CLIENT:-ngs3fs}
+if [[ -z "$goofys" ]]; then
+  goofys=$(command -v goofys || true)
+fi
 check=$xfstests_dir/check
 fsstress=$xfstests_dir/ltp/fsstress
 random_read_stress=$project_dir/build/dev/random_read_stress
@@ -36,12 +41,30 @@ random_read_file_size=${NGS3FS_RANDOM_READ_FILE_SIZE:-4194304}
 random_read_maximum=${NGS3FS_RANDOM_READ_MAXIMUM:-262144}
 random_read_seed=${NGS3FS_RANDOM_READ_SEED:-0x4e47533346535244}
 backend=$run_dir/backend
+bucket=ngs3fs-xfstests
+prefix=data
 mount_dir=$run_dir/mnt
 access_key=ngs3fs-xfstests
 secret_key=ngs3fs-xfstests-secret
 endpoint=http://127.0.0.1:$port
 server_pid=
-ngs3fs_pid=
+client_pid=
+client_log=$run_dir/$client.log
+
+case $client in
+  ngs3fs)
+    client_binary=$ngs3fs
+    test_device=ngs3fs
+    ;;
+  goofys)
+    client_binary=$goofys
+    test_device=$bucket:$prefix
+    ;;
+  *)
+    echo "NGS3FS_TEST_CLIENT must be ngs3fs or goofys" >&2
+    exit 2
+    ;;
+esac
 
 cleanup() {
   status=$?
@@ -49,9 +72,9 @@ cleanup() {
   if mountpoint -q "$mount_dir"; then
     fusermount3 -u "$mount_dir"
   fi
-  if [[ -n "$ngs3fs_pid" ]]; then
-    kill "$ngs3fs_pid" 2>/dev/null
-    wait "$ngs3fs_pid" 2>/dev/null
+  if [[ -n "$client_pid" ]]; then
+    kill "$client_pid" 2>/dev/null
+    wait "$client_pid" 2>/dev/null
   fi
   if [[ -n "$server_pid" ]]; then
     kill "$server_pid" 2>/dev/null
@@ -61,24 +84,28 @@ cleanup() {
     echo "===== xfstests results =====" >&2
     find "$run_dir/results" -maxdepth 3 -type f -print -exec \
       sed -n '1,240p' {} \; 2>/dev/null >&2
-    echo "===== ngs3fs log =====" >&2
-    sed -n '1,240p' "$run_dir/ngs3fs.log" >&2
+    echo "===== $client log =====" >&2
+    if [[ -f "$client_log" ]]; then
+      sed -n '1,240p' "$client_log" >&2
+    fi
     echo "===== VersityGW log =====" >&2
-    sed -n '1,240p' "$run_dir/versitygw.log" >&2
+    if [[ -f "$run_dir/versitygw.log" ]]; then
+      sed -n '1,240p' "$run_dir/versitygw.log" >&2
+    fi
   fi
   exit "$status"
 }
 
 trap cleanup EXIT
 
-for file in "$versitygw" "$ngs3fs" "$check" "$fsstress" \
+for file in "$versitygw" "$client_binary" "$check" "$fsstress" \
             "$random_read_stress"; do
   if [[ ! -e "$file" ]]; then
     echo "missing xfstests dependency: $file" >&2
     exit 1
   fi
 done
-if [[ ! -x "$versitygw" || ! -x "$ngs3fs" || ! -x "$check" ||
+if [[ ! -x "$versitygw" || ! -x "$client_binary" || ! -x "$check" ||
       ! -x "$fsstress" || ! -x "$random_read_stress" ]]; then
   echo "all xfstests executables must be executable" >&2
   exit 1
@@ -94,7 +121,7 @@ if (( random_read_files < 2 || random_read_threads <= 0 ||
   exit 1
 fi
 
-mkdir -p "$backend/ngs3fs-xfstests/data" "$mount_dir" "$run_dir/results"
+mkdir -p "$backend/$bucket/$prefix" "$mount_dir" "$run_dir/results"
 
 ROOT_ACCESS_KEY_ID=$access_key ROOT_SECRET_ACCESS_KEY=$secret_key \
   "$versitygw" --port "127.0.0.1:$port" --keep-alive --quiet \
@@ -116,24 +143,30 @@ if ! curl --silent --output /dev/null "$endpoint/"; then
   exit 1
 fi
 
-AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
-  "$ngs3fs" -f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port" \
-    -b ngs3fs-xfstests -k data -m 0644 -D 0755 "$mount_dir" \
-    >"$run_dir/ngs3fs.log" 2>&1 &
-ngs3fs_pid=$!
+if [[ $client == ngs3fs ]]; then
+  AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
+    "$ngs3fs" -f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port" \
+      -b "$bucket" -k "$prefix" -m 0644 -D 0755 "$mount_dir" \
+      >"$client_log" 2>&1 &
+else
+  AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
+    "$goofys" -f --endpoint "$endpoint/" --region us-east-1 \
+      "$bucket:$prefix" "$mount_dir" >"$client_log" 2>&1 &
+fi
+client_pid=$!
 
 for ((attempt = 0; attempt != 100; ++attempt)); do
   if mountpoint -q "$mount_dir"; then
     break
   fi
-  if ! kill -0 "$ngs3fs_pid" 2>/dev/null; then
-    echo "ngs3fs exited before mounting" >&2
+  if ! kill -0 "$client_pid" 2>/dev/null; then
+    echo "$client exited before mounting" >&2
     exit 1
   fi
   sleep 0.1
 done
 if ! mountpoint -q "$mount_dir"; then
-  echo "ngs3fs did not mount" >&2
+  echo "$client did not mount" >&2
   exit 1
 fi
 
@@ -165,17 +198,17 @@ setsid "$fsstress" "${stress_args[@]}" \
   -p "$stress_jobs" \
   -n "$stress_operations"
 
-if ! kill -0 "$ngs3fs_pid" 2>/dev/null; then
+if ! kill -0 "$client_pid" 2>/dev/null; then
   set +e
-  wait "$ngs3fs_pid"
-  ngs3fs_status=$?
+  wait "$client_pid"
+  client_status=$?
   set -e
-  ngs3fs_pid=
-  echo "ngs3fs exited during filtered xfstests: status=$ngs3fs_status" >&2
+  client_pid=
+  echo "$client exited during filtered xfstests: status=$client_status" >&2
   exit 1
 fi
 if ! mountpoint -q "$mount_dir"; then
-  echo "ngs3fs did not survive the filtered xfstests workload" >&2
+  echo "$client did not survive the filtered xfstests workload" >&2
   exit 1
 fi
 
@@ -190,8 +223,8 @@ printf 'concurrent random-read stress: %s threads, %s files, %s operations per t
   -r "$random_read_maximum" \
   -S "$random_read_seed"
 
-if ! kill -0 "$ngs3fs_pid" 2>/dev/null || ! mountpoint -q "$mount_dir"; then
-  echo "ngs3fs did not survive the concurrent random-read workload" >&2
+if ! kill -0 "$client_pid" 2>/dev/null || ! mountpoint -q "$mount_dir"; then
+  echo "$client did not survive the concurrent random-read workload" >&2
   exit 1
 fi
 
@@ -202,13 +235,13 @@ fi
 # writes, O_RDWR, truncate, writable mmap, hard/symbolic links, xattrs, locks,
 # special files, direct I/O, or persistence across fsync/remount stay disabled.
 # The xfstests runner intentionally unmounts TEST_DIR after the final case, so
-# run it after fsstress and require ngs3fs to finish successfully.
+# run it after fsstress and require the client to finish successfully.
 echo "xfstests correctness: generic/001 generic/245"
 (
   cd "$xfstests_dir"
   setsid env \
     EMAIL=ngs3fs-ci \
-    TEST_DEV=ngs3fs \
+    TEST_DEV="$test_device" \
     TEST_DIR="$mount_dir" \
     FSTYP=fuse \
     RESULT_BASE="$run_dir/results" \
@@ -216,12 +249,12 @@ echo "xfstests correctness: generic/001 generic/245"
 )
 
 set +e
-wait "$ngs3fs_pid"
-ngs3fs_status=$?
+wait "$client_pid"
+client_status=$?
 set -e
-ngs3fs_pid=
-if (( ngs3fs_status != 0 )); then
-  echo "ngs3fs exited after xfstests: status=$ngs3fs_status" >&2
+client_pid=
+if (( client_status != 0 )); then
+  echo "$client exited after xfstests: status=$client_status" >&2
   exit 1
 fi
 if mountpoint -q "$mount_dir"; then
@@ -229,4 +262,10 @@ if mountpoint -q "$mount_dir"; then
   exit 1
 fi
 
-printf 'filtered xfstests passed; logs: %s\n' "$run_dir"
+if [[ $client == goofys ]] && grep -q DirectoryObjectContainsData "$client_log"; then
+  count=$(grep -c DirectoryObjectContainsData "$client_log")
+  echo "goofys encountered $count DirectoryObjectContainsData failures" >&2
+  exit 1
+fi
+
+printf 'filtered xfstests passed for %s; logs: %s\n' "$client" "$run_dir"
