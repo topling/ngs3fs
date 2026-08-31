@@ -1,0 +1,73 @@
+name: Provider E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  provider:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Amazon S3
+            key: AWS
+          - name: Alibaba OSS
+            key: OSS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      NGS3FS_ENDPOINT_HOST: ${{ vars[format('NGS3FS_{0}_ENDPOINT_HOST', matrix.key)] }}
+      NGS3FS_ENDPOINT_PORT: ${{ vars[format('NGS3FS_{0}_ENDPOINT_PORT', matrix.key)] }}
+      NGS3FS_AUTHORITY: ${{ vars[format('NGS3FS_{0}_AUTHORITY', matrix.key)] }}
+      NGS3FS_BUCKET: ${{ vars[format('NGS3FS_{0}_BUCKET', matrix.key)] }}
+      NGS3FS_PREFIX: ${{ vars[format('NGS3FS_{0}_PREFIX', matrix.key)] }}
+      NGS3FS_CHECKSUM: ${{ vars[format('NGS3FS_{0}_CHECKSUM', matrix.key)] }}
+      AWS_REGION: ${{ vars[format('NGS3FS_{0}_REGION', matrix.key)] }}
+    steps:
+      - name: Report unconfigured provider
+        if: env.NGS3FS_ENDPOINT_HOST == '' || env.NGS3FS_BUCKET == ''
+        run: echo '${{ matrix.name }} is not configured; set the documented repository variables and secrets.'
+
+      - name: Check out ngs3fs
+        if: env.NGS3FS_ENDPOINT_HOST != '' && env.NGS3FS_BUCKET != ''
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        if: env.NGS3FS_ENDPOINT_HOST != '' && env.NGS3FS_BUCKET != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake curl fuse3 libfuse3-dev libssl-dev ninja-build
+
+      - name: Enable FUSE
+        if: env.NGS3FS_ENDPOINT_HOST != '' && env.NGS3FS_BUCKET != ''
+        run: |
+          sudo modprobe fuse
+          sudo chmod a+rw /dev/fuse
+
+      - name: Build
+        if: env.NGS3FS_ENDPOINT_HOST != '' && env.NGS3FS_BUCKET != ''
+        run: ./scripts/bootstrap.sh
+
+      - name: Run provider E2E
+        if: env.NGS3FS_ENDPOINT_HOST != '' && env.NGS3FS_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets[format('NGS3FS_{0}_ACCESS_KEY_ID', matrix.key)] }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets[format('NGS3FS_{0}_SECRET_ACCESS_KEY', matrix.key)] }}
+          AWS_SESSION_TOKEN: ${{ secrets[format('NGS3FS_{0}_SESSION_TOKEN', matrix.key)] }}
+        run: ./scripts/test_provider_e2e.sh "$GITHUB_WORKSPACE/build/provider-${{ matrix.key }}"
+
+      - name: Upload provider evidence
+        if: always() && env.NGS3FS_ENDPOINT_HOST != '' && env.NGS3FS_BUCKET != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: provider-${{ matrix.key }}-evidence
+          retention-days: 7
+          if-no-files-found: warn
+          path: build/provider-${{ matrix.key }}/ngs3fs.log

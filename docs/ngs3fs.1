@@ -1,0 +1,114 @@
+.TH NGS3FS 1 "August 2026" "ngs3fs 0.1.0" "User Commands"
+.SH NAME
+ngs3fs \- low-latency S3 FUSE client
+.SH SYNOPSIS
+.B ngs3fs
+.RI [ options ]
+.RI [ "FUSE options" ]
+.I mountpoint
+.SH DESCRIPTION
+.B ngs3fs
+mounts one S3 bucket or key prefix using the Linux kernel page cache. It is
+optimized for buffered and mmap-heavy reads. HTTP/2 is preferred and HTTP/1.1
+is detected automatically.
+.PP
+Writes replace an object from offset zero and must be strictly sequential.
+Writable mmap, O_RDWR, O_DIRECT, random overwrite, symbolic links and hard
+links are unsupported. FUSE writeback cache must remain disabled.
+.PP
+fsync is intentionally non-durable. The first flush publishes and permanently
+seals a writable handle. Applications must check close errors and must not
+continue writing through descriptors retained by dup or fork after any close.
+.SH REQUIRED OPTIONS
+.TP
+.BI "-e, --endpoint-host " host
+Network host of the S3 endpoint.
+.TP
+.BI "-b, --bucket " bucket
+S3 bucket name.
+.SH CONNECTION OPTIONS
+.TP
+.BI "-p, --endpoint-port " port
+Endpoint port. Port 443 enables TLS automatically.
+.TP
+.BI "-a, --authority " authority
+HTTP authority, normally a virtual-hosted bucket endpoint.
+.TP
+.BI "-r, --region " region
+SigV4 region. Default is us-east-1.
+.TP
+.B -S, --tls
+Require TLS on a non-443 port.
+.TP
+.BI "--connect-timeout " milliseconds
+TCP connection timeout. Default is 5000.
+.TP
+.BI "--request-timeout " milliseconds
+No-I/O-progress timeout for active requests. Default is 30000.
+.TP
+.BI "--protocol-probe-timeout " milliseconds
+Maximum cleartext HTTP/2 detection wait. Default is 1000.
+.TP
+.BI "--metadata-timeout " milliseconds
+Per-attempt ECS, IMDS and credential endpoint timeout. Default is 1000.
+.TP
+.BI "--stats-interval " seconds
+Emit aggregate JSON health and resource counters to stderr. Zero disables it.
+.SH CACHE AND I/O OPTIONS
+.TP
+.BI "--io-size " bytes
+Preferred I/O size reported by statfs. Default is 256 KiB.
+.TP
+.BI "-R, --read-ahead " bytes
+Requested kernel BDI read-ahead. Default is 256 KiB.
+.TP
+.BI "-T, --dir-cache-timeout " milliseconds
+Directory cache lifetime. Default is 1000.
+.TP
+.BI "-I, --max-cached-inodes " count
+Soft inode cache limit. Default is 1000000.
+.SH WRITE OPTIONS
+.TP
+.BI "-P, --part-size " bytes
+Multipart part size from 5 MiB through 5 GiB. Default is 8 MiB.
+.TP
+.BI "-c, --max-uploads " count
+Concurrent uploads. Default is 4.
+.TP
+.BI "-C, --max-connections " count
+Connection pool size; it must exceed max-uploads. Default is 8.
+.TP
+.BI "-B, --max-pinned-memory " bytes
+Mount-global retained pipe payload budget. Default is 256 MiB.
+.TP
+.BI "-K, --checksum " algorithm
+Upload checksum. Values include auto, default, none, crc32, crc32c,
+crc64nvme, sha1, sha256, md5, xxhash64, xxhash3, xxhash128, sha512 and
+crc64xz.
+.TP
+.B --verify-read-checksum
+Verify a usable full-object response checksum. Range reads are not expanded.
+.SH CREDENTIALS
+Credential precedence is AWS environment variables, Web Identity, the selected
+shared profile, credential_process, ECS/EKS container credentials and IMDSv2.
+Refreshable credentials are renewed before expiration. AWS_PROFILE,
+AWS_SHARED_CREDENTIALS_FILE and AWS_CONFIG_FILE are honored. AssumeRole and SSO
+profiles should export credentials through credential_process.
+.SH FILE ATTRIBUTES
+UID, GID, file mode and directory mode are mount-wide and selected with
+--uid, --gid, --file-mode and --dir-mode.
+.SH SIGNALS AND LOGGING
+Warnings and failures are written to stderr. With --metrics, each read emits a
+JSON line containing latency and transport counters. Likely random-read advice
+is reported at most once per minute. --stats-interval reports remote read and
+FUSE write counts and bytes, callback errors, inode/open-handle counts, retained
+pipe bytes, copied-write bytes and the active credential source.
+.SH PRODUCTION NOTES
+Configure the bucket AbortIncompleteMultipartUpload lifecycle rule. Select a
+part size large enough that the largest expected object uses at most 10000
+parts. Directory rename is atomic only when the provider implements
+RenameObject; otherwise it is an explicitly non-atomic CopyObject/DeleteObject
+operation.
+.SH SEE ALSO
+.BR fusermount3 (1),
+.BR mount.fuse3 (8)

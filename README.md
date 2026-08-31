@@ -144,11 +144,16 @@ multi-file namespace. It remains experimental rather than production-ready.
   implicit-directory model. `mkdir` writes an empty trailing-slash marker;
   the marker itself is hidden from directory contents.
 - SigV4 GET/PUT/HEAD/control requests, including temporary credentials. The
-  signer is checked against AWS's published S3 Range GET test vector. Static
-  credentials come from the AWS environment variables first, then the selected
-  profile in `~/.aws/credentials` (or `AWS_SHARED_CREDENTIALS_FILE`). Directory
-  buckets obtain and refresh `CreateSession` credentials with a single
-  coordinated refresher. Range GET initially signs only the headers required
+  signer is checked against AWS's published S3 Range GET test vector. The
+  refreshable AWS chain supports environment variables, shared profiles,
+  `credential_process`, Web Identity/STS, ECS/EKS credentials and IMDSv2.
+  A background refresher periodically reloads shared-file credentials and
+  renews temporary credentials before expiration, keeping credential I/O off
+  the request path. A still-valid snapshot survives transient refresh failure.
+  Profiles that require source-profile AssumeRole or SSO must expose
+  credentials with `credential_process`. Directory buckets obtain and refresh
+  `CreateSession` credentials with a single coordinated refresher. Range GET
+  initially signs only the headers required
   by SigV4 plus the close-to-open `If-Match`, allowing each worker to reuse the
   authorization header within the same second. If an S3-compatible endpoint
   rejects the unsigned standard `Range` header, ngs3fs retries once with Range
@@ -204,6 +209,10 @@ multi-file namespace. It remains experimental rather than production-ready.
   write scheduler and retained-memory budget are mount-global. Bulk transfers
   use at most `max-connections - 1`, reserving one connection for reads and
   control requests.
+- TCP connect, active-request no-progress, cleartext protocol-probe and
+  credential-metadata timeouts are independently configurable with
+  `--connect-timeout`, `--request-timeout`, `--protocol-probe-timeout` and
+  `--metadata-timeout`.
 
 ## TODO
 
@@ -224,7 +233,8 @@ pinned SHA-256 values, and extracts the libfuse3 development packages into
 The current build also uses the minimal SSO and hash-map implementation from a
 local topling-zip source checkout selected by `TOPLING_ZIP_SOURCE_DIR`; jemalloc
 is explicitly disabled for that imported code. CMake fetches the pinned
-TinyXML-2 v11.0.0 release for S3 XML response parsing.
+TinyXML-2 v11.0.0 release for S3 XML response parsing and yyjson v0.12.0 for
+credential endpoint and `credential_process` responses.
 
 ```sh
 ./scripts/bootstrap.sh
@@ -232,6 +242,21 @@ cmake --build --preset dev
 ctest --preset dev --output-on-failure
 ./build/dev/ngs3fs --self-test
 ```
+
+The `asan`, `tsan`, and `clang` presets are CI hardening gates. The `release`
+preset disables tests, benchmarks and test-only assertion overrides. Install
+or package a tested production build with:
+
+```sh
+NGS3FS_PRESET=asan ./scripts/bootstrap.sh
+cmake --preset release && cmake --build --preset release
+cmake --install build/release --prefix /usr/local
+cpack --config build/release/CPackConfig.cmake -G DEB
+```
+
+The package includes `ngs3fs(1)`, an example `ngs3fs@.service`, and the
+[production operations guide](docs/operations.md). Tagged builds produce DEB
+and TGZ packages, SHA-256 evidence, and an SPDX JSON SBOM.
 
 ## Filesystem correctness and stress tests
 
@@ -248,6 +273,13 @@ non-empty directory. The stress phase uses the suite's own `ltp/fsstress` with
 all defaults disabled, then enables only `creat`, `getattr`, `getdents`,
 `mkdir`, `rename`, `rnoreplace`, `rmdir`, `stat`, and `unlink`. CI runs eight
 worker processes with 500 operations each.
+
+A separate two-mount workload races replacement writes through independent
+ngs3fs processes and verifies that the resulting object is complete, then
+lists the same 5,000-entry directory through both caches. The scheduled/manual
+`Provider E2E` workflow runs mmap, multipart upload, concurrent distinct-file
+writes and rename directly against configured Amazon S3 and Alibaba OSS
+accounts; unconfigured providers are reported as skipped rather than passed.
 
 Because `fsstress` does not import pre-existing files and its supported create
 operation produces empty files, a separate concurrent random-read stress phase
@@ -311,6 +343,9 @@ mkdir -p mount
   -a bucket.example.test:9000 \
   -b bucket -k optional/raw/prefix \
   --checksum auto \
+  --connect-timeout 5000 --request-timeout 30000 \
+  --protocol-probe-timeout 1000 --metadata-timeout 1000 \
+  --stats-interval 60 \
   --io-size 256KiB -R 256KiB -T 1000 -I 1000000 \
   -P 8MiB -c 4 -C 8 -B 256MiB \
   -u 1000 -g 1000 -m 0644 -D 0755 \
@@ -332,6 +367,11 @@ tuning is available.
 Use `-S/--tls` for HTTPS on a non-443 port. Protocol selection remains
 automatic: ALPN or the cleartext probe prefers HTTP/2 and falls back to
 HTTP/1.1 without a user protocol switch.
+
+For long-running mounts prefer Web Identity, ECS/EKS, IMDSv2, or a profile
+with `credential_process`. Shared credential files are reloaded periodically.
+Profiles that require source-profile AssumeRole or SSO must provide
+`credential_process`; this avoids silently falling back to anonymous access.
 
 ## Performance accounting
 

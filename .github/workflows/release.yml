@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out ngs3fs
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake curl fuse3 libfuse3-dev libssl-dev ninja-build
+
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          test -c /dev/fuse
+          sudo chmod a+rw /dev/fuse
+
+      - name: Build and test
+        run: ./scripts/bootstrap.sh
+
+      - name: Build production binary
+        run: |
+          cmake --preset release
+          cmake --build --preset release
+
+      - name: Build packages
+        run: |
+          mkdir -p build/packages
+          cd build/packages
+          cpack --config ../release/CPackConfig.cmake -G TGZ
+          cpack --config ../release/CPackConfig.cmake -G DEB
+          test -n "$(find . -maxdepth 1 -name 'ngs3fs-*.tar.gz' -print -quit)"
+          test -n "$(find . -maxdepth 1 -name 'ngs3fs_*.deb' -print -quit)"
+          sha256sum ngs3fs-*.tar.gz ngs3fs_*.deb >SHA256SUMS
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0.24.2
+        with:
+          path: build/release/ngs3fs
+          format: spdx-json
+          output-file: build/packages/ngs3fs.spdx.json
+
+      - name: Upload package evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: ngs3fs-packages
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            build/packages/ngs3fs-*.tar.gz
+            build/packages/ngs3fs_*.deb
+            build/packages/ngs3fs.spdx.json
+            build/packages/SHA256SUMS
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested packages
+        uses: actions/download-artifact@v8
+        with:
+          name: ngs3fs-packages
+          path: build/packages
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            build/packages/ngs3fs-*.tar.gz \
+            build/packages/ngs3fs_*.deb \
+            build/packages/ngs3fs.spdx.json \
+            build/packages/SHA256SUMS \
+            --generate-notes \
+            --verify-tag

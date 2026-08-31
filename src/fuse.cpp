@@ -1,3 +1,4 @@
+#include "credentials.hpp"
 #include "http.hpp"
 #include "io.hpp"
 #include "s3.hpp"
@@ -62,7 +63,6 @@ struct MountConfig {
   std::string bucket_path;
   std::string prefix;
   std::string region                = "us-east-1";
-  Credentials credentials;
   size_t maximum_read_size          = kPreferredIoSize;
   size_t maximum_write_size         = kPreferredIoSize;
   uint32_t io_size                  = kPreferredIoSize;
@@ -71,8 +71,13 @@ struct MountConfig {
   uint64_t max_pinned_memory        = 256ULL * 1024ULL * 1024ULL;
   uint64_t directory_cache_ns       = 1000ULL * 1000ULL * 1000ULL;
   size_t max_cached_inodes          = 1'000'000;
+  uint32_t stats_interval_seconds   = 0;
   unsigned max_uploads              = 4;
   unsigned max_connections          = 8;
+  int connect_timeout_ms            = kConnectTimeoutMs;
+  int request_timeout_ms            = kRequestIoTimeoutMs;
+  int protocol_probe_timeout_ms     = kProtocolProbeTimeoutMs;
+  int metadata_timeout_ms           = 1000;
   ChecksumAlgorithm checksum        = CHECKSUM_AUTO;
   ChecksumService checksum_service  = CHECKSUM_SERVICE_UNKNOWN;
   uid_t uid                         = ::getuid();
@@ -167,7 +172,9 @@ class HttpPool {
         try {
           slots_[i]->client = HttpClient::connect(
               config.endpoint_host, config.endpoint_port,
-              config.authority, config.tls);
+              config.authority, config.tls, config.request_timeout_ms,
+              config.connect_timeout_ms,
+              config.protocol_probe_timeout_ms);
         } catch (...) {
           errors[i] = std::current_exception();
         }
@@ -418,10 +425,19 @@ class AmzDateTimeCache {
 
 struct State;
 void cache_reclaim_loop(std::stop_token stop, State* state) noexcept;
+void stats_report_loop(std::stop_token stop, State* state) noexcept;
 
 struct State {
   explicit State(MountConfig value)
       : config(std::move(value)),
+        credentials(CredentialProviderOptions{
+            .region = config.region,
+            .connect_timeout_ms = config.connect_timeout_ms,
+            .request_timeout_ms = config.request_timeout_ms,
+            .protocol_probe_timeout_ms =
+                config.protocol_probe_timeout_ms,
+            .metadata_timeout_ms = config.metadata_timeout_ms,
+        }),
         directory_mtime(wall_time_seconds()),
         root_item(std::make_unique<InodeDir>()),
         http(std::make_unique<HttpPool>(config)),
@@ -430,10 +446,26 @@ struct State {
           cache_reclaim_loop(stop, this);
         }) {
     root_item->set_parent(root_item.get());
+    if (config.stats_interval_seconds != 0) {
+      stats_reporter = std::jthread([this](std::stop_token stop) {
+        stats_report_loop(stop, this);
+      });
+    }
   }
 
   ~State() {
-    cache_reclaimer.request_stop();
+    {
+      std::lock_guard guard(stats_wait_mutex);
+      stats_reporter.request_stop();
+    }
+    stats_condition.notify_all();
+    if (stats_reporter.joinable()) {
+      stats_reporter.join();
+    }
+    {
+      std::lock_guard guard(cache_mutex);
+      cache_reclaimer.request_stop();
+    }
     cache_condition.notify_all();
     if (cache_reclaimer.joinable()) {
       cache_reclaimer.join();
@@ -458,11 +490,13 @@ struct State {
   };
 
   MountConfig config;
+  CredentialProvider credentials;
   time_t directory_mtime;
   std::unique_ptr<InodeDir> root_item;
   AmzDateTimeCache date_time;
   std::mutex retired_mutex;
   std::mutex open_files_mutex;
+  std::condition_variable open_files_condition;
   std::mutex cache_mutex;
   std::mutex session_mutex;
   std::mutex metrics_mutex;
@@ -472,6 +506,8 @@ struct State {
   std::mutex budget_mutex;
   std::condition_variable budget_condition;
   std::condition_variable cache_condition;
+  std::condition_variable stats_condition;
+  std::mutex stats_wait_mutex;
   std::map<fuse_ino_t, InodeBase*> retired_items;
   std::atomic<size_t> retired_count{0};
   std::map<std::string, OpenFileState, std::less<>> open_files;
@@ -493,6 +529,11 @@ struct State {
   InodeDir* cache_clock_hand       = nullptr;
   size_t cache_clock_size          = 0;
   std::atomic<size_t> cached_inodes{0};
+  std::atomic<uint64_t> remote_reads{0};
+  std::atomic<uint64_t> remote_read_bytes{0};
+  std::atomic<uint64_t> fuse_writes{0};
+  std::atomic<uint64_t> fuse_write_bytes{0};
+  std::atomic<uint64_t> request_errors{0};
   bool budget_exhausted            = false;
   bool cache_budget_warned         = false;
   uint64_t cache_warning_ns        = 0;
@@ -504,7 +545,64 @@ struct State {
   std::atomic<int> rename_object_support{0};
   std::atomic<int> range_signing_mode{0};
   std::jthread cache_reclaimer;
+  std::jthread stats_reporter;
 };
+
+void emit_runtime_stats(State& state, const char* event) noexcept {
+  uint64_t pinned_bytes = 0;
+  uint64_t fallback_bytes = 0;
+  size_t open_handles = 0;
+  {
+    std::lock_guard guard(state.budget_mutex);
+    pinned_bytes = state.pinned_bytes;
+  }
+  {
+    std::lock_guard guard(state.metrics_mutex);
+    fallback_bytes = state.fallback_write_bytes;
+  }
+  {
+    std::lock_guard guard(state.open_files_mutex);
+    for (const auto& [path, opened] : state.open_files) {
+      (void)path;
+      open_handles += opened.readers + unsigned(opened.writer);
+    }
+  }
+  fprintf(stderr,
+          "{\"event\":\"%s\",\"remote_reads\":%" PRIu64
+          ",\"remote_read_bytes\":%" PRIu64
+          ",\"fuse_writes\":%" PRIu64
+          ",\"fuse_write_bytes\":%" PRIu64
+          ",\"request_errors\":%" PRIu64
+          ",\"cached_inodes\":%zu,\"open_handles\":%zu"
+          ",\"pinned_bytes\":%" PRIu64
+          ",\"copied_write_bytes\":%" PRIu64
+          ",\"credential_source\":\"%s\"}\n",
+          event,
+          state.remote_reads.load(std::memory_order_relaxed),
+          state.remote_read_bytes.load(std::memory_order_relaxed),
+          state.fuse_writes.load(std::memory_order_relaxed),
+          state.fuse_write_bytes.load(std::memory_order_relaxed),
+          state.request_errors.load(std::memory_order_relaxed),
+          state.cached_inodes.load(std::memory_order_relaxed), open_handles,
+          pinned_bytes, fallback_bytes, state.credentials.source_name());
+}
+
+void stats_report_loop(std::stop_token stop, State* state) noexcept {
+  const auto interval = std::chrono::seconds(
+      state->config.stats_interval_seconds);
+  std::unique_lock guard(state->stats_wait_mutex);
+  while (!stop.stop_requested()) {
+    if (state->stats_condition.wait_for(
+            guard, interval, [&] { return stop.stop_requested(); })) {
+      break;
+    }
+    guard.unlock();
+    emit_runtime_stats(*state, "stats");
+    guard.lock();
+  }
+  guard.unlock();
+  emit_runtime_stats(*state, "shutdown_stats");
+}
 
 void invalidate_page_cache(State& state, fuse_ino_t inode) noexcept {
   int error = 0;
@@ -969,84 +1067,10 @@ bool fuse_option_present(std::string_view options,
 }
 
 void load_environment(MountConfig& config) {
-  if (const char* value = getenv("AWS_ACCESS_KEY_ID")) {
-    config.credentials.access_key_id = value;
-  }
-  if (const char* value = getenv("AWS_SECRET_ACCESS_KEY")) {
-    config.credentials.secret_access_key = value;
-  }
-  if (const char* value = getenv("AWS_SESSION_TOKEN")) {
-    config.credentials.session_token = value;
-  }
   if (const char* value = getenv("AWS_REGION")) {
     config.region = value;
   } else if (const char* value = getenv("AWS_DEFAULT_REGION")) {
     config.region = value;
-  }
-}
-
-std::string_view trim_ascii(std::string_view value) noexcept {
-  while (!value.empty() && isspace(u_char(value.front())) != 0) {
-    value.remove_prefix(1);
-  }
-  while (!value.empty() && isspace(u_char(value.back())) != 0) {
-    value.remove_suffix(1);
-  }
-  return value;
-}
-
-void load_shared_credentials(MountConfig& config) {
-  if (!config.credentials.access_key_id.empty()) {
-    return;
-  }
-  std::string path;
-  if (const char* value = getenv("AWS_SHARED_CREDENTIALS_FILE")) {
-    path = value;
-  } else if (const char* value = getenv("HOME")) {
-    path = std::string(value) + "/.aws/credentials";
-  } else {
-    return;
-  }
-  const char* profile_value = getenv("AWS_PROFILE");
-  const std::string profile =
-      profile_value == nullptr ? "default" : profile_value;
-  std::ifstream input(path);
-  if (!input) {
-    return;
-  }
-  bool selected = false;
-  std::string line;
-  while (std::getline(input, line)) {
-    std::string_view text = trim_ascii(line);
-    if (text.empty() || text.front() == '#' || text.front() == ';') {
-      continue;
-    }
-    if (text.front() == '[' && text.back() == ']') {
-      std::string_view section = trim_ascii(
-          text.substr(1, text.size() - 2));
-      if (section.starts_with("profile ")) {
-        section.remove_prefix(8);
-        section = trim_ascii(section);
-      }
-      selected = section == profile;
-      continue;
-    }
-    if (!selected) {
-      continue;
-    }
-    const size_t equal = text.find('=');
-    if (equal == std::string_view::npos) {
-      continue;
-    }
-    const std::string_view name = trim_ascii(text.substr(0, equal));
-    const std::string_view value = trim_ascii(text.substr(equal + 1));
-    if (name == "aws_access_key_id") {
-      config.credentials.access_key_id.assign(value);
-    } else if (name == "aws_secret_access_key") {
-      config.credentials.secret_access_key.assign(value);
-    } else if (name == "aws_session_token") {
-      config.credentials.session_token.assign(value);
-    }
   }
 }
 
@@ -1058,6 +1082,11 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
 
   constexpr int io_size_option = 256;
   constexpr int verify_read_checksum_option = 257;
+  constexpr int connect_timeout_option = 258;
+  constexpr int request_timeout_option = 259;
+  constexpr int protocol_probe_timeout_option = 260;
+  constexpr int metadata_timeout_option = 261;
+  constexpr int stats_interval_option = 262;
   constexpr option long_options[] = {
       {"endpoint-host", required_argument, nullptr, 'e'},
       {"endpoint-port", required_argument, nullptr, 'p'},
@@ -1069,6 +1098,16 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       {"verify-read-checksum", no_argument, nullptr,
        verify_read_checksum_option},
       {"io-size", required_argument, nullptr, io_size_option},
+      {"connect-timeout", required_argument, nullptr,
+       connect_timeout_option},
+      {"request-timeout", required_argument, nullptr,
+       request_timeout_option},
+      {"protocol-probe-timeout", required_argument, nullptr,
+       protocol_probe_timeout_option},
+      {"metadata-timeout", required_argument, nullptr,
+       metadata_timeout_option},
+      {"stats-interval", required_argument, nullptr,
+       stats_interval_option},
       {"read-ahead", required_argument, nullptr, 'R'},
       {"dir-cache-timeout", required_argument, nullptr, 'T'},
       {"max-cached-inodes", required_argument, nullptr, 'I'},
@@ -1164,6 +1203,42 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
               "--io-size must be nonzero and at most UINT32_MAX");
         }
         config.io_size = static_cast<uint32_t>(value);
+        break;
+      }
+      case connect_timeout_option:
+      case request_timeout_option:
+      case protocol_probe_timeout_option:
+      case metadata_timeout_option: {
+        const char* name = parsed == connect_timeout_option
+                               ? "--connect-timeout"
+                           : parsed == request_timeout_option
+                               ? "--request-timeout"
+                           : parsed == protocol_probe_timeout_option
+                               ? "--protocol-probe-timeout"
+                               : "--metadata-timeout";
+        const uint64_t value = parse_required_unsigned(name);
+        constexpr uint64_t maximum = 60ULL * 60ULL * 1000ULL;
+        if (value == 0 || value > maximum) {
+          throw std::invalid_argument(
+              std::string(name) + " must be between 1 and 3600000 ms");
+        }
+        int& destination = parsed == connect_timeout_option
+                               ? config.connect_timeout_ms
+                           : parsed == request_timeout_option
+                               ? config.request_timeout_ms
+                           : parsed == protocol_probe_timeout_option
+                               ? config.protocol_probe_timeout_ms
+                               : config.metadata_timeout_ms;
+        destination = int(value);
+        break;
+      }
+      case stats_interval_option: {
+        const uint64_t value = parse_required_unsigned("--stats-interval");
+        if (value > 24ULL * 60ULL * 60ULL) {
+          throw std::invalid_argument(
+              "--stats-interval must be at most 86400 seconds");
+        }
+        config.stats_interval_seconds = uint32_t(value);
         break;
       }
       case 'R': {
@@ -1502,6 +1577,10 @@ std::string object_request_path(const State& state, std::string_view key) {
 }
 
 void reply_callback_error(fuse_req_t request) noexcept {
+  State& state = state_from(request);
+  if (state.config.stats_interval_seconds != 0) {
+    state.request_errors.fetch_add(1, std::memory_order_relaxed);
+  }
   try {
     throw;
   } catch (const std::system_error& error) {
@@ -1623,14 +1702,16 @@ void ensure_express_session(State& state) {
     };
     HeaderList authorization;
     authorization_headers_for_credentials(
-        authorization, state, state.config.credentials, "GET", "/?session",
+        authorization, state, state.credentials.get(), "GET", "/?session",
         headers, kEmptyPayloadSha256);
     headers.insert(headers.end(),
                    std::make_move_iterator(authorization.begin()),
                    std::make_move_iterator(authorization.end()));
     std::unique_ptr<HttpClient> client = HttpClient::connect(
         state.config.endpoint_host, state.config.endpoint_port,
-        state.config.authority, state.config.tls);
+        state.config.authority, state.config.tls,
+        state.config.request_timeout_ms, state.config.connect_timeout_ms,
+        state.config.protocol_probe_timeout_ms);
     const Response response = client->request_no_body(
         "GET", "/?session", headers, kMaximumListResponseSize);
     if (response.status != 200) {
@@ -1685,7 +1766,7 @@ void authorization_headers(
     std::string_view datetime = {}) {
   if (!state.config.directory_bucket) {
     authorization_headers_for_credentials(
-        output, state, state.config.credentials, method, request_path,
+        output, state, state.credentials.get(), method, request_path,
         signed_headers, payload_hash, fast_get, datetime);
     return;
   }
@@ -1722,7 +1803,7 @@ HeaderList base_authorization_headers(
     std::string_view payload_hash) {
   HeaderList output;
   authorization_headers_for_credentials(
-      output, state, state.config.credentials, method, request_path,
+      output, state, state.credentials.get(), method, request_path,
       signed_headers, payload_hash);
   return output;
 }
@@ -1974,7 +2055,7 @@ bool refresh_open_metadata(State& state, OpenHandle& handle) {
 
 void register_open_handle(State& state, fuse_ino_t inode,
                           OpenHandle& handle) {
-  std::lock_guard open_files_guard(state.open_files_mutex);
+  std::unique_lock open_files_guard(state.open_files_mutex);
   InodeBase& base = inode_item(state, inode);
   if (!base.regular()) {
     throw std::system_error(EISDIR, std::generic_category(), "open");
@@ -1985,6 +2066,29 @@ void register_open_handle(State& state, fuse_ino_t inode,
   handle.item        = &item;
   handle.object_path = object_request_path(state, key);
   handle.size        = item.fsize.load(std::memory_order_relaxed);
+  for (const State::BlockedPath& blocked : state.blocked_paths) {
+    if (blocked_path_contains(blocked, handle.object_path)) {
+      throw std::system_error(EBUSY, std::generic_category(),
+                              "object path is being changed");
+    }
+  }
+  const auto conflicts = [&] {
+    const auto position = state.open_files.find(handle.object_path);
+    if (position == state.open_files.end()) {
+      return false;
+    }
+    const State::OpenFileState& opened = position->second;
+    return (handle.writable && (opened.writer || opened.readers != 0)) ||
+           (!handle.writable && opened.writer);
+  };
+  if (conflicts()) {
+    // FUSE_RELEASE can be processed just after a close returns while a later
+    // FUSE_OPEN is already running on another worker. Give that queued release
+    // a bounded chance to retire its handle before reporting a real conflict.
+    state.open_files_condition.wait_for(
+        open_files_guard, std::chrono::milliseconds(100),
+        [&] { return !conflicts(); });
+  }
   for (const State::BlockedPath& blocked : state.blocked_paths) {
     if (blocked_path_contains(blocked, handle.object_path)) {
       throw std::system_error(EBUSY, std::generic_category(),
@@ -2060,6 +2164,7 @@ void unregister_open_handle(State& state, std::string_view path,
       }
     }
   }
+  state.open_files_condition.notify_all();
   if (item != nullptr) {
     if (release_inode_count(item->open_count)) {
       sweep_retired_items(state);
@@ -2622,7 +2727,7 @@ InodePin pin_cached_child(State& state, InodeBase& parent,
   Directory& children = parent.dir_children();
   std::shared_lock guard(children.mutex);
   const auto i = children.find(
-      terark::fstring(name.data(), name.size()));
+      terark::fstring(name.data(), ptrdiff_t(name.size())));
   if (i == children.end() || i->second->detached()) {
     return {};
   }
@@ -2831,7 +2936,8 @@ fuse_ino_t install_item(State& state, fuse_ino_t parent,
     if (parent_item.detached()) {
       throw std::system_error(ESTALE, std::generic_category(), "directory");
     }
-    const terark::fstring key(child.name.data(), child.name.size());
+    const terark::fstring key(
+        child.name.data(), ptrdiff_t(child.name.size()));
     auto position = children.find(key);
     item = position == children.end() ? nullptr : position->second;
     if (item != nullptr && exclusive) {
@@ -3023,7 +3129,8 @@ void refresh_directory_locked(State& state, fuse_ino_t inode,
       {
         std::shared_lock guard(children.mutex);
         const auto i = children.find(
-            terark::fstring(child.name.data(), child.name.size()));
+            terark::fstring(
+                child.name.data(), ptrdiff_t(child.name.size())));
         if (i != children.end()) {
           InodeBase* item = i->second;
           directory_won = item->directory() &&
@@ -4832,13 +4939,13 @@ void ngs3fs_init(void* userdata, fuse_conn_info* connection) {
   unsigned int desired = FUSE_CAP_ASYNC_READ | FUSE_CAP_ATOMIC_O_TRUNC;
   if ((connection->capable & FUSE_CAP_EXPLICIT_INVAL_DATA) != 0) {
     desired |= FUSE_CAP_EXPLICIT_INVAL_DATA;
-    connection->want &= ~FUSE_CAP_AUTO_INVAL_DATA;
+    connection->want &= ~unsigned(FUSE_CAP_AUTO_INVAL_DATA);
   }
   if (state.splice_available) {
     desired |= FUSE_CAP_SPLICE_READ | FUSE_CAP_SPLICE_WRITE |
                FUSE_CAP_SPLICE_MOVE;
   }
-  connection->want &= ~FUSE_CAP_WRITEBACK_CACHE;
+  connection->want &= ~unsigned(FUSE_CAP_WRITEBACK_CACHE);
   connection->want |= connection->capable & desired;
   state.atomic_o_trunc =
       (connection->want & FUSE_CAP_ATOMIC_O_TRUNC) != 0;
@@ -4908,7 +5015,7 @@ void ngs3fs_lookup(fuse_req_t request, fuse_ino_t parent, const char* name) {
       Directory& children = directory.dir_children();
       std::shared_lock guard(children.mutex);
       const auto i = children.find(
-          terark::fstring(name, strlen(name)));
+          terark::fstring(name, ptrdiff_t(strlen(name))));
       InodeBase* item = i == children.end() ? nullptr : i->second;
       if (item != nullptr && !item->detached()) {
         retain_inode_count(item->nlookup, "inode lookup count");
@@ -5387,7 +5494,9 @@ void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
       verify_read_checksum(response, pipe, wanted, state.config.checksum);
     }
 
-    fuse_bufvec buffers = FUSE_BUFVEC_INIT(wanted);
+    fuse_bufvec buffers{};
+    buffers.count = 1;
+    buffers.buf[0].size = wanted;
     buffers.buf[0].flags = static_cast<fuse_buf_flags>(
         FUSE_BUF_IS_FD | FUSE_BUF_FD_RETRY);
     buffers.buf[0].fd = pipe.read_fd();
@@ -5434,6 +5543,10 @@ void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
                 << '\n';
     }
     if (reply_result == 0) {
+      if (state.config.stats_interval_seconds != 0) {
+        state.remote_reads.fetch_add(1, std::memory_order_relaxed);
+        state.remote_read_bytes.fetch_add(wanted, std::memory_order_relaxed);
+      }
       worker.transport_pipe = std::move(pipe);
     }
   } catch (...) {
@@ -5584,6 +5697,10 @@ void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
     handle.size              = end;
     handle.write_in_progress = false;
     handle.condition.notify_all();
+    if (state.config.stats_interval_seconds != 0) {
+      state.fuse_writes.fetch_add(1, std::memory_order_relaxed);
+      state.fuse_write_bytes.fetch_add(length, std::memory_order_relaxed);
+    }
     fuse_reply_write(request, length);
   } catch (...) {
     reply_callback_error(request);
@@ -5917,7 +6034,8 @@ bool move_cached_item(InodeBase& item, InodeBase& new_parent,
       return false;
     }
     const auto inserted = new_directory.insert_i(
-        terark::fstring(new_name.data(), new_name.size()), &item);
+        terark::fstring(
+            new_name.data(), ptrdiff_t(new_name.size())), &item);
     if (!inserted.second) {
       throw std::logic_error(
           "rename destination cache entry already exists");
@@ -5933,7 +6051,8 @@ bool move_cached_item(InodeBase& item, InodeBase& new_parent,
       return false;
     }
     const auto inserted = new_directory.insert_i(
-        terark::fstring(new_name.data(), new_name.size()), &item);
+        terark::fstring(
+            new_name.data(), ptrdiff_t(new_name.size())), &item);
     if (!inserted.second) {
       throw std::logic_error(
           "rename destination cache entry already exists");
@@ -6103,7 +6222,7 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
     fuse_reply_err(request, EINVAL);
     return;
   }
-  if ((flags & ~RENAME_NOREPLACE) != 0) {
+  if ((flags & ~unsigned(RENAME_NOREPLACE)) != 0) {
     fuse_reply_err(request, EINVAL);
     return;
   }
@@ -6309,6 +6428,16 @@ void print_help() {
          "(default off)\n"
       << "      --io-size BYTES       statfs optimal I/O size; accepts "
          "KiB/MiB (default 256 KiB)\n"
+      << "      --connect-timeout MS  TCP connect timeout (default 5000)\n"
+      << "      --request-timeout MS  no-I/O-progress timeout "
+         "(default 30000)\n"
+      << "      --protocol-probe-timeout MS\n"
+         "                             cleartext HTTP/2 probe timeout "
+         "(default 1000)\n"
+      << "      --metadata-timeout MS credential metadata timeout "
+         "(default 1000)\n"
+      << "      --stats-interval SEC emit aggregate JSON stats to stderr; "
+         "0 disables (default 0)\n"
       << "  -R, --read-ahead BYTES    kernel read-ahead; accepts "
          "KiB/MiB (default 256 KiB)\n"
       << "  -T, --dir-cache-timeout MS\n"
@@ -6322,7 +6451,8 @@ void print_help() {
       << "  -B, --max-pinned-memory BYTES\n"
          "                             retained write budget (default 256 MiB)\n"
       << "  credentials            AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, "
-         "AWS_SESSION_TOKEN\n"
+         "AWS_SESSION_TOKEN, shared profiles, credential_process, web "
+         "identity, ECS, or IMDSv2\n"
       << "  -u, --uid UID             getattr owner (default mount user)\n"
       << "  -g, --gid GID             getattr group (default mount group)\n"
       << "  -m, --file-mode OCTAL     object file mode (default 0644)\n"
@@ -6337,7 +6467,6 @@ int run(int argc, char** argv) {
   fuse_args arguments = FUSE_ARGS_INIT(0, nullptr);
   MountConfig config;
   load_environment(config);
-  load_shared_credentials(config);
   try {
     if (!parse_arguments(argc, argv, config, arguments)) {
       throw std::runtime_error("unable to allocate FUSE arguments");
@@ -6407,22 +6536,9 @@ int run(int argc, char** argv) {
     free(options.mountpoint);
     return 2;
   }
-  if (config.credentials.access_key_id.empty() !=
-      config.credentials.secret_access_key.empty()) {
-    std::cerr << "both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are "
-                 "required for signed requests\n";
-    fuse_opt_free_args(&arguments);
-    free(options.mountpoint);
-    return 2;
-  }
   if (config.authority.find_first_of("\r\n") != std::string::npos ||
-      config.region.find_first_of("\r\n") != std::string::npos ||
-      config.credentials.access_key_id.find_first_of("\r\n") !=
-          std::string::npos ||
-      config.credentials.session_token.find_first_of("\r\n") !=
-          std::string::npos) {
-    std::cerr << "authority, region, and credential header values must not "
-                 "contain CR or LF\n";
+      config.region.find_first_of("\r\n") != std::string::npos) {
+    std::cerr << "authority and region must not contain CR or LF\n";
     fuse_opt_free_args(&arguments);
     free(options.mountpoint);
     return 2;

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+preset=${NGS3FS_PRESET:-dev}
 deps_dir="${project_dir}/.deps"
 nghttp2_version="1.70.0"
 source_dir="${deps_dir}/src/nghttp2-${nghttp2_version}"
@@ -53,6 +54,6 @@ if [[ ! -f "${deps_dir}/sysroot/usr/include/fuse3/fuse_lowlevel.h" ]]; then
   done < <(find "${deps_dir}/debs" -maxdepth 1 -type f -name 'libfuse3*.deb' -print)
 fi
 
-cmake --preset dev
-cmake --build --preset dev
-ctest --preset dev
+cmake --preset "$preset"
+cmake --build --preset "$preset"
+ctest --preset "$preset"

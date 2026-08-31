@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.25)
 
 project(ngs3fs VERSION 0.1.0 LANGUAGES C CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
@@ -65,12 +67,19 @@ include(Dependencies)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto SSL)
 ngs3fs_find_fuse3()
 
-set(tinyxml2_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(ngs3fs_tinyxml2
-  GIT_REPOSITORY https://github.com/leethomason/tinyxml2.git
-  GIT_TAG 11.0.0
-  GIT_SHALLOW TRUE)
-FetchContent_MakeAvailable(ngs3fs_tinyxml2)
+  URL https://github.com/leethomason/tinyxml2/archive/refs/tags/11.0.0.tar.gz
+  URL_HASH SHA256=5556deb5081fb246ee92afae73efd943c889cef0cafea92b0b82422d6a18f289
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_GetProperties(ngs3fs_tinyxml2)
+if(NOT ngs3fs_tinyxml2_POPULATED)
+  FetchContent_Populate(ngs3fs_tinyxml2)
+endif()
+add_library(ngs3fs_tinyxml2 STATIC
+  "${ngs3fs_tinyxml2_SOURCE_DIR}/tinyxml2.cpp")
+target_include_directories(ngs3fs_tinyxml2 SYSTEM PUBLIC
+  "${ngs3fs_tinyxml2_SOURCE_DIR}")
+target_compile_definitions(ngs3fs_tinyxml2 PUBLIC _FILE_OFFSET_BITS=64)
 
 FetchContent_Declare(ngs3fs_xxhash
   URL https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.3.tar.gz
@@ -85,8 +94,22 @@ add_library(ngs3fs_xxhash STATIC
 target_include_directories(ngs3fs_xxhash SYSTEM PUBLIC
   "${ngs3fs_xxhash_SOURCE_DIR}")
 
+FetchContent_Declare(ngs3fs_yyjson
+  URL https://github.com/ibireme/yyjson/archive/refs/tags/0.12.0.tar.gz
+  URL_HASH SHA256=b16246f617b2a136c78d73e5e2647c6f1de1313e46678062985bdcf1f40bb75d
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_GetProperties(ngs3fs_yyjson)
+if(NOT ngs3fs_yyjson_POPULATED)
+  FetchContent_Populate(ngs3fs_yyjson)
+endif()
+add_library(ngs3fs_yyjson STATIC
+  "${ngs3fs_yyjson_SOURCE_DIR}/src/yyjson.c")
+target_include_directories(ngs3fs_yyjson SYSTEM PUBLIC
+  "${ngs3fs_yyjson_SOURCE_DIR}/src")
+
 add_library(ngs3fs_core
   ${TOPLING_ZIP_SOURCE_DIR}/src/terark/hash_common.cpp
+  src/credentials.cpp
   src/http.cpp
   src/io.cpp
   src/s3.cpp
@@ -104,8 +127,9 @@ target_link_libraries(ngs3fs_core PUBLIC
   OpenSSL::SSL
   nghttp2_static
   llhttp::llhttp
-  tinyxml2::tinyxml2
+  ngs3fs_tinyxml2
   ngs3fs_xxhash
+  ngs3fs_yyjson
 )
 
 if(NGS3FS_BUILD_BENCHMARKS)
@@ -124,6 +148,29 @@ target_compile_definitions(ngs3fs PRIVATE FUSE_USE_VERSION=35)
 target_compile_options(ngs3fs PRIVATE
   -Wall -Wextra -Wpedantic -Wconversion)
 
+install(TARGETS ngs3fs
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES docs/ngs3fs.1
+  DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
+install(FILES README.md LICENSE docs/operations.md
+  DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(FILES packaging/ngs3fs@.service
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system)
+install(FILES packaging/ngs3fs.env.example
+  DESTINATION ${CMAKE_INSTALL_DOCDIR}/examples)
+
+set(CPACK_PACKAGE_NAME ngs3fs)
+set(CPACK_PACKAGE_VENDOR Topling)
+set(CPACK_PACKAGE_CONTACT "Topling <support@topling.cn>")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+  "Low-latency libnghttp2/llhttp S3 FUSE client")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_GENERATOR "TGZ;DEB")
+include(CPack)
+
 if(NGS3FS_BUILD_TESTS)
   enable_testing()
   add_compile_options(-UNDEBUG)
@@ -136,6 +183,16 @@ if(NGS3FS_BUILD_TESTS)
   target_link_libraries(random_read_stress PRIVATE Threads::Threads)
   target_compile_options(random_read_stress PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
+
+  add_executable(cross_mount_race tests/cross_mount_race.cpp)
+  target_compile_options(cross_mount_race PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+  target_link_libraries(cross_mount_race PRIVATE Threads::Threads)
+
+  add_executable(provider_smoke tests/provider_smoke.cpp)
+  target_compile_options(provider_smoke PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+  target_link_libraries(provider_smoke PRIVATE Threads::Threads)
 
   add_executable(ngs3fs_core_tests tests/core_tests.cpp)
   target_link_libraries(ngs3fs_core_tests PRIVATE ngs3fs_core)
@@ -216,6 +273,26 @@ if(NGS3FS_BUILD_TESTS)
   target_link_libraries(protocol_probe_timeout_test PRIVATE ngs3fs_core)
   add_test(NAME protocol_probe_timeout_test COMMAND protocol_probe_timeout_test)
   set_tests_properties(protocol_probe_timeout_test PROPERTIES TIMEOUT 5)
+
+  add_executable(credential_process_helper
+    tests/credential_process_helper.cpp)
+  target_compile_options(credential_process_helper PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+
+  add_executable(credential_provider_test
+    tests/credential_provider_test.cpp)
+  target_link_libraries(credential_provider_test PRIVATE ngs3fs_core)
+  add_test(NAME credential_provider_test
+    COMMAND credential_provider_test $<TARGET_FILE:credential_process_helper>)
+  set_tests_properties(credential_provider_test PROPERTIES TIMEOUT 30)
+
+  add_test(NAME timeout_options_test
+    COMMAND ngs3fs --connect-timeout 1000 --request-timeout 2000
+                   --protocol-probe-timeout 100 --metadata-timeout 500
+                   --stats-interval 30 --help)
+  add_test(NAME timeout_options_zero_test
+    COMMAND ngs3fs --request-timeout 0 --help)
+  set_tests_properties(timeout_options_zero_test PROPERTIES WILL_FAIL TRUE)
 
   add_executable(h2_reconnect_client_test
     tests/h2_reconnect_client_test.cpp)

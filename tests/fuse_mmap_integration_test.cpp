@@ -1030,8 +1030,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
             port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
             uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
             "0750", "--io-size", "384KiB", "-R", "256KiB", "-I", "1",
-            "--checksum", checksum.data(), "--verify-read-checksum", "-f",
-            mountpoint.data(),
+            "--checksum", checksum.data(), "--verify-read-checksum",
+            "--stats-interval", "86400", "-f", mountpoint.data(),
             static_cast<char*>(nullptr));
     _exit(127);
   }

@@ -71,6 +71,12 @@ jobs:
             xfsprogs \
             xz-utils
 
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          test -c /dev/fuse
+          sudo chmod a+rw /dev/fuse
+
       - name: Bootstrap, build, and test
         run: ./scripts/bootstrap.sh
 
@@ -96,12 +102,6 @@ jobs:
             dacec530fecaa8776feec0536998dd4bd78036e0d4db0da9b9189d96bb790e03 \
             "$archive" | sha256sum --check
           tar -xzf "$archive" -C build/e2e/versitygw
-
-      - name: Enable FUSE
-        run: |
-          sudo modprobe fuse
-          test -c /dev/fuse
-          sudo chmod a+rw /dev/fuse
 
       - name: Run libfuse functional and stress cases against ngs3fs
         env:
@@ -133,6 +133,62 @@ jobs:
             ./scripts/test_xfstests.sh \
             "$GITHUB_WORKSPACE/upstream/xfstests" \
             "$GITHUB_WORKSPACE/build/xfstests"
+
+      - name: Run multi-mount race and large-directory test
+        env:
+          NGS3FS_LARGE_DIRECTORY_ENTRIES: 5000
+        run: |
+          ./scripts/test_multi_mount.sh \
+            "$GITHUB_WORKSPACE/build/multi-mount"
+
+  hardening:
+    name: hardening (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: asan-ubsan
+            runner: ubuntu-24.04
+            preset: asan
+          - name: tsan
+            runner: ubuntu-24.04
+            preset: tsan
+          - name: clang
+            runner: ubuntu-24.04
+            preset: clang
+          - name: arm64
+            runner: ubuntu-24.04-arm
+            preset: dev
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Check out ngs3fs
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            curl \
+            fuse3 \
+            libfuse3-dev \
+            libssl-dev \
+            ninja-build
+
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          test -c /dev/fuse
+          sudo chmod a+rw /dev/fuse
+
+      - name: Build and test
+        env:
+          NGS3FS_PRESET: ${{ matrix.preset }}
+          AWS_EC2_METADATA_DISABLED: 'true'
+        run: ./scripts/bootstrap.sh
 
   benchmark:
     runs-on: ubuntu-24.04
@@ -176,6 +232,12 @@ jobs:
             ninja-build \
             python3
 
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          test -c /dev/fuse
+          sudo chmod a+rw /dev/fuse
+
       - name: Build ngs3fs and goofys
         run: |
           ./scripts/bootstrap.sh
@@ -197,11 +259,8 @@ jobs:
             "$archive" | sha256sum --check
           tar -xzf "$archive" -C build/e2e/versitygw
 
-      - name: Enable FUSE and perf
+      - name: Enable perf
         run: |
-          sudo modprobe fuse
-          test -c /dev/fuse
-          sudo chmod a+rw /dev/fuse
           sudo sysctl -w kernel.perf_event_paranoid=-1
           sudo sysctl -w kernel.kptr_restrict=0
           perf --version

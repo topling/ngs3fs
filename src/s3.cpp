@@ -1204,16 +1204,17 @@ std::string uri_encode(std::string_view value, bool preserve_slashes) {
   constexpr char digits[] = "0123456789ABCDEF";
   std::string output;
   output.reserve(value.size());
-  for (const unsigned char item : value) {
+  for (char ch : value) {
+    const u_char item = u_char(ch);
     const bool unreserved =
         isalnum(item) != 0 || item == '-' || item == '.' || item == '_' ||
         item == '~' || (preserve_slashes && item == '/');
     if (unreserved) {
-      output.push_back(static_cast<char>(item));
+      output.push_back(char(item));
     } else {
       output.push_back('%');
       output.push_back(digits[item >> 4]);
-      output.push_back(digits[item & 0x0fU]);
+      output.push_back(digits[item & 0x0f]);
     }
   }
   return output;

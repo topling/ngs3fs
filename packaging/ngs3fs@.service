@@ -1,0 +1,28 @@
+[Unit]
+Description=ngs3fs S3 mount %i
+Documentation=man:ngs3fs(1)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ngs3fs/%i.env
+ExecStartPre=/usr/bin/mkdir -p /mnt/ngs3fs/%i
+ExecStartPre=-/bin/fusermount3 -u /mnt/ngs3fs/%i
+ExecStart=/usr/bin/ngs3fs -f $NGS3FS_OPTIONS /mnt/ngs3fs/%i
+ExecStop=-/bin/fusermount3 -u /mnt/ngs3fs/%i
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=70s
+LimitNOFILE=1048576
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

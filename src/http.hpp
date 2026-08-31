@@ -96,7 +96,9 @@ class HttpClient {
   static std::unique_ptr<HttpClient> connect(
       std::string_view host, uint16_t port,
       std::string authority = {}, bool tls = false,
-      int io_timeout_ms = kRequestIoTimeoutMs);
+      int io_timeout_ms = kRequestIoTimeoutMs,
+      int connect_timeout_ms = kConnectTimeoutMs,
+      int probe_timeout_ms = kProtocolProbeTimeoutMs);
 
   virtual ~HttpClient() = default;
 

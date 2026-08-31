@@ -274,9 +274,10 @@ struct TlsConnection {
 };
 
 TlsConnection connect_tls(std::string_view host, uint16_t port,
+                          int connect_timeout_ms = kConnectTimeoutMs,
                           int io_timeout_ms = kRequestIoTimeoutMs) {
   UniqueFd remote = connect_tcp(
-      host, port, kConnectTimeoutMs, io_timeout_ms);
+      host, port, connect_timeout_ms, io_timeout_ms);
   std::unique_ptr<SSL_CTX, SslContextDeleter> context(
       SSL_CTX_new(TLS_client_method()));
   if (!context) {
@@ -548,7 +549,10 @@ class Http2Client final : public HttpClient {
                        std::string reconnect_host = {},
                        uint16_t reconnect_port = 0,
                        std::shared_ptr<TlsTunnel> connected_tunnel = {},
-                       int connected_io_timeout_ms = kRequestIoTimeoutMs);
+                       int connected_io_timeout_ms = kRequestIoTimeoutMs,
+                       int connected_connect_timeout_ms = kConnectTimeoutMs,
+                       int connected_probe_timeout_ms =
+                           kProtocolProbeTimeoutMs);
 
   RangeResponse get_range(std::string_view path, uint64_t offset,
                           size_t length, Pipe& destination,
@@ -611,7 +615,9 @@ class Http2Client final : public HttpClient {
   std::string authority;
   std::string host;
   uint16_t port = 0;
-  int io_timeout_ms = kRequestIoTimeoutMs;
+  int io_timeout_ms      = kRequestIoTimeoutMs;
+  int connect_timeout_ms = kConnectTimeoutMs;
+  int probe_timeout_ms   = kProtocolProbeTimeoutMs;
   std::unique_ptr<nghttp2_session_callbacks, Http2CallbacksDeleter> callbacks;
   std::unique_ptr<nghttp2_option, Http2OptionDeleter> option;
   std::unique_ptr<nghttp2_session, Http2SessionDeleter> session;
@@ -870,13 +876,17 @@ Http2Client::Http2Client(UniqueFd connected_socket,
                          std::string reconnect_host,
                          uint16_t reconnect_port,
                          std::shared_ptr<TlsTunnel> connected_tunnel,
-                         int connected_io_timeout_ms)
+                         int connected_io_timeout_ms,
+                         int connected_connect_timeout_ms,
+                         int connected_probe_timeout_ms)
     : tunnel(std::move(connected_tunnel)),
       socket(std::move(connected_socket)),
       authority(std::move(request_authority)),
       host(std::move(reconnect_host)),
       port(reconnect_port),
       io_timeout_ms(connected_io_timeout_ms),
+      connect_timeout_ms(connected_connect_timeout_ms),
+      probe_timeout_ms(connected_probe_timeout_ms),
       tls(tunnel != nullptr) {
   Pipe probe = Pipe::create(kPreferredIoSize);
   maximum_frame_size = uint32_t(std::clamp<size_t>(
@@ -897,7 +907,8 @@ void Http2Client::ensure_ready() {
   UniqueFd connected;
   std::shared_ptr<TlsTunnel> connected_tunnel;
   if (tls) {
-    TlsConnection transport = connect_tls(host, port, io_timeout_ms);
+    TlsConnection transport = connect_tls(
+        host, port, connect_timeout_ms, io_timeout_ms);
     if (!transport.http2) {
       throw std::runtime_error(
           "TLS reconnect changed protocol from HTTP/2");
@@ -906,7 +917,7 @@ void Http2Client::ensure_ready() {
     connected_tunnel = std::move(transport.tunnel);
   } else {
     connected = connect_tcp(
-        host, port, kConnectTimeoutMs, io_timeout_ms);
+        host, port, connect_timeout_ms, io_timeout_ms);
   }
   socket.reset();
   tunnel.reset();
@@ -1498,8 +1509,7 @@ bool Http2Client::probe_server() {
     throw std::logic_error("cannot probe HTTP/2 during an active request");
   }
   flush();
-  set_socket_receive_timeout(socket.get(),
-                                 kProtocolProbeTimeoutMs);
+  set_socket_receive_timeout(socket.get(), probe_timeout_ms);
 
   constexpr std::array prefix{
       std::byte{'H'}, std::byte{'T'}, std::byte{'T'}, std::byte{'P'},
@@ -1945,13 +1955,15 @@ class Http1Client final : public HttpClient {
   Http1Client(UniqueFd connected_socket, std::string request_authority,
               std::string reconnect_host = {}, uint16_t reconnect_port = 0,
               std::shared_ptr<TlsTunnel> connected_tunnel = {},
-              int connected_io_timeout_ms = kRequestIoTimeoutMs)
+              int connected_io_timeout_ms = kRequestIoTimeoutMs,
+              int connected_connect_timeout_ms = kConnectTimeoutMs)
       : tunnel(std::move(connected_tunnel)),
         socket(std::move(connected_socket)),
         authority(std::move(request_authority)),
         host(std::move(reconnect_host)),
         port(reconnect_port),
         io_timeout_ms(connected_io_timeout_ms),
+        connect_timeout_ms(connected_connect_timeout_ms),
         tls(tunnel != nullptr) {}
 
   Response get_range(std::string_view path, uint64_t offset,
@@ -1992,7 +2004,8 @@ class Http1Client final : public HttpClient {
   std::string request_head;
   std::string upload_method;
   uint16_t port = 0;
-  int io_timeout_ms = kRequestIoTimeoutMs;
+  int io_timeout_ms      = kRequestIoTimeoutMs;
+  int connect_timeout_ms = kConnectTimeoutMs;
   bool request_active = false;
   bool upload_chunked = false;
   uint64_t tls_upload_request_id = 0;
@@ -2008,7 +2021,8 @@ class Http1Client final : public HttpClient {
       throw std::runtime_error("HTTP/1.1 connection is not reusable");
     }
     if (tls) {
-      TlsConnection transport = connect_tls(host, port, io_timeout_ms);
+      TlsConnection transport = connect_tls(
+          host, port, connect_timeout_ms, io_timeout_ms);
       if (transport.http2) {
         throw std::runtime_error(
             "TLS reconnect changed protocol from HTTP/1.1");
@@ -2017,7 +2031,7 @@ class Http1Client final : public HttpClient {
       socket = std::move(transport.socket);
     } else {
       socket = connect_tcp(
-          host, port, kConnectTimeoutMs, io_timeout_ms);
+          host, port, connect_timeout_ms, io_timeout_ms);
     }
   }
 
@@ -2480,26 +2494,30 @@ Response Http1Client::request_no_body(
 // HTTP/2-preferred protocol selection.
 std::unique_ptr<HttpClient> HttpClient::connect(
     std::string_view host, uint16_t port, std::string authority, bool tls,
-    int io_timeout_ms) {
+    int io_timeout_ms, int connect_timeout_ms, int probe_timeout_ms) {
   if (authority.empty()) {
     authority = std::string(host) + ':' + std::to_string(port);
   }
 
   if (tls) {
-    TlsConnection transport = connect_tls(host, port, io_timeout_ms);
+    TlsConnection transport = connect_tls(
+        host, port, connect_timeout_ms, io_timeout_ms);
     if (transport.http2) {
       return std::make_unique<Http2Client>(
           std::move(transport.socket), authority, std::string(host), port,
-          std::move(transport.tunnel), io_timeout_ms);
+          std::move(transport.tunnel), io_timeout_ms, connect_timeout_ms,
+          probe_timeout_ms);
     }
     return std::make_unique<Http1Client>(
         std::move(transport.socket), std::move(authority), std::string(host),
-        port, std::move(transport.tunnel), io_timeout_ms);
+        port, std::move(transport.tunnel), io_timeout_ms,
+        connect_timeout_ms);
   }
 
   auto h2 = std::make_unique<Http2Client>(
-      connect_tcp(host, port, kConnectTimeoutMs, io_timeout_ms), authority,
-      std::string(host), port, std::shared_ptr<TlsTunnel>{}, io_timeout_ms);
+      connect_tcp(host, port, connect_timeout_ms, io_timeout_ms), authority,
+      std::string(host), port, std::shared_ptr<TlsTunnel>{}, io_timeout_ms,
+      connect_timeout_ms, probe_timeout_ms);
   try {
     if (h2->probe_server()) {
       return h2;
@@ -2509,7 +2527,7 @@ std::unique_ptr<HttpClient> HttpClient::connect(
     // HTTP/2 preface. Reconnect below and use HTTP/1.1.
   }
   return std::make_unique<Http1Client>(
-      connect_tcp(host, port, kConnectTimeoutMs, io_timeout_ms),
+      connect_tcp(host, port, connect_timeout_ms, io_timeout_ms),
       std::move(authority), std::string(host), port,
-      std::shared_ptr<TlsTunnel>{}, io_timeout_ms);
+      std::shared_ptr<TlsTunnel>{}, io_timeout_ms, connect_timeout_ms);
 }

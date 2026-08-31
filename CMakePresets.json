@@ -15,18 +15,99 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "NGS3FS_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "asan",
+      "displayName": "Address and undefined behavior sanitizers",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "NGS3FS_ENABLE_SANITIZERS": "ON",
+        "NGS3FS_BUILD_BENCHMARKS": "OFF"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "Thread sanitizer",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/tsan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "NGS3FS_ENABLE_TSAN": "ON",
+        "NGS3FS_BUILD_BENCHMARKS": "OFF"
+      }
+    },
+    {
+      "name": "clang",
+      "displayName": "Clang portability build",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/clang",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "NGS3FS_BUILD_BENCHMARKS": "OFF"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Production release",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NGS3FS_BUILD_TESTS": "OFF",
+        "NGS3FS_BUILD_BENCHMARKS": "OFF"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "dev",
       "configurePreset": "dev"
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan"
+    },
+    {
+      "name": "clang",
+      "configurePreset": "clang"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
     }
   ],
   "testPresets": [
     {
       "name": "dev",
       "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "clang",
+      "configurePreset": "clang",
       "output": {
         "outputOnFailure": true
       }
