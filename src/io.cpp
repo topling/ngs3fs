@@ -117,10 +117,13 @@ size_t splice_from_fd_exact(int source_fd, uint64_t& source_offset,
 
 size_t splice_some(int source_fd, uint64_t* source_offset,
                    int destination_fd, size_t length,
-                   unsigned int flags) {
+                   unsigned int flags, size_t* calls) {
   for (;;) {
     off_t offset = source_offset == nullptr ? 0 : off_t(*source_offset);
     off_t* position = source_offset == nullptr ? nullptr : &offset;
+    if (calls != nullptr) {
+      ++*calls;
+    }
     const ssize_t result = ::splice(source_fd, position, destination_fd,
                                     nullptr, length, flags);
     if (result > 0) {

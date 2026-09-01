@@ -77,7 +77,7 @@ size_t splice_from_fd_exact(int source_fd, uint64_t& source_offset,
 
 size_t splice_some(int source_fd, uint64_t* source_offset,
                    int destination_fd, size_t length,
-                   unsigned int flags);
+                   unsigned int flags, size_t* calls = nullptr);
 
 size_t tee_exact(int source_fd, int destination_fd,
                  size_t length, unsigned int flags);

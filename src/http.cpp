@@ -1755,27 +1755,27 @@ bool wait_for_body_batch(UniqueFd& socket, ReceiveLowWater& low_water,
 
 size_t splice_coalesced_body(UniqueFd& socket, int destination,
                              size_t bytes, size_t header_over_read,
-                             size_t batch_size, size_t threshold,
-                             int io_timeout_ms,
+                             size_t batch_size, int io_timeout_ms,
                              size_t* calls, bool& low_water_used) {
   ReceiveLowWater low_water(socket);
   size_t transferred = 0;
   size_t batch = batch_size -
                  std::min(header_over_read, batch_size);
 
-  while (bytes - transferred >= threshold) {
-    batch = std::min(batch, bytes - transferred);
+  while (transferred != bytes) {
+    const size_t remaining = bytes - transferred;
+    batch = std::min(batch, remaining);
     if (!wait_for_body_batch(socket, low_water, batch, io_timeout_ms,
                              low_water_used)) {
       break;
     }
-    transferred += splice_exact(
-        socket.get(), destination, batch,
+    const size_t moved = splice_some(
+        socket.get(), nullptr, destination, remaining,
         SPLICE_F_MOVE | SPLICE_F_MORE, calls);
-    if (batch_size != kHttp1CoalesceSize) {
-      break;
+    if (moved == 0) {
+      http1_throw_errno("splice(HTTP/1.1 body)");
     }
-    batch = batch_size;
+    transferred += moved;
   }
 
   if (!low_water.restore()) {
@@ -2374,7 +2374,7 @@ class Http1Client final : public HttpClient {
                 response.externally_spliced_bytes = splice_coalesced_body(
                     socket, destination->write_fd(), remaining,
                     header_over_read, receive_batch_size,
-                    coalesce_threshold, io_timeout_ms,
+                    io_timeout_ms,
                     &response.transport_splice_calls,
                     response.low_water_used);
               } else {
