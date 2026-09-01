@@ -1573,11 +1573,8 @@ void Http2Client::consume(const RangeResponse& response) {
 // HTTP/1.1 client.
 constexpr size_t kMaxResponseHeaderBytes = 64U * 1024U;
 constexpr size_t kHttp1ReadSize          = 1024;
+constexpr size_t kHttp1CoalesceSize      = 256U * 1024U;
 constexpr int    kHttp1CoalesceTimeoutMs = 5'000;
-const size_t     kHttp1PageSize          = [] {
-  const long value = ::sysconf(_SC_PAGESIZE);
-  return value > 0 ? size_t(value) : size_t(4096);
-}();
 
 [[noreturn]] void http1_throw_errno(const char* operation);
 
@@ -1655,39 +1652,34 @@ class ReceiveLowWater {
 
   ~ReceiveLowWater() { restore(); }
 
-  bool set(size_t bytes, uint64_t body_offset, size_t capacity) noexcept {
-    if (bytes == 0 || capacity == 0) {
-      return false;
-    }
-    if (bytes > capacity) {
-      bytes = capacity;
-      const size_t phase = size_t(body_offset % kHttp1PageSize);
-      const size_t excess =
-          (phase + bytes % kHttp1PageSize) % kHttp1PageSize;
-      if (excess != 0 && bytes > excess) {
-        bytes -= excess;
-      }
-    }
+  bool set(size_t bytes) noexcept {
     if (bytes == 0 || bytes > size_t(INT_MAX)) {
       return false;
     }
     const int value = int(bytes);
-    active_ = ::setsockopt(socket_.get(), SOL_SOCKET, SO_RCVLOWAT,
-                           &value, sizeof(value)) == 0;
-    return active_;
+    if (value == value_) {
+      return true;
+    }
+    if (::setsockopt(socket_.get(), SOL_SOCKET, SO_RCVLOWAT,
+                     &value, sizeof(value)) != 0) {
+      return false;
+    }
+    value_ = value;
+    return true;
   }
 
   bool restore() noexcept {
-    if (!active_) {
+    if (value_ == 1) {
       return true;
     }
-    active_ = false;
     const int value = 1;
     if (::setsockopt(socket_.get(), SOL_SOCKET, SO_RCVLOWAT,
                      &value, sizeof(value)) == 0) {
+      value_ = value;
       return true;
     }
     const int error = errno;
+    value_ = 1;
     socket_.reset();
     errno = error;
     return false;
@@ -1695,32 +1687,20 @@ class ReceiveLowWater {
 
  private:
   UniqueFd& socket_;
-  bool active_ = false;
+  int value_ = 1;
 };
 
-size_t http1_receive_capacity(int socket) noexcept {
-  int value = 0;
-  socklen_t size = sizeof(value);
-  if (::getsockopt(socket, SOL_SOCKET, SO_RCVBUF, &value, &size) != 0 ||
-      size != sizeof(value) || value < 2) {
-    return 0;
-  }
-  return size_t(value / 2);
-}
-
-bool coalesce_body(UniqueFd& socket, size_t bytes, uint64_t body_offset,
-                   size_t receive_capacity, int io_timeout_ms) {
-  if (bytes == 0) {
+bool wait_for_body_batch(UniqueFd& socket, ReceiveLowWater& low_water,
+                         size_t bytes, int io_timeout_ms,
+                         bool& low_water_used) {
+  if (!low_water.set(bytes)) {
     return false;
   }
+  low_water_used = true;
 
   const int timeout_ms = std::min(io_timeout_ms, kHttp1CoalesceTimeoutMs);
   const uint64_t deadline = http1_monotonic_ns() +
                             uint64_t(timeout_ms) * 1'000'000ULL;
-  ReceiveLowWater low_water(socket);
-  if (!low_water.set(bytes, body_offset, receive_capacity)) {
-    return false;
-  }
 
   int result;
   for (;;) {
@@ -1744,14 +1724,43 @@ bool coalesce_body(UniqueFd& socket, size_t bytes, uint64_t body_offset,
   }
 
   const int poll_error = result < 0 ? errno : 0;
-  if (!low_water.restore()) {
-    http1_throw_errno("setsockopt(SO_RCVLOWAT restore)");
-  }
   if (result < 0) {
     errno = poll_error;
     http1_throw_errno("poll(HTTP/1.1 body)");
   }
-  return true;
+  return result != 0;
+}
+
+size_t splice_coalesced_body(UniqueFd& socket, int destination,
+                             size_t bytes, size_t header_over_read,
+                             size_t threshold, int io_timeout_ms,
+                             size_t* calls, bool& low_water_used) {
+  ReceiveLowWater low_water(socket);
+  size_t transferred = 0;
+  size_t batch = kHttp1CoalesceSize -
+                 std::min(header_over_read, kHttp1CoalesceSize);
+
+  while (bytes - transferred >= threshold) {
+    batch = std::min(batch, bytes - transferred);
+    if (!wait_for_body_batch(socket, low_water, batch, io_timeout_ms,
+                             low_water_used)) {
+      break;
+    }
+    transferred += splice_exact(
+        socket.get(), destination, batch,
+        SPLICE_F_MOVE | SPLICE_F_MORE, calls);
+    batch = kHttp1CoalesceSize;
+  }
+
+  if (!low_water.restore()) {
+    http1_throw_errno("setsockopt(SO_RCVLOWAT restore)");
+  }
+  if (transferred != bytes) {
+    transferred += splice_exact(
+        socket.get(), destination, bytes - transferred,
+        SPLICE_F_MOVE | SPLICE_F_MORE, calls);
+  }
+  return transferred;
 }
 
 ssostr<32> ascii_lower(const ssostr<32>& value) {
@@ -2134,12 +2143,7 @@ class Http1Client final : public HttpClient {
         connect_timeout_ms(connected_connect_timeout_ms),
         tls(tunnel != nullptr),
         low_water_available(receive_low_water_available),
-        coalesce_threshold(receive_coalesce_threshold) {
-    if (!tls && low_water_available) {
-      receive_capacity = http1_receive_capacity(socket.get());
-      low_water_available = receive_capacity != 0;
-    }
-  }
+        coalesce_threshold(receive_coalesce_threshold) {}
 
   Response get_range(std::string_view path, uint64_t offset,
                      size_t length, Pipe& destination,
@@ -2188,8 +2192,6 @@ class Http1Client final : public HttpClient {
   size_t upload_length = kUnknownBodyLength;
   bool tls                        = false;
   bool low_water_available        = true;
-  bool receive_capacity_refreshed = false;
-  size_t receive_capacity         = 0;
   size_t coalesce_threshold       = kDefaultReceiveCoalesceThreshold;
 
   void ensure_connected() {
@@ -2211,18 +2213,12 @@ class Http1Client final : public HttpClient {
     } else {
       socket = connect_tcp(
           host, port, connect_timeout_ms, io_timeout_ms);
-      receive_capacity_refreshed = false;
-      if (low_water_available) {
-        receive_capacity = http1_receive_capacity(socket.get());
-        low_water_available = receive_capacity != 0;
-      }
     }
   }
 
   Response receive_response(std::string_view method, Pipe* destination,
                             size_t max_body_bytes, uint64_t wire_start_ns,
-                            bool capture_headers, bool measure_transport,
-                            uint64_t response_offset) {
+                            bool capture_headers, bool measure_transport) {
     std::array<std::byte, kHttp1ReadSize> buf;
     size_t begin = 0;
     size_t end   = 0;
@@ -2310,6 +2306,7 @@ class Http1Client final : public HttpClient {
             begin = 0;
             end   = 0;
           }
+          const size_t header_over_read = response.body_bytes;
           if (remaining != 0) {
             if (destination == nullptr) {
               const size_t old_size = response.body.size();
@@ -2338,23 +2335,17 @@ class Http1Client final : public HttpClient {
               if (!tls && low_water_available &&
                   coalesce_threshold != 0 &&
                   remaining >= coalesce_threshold) {
-                response.low_water_used =
-                    coalesce_body(socket, remaining,
-                                  response_offset + response.body_bytes,
-                                  receive_capacity,
-                                  io_timeout_ms);
-              }
-              response.externally_spliced_bytes = splice_exact(
-                  socket.get(), destination->write_fd(), remaining,
-                  SPLICE_F_MOVE | SPLICE_F_MORE,
-                  &response.transport_splice_calls);
-              if (!tls && low_water_available &&
-                  !receive_capacity_refreshed &&
-                  remaining > receive_capacity) {
-                receive_capacity = std::max(
-                    receive_capacity,
-                    http1_receive_capacity(socket.get()));
-                receive_capacity_refreshed = true;
+                response.externally_spliced_bytes = splice_coalesced_body(
+                    socket, destination->write_fd(), remaining,
+                    header_over_read,
+                    coalesce_threshold, io_timeout_ms,
+                    &response.transport_splice_calls,
+                    response.low_water_used);
+              } else {
+                response.externally_spliced_bytes = splice_exact(
+                    socket.get(), destination->write_fd(), remaining,
+                    SPLICE_F_MOVE | SPLICE_F_MORE,
+                    &response.transport_splice_calls);
               }
               response.body_bytes += remaining;
             }
@@ -2418,8 +2409,7 @@ class Http1Client final : public HttpClient {
                          bool capture_headers,
                          bool measure_transport,
                          std::span<const Header> generated_headers = {},
-                         bool trusted_headers = false,
-                         uint64_t response_offset = 0) {
+                         bool trusted_headers = false) {
     if (request_active) {
       throw std::logic_error("HTTP/1.1 connection already has a request");
     }
@@ -2445,7 +2435,7 @@ class Http1Client final : public HttpClient {
       }
       Response response = receive_response(
           method, response_pipe, max_response_body, wire_start_ns,
-          capture_headers, measure_transport, response_offset);
+          capture_headers, measure_transport);
       response.externally_sent_bytes = sent;
       request_active = false;
       return response;
@@ -2499,7 +2489,7 @@ Response Http1Client::get_range(
 
   return perform("GET", path, extra_headers, std::nullopt, -1, 0,
                  &destination, length, capture_headers,
-                 measure_transport, generated_headers, true, offset);
+                 measure_transport, generated_headers, true);
 }
 
 Response Http1Client::put_from_fd(
@@ -2646,7 +2636,7 @@ Response Http1Client::finish_upload(size_t max_response_body) {
       send_all(socket.get(), end);
     }
     Response response = receive_response(
-        upload_method, nullptr, max_response_body, 0, true, false, 0);
+        upload_method, nullptr, max_response_body, 0, true, false);
     response.externally_sent_bytes = upload_sent;
     request_active = false;
     upload_chunked = false;

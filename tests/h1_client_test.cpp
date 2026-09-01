@@ -259,7 +259,7 @@ int main() {
       http1_low_water_preflight(low_water_error);
   assert(low_water_available || !low_water_error.empty());
 
-  std::vector<std::byte> expected_download(512U * 1024U);
+  std::vector<std::byte> expected_download(1024U * 1024U);
   std::vector<std::byte> expected_upload(96U * 1024U);
   std::vector<std::byte> expected_control(384U * 1024U);
   for (size_t i = 0; i < expected_download.size(); ++i) {
@@ -293,7 +293,7 @@ int main() {
   assert(downloaded.externally_spliced_bytes +
              downloaded.fallback_copied_bytes ==
          expected_download.size());
-  assert(downloaded.transport_splice_calls >= 1);
+  assert(downloaded.transport_splice_calls >= 4);
   assert(downloaded.low_water_used == low_water_available);
   assert(downloaded.headers.at("etag") == "\"h1-etag\"");
   std::vector<std::byte> actual_download(expected_download.size());
