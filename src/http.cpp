@@ -1575,6 +1575,10 @@ constexpr size_t kMaxResponseHeaderBytes = 64U * 1024U;
 constexpr size_t kHttp1ReadSize          = 1024;
 constexpr size_t kHttp1CoalesceSize      = 256U * 1024U;
 constexpr int    kHttp1CoalesceTimeoutMs = 5'000;
+const size_t     kHttp1PageSize          = [] {
+  const long value = ::sysconf(_SC_PAGESIZE);
+  return value > 0 ? size_t(value) : size_t(4096);
+}();
 
 [[noreturn]] void http1_throw_errno(const char* operation);
 
@@ -1690,6 +1694,18 @@ class ReceiveLowWater {
   int value_ = 1;
 };
 
+size_t http1_receive_batch_size(int socket) noexcept {
+  int value = 0;
+  socklen_t size = sizeof(value);
+  if (::getsockopt(socket, SOL_SOCKET, SO_RCVBUF, &value, &size) != 0 ||
+      size != sizeof(value) || value < 2) {
+    return 0;
+  }
+  size_t bytes = std::min(kHttp1CoalesceSize, size_t(value / 2));
+  bytes -= bytes % kHttp1PageSize;
+  return bytes;
+}
+
 bool wait_for_body_batch(UniqueFd& socket, ReceiveLowWater& low_water,
                          size_t bytes, int io_timeout_ms,
                          bool& low_water_used) {
@@ -1733,12 +1749,13 @@ bool wait_for_body_batch(UniqueFd& socket, ReceiveLowWater& low_water,
 
 size_t splice_coalesced_body(UniqueFd& socket, int destination,
                              size_t bytes, size_t header_over_read,
-                             size_t threshold, int io_timeout_ms,
+                             size_t batch_size, size_t threshold,
+                             int io_timeout_ms,
                              size_t* calls, bool& low_water_used) {
   ReceiveLowWater low_water(socket);
   size_t transferred = 0;
-  size_t batch = kHttp1CoalesceSize -
-                 std::min(header_over_read, kHttp1CoalesceSize);
+  size_t batch = batch_size -
+                 std::min(header_over_read, batch_size);
 
   while (bytes - transferred >= threshold) {
     batch = std::min(batch, bytes - transferred);
@@ -1749,7 +1766,7 @@ size_t splice_coalesced_body(UniqueFd& socket, int destination,
     transferred += splice_exact(
         socket.get(), destination, batch,
         SPLICE_F_MOVE | SPLICE_F_MORE, calls);
-    batch = kHttp1CoalesceSize;
+    batch = batch_size;
   }
 
   if (!low_water.restore()) {
@@ -2143,7 +2160,12 @@ class Http1Client final : public HttpClient {
         connect_timeout_ms(connected_connect_timeout_ms),
         tls(tunnel != nullptr),
         low_water_available(receive_low_water_available),
-        coalesce_threshold(receive_coalesce_threshold) {}
+        coalesce_threshold(receive_coalesce_threshold) {
+    if (!tls && low_water_available) {
+      receive_batch_size = http1_receive_batch_size(socket.get());
+      low_water_available = receive_batch_size != 0;
+    }
+  }
 
   Response get_range(std::string_view path, uint64_t offset,
                      size_t length, Pipe& destination,
@@ -2192,6 +2214,7 @@ class Http1Client final : public HttpClient {
   size_t upload_length = kUnknownBodyLength;
   bool tls                        = false;
   bool low_water_available        = true;
+  size_t receive_batch_size       = 0;
   size_t coalesce_threshold       = kDefaultReceiveCoalesceThreshold;
 
   void ensure_connected() {
@@ -2213,6 +2236,10 @@ class Http1Client final : public HttpClient {
     } else {
       socket = connect_tcp(
           host, port, connect_timeout_ms, io_timeout_ms);
+      if (low_water_available) {
+        receive_batch_size = http1_receive_batch_size(socket.get());
+        low_water_available = receive_batch_size != 0;
+      }
     }
   }
 
@@ -2337,7 +2364,7 @@ class Http1Client final : public HttpClient {
                   remaining >= coalesce_threshold) {
                 response.externally_spliced_bytes = splice_coalesced_body(
                     socket, destination->write_fd(), remaining,
-                    header_over_read,
+                    header_over_read, receive_batch_size,
                     coalesce_threshold, io_timeout_ms,
                     &response.transport_splice_calls,
                     response.low_water_used);
