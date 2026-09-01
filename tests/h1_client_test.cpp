@@ -293,7 +293,7 @@ int main() {
   assert(downloaded.externally_spliced_bytes +
              downloaded.fallback_copied_bytes ==
          expected_download.size());
-  assert(downloaded.transport_splice_calls >= 4);
+  assert(downloaded.transport_splice_calls >= 2);
   assert(downloaded.low_water_used == low_water_available);
   assert(downloaded.headers.at("etag") == "\"h1-etag\"");
   std::vector<std::byte> actual_download(expected_download.size());

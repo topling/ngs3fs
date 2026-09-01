@@ -1701,9 +1701,15 @@ size_t http1_receive_batch_size(int socket) noexcept {
       size != sizeof(value) || value < 2) {
     return 0;
   }
-  size_t bytes = std::min(kHttp1CoalesceSize, size_t(value / 2));
+  size_t bytes = size_t(value / 2);
   bytes -= bytes % kHttp1PageSize;
-  return bytes;
+  if (bytes <= kHttp1PageSize) {
+    return 0;
+  }
+  if (bytes <= kHttp1CoalesceSize) {
+    return bytes - kHttp1PageSize;
+  }
+  return kHttp1CoalesceSize;
 }
 
 bool wait_for_body_batch(UniqueFd& socket, ReceiveLowWater& low_water,
@@ -1766,6 +1772,9 @@ size_t splice_coalesced_body(UniqueFd& socket, int destination,
     transferred += splice_exact(
         socket.get(), destination, batch,
         SPLICE_F_MOVE | SPLICE_F_MORE, calls);
+    if (batch_size != kHttp1CoalesceSize) {
+      break;
+    }
     batch = batch_size;
   }
 
