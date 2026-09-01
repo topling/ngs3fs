@@ -1572,8 +1572,12 @@ void Http2Client::consume(const RangeResponse& response) {
 
 // HTTP/1.1 client.
 constexpr size_t kMaxResponseHeaderBytes = 64U * 1024U;
-constexpr size_t kHttp1ReadSize = 1024;
-constexpr int kHttp1CoalesceTimeoutMs = 5'000;
+constexpr size_t kHttp1ReadSize          = 1024;
+constexpr int    kHttp1CoalesceTimeoutMs = 5'000;
+const size_t     kHttp1PageSize          = [] {
+  const long value = ::sysconf(_SC_PAGESIZE);
+  return value > 0 ? size_t(value) : size_t(4096);
+}();
 
 [[noreturn]] void http1_throw_errno(const char* operation);
 
@@ -1651,7 +1655,19 @@ class ReceiveLowWater {
 
   ~ReceiveLowWater() { restore(); }
 
-  bool set(size_t bytes) noexcept {
+  bool set(size_t bytes, uint64_t body_offset, size_t capacity) noexcept {
+    if (bytes == 0 || capacity == 0) {
+      return false;
+    }
+    if (bytes > capacity) {
+      bytes = capacity;
+      const size_t phase = size_t(body_offset % kHttp1PageSize);
+      const size_t excess =
+          (phase + bytes % kHttp1PageSize) % kHttp1PageSize;
+      if (excess != 0 && bytes > excess) {
+        bytes -= excess;
+      }
+    }
     if (bytes == 0 || bytes > size_t(INT_MAX)) {
       return false;
     }
@@ -1682,7 +1698,18 @@ class ReceiveLowWater {
   bool active_ = false;
 };
 
-bool coalesce_body(UniqueFd& socket, size_t bytes, int io_timeout_ms) {
+size_t http1_receive_capacity(int socket) noexcept {
+  int value = 0;
+  socklen_t size = sizeof(value);
+  if (::getsockopt(socket, SOL_SOCKET, SO_RCVBUF, &value, &size) != 0 ||
+      size != sizeof(value) || value < 2) {
+    return 0;
+  }
+  return size_t(value / 2);
+}
+
+bool coalesce_body(UniqueFd& socket, size_t bytes, uint64_t body_offset,
+                   size_t receive_capacity, int io_timeout_ms) {
   if (bytes == 0) {
     return false;
   }
@@ -1691,7 +1718,7 @@ bool coalesce_body(UniqueFd& socket, size_t bytes, int io_timeout_ms) {
   const uint64_t deadline = http1_monotonic_ns() +
                             uint64_t(timeout_ms) * 1'000'000ULL;
   ReceiveLowWater low_water(socket);
-  if (!low_water.set(bytes)) {
+  if (!low_water.set(bytes, body_offset, receive_capacity)) {
     return false;
   }
 
@@ -2095,7 +2122,9 @@ class Http1Client final : public HttpClient {
               std::shared_ptr<TlsTunnel> connected_tunnel = {},
               int connected_io_timeout_ms = kRequestIoTimeoutMs,
               int connected_connect_timeout_ms = kConnectTimeoutMs,
-              bool receive_low_water_available = true)
+              bool receive_low_water_available = true,
+              size_t receive_coalesce_threshold =
+                  kDefaultReceiveCoalesceThreshold)
       : tunnel(std::move(connected_tunnel)),
         socket(std::move(connected_socket)),
         authority(std::move(request_authority)),
@@ -2104,7 +2133,13 @@ class Http1Client final : public HttpClient {
         io_timeout_ms(connected_io_timeout_ms),
         connect_timeout_ms(connected_connect_timeout_ms),
         tls(tunnel != nullptr),
-        low_water_available(receive_low_water_available) {}
+        low_water_available(receive_low_water_available),
+        coalesce_threshold(receive_coalesce_threshold) {
+    if (!tls && low_water_available) {
+      receive_capacity = http1_receive_capacity(socket.get());
+      low_water_available = receive_capacity != 0;
+    }
+  }
 
   Response get_range(std::string_view path, uint64_t offset,
                      size_t length, Pipe& destination,
@@ -2151,8 +2186,10 @@ class Http1Client final : public HttpClient {
   uint64_t tls_upload_request_id = 0;
   size_t upload_sent = 0;
   size_t upload_length = kUnknownBodyLength;
-  bool tls = false;
-  bool low_water_available = true;
+  bool tls                  = false;
+  bool low_water_available  = true;
+  size_t receive_capacity   = 0;
+  size_t coalesce_threshold = kDefaultReceiveCoalesceThreshold;
 
   void ensure_connected() {
     if (socket) {
@@ -2173,13 +2210,17 @@ class Http1Client final : public HttpClient {
     } else {
       socket = connect_tcp(
           host, port, connect_timeout_ms, io_timeout_ms);
+      if (low_water_available) {
+        receive_capacity = http1_receive_capacity(socket.get());
+        low_water_available = receive_capacity != 0;
+      }
     }
   }
 
   Response receive_response(std::string_view method, Pipe* destination,
                             size_t max_body_bytes, uint64_t wire_start_ns,
-                            bool capture_headers,
-                            bool measure_transport) {
+                            bool capture_headers, bool measure_transport,
+                            uint64_t response_offset) {
     std::array<std::byte, kHttp1ReadSize> buf;
     size_t begin = 0;
     size_t end   = 0;
@@ -2213,7 +2254,7 @@ class Http1Client final : public HttpClient {
             http1_throw_errno("recv(HTTP/1.1 header)");
           }
           begin = 0;
-          end   = static_cast<size_t>(n);
+          end   = size_t(n);
         }
 
         const size_t before = response.body_bytes;
@@ -2292,9 +2333,14 @@ class Http1Client final : public HttpClient {
               response.body_bytes += remaining;
               response.fallback_copied_bytes += remaining;
             } else {
-              if (!tls && low_water_available) {
+              if (!tls && low_water_available &&
+                  coalesce_threshold != 0 &&
+                  remaining >= coalesce_threshold) {
                 response.low_water_used =
-                    coalesce_body(socket, remaining, io_timeout_ms);
+                    coalesce_body(socket, remaining,
+                                  response_offset + response.body_bytes,
+                                  receive_capacity,
+                                  io_timeout_ms);
               }
               response.externally_spliced_bytes = splice_exact(
                   socket.get(), destination->write_fd(), remaining,
@@ -2362,7 +2408,8 @@ class Http1Client final : public HttpClient {
                          bool capture_headers,
                          bool measure_transport,
                          std::span<const Header> generated_headers = {},
-                         bool trusted_headers = false) {
+                         bool trusted_headers = false,
+                         uint64_t response_offset = 0) {
     if (request_active) {
       throw std::logic_error("HTTP/1.1 connection already has a request");
     }
@@ -2388,7 +2435,7 @@ class Http1Client final : public HttpClient {
       }
       Response response = receive_response(
           method, response_pipe, max_response_body, wire_start_ns,
-          capture_headers, measure_transport);
+          capture_headers, measure_transport, response_offset);
       response.externally_sent_bytes = sent;
       request_active = false;
       return response;
@@ -2442,7 +2489,7 @@ Response Http1Client::get_range(
 
   return perform("GET", path, extra_headers, std::nullopt, -1, 0,
                  &destination, length, capture_headers,
-                 measure_transport, generated_headers, true);
+                 measure_transport, generated_headers, true, offset);
 }
 
 Response Http1Client::put_from_fd(
@@ -2589,7 +2636,7 @@ Response Http1Client::finish_upload(size_t max_response_body) {
       send_all(socket.get(), end);
     }
     Response response = receive_response(
-        upload_method, nullptr, max_response_body, 0, true, false);
+        upload_method, nullptr, max_response_body, 0, true, false, 0);
     response.externally_sent_bytes = upload_sent;
     request_active = false;
     upload_chunked = false;
@@ -2640,7 +2687,8 @@ Response Http1Client::request_no_body(
 std::unique_ptr<HttpClient> HttpClient::connect(
     std::string_view host, uint16_t port, std::string authority, bool tls,
     int io_timeout_ms, int connect_timeout_ms, int probe_timeout_ms,
-    bool http1_low_water_available) {
+    bool http1_low_water_available,
+    size_t receive_coalesce_threshold) {
   if (authority.empty()) {
     authority = std::string(host) + ':' + std::to_string(port);
   }
@@ -2657,7 +2705,8 @@ std::unique_ptr<HttpClient> HttpClient::connect(
     return std::make_unique<Http1Client>(
         std::move(transport.socket), std::move(authority), std::string(host),
         port, std::move(transport.tunnel), io_timeout_ms,
-        connect_timeout_ms, http1_low_water_available);
+        connect_timeout_ms, http1_low_water_available,
+        receive_coalesce_threshold);
   }
 
   auto h2 = std::make_unique<Http2Client>(
@@ -2676,5 +2725,5 @@ std::unique_ptr<HttpClient> HttpClient::connect(
       connect_tcp(host, port, connect_timeout_ms, io_timeout_ms),
       std::move(authority), std::string(host), port,
       std::shared_ptr<TlsTunnel>{}, io_timeout_ms, connect_timeout_ms,
-      http1_low_water_available);
+      http1_low_water_available, receive_coalesce_threshold);
 }

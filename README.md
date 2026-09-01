@@ -28,14 +28,19 @@ multi-file namespace. It remains experimental rather than production-ready.
 - HTTP/1.1 response headers are scanned once by llhttp. For a fixed-length
   response, llhttp pauses at the header boundary, body bytes already returned
   by that `recv(2)` are copied once into the transport pipe, and the remainder
-  is requested from `splice(2)` at its full remaining length. Cleartext
-  HTTP/1.1 uses `SO_RCVLOWAT` plus a bounded `poll(2)` to coalesce arrivals
-  before that splice; kernel short returns are still retried without an
-  artificial batching threshold. A mount-time set/read-back/restore preflight
-  records whether `SO_RCVLOWAT` is usable. Failure prints one warning and
-  retains the old immediate-splice behavior without retrying the failed socket
-  option on every read. Chunked and EOF-delimited responses are strictly
-  parsed by llhttp and use a bounded copied fallback.
+  is requested from `splice(2)` at its full remaining length. For cleartext
+  HTTP/1.1, a remaining body of at least 64 KiB first uses a temporary
+  `SO_RCVLOWAT` plus one bounded `poll(2)` to coalesce arrivals; shorter bodies
+  skip all LOWAT setup and splice immediately. The threshold is configurable
+  with `--receive-coalesce-threshold`, and `0` disables coalescing. LOWAT is
+  capped to the socket's attainable receive capacity. When the whole remainder
+  does not fit, the per-request value is reduced so the response range position
+  reached after header-overread bytes and LOWAT bytes is page-aligned. The
+  option is restored before splice. A mount-time preflight warns and falls back
+  to immediate splice when the socket option is unavailable. Kernel short
+  returns are still retried.
+  Chunked and EOF-delimited responses are strictly parsed by llhttp and use a
+  bounded copied fallback.
 - Range GET payload path:
 
   ```text
@@ -349,6 +354,7 @@ mkdir -p mount
   --checksum auto \
   --connect-timeout 5000 --request-timeout 30000 \
   --protocol-probe-timeout 1000 --metadata-timeout 1000 \
+  --receive-coalesce-threshold 64KiB \
   --stats-interval 60 \
   --io-size 256KiB -R 256KiB -T 1000 -I 1000000 \
   -P 8MiB -c 4 -C 8 -B 256MiB \
@@ -362,6 +368,10 @@ virtual-hosted requests are inferred from `--authority` and `--bucket`.
 `--io-size` controls only the preferred transfer-size hint returned by
 `statfs(2)` and must be nonzero; it does not change FUSE request sizing or
 kernel read-ahead.
+`--receive-coalesce-threshold` applies after any body bytes read together with
+the HTTP/1.1 header have been subtracted. Smaller remaining bodies take the
+immediate-splice path without socket-option or poll overhead; `0` selects that
+path for every response.
 `--verify-read-checksum` is intentionally independent of the upload checksum
 selection and is disabled unless explicitly requested.
 `--read-ahead` must be page-aligned; `0` disables it. Values above the

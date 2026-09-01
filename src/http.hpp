@@ -52,6 +52,7 @@ struct ReceiveResult {
 };
 
 inline constexpr size_t kDefaultShadowSpanSize = 256U * 1024U;
+inline constexpr size_t kDefaultReceiveCoalesceThreshold = 64U * 1024U;
 inline constexpr size_t kUnknownBodyLength = SIZE_MAX;
 
 bool http1_low_water_preflight(std::string& error) noexcept;
@@ -102,7 +103,9 @@ class HttpClient {
       int io_timeout_ms = kRequestIoTimeoutMs,
       int connect_timeout_ms = kConnectTimeoutMs,
       int probe_timeout_ms = kProtocolProbeTimeoutMs,
-      bool http1_low_water_available = true);
+      bool http1_low_water_available = true,
+      size_t receive_coalesce_threshold =
+          kDefaultReceiveCoalesceThreshold);
 
   virtual ~HttpClient() = default;
 

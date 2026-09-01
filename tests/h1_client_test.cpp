@@ -172,6 +172,21 @@ void run_server(ServerInput input) {
   std::this_thread::sleep_for(std::chrono::milliseconds(5));
   write_all(socket.get(), std::span(input.download).subspan(prefix));
 
+  constexpr size_t small_size = 64U * 1024U + 512U;
+  const std::string small = read_request_head(socket.get(), "small GET");
+  assert(small.starts_with("GET /bucket/small HTTP/1.1\r\n"));
+  assert(small.find("range: bytes=0-66047\r\n") != std::string::npos);
+  const std::string small_response =
+      "HTTP/1.1 206 Partial Content\r\ncontent-length: " +
+      std::to_string(small_size) + "\r\n\r\n";
+  std::vector<std::byte> small_first(small_response.size() + prefix);
+  memcpy(small_first.data(), small_response.data(), small_response.size());
+  memcpy(small_first.data() + small_response.size(),
+         input.download.data(), prefix);
+  write_all(socket.get(), small_first);
+  write_all(socket.get(),
+            std::span(input.download).subspan(prefix, small_size - prefix));
+
   const std::string put = read_request_head(socket.get(), "PUT");
   assert(put.starts_with("PUT /bucket/key HTTP/1.1\r\n"));
   assert(content_length(put) == input.upload.size());
@@ -286,6 +301,17 @@ int main() {
   assert(actual_download == expected_download);
   client->consume(downloaded);
 
+  constexpr size_t small_size = 64U * 1024U + 512U;
+  Pipe small_pipe = Pipe::create(small_size);
+  const Response small = client->get_range(
+      "/bucket/small", 0, small_size, small_pipe);
+  assert(small.fallback_copied_bytes > 512);
+  assert(!small.low_water_used);
+  std::vector<std::byte> actual_small(small_size);
+  read_all(small_pipe.read_fd(), actual_small);
+  assert(memcmp(actual_small.data(), expected_download.data(), small_size) == 0);
+  client->consume(small);
+
   UniqueFd upload_memory(
       ::memfd_create("h1-upload", MFD_CLOEXEC));
   assert(upload_memory);
@@ -338,7 +364,7 @@ int main() {
 
   server.join();
 
-  std::vector<std::byte> delayed_body(64U * 1024U);
+  std::vector<std::byte> delayed_body(128U * 1024U);
   for (size_t i = 0; i < delayed_body.size(); ++i) {
     delayed_body[i] = std::byte((i * 31U + 13U) & 0xffU);
   }
@@ -363,15 +389,60 @@ int main() {
     memcpy(first.data(), response.data(), response.size());
     memcpy(first.data() + response.size(), delayed_body.data(), prefix);
     write_all(socket.get(), first);
-    std::this_thread::sleep_for(std::chrono::milliseconds(
-        low_water_available ? 350 : 100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     write_all(socket.get(), std::span(delayed_body).subspan(prefix));
+
+    const std::string repeated = read_request_head(
+        socket.get(), "repeated delayed GET");
+    assert(repeated.starts_with(
+        "GET /bucket/delayed-repeat HTTP/1.1\r\n"));
+    send_text(socket.get(),
+              "HTTP/1.1 103 Early Hints\r\n"
+              "link: </next>; rel=preload\r\n\r\n"
+              "HTTP/1.1 206 Partial Content\r\ncontent-length: " +
+                  std::to_string(delayed_body.size()) + "\r\n\r\n");
+    write_all(socket.get(), delayed_body);
+
+    constexpr size_t changed_size = 96U * 1024U;
+    const std::string changed = read_request_head(
+        socket.get(), "changed-size delayed GET");
+    assert(changed.starts_with(
+        "GET /bucket/delayed-changed HTTP/1.1\r\n"));
+    send_text(socket.get(),
+              "HTTP/1.1 206 Partial Content\r\ncontent-length: " +
+                  std::to_string(changed_size) + "\r\n\r");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    send_text(socket.get(), "\n");
+    write_all(socket.get(), std::span(delayed_body).first(changed_size));
+
+    constexpr size_t first_tail_chunk = 96U * 1024U;
+    const std::string short_tail = read_request_head(
+        socket.get(), "short-tail delayed GET");
+    assert(short_tail.starts_with(
+        "GET /bucket/delayed-short-tail HTTP/1.1\r\n"));
+    send_text(socket.get(),
+              "HTTP/1.1 206 Partial Content\r\ncontent-length: " +
+                  std::to_string(delayed_body.size()) + "\r\n\r\n");
+    write_all(socket.get(),
+              std::span(delayed_body).first(first_tail_chunk));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    write_all(socket.get(),
+              std::span(delayed_body).subspan(first_tail_chunk));
 
     const std::string head = read_request_head(socket.get(), "delayed HEAD");
     assert(head.starts_with("HEAD /bucket/delayed HTTP/1.1\r\n"));
     send_text(socket.get(),
               "HTTP/1.1 200 OK\r\n"
               "content-length: 65536\r\n\r\n");
+
+    const std::string missing = read_request_head(
+        socket.get(), "missing delayed GET");
+    assert(missing.starts_with(
+        "GET /bucket/delayed-missing HTTP/1.1\r\n"));
+    send_text(socket.get(),
+              "HTTP/1.1 404 Not Found\r\n"
+              "content-length: 9\r\n\r\n"
+              "not found");
 
     const std::string close = read_request_head(socket.get(), "closing HEAD");
     assert(close.starts_with("HEAD /bucket/delayed-close HTTP/1.1\r\n"));
@@ -392,10 +463,44 @@ int main() {
   std::vector<std::byte> actual_delayed(delayed_body.size());
   read_all(delayed_pipe.read_fd(), actual_delayed);
   assert(actual_delayed == delayed_body);
+
+  Pipe repeated_pipe = Pipe::create(delayed_body.size());
+  const Response repeated = delayed_client->get_range(
+      "/bucket/delayed-repeat", 0, delayed_body.size(), repeated_pipe);
+  assert(repeated.low_water_used == low_water_available);
+  read_all(repeated_pipe.read_fd(), actual_delayed);
+  assert(actual_delayed == delayed_body);
+
+  constexpr size_t changed_size = 96U * 1024U;
+  Pipe changed_pipe = Pipe::create(changed_size);
+  const Response changed = delayed_client->get_range(
+      "/bucket/delayed-changed", 0, changed_size, changed_pipe);
+  assert(changed.low_water_used == low_water_available);
+  std::vector<std::byte> actual_changed(changed_size);
+  read_all(changed_pipe.read_fd(), actual_changed);
+  assert(memcmp(actual_changed.data(), delayed_body.data(), changed_size) == 0);
+
+  Pipe short_tail_pipe = Pipe::create(delayed_body.size());
+  const Response short_tail = delayed_client->get_range(
+      "/bucket/delayed-short-tail", 0, delayed_body.size(), short_tail_pipe);
+  assert(short_tail.low_water_used == low_water_available);
+  std::vector<std::byte> actual_short_tail(delayed_body.size());
+  read_all(short_tail_pipe.read_fd(), actual_short_tail);
+  assert(actual_short_tail == delayed_body);
+
   const Response delayed_head = delayed_client->request_no_body(
       "HEAD", "/bucket/delayed");
   assert(delayed_head.status == 200);
   assert(delayed_head.body_bytes == 0);
+
+  Pipe missing_pipe = Pipe::create(delayed_body.size());
+  const Response missing = delayed_client->get_range(
+      "/bucket/delayed-missing", 0, delayed_body.size(), missing_pipe);
+  assert(missing.status == 404);
+  assert(!missing.low_water_used);
+  std::array<std::byte, 9> missing_body{};
+  read_all(missing_pipe.read_fd(), missing_body);
+  assert(memcmp(missing_body.data(), "not found", missing_body.size()) == 0);
   const Response closing_head = delayed_client->request_no_body(
       "HEAD", "/bucket/delayed-close");
   assert(closing_head.status == 200);

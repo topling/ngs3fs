@@ -269,9 +269,17 @@ jobs:
         run: |
           sudo env \
             GOOFYS_BIN="$GITHUB_WORKSPACE/build/tools/goofys" \
-            BENCHMARK_REPETITIONS=3 \
+            BENCHMARK_REPETITIONS=4 \
             ./scripts/benchmark_random_read.sh \
             "$GITHUB_WORKSPACE/build/benchmarks/github-random-read"
+
+      - name: A/B test receive coalescing
+        run: |
+          sudo env \
+            BENCHMARK_REPETITIONS=4 \
+            RECEIVE_COALESCE_THRESHOLDS="0 64KiB" \
+            ./scripts/benchmark_receive_coalesce.sh \
+            "$GITHUB_WORKSPACE/build/benchmarks/github-receive-coalesce"
 
       - name: Profile strict random advice
         if: always()
@@ -317,6 +325,14 @@ jobs:
             build/benchmarks/github-random-read/*/ngs3fs.log
             build/benchmarks/github-random-read/*/goofys.log
             build/benchmarks/github-random-read/*/versity.log
+            build/benchmarks/github-receive-coalesce/system.txt
+            build/benchmarks/github-receive-coalesce/samples.csv
+            build/benchmarks/github-receive-coalesce/summary.csv
+            build/benchmarks/github-receive-coalesce/*/random-read-summary.csv
+            build/benchmarks/github-receive-coalesce/*/*-random-read-result.txt
+            build/benchmarks/github-receive-coalesce/*/ngs3fs-random-read-requests.log
+            build/benchmarks/github-receive-coalesce/*/ngs3fs.log
+            build/benchmarks/github-receive-coalesce/*/versity.log
             build/profiles/github-*-advice/profile-summary.csv
             build/profiles/github-*-advice/random-read.txt
             build/profiles/github-*-advice/ngs3fs.log

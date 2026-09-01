@@ -14,6 +14,7 @@ object_mib=${OBJECT_MIB:-256}
 order=${ORDER:-forward}
 metrics=${METRICS:-0}
 read_ahead=${READ_AHEAD:-256KiB}
+receive_coalesce_threshold=${RECEIVE_COALESCE_THRESHOLD:-64KiB}
 max_connections=${MAX_CONNECTIONS:-8}
 random_files=${RANDOM_READ_FILES:-32}
 random_threads=${RANDOM_READ_THREADS:-16}
@@ -22,6 +23,7 @@ random_file_size=${RANDOM_READ_FILE_SIZE:-4194304}
 random_maximum_read=${RANDOM_READ_MAXIMUM:-262144}
 random_seed=${RANDOM_READ_SEED:-0x4e47533346535244}
 random_advice=${RANDOM_READ_ADVICE:-random}
+perf=${PERF_BIN:-perf}
 
 versitygw="$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64/versitygw"
 ngs3fs=${NGS3FS_BIN:-"$project_dir/build/dev/ngs3fs"}
@@ -114,6 +116,7 @@ process_cpu_ns() {
 start_ngs3fs() {
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
     "$ngs3fs" -f "${metrics_args[@]}" -R "$read_ahead" \
+      --receive-coalesce-threshold "$receive_coalesce_threshold" \
       -C "$max_connections" \
       -e 127.0.0.1 -p "$port" \
       -a "127.0.0.1:$port" -b "$bucket" \
@@ -169,8 +172,8 @@ run_case() {
 
   first_line=$(wc -l <"$daemon_log")
   start_ns=$(process_cpu_ns "$daemon_pid")
-  if perf --version >/dev/null 2>&1; then
-    perf stat --no-big-num -x, \
+  if "$perf" --version >/dev/null 2>&1; then
+    "$perf" stat --no-big-num -x, \
       -e task-clock,cycles:u,instructions:u,context-switches,cpu-migrations,page-faults \
       -p "$daemon_pid" -o "$stem-perf.csv" sleep 3600 &
     perf_pid=$!
@@ -286,7 +289,10 @@ run_random_read_client() {
 
 trap cleanup EXIT INT TERM
 
-required_binaries=("$versitygw" "$ngs3fs" "$goofys")
+required_binaries=("$versitygw" "$ngs3fs")
+if [[ "$client" = goofys || "$client" = both ]]; then
+  required_binaries+=("$goofys")
+fi
 random_advice_args=()
 case "$random_advice" in
   random) ;;
