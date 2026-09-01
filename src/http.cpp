@@ -2186,10 +2186,11 @@ class Http1Client final : public HttpClient {
   uint64_t tls_upload_request_id = 0;
   size_t upload_sent = 0;
   size_t upload_length = kUnknownBodyLength;
-  bool tls                  = false;
-  bool low_water_available  = true;
-  size_t receive_capacity   = 0;
-  size_t coalesce_threshold = kDefaultReceiveCoalesceThreshold;
+  bool tls                        = false;
+  bool low_water_available        = true;
+  bool receive_capacity_refreshed = false;
+  size_t receive_capacity         = 0;
+  size_t coalesce_threshold       = kDefaultReceiveCoalesceThreshold;
 
   void ensure_connected() {
     if (socket) {
@@ -2210,6 +2211,7 @@ class Http1Client final : public HttpClient {
     } else {
       socket = connect_tcp(
           host, port, connect_timeout_ms, io_timeout_ms);
+      receive_capacity_refreshed = false;
       if (low_water_available) {
         receive_capacity = http1_receive_capacity(socket.get());
         low_water_available = receive_capacity != 0;
@@ -2346,6 +2348,14 @@ class Http1Client final : public HttpClient {
                   socket.get(), destination->write_fd(), remaining,
                   SPLICE_F_MOVE | SPLICE_F_MORE,
                   &response.transport_splice_calls);
+              if (!tls && low_water_available &&
+                  !receive_capacity_refreshed &&
+                  remaining > receive_capacity) {
+                receive_capacity = std::max(
+                    receive_capacity,
+                    http1_receive_capacity(socket.get()));
+                receive_capacity_refreshed = true;
+              }
               response.body_bytes += remaining;
             }
           }
