@@ -77,7 +77,7 @@ size_t splice_from_fd_exact(int source_fd, uint64_t& source_offset,
 
 size_t splice_some(int source_fd, uint64_t* source_offset,
                    int destination_fd, size_t length,
-                   unsigned int flags, size_t* calls = nullptr);
+                   unsigned int flags);
 
 size_t tee_exact(int source_fd, int destination_fd,
                  size_t length, unsigned int flags);
@@ -96,9 +96,12 @@ void read_all(int fd, std::span<std::byte> bytes);
 inline constexpr int kConnectTimeoutMs = 5'000;
 inline constexpr int kRequestIoTimeoutMs = 30'000;
 inline constexpr int kProtocolProbeTimeoutMs = 1'000;
+inline constexpr size_t kDefaultSocketReceiveBufferSize =
+    2U * 1024U * 1024U;
 
 UniqueFd connect_tcp(std::string_view host, uint16_t port,
                      int connect_timeout_ms = kConnectTimeoutMs,
-                     int io_timeout_ms = kRequestIoTimeoutMs);
+                     int io_timeout_ms = kRequestIoTimeoutMs,
+                     size_t receive_buffer_size = 0);
 
 void set_socket_receive_timeout(int fd, int timeout_ms);

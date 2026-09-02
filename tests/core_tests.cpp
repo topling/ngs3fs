@@ -3,6 +3,7 @@
 #include "s3.hpp"
 
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 
 #include <array>
@@ -10,6 +11,7 @@
 #undef NDEBUG
 #endif
 #include <assert.h>
+#include <limits.h>
 #include <stddef.h>
 #include <iostream>
 #include <span>
@@ -442,6 +444,42 @@ void test_amz_datetime() {
   assert(now[15] == 'Z');
 }
 
+void test_socket_receive_buffer_fallback() {
+  UniqueFd listener(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC,
+                             IPPROTO_TCP));
+  assert(listener);
+  sockaddr_in address{};
+  address.sin_family      = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  assert(::bind(listener.get(), reinterpret_cast<sockaddr*>(&address),
+                sizeof(address)) == 0);
+  assert(::listen(listener.get(), 1) == 0);
+  socklen_t address_size = sizeof(address);
+  assert(::getsockname(listener.get(), reinterpret_cast<sockaddr*>(&address),
+                       &address_size) == 0);
+
+  UniqueFd automatic(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC,
+                              IPPROTO_TCP));
+  assert(automatic);
+  int automatic_size = 0;
+  socklen_t automatic_size_length = sizeof(automatic_size);
+  assert(::getsockopt(automatic.get(), SOL_SOCKET, SO_RCVBUF,
+                      &automatic_size, &automatic_size_length) == 0);
+  assert(automatic_size_length == sizeof(automatic_size));
+
+  UniqueFd client = connect_tcp(
+      "127.0.0.1", ntohs(address.sin_port), 1'000, 1'000,
+      size_t(INT_MAX));
+  int actual = 0;
+  socklen_t actual_size = sizeof(actual);
+  assert(::getsockopt(client.get(), SOL_SOCKET, SO_RCVBUF,
+                      &actual, &actual_size) == 0);
+  assert(actual_size == sizeof(actual));
+  assert(actual == automatic_size);
+  UniqueFd peer(::accept4(listener.get(), nullptr, nullptr, SOCK_CLOEXEC));
+  assert(peer);
+}
+
 void test_s3_mtime() {
   assert(parse_s3_mtime("1969-12-31T23:59:59Z") == -1);
   assert(parse_s3_mtime("1970-01-01T00:00:00Z") == 0);
@@ -462,6 +500,7 @@ int main() {
   test_data_checksums();
   test_aws_sigv4_reference_vector();
   test_amz_datetime();
+  test_socket_receive_buffer_fallback();
   test_s3_mtime();
   std::cout << "ngs3fs core tests passed\n";
   return 0;

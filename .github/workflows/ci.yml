@@ -263,6 +263,7 @@ jobs:
         run: |
           sudo sysctl -w kernel.perf_event_paranoid=-1
           sudo sysctl -w kernel.kptr_restrict=0
+          sudo sysctl -w net.core.rmem_max=16777216
           perf --version
 
       - name: Compare concurrent random reads
@@ -273,13 +274,13 @@ jobs:
             ./scripts/benchmark_random_read.sh \
             "$GITHUB_WORKSPACE/build/benchmarks/github-random-read"
 
-      - name: A/B test receive coalescing
+      - name: A/B test socket receive buffer
         run: |
           sudo env \
-            BENCHMARK_REPETITIONS=4 \
-            RECEIVE_COALESCE_THRESHOLDS="0 64KiB" \
-            ./scripts/benchmark_receive_coalesce.sh \
-            "$GITHUB_WORKSPACE/build/benchmarks/github-receive-coalesce"
+            BENCHMARK_REPETITIONS=8 \
+            SOCKET_BUFFER_SIZES="0 2MiB" \
+            ./scripts/benchmark_socket_buffer.sh \
+            "$GITHUB_WORKSPACE/build/benchmarks/github-socket-buffer"
 
       - name: Profile strict random advice
         if: always()
@@ -325,14 +326,14 @@ jobs:
             build/benchmarks/github-random-read/*/ngs3fs.log
             build/benchmarks/github-random-read/*/goofys.log
             build/benchmarks/github-random-read/*/versity.log
-            build/benchmarks/github-receive-coalesce/system.txt
-            build/benchmarks/github-receive-coalesce/samples.csv
-            build/benchmarks/github-receive-coalesce/summary.csv
-            build/benchmarks/github-receive-coalesce/*/random-read-summary.csv
-            build/benchmarks/github-receive-coalesce/*/*-random-read-result.txt
-            build/benchmarks/github-receive-coalesce/*/ngs3fs-random-read-requests.log
-            build/benchmarks/github-receive-coalesce/*/ngs3fs.log
-            build/benchmarks/github-receive-coalesce/*/versity.log
+            build/benchmarks/github-socket-buffer/system.txt
+            build/benchmarks/github-socket-buffer/samples.csv
+            build/benchmarks/github-socket-buffer/summary.csv
+            build/benchmarks/github-socket-buffer/*/random-read-summary.csv
+            build/benchmarks/github-socket-buffer/*/*-random-read-result.txt
+            build/benchmarks/github-socket-buffer/*/ngs3fs-random-read-requests.log
+            build/benchmarks/github-socket-buffer/*/ngs3fs.log
+            build/benchmarks/github-socket-buffer/*/versity.log
             build/profiles/github-*-advice/profile-summary.csv
             build/profiles/github-*-advice/random-read.txt
             build/profiles/github-*-advice/ngs3fs.log

@@ -28,17 +28,14 @@ multi-file namespace. It remains experimental rather than production-ready.
 - HTTP/1.1 response headers are scanned once by llhttp. For a fixed-length
   response, llhttp pauses at the header boundary, body bytes already returned
   by that `recv(2)` are copied once into the transport pipe, and the remainder
-  is requested from `splice(2)` at its full remaining length. For cleartext
-  HTTP/1.1, a remaining body of at least 64 KiB first uses a temporary
-  `SO_RCVLOWAT` plus one bounded `poll(2)` to coalesce arrivals; shorter bodies
-  skip all LOWAT setup and splice immediately. The threshold is configurable
-  with `--receive-coalesce-threshold`, and `0` disables coalescing. LOWAT is
-  capped to the socket's attainable receive capacity. When the whole remainder
-  does not fit, the per-request value is reduced so the response range position
-  reached after header-overread bytes and LOWAT bytes is page-aligned. The
-  option is restored before splice. A mount-time preflight warns and falls back
-  to immediate splice when the socket option is unavailable. Kernel short
-  returns are still retried.
+  is requested from blocking `splice(2)` at its full remaining length. Kernel
+  short returns are retried without an extra `poll(2)` or `SO_RCVLOWAT` state
+  machine. Each TCP connection requests a receive buffer of
+  `max(2 MiB, max_read)` before `connect(2)` so short, high-bandwidth S3 range
+  requests do not depend on receive-window growth one RTT later. The kernel may
+  cap this request; ngs3fs then warns once, discards the locked socket, and
+  reconnects with normal TCP receive autotuning. Use `--socket-buffer-size 0`
+  to select autotuning directly.
   Chunked and EOF-delimited responses are strictly parsed by llhttp and use a
   bounded copied fallback.
 - Range GET payload path:
@@ -354,7 +351,7 @@ mkdir -p mount
   --checksum auto \
   --connect-timeout 5000 --request-timeout 30000 \
   --protocol-probe-timeout 1000 --metadata-timeout 1000 \
-  --receive-coalesce-threshold 64KiB \
+  --socket-buffer-size 2MiB \
   --stats-interval 60 \
   --io-size 256KiB -R 256KiB -T 1000 -I 1000000 \
   -P 8MiB -c 4 -C 8 -B 256MiB \
@@ -368,10 +365,11 @@ virtual-hosted requests are inferred from `--authority` and `--bucket`.
 `--io-size` controls only the preferred transfer-size hint returned by
 `statfs(2)` and must be nonzero; it does not change FUSE request sizing or
 kernel read-ahead.
-`--receive-coalesce-threshold` applies after any body bytes read together with
-the HTTP/1.1 header have been subtracted. Smaller remaining bodies take the
-immediate-splice path without socket-option or poll overhead; `0` selects that
-path for every response.
+`--socket-buffer-size` requests the per-connection TCP receive-buffer capacity
+before connect. Its default is the greater of 2 MiB and FUSE `max_read`; `0`
+leaves receive-window sizing to normal kernel TCP autotuning. Linux may cap an
+explicit value at `net.core.rmem_max`, in which case ngs3fs prints one warning
+and recreates the socket without locking its receive-buffer size.
 `--verify-read-checksum` is intentionally independent of the upload checksum
 selection and is disabled unless explicitly requested.
 `--read-ahead` must be page-aligned; `0` disables it. Values above the

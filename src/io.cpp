@@ -9,9 +9,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 #include <chrono>
 #include <limits>
 #include <memory>
@@ -117,13 +120,10 @@ size_t splice_from_fd_exact(int source_fd, uint64_t& source_offset,
 
 size_t splice_some(int source_fd, uint64_t* source_offset,
                    int destination_fd, size_t length,
-                   unsigned int flags, size_t* calls) {
+                   unsigned int flags) {
   for (;;) {
     off_t offset = source_offset == nullptr ? 0 : off_t(*source_offset);
     off_t* position = source_offset == nullptr ? nullptr : &offset;
-    if (calls != nullptr) {
-      ++*calls;
-    }
     const ssize_t result = ::splice(source_fd, position, destination_fd,
                                     nullptr, length, flags);
     if (result > 0) {
@@ -339,8 +339,61 @@ void configure_blocking_socket(int fd, int io_timeout_ms) {
   }
 }
 
+size_t socket_receive_buffer_capacity(int fd) noexcept {
+  int actual = 0;
+  socklen_t size = sizeof(actual);
+  if (::getsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                   &actual, &size) != 0 || size != sizeof(actual)) {
+    return 0;
+  }
+  // Linux reports twice the user-visible receive-buffer allowance.
+  return actual > 0 ? size_t(actual) / 2 : 0;
+}
+
+bool configure_socket_receive_buffer(int fd, size_t requested) noexcept {
+  if (requested == 0) {
+    return true;
+  }
+
+  static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+  const auto warn = [&](const char* reason, size_t effective) {
+    if (!warned.test_and_set(std::memory_order_relaxed)) {
+      fprintf(stderr,
+              "warning: unable to obtain the requested %zu-byte TCP "
+              "receive buffer (%s, effective %zu bytes); reads will "
+              "fall back to TCP receive autotuning; consider raising "
+              "net.core.rmem_max\n",
+              requested, reason, effective);
+    }
+  };
+
+  if (requested > size_t(INT_MAX)) {
+    warn("value exceeds INT_MAX", 0);
+    return false;
+  }
+  const int value = int(requested);
+  if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                   &value, sizeof(value)) != 0) {
+    const int error = errno;
+    warn(strerror(error), socket_receive_buffer_capacity(fd));
+    return false;
+  }
+
+  const size_t effective = socket_receive_buffer_capacity(fd);
+  if (effective == 0) {
+    warn("SO_RCVBUF verification failed", 0);
+    return false;
+  }
+  if (effective < requested) {
+    warn("the kernel capped SO_RCVBUF", effective);
+    return false;
+  }
+  return true;
+}
+
 UniqueFd connect_tcp(std::string_view host, uint16_t port,
-                     int connect_timeout_ms, int io_timeout_ms) {
+                     int connect_timeout_ms, int io_timeout_ms,
+                     size_t receive_buffer_size) {
   if (connect_timeout_ms <= 0 || io_timeout_ms <= 0) {
     throw std::invalid_argument("socket timeouts must be positive");
   }
@@ -372,6 +425,17 @@ UniqueFd connect_tcp(std::string_view host, uint16_t port,
     if (!socket) {
       last_error = errno;
       continue;
+    }
+    if (!configure_socket_receive_buffer(
+            socket.get(), receive_buffer_size)) {
+      socket.reset(::socket(address->ai_family,
+                            address->ai_socktype | SOCK_CLOEXEC |
+                                SOCK_NONBLOCK,
+                            address->ai_protocol));
+      if (!socket) {
+        last_error = errno;
+        continue;
+      }
     }
 
     if (::connect(socket.get(), address->ai_addr, address->ai_addrlen) != 0) {

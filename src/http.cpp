@@ -275,9 +275,10 @@ struct TlsConnection {
 
 TlsConnection connect_tls(std::string_view host, uint16_t port,
                           int connect_timeout_ms = kConnectTimeoutMs,
-                          int io_timeout_ms = kRequestIoTimeoutMs) {
+                          int io_timeout_ms = kRequestIoTimeoutMs,
+                          size_t receive_buffer_size = 0) {
   UniqueFd remote = connect_tcp(
-      host, port, connect_timeout_ms, io_timeout_ms);
+      host, port, connect_timeout_ms, io_timeout_ms, receive_buffer_size);
   std::unique_ptr<SSL_CTX, SslContextDeleter> context(
       SSL_CTX_new(TLS_client_method()));
   if (!context) {
@@ -552,7 +553,8 @@ class Http2Client final : public HttpClient {
                        int connected_io_timeout_ms = kRequestIoTimeoutMs,
                        int connected_connect_timeout_ms = kConnectTimeoutMs,
                        int connected_probe_timeout_ms =
-                           kProtocolProbeTimeoutMs);
+                           kProtocolProbeTimeoutMs,
+                       size_t connected_receive_buffer_size = 0);
 
   RangeResponse get_range(std::string_view path, uint64_t offset,
                           size_t length, Pipe& destination,
@@ -615,9 +617,10 @@ class Http2Client final : public HttpClient {
   std::string authority;
   std::string host;
   uint16_t port = 0;
-  int io_timeout_ms      = kRequestIoTimeoutMs;
-  int connect_timeout_ms = kConnectTimeoutMs;
-  int probe_timeout_ms   = kProtocolProbeTimeoutMs;
+  int io_timeout_ms          = kRequestIoTimeoutMs;
+  int connect_timeout_ms     = kConnectTimeoutMs;
+  int probe_timeout_ms       = kProtocolProbeTimeoutMs;
+  size_t receive_buffer_size = 0;
   std::unique_ptr<nghttp2_session_callbacks, Http2CallbacksDeleter> callbacks;
   std::unique_ptr<nghttp2_option, Http2OptionDeleter> option;
   std::unique_ptr<nghttp2_session, Http2SessionDeleter> session;
@@ -878,7 +881,8 @@ Http2Client::Http2Client(UniqueFd connected_socket,
                          std::shared_ptr<TlsTunnel> connected_tunnel,
                          int connected_io_timeout_ms,
                          int connected_connect_timeout_ms,
-                         int connected_probe_timeout_ms)
+                         int connected_probe_timeout_ms,
+                         size_t connected_receive_buffer_size)
     : tunnel(std::move(connected_tunnel)),
       socket(std::move(connected_socket)),
       authority(std::move(request_authority)),
@@ -887,6 +891,7 @@ Http2Client::Http2Client(UniqueFd connected_socket,
       io_timeout_ms(connected_io_timeout_ms),
       connect_timeout_ms(connected_connect_timeout_ms),
       probe_timeout_ms(connected_probe_timeout_ms),
+      receive_buffer_size(connected_receive_buffer_size),
       tls(tunnel != nullptr) {
   Pipe probe = Pipe::create(kPreferredIoSize);
   maximum_frame_size = uint32_t(std::clamp<size_t>(
@@ -908,7 +913,8 @@ void Http2Client::ensure_ready() {
   std::shared_ptr<TlsTunnel> connected_tunnel;
   if (tls) {
     TlsConnection transport = connect_tls(
-        host, port, connect_timeout_ms, io_timeout_ms);
+        host, port, connect_timeout_ms, io_timeout_ms,
+        receive_buffer_size);
     if (!transport.http2) {
       throw std::runtime_error(
           "TLS reconnect changed protocol from HTTP/2");
@@ -917,7 +923,8 @@ void Http2Client::ensure_ready() {
     connected_tunnel = std::move(transport.tunnel);
   } else {
     connected = connect_tcp(
-        host, port, connect_timeout_ms, io_timeout_ms);
+        host, port, connect_timeout_ms, io_timeout_ms,
+        receive_buffer_size);
   }
   socket.reset();
   tunnel.reset();
@@ -1573,12 +1580,6 @@ void Http2Client::consume(const RangeResponse& response) {
 // HTTP/1.1 client.
 constexpr size_t kMaxResponseHeaderBytes = 64U * 1024U;
 constexpr size_t kHttp1ReadSize          = 1024;
-constexpr size_t kHttp1CoalesceSize      = 256U * 1024U;
-constexpr int    kHttp1CoalesceTimeoutMs = 5'000;
-const size_t     kHttp1PageSize          = [] {
-  const long value = ::sysconf(_SC_PAGESIZE);
-  return value > 0 ? size_t(value) : size_t(4096);
-}();
 
 [[noreturn]] void http1_throw_errno(const char* operation);
 
@@ -1593,200 +1594,6 @@ uint64_t http1_monotonic_ns() {
   }
   return static_cast<uint64_t>(value.tv_sec) * 1'000'000'000ULL +
          static_cast<uint64_t>(value.tv_nsec);
-}
-
-bool http1_low_water_preflight(std::string& error) noexcept {
-  error.clear();
-  try {
-    UniqueFd socket(::socket(
-        AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP));
-    if (!socket) {
-      throw std::system_error(errno, std::generic_category(),
-                              "socket(SO_RCVLOWAT preflight)");
-    }
-
-    int value = 2;
-    if (::setsockopt(socket.get(), SOL_SOCKET, SO_RCVLOWAT,
-                     &value, sizeof(value)) != 0) {
-      throw std::system_error(errno, std::generic_category(),
-                              "setsockopt(SO_RCVLOWAT preflight)");
-    }
-    int actual = 0;
-    socklen_t size = sizeof(actual);
-    if (::getsockopt(socket.get(), SOL_SOCKET, SO_RCVLOWAT,
-                     &actual, &size) != 0) {
-      throw std::system_error(errno, std::generic_category(),
-                              "getsockopt(SO_RCVLOWAT preflight)");
-    }
-    if (size != sizeof(actual) || actual != value) {
-      error = "SO_RCVLOWAT value was not retained";
-      return false;
-    }
-
-    value = 1;
-    if (::setsockopt(socket.get(), SOL_SOCKET, SO_RCVLOWAT,
-                     &value, sizeof(value)) != 0) {
-      throw std::system_error(errno, std::generic_category(),
-                              "setsockopt(SO_RCVLOWAT restore preflight)");
-    }
-    actual = 0;
-    size = sizeof(actual);
-    if (::getsockopt(socket.get(), SOL_SOCKET, SO_RCVLOWAT,
-                     &actual, &size) != 0) {
-      throw std::system_error(errno, std::generic_category(),
-                              "getsockopt(SO_RCVLOWAT restore preflight)");
-    }
-    if (size != sizeof(actual) || actual != value) {
-      error = "SO_RCVLOWAT default value was not restored";
-      return false;
-    }
-    return true;
-  } catch (const std::exception& exception) {
-    error = exception.what();
-    return false;
-  }
-}
-
-class ReceiveLowWater {
- public:
-  explicit ReceiveLowWater(UniqueFd& socket) noexcept : socket_(socket) {}
-
-  ReceiveLowWater(const ReceiveLowWater&) = delete;
-  ReceiveLowWater& operator=(const ReceiveLowWater&) = delete;
-
-  ~ReceiveLowWater() { restore(); }
-
-  bool set(size_t bytes) noexcept {
-    if (bytes == 0 || bytes > size_t(INT_MAX)) {
-      return false;
-    }
-    const int value = int(bytes);
-    if (value == value_) {
-      return true;
-    }
-    if (::setsockopt(socket_.get(), SOL_SOCKET, SO_RCVLOWAT,
-                     &value, sizeof(value)) != 0) {
-      return false;
-    }
-    value_ = value;
-    return true;
-  }
-
-  bool restore() noexcept {
-    if (value_ == 1) {
-      return true;
-    }
-    const int value = 1;
-    if (::setsockopt(socket_.get(), SOL_SOCKET, SO_RCVLOWAT,
-                     &value, sizeof(value)) == 0) {
-      value_ = value;
-      return true;
-    }
-    const int error = errno;
-    value_ = 1;
-    socket_.reset();
-    errno = error;
-    return false;
-  }
-
- private:
-  UniqueFd& socket_;
-  int value_ = 1;
-};
-
-size_t http1_receive_batch_size(int socket) noexcept {
-  int value = 0;
-  socklen_t size = sizeof(value);
-  if (::getsockopt(socket, SOL_SOCKET, SO_RCVBUF, &value, &size) != 0 ||
-      size != sizeof(value) || value < 2) {
-    return 0;
-  }
-  size_t bytes = size_t(value / 2);
-  bytes -= bytes % kHttp1PageSize;
-  if (bytes <= kHttp1PageSize) {
-    return 0;
-  }
-  if (bytes <= kHttp1CoalesceSize) {
-    return bytes - kHttp1PageSize;
-  }
-  return kHttp1CoalesceSize;
-}
-
-bool wait_for_body_batch(UniqueFd& socket, ReceiveLowWater& low_water,
-                         size_t bytes, int io_timeout_ms,
-                         bool& low_water_used) {
-  if (!low_water.set(bytes)) {
-    return false;
-  }
-  low_water_used = true;
-
-  const int timeout_ms = std::min(io_timeout_ms, kHttp1CoalesceTimeoutMs);
-  const uint64_t deadline = http1_monotonic_ns() +
-                            uint64_t(timeout_ms) * 1'000'000ULL;
-
-  int result;
-  for (;;) {
-    const uint64_t now = http1_monotonic_ns();
-    if (now >= deadline) {
-      result = 0;
-      break;
-    }
-    const uint64_t left_ns = deadline - now;
-    const int left_ms = int(std::min<uint64_t>(
-        (left_ns + 999'999ULL) / 1'000'000ULL, uint64_t(INT_MAX)));
-    pollfd descriptor{
-        .fd = socket.get(),
-        .events = POLLIN,
-        .revents = 0,
-    };
-    result = ::poll(&descriptor, 1, left_ms);
-    if (result >= 0 || errno != EINTR) {
-      break;
-    }
-  }
-
-  const int poll_error = result < 0 ? errno : 0;
-  if (result < 0) {
-    errno = poll_error;
-    http1_throw_errno("poll(HTTP/1.1 body)");
-  }
-  return result != 0;
-}
-
-size_t splice_coalesced_body(UniqueFd& socket, int destination,
-                             size_t bytes, size_t header_over_read,
-                             size_t batch_size, int io_timeout_ms,
-                             size_t* calls, bool& low_water_used) {
-  ReceiveLowWater low_water(socket);
-  size_t transferred = 0;
-  size_t batch = batch_size -
-                 std::min(header_over_read, batch_size);
-
-  while (transferred != bytes) {
-    const size_t remaining = bytes - transferred;
-    batch = std::min(batch, remaining);
-    if (!wait_for_body_batch(socket, low_water, batch, io_timeout_ms,
-                             low_water_used)) {
-      break;
-    }
-    const size_t moved = splice_some(
-        socket.get(), nullptr, destination, remaining,
-        SPLICE_F_MOVE | SPLICE_F_MORE, calls);
-    if (moved == 0) {
-      http1_throw_errno("splice(HTTP/1.1 body)");
-    }
-    transferred += moved;
-  }
-
-  if (!low_water.restore()) {
-    http1_throw_errno("setsockopt(SO_RCVLOWAT restore)");
-  }
-  if (transferred != bytes) {
-    transferred += splice_exact(
-        socket.get(), destination, bytes - transferred,
-        SPLICE_F_MOVE | SPLICE_F_MORE, calls);
-  }
-  return transferred;
 }
 
 ssostr<32> ascii_lower(const ssostr<32>& value) {
@@ -2157,9 +1964,7 @@ class Http1Client final : public HttpClient {
               std::shared_ptr<TlsTunnel> connected_tunnel = {},
               int connected_io_timeout_ms = kRequestIoTimeoutMs,
               int connected_connect_timeout_ms = kConnectTimeoutMs,
-              bool receive_low_water_available = true,
-              size_t receive_coalesce_threshold =
-                  kDefaultReceiveCoalesceThreshold)
+              size_t connected_receive_buffer_size = 0)
       : tunnel(std::move(connected_tunnel)),
         socket(std::move(connected_socket)),
         authority(std::move(request_authority)),
@@ -2167,14 +1972,8 @@ class Http1Client final : public HttpClient {
         port(reconnect_port),
         io_timeout_ms(connected_io_timeout_ms),
         connect_timeout_ms(connected_connect_timeout_ms),
-        tls(tunnel != nullptr),
-        low_water_available(receive_low_water_available),
-        coalesce_threshold(receive_coalesce_threshold) {
-    if (!tls && low_water_available) {
-      receive_batch_size = http1_receive_batch_size(socket.get());
-      low_water_available = receive_batch_size != 0;
-    }
-  }
+        receive_buffer_size(connected_receive_buffer_size),
+        tls(tunnel != nullptr) {}
 
   Response get_range(std::string_view path, uint64_t offset,
                      size_t length, Pipe& destination,
@@ -2214,17 +2013,15 @@ class Http1Client final : public HttpClient {
   std::string request_head;
   std::string upload_method;
   uint16_t port = 0;
-  int io_timeout_ms      = kRequestIoTimeoutMs;
-  int connect_timeout_ms = kConnectTimeoutMs;
-  bool request_active = false;
-  bool upload_chunked = false;
+  int io_timeout_ms          = kRequestIoTimeoutMs;
+  int connect_timeout_ms     = kConnectTimeoutMs;
+  size_t receive_buffer_size = 0;
+  bool request_active        = false;
+  bool upload_chunked        = false;
   uint64_t tls_upload_request_id = 0;
   size_t upload_sent = 0;
   size_t upload_length = kUnknownBodyLength;
-  bool tls                        = false;
-  bool low_water_available        = true;
-  size_t receive_batch_size       = 0;
-  size_t coalesce_threshold       = kDefaultReceiveCoalesceThreshold;
+  bool tls = false;
 
   void ensure_connected() {
     if (socket) {
@@ -2235,7 +2032,8 @@ class Http1Client final : public HttpClient {
     }
     if (tls) {
       TlsConnection transport = connect_tls(
-          host, port, connect_timeout_ms, io_timeout_ms);
+          host, port, connect_timeout_ms, io_timeout_ms,
+          receive_buffer_size);
       if (transport.http2) {
         throw std::runtime_error(
             "TLS reconnect changed protocol from HTTP/1.1");
@@ -2244,11 +2042,8 @@ class Http1Client final : public HttpClient {
       socket = std::move(transport.socket);
     } else {
       socket = connect_tcp(
-          host, port, connect_timeout_ms, io_timeout_ms);
-      if (low_water_available) {
-        receive_batch_size = http1_receive_batch_size(socket.get());
-        low_water_available = receive_batch_size != 0;
-      }
+          host, port, connect_timeout_ms, io_timeout_ms,
+          receive_buffer_size);
     }
   }
 
@@ -2342,7 +2137,6 @@ class Http1Client final : public HttpClient {
             begin = 0;
             end   = 0;
           }
-          const size_t header_over_read = response.body_bytes;
           if (remaining != 0) {
             if (destination == nullptr) {
               const size_t old_size = response.body.size();
@@ -2368,21 +2162,10 @@ class Http1Client final : public HttpClient {
               response.body_bytes += remaining;
               response.fallback_copied_bytes += remaining;
             } else {
-              if (!tls && low_water_available &&
-                  coalesce_threshold != 0 &&
-                  remaining >= coalesce_threshold) {
-                response.externally_spliced_bytes = splice_coalesced_body(
-                    socket, destination->write_fd(), remaining,
-                    header_over_read, receive_batch_size,
-                    io_timeout_ms,
-                    &response.transport_splice_calls,
-                    response.low_water_used);
-              } else {
-                response.externally_spliced_bytes = splice_exact(
-                    socket.get(), destination->write_fd(), remaining,
-                    SPLICE_F_MOVE | SPLICE_F_MORE,
-                    &response.transport_splice_calls);
-              }
+              response.externally_spliced_bytes = splice_exact(
+                  socket.get(), destination->write_fd(), remaining,
+                  SPLICE_F_MOVE | SPLICE_F_MORE,
+                  &response.transport_splice_calls);
               response.body_bytes += remaining;
             }
           }
@@ -2723,32 +2506,32 @@ Response Http1Client::request_no_body(
 std::unique_ptr<HttpClient> HttpClient::connect(
     std::string_view host, uint16_t port, std::string authority, bool tls,
     int io_timeout_ms, int connect_timeout_ms, int probe_timeout_ms,
-    bool http1_low_water_available,
-    size_t receive_coalesce_threshold) {
+    size_t socket_receive_buffer_size) {
   if (authority.empty()) {
     authority = std::string(host) + ':' + std::to_string(port);
   }
 
   if (tls) {
     TlsConnection transport = connect_tls(
-        host, port, connect_timeout_ms, io_timeout_ms);
+        host, port, connect_timeout_ms, io_timeout_ms,
+        socket_receive_buffer_size);
     if (transport.http2) {
       return std::make_unique<Http2Client>(
           std::move(transport.socket), authority, std::string(host), port,
           std::move(transport.tunnel), io_timeout_ms, connect_timeout_ms,
-          probe_timeout_ms);
+          probe_timeout_ms, socket_receive_buffer_size);
     }
     return std::make_unique<Http1Client>(
         std::move(transport.socket), std::move(authority), std::string(host),
         port, std::move(transport.tunnel), io_timeout_ms,
-        connect_timeout_ms, http1_low_water_available,
-        receive_coalesce_threshold);
+        connect_timeout_ms, socket_receive_buffer_size);
   }
 
   auto h2 = std::make_unique<Http2Client>(
-      connect_tcp(host, port, connect_timeout_ms, io_timeout_ms), authority,
+      connect_tcp(host, port, connect_timeout_ms, io_timeout_ms,
+                  socket_receive_buffer_size), authority,
       std::string(host), port, std::shared_ptr<TlsTunnel>{}, io_timeout_ms,
-      connect_timeout_ms, probe_timeout_ms);
+      connect_timeout_ms, probe_timeout_ms, socket_receive_buffer_size);
   try {
     if (h2->probe_server()) {
       return h2;
@@ -2758,8 +2541,9 @@ std::unique_ptr<HttpClient> HttpClient::connect(
     // HTTP/2 preface. Reconnect below and use HTTP/1.1.
   }
   return std::make_unique<Http1Client>(
-      connect_tcp(host, port, connect_timeout_ms, io_timeout_ms),
+      connect_tcp(host, port, connect_timeout_ms, io_timeout_ms,
+                  socket_receive_buffer_size),
       std::move(authority), std::string(host), port,
       std::shared_ptr<TlsTunnel>{}, io_timeout_ms, connect_timeout_ms,
-      http1_low_water_available, receive_coalesce_threshold);
+      socket_receive_buffer_size);
 }

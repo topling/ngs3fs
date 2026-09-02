@@ -254,11 +254,6 @@ int main() {
                        &address_length) == 0);
   const uint16_t port = ntohs(address.sin_port);
 
-  std::string low_water_error;
-  const bool low_water_available =
-      http1_low_water_preflight(low_water_error);
-  assert(low_water_available || !low_water_error.empty());
-
   std::vector<std::byte> expected_download(1024U * 1024U);
   std::vector<std::byte> expected_upload(96U * 1024U);
   std::vector<std::byte> expected_control(384U * 1024U);
@@ -283,7 +278,7 @@ int main() {
 
   auto client = HttpClient::connect(
       "127.0.0.1", port, "mock-s3", false, kRequestIoTimeoutMs,
-      kConnectTimeoutMs, kProtocolProbeTimeoutMs, low_water_available);
+      kConnectTimeoutMs, kProtocolProbeTimeoutMs);
   auto download_pipe = Pipe::create(expected_download.size());
   const auto downloaded = client->get_range(
       "/bucket/key", 0, expected_download.size(), download_pipe);
@@ -294,7 +289,6 @@ int main() {
              downloaded.fallback_copied_bytes ==
          expected_download.size());
   assert(downloaded.transport_splice_calls >= 2);
-  assert(downloaded.low_water_used == low_water_available);
   assert(downloaded.headers.at("etag") == "\"h1-etag\"");
   std::vector<std::byte> actual_download(expected_download.size());
   read_all(download_pipe.read_fd(), actual_download);
@@ -306,7 +300,6 @@ int main() {
   const Response small = client->get_range(
       "/bucket/small", 0, small_size, small_pipe);
   assert(small.fallback_copied_bytes > 512);
-  assert(!small.low_water_used);
   std::vector<std::byte> actual_small(small_size);
   read_all(small_pipe.read_fd(), actual_small);
   assert(memcmp(actual_small.data(), expected_download.data(), small_size) == 0);
@@ -454,12 +447,11 @@ int main() {
 
   auto delayed_client = HttpClient::connect(
       "127.0.0.1", port, "mock-s3", false, 250,
-      kConnectTimeoutMs, kProtocolProbeTimeoutMs, low_water_available);
+      kConnectTimeoutMs, kProtocolProbeTimeoutMs);
   Pipe delayed_pipe = Pipe::create(delayed_body.size());
   const Response delayed = delayed_client->get_range(
       "/bucket/delayed", 0, delayed_body.size(), delayed_pipe);
   assert(delayed.transport_splice_calls >= 2);
-  assert(delayed.low_water_used == low_water_available);
   std::vector<std::byte> actual_delayed(delayed_body.size());
   read_all(delayed_pipe.read_fd(), actual_delayed);
   assert(actual_delayed == delayed_body);
@@ -467,7 +459,6 @@ int main() {
   Pipe repeated_pipe = Pipe::create(delayed_body.size());
   const Response repeated = delayed_client->get_range(
       "/bucket/delayed-repeat", 0, delayed_body.size(), repeated_pipe);
-  assert(repeated.low_water_used == low_water_available);
   read_all(repeated_pipe.read_fd(), actual_delayed);
   assert(actual_delayed == delayed_body);
 
@@ -475,7 +466,6 @@ int main() {
   Pipe changed_pipe = Pipe::create(changed_size);
   const Response changed = delayed_client->get_range(
       "/bucket/delayed-changed", 0, changed_size, changed_pipe);
-  assert(changed.low_water_used == low_water_available);
   std::vector<std::byte> actual_changed(changed_size);
   read_all(changed_pipe.read_fd(), actual_changed);
   assert(memcmp(actual_changed.data(), delayed_body.data(), changed_size) == 0);
@@ -483,7 +473,6 @@ int main() {
   Pipe short_tail_pipe = Pipe::create(delayed_body.size());
   const Response short_tail = delayed_client->get_range(
       "/bucket/delayed-short-tail", 0, delayed_body.size(), short_tail_pipe);
-  assert(short_tail.low_water_used == low_water_available);
   std::vector<std::byte> actual_short_tail(delayed_body.size());
   read_all(short_tail_pipe.read_fd(), actual_short_tail);
   assert(actual_short_tail == delayed_body);
@@ -497,7 +486,6 @@ int main() {
   const Response missing = delayed_client->get_range(
       "/bucket/delayed-missing", 0, delayed_body.size(), missing_pipe);
   assert(missing.status == 404);
-  assert(!missing.low_water_used);
   std::array<std::byte, 9> missing_body{};
   read_all(missing_pipe.read_fd(), missing_body);
   assert(memcmp(missing_body.data(), "not found", missing_body.size()) == 0);

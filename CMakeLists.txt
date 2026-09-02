@@ -234,13 +234,17 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME io_size_zero_test
     COMMAND ngs3fs --io-size 0 --help)
   set_tests_properties(io_size_zero_test PROPERTIES WILL_FAIL TRUE)
-  add_test(NAME receive_coalesce_threshold_option_test
-    COMMAND ngs3fs --receive-coalesce-threshold 32KiB --help)
-  add_test(NAME receive_coalesce_threshold_zero_test
-    COMMAND ngs3fs --receive-coalesce-threshold 0 --help)
-  add_test(NAME receive_coalesce_threshold_invalid_test
-    COMMAND ngs3fs --receive-coalesce-threshold nope --help)
-  set_tests_properties(receive_coalesce_threshold_invalid_test
+  add_test(NAME socket_buffer_size_option_test
+    COMMAND ngs3fs --socket-buffer-size 4MiB --help)
+  add_test(NAME socket_buffer_size_auto_test
+    COMMAND ngs3fs --socket-buffer-size 0 --help)
+  add_test(NAME socket_buffer_size_invalid_test
+    COMMAND ngs3fs --socket-buffer-size nope --help)
+  set_tests_properties(socket_buffer_size_invalid_test
+    PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME socket_buffer_size_oversized_test
+    COMMAND ngs3fs --socket-buffer-size 2GiB --help)
+  set_tests_properties(socket_buffer_size_oversized_test
     PROPERTIES WILL_FAIL TRUE)
   add_test(NAME checksum_options_test
     COMMAND ngs3fs --checksum xxhash128 --verify-read-checksum --help)

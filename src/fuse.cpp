@@ -67,7 +67,7 @@ struct MountConfig {
   size_t maximum_write_size         = kPreferredIoSize;
   uint32_t io_size                  = kPreferredIoSize;
   uint32_t read_ahead_size          = kPreferredIoSize;
-  size_t receive_coalesce_threshold = kDefaultReceiveCoalesceThreshold;
+  size_t socket_receive_buffer_size = kDefaultSocketReceiveBufferSize;
   uint64_t part_size                = 8ULL * 1024ULL * 1024ULL;
   uint64_t max_pinned_memory        = 256ULL * 1024ULL * 1024ULL;
   uint64_t directory_cache_ns       = 1000ULL * 1000ULL * 1000ULL;
@@ -85,11 +85,11 @@ struct MountConfig {
   gid_t gid                         = ::getgid();
   mode_t file_mode                  = 0644;
   mode_t directory_mode             = 0755;
-  bool report_metrics               = false;
-  bool directory_bucket             = false;
-  bool tls                          = false;
-  bool verify_read_checksum         = false;
-  bool http1_low_water_available    = true;
+  bool report_metrics                  = false;
+  bool directory_bucket                = false;
+  bool tls                             = false;
+  bool verify_read_checksum            = false;
+  bool socket_receive_buffer_explicit  = false;
 };
 
 enum WriteState {
@@ -177,8 +177,7 @@ class HttpPool {
               config.authority, config.tls, config.request_timeout_ms,
               config.connect_timeout_ms,
               config.protocol_probe_timeout_ms,
-              config.http1_low_water_available,
-              config.receive_coalesce_threshold);
+              config.socket_receive_buffer_size);
         } catch (...) {
           errors[i] = std::current_exception();
         }
@@ -1091,7 +1090,7 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   constexpr int protocol_probe_timeout_option     = 260;
   constexpr int metadata_timeout_option           = 261;
   constexpr int stats_interval_option             = 262;
-  constexpr int receive_coalesce_threshold_option = 263;
+  constexpr int socket_buffer_size_option          = 263;
   constexpr option long_options[] = {
       {"endpoint-host", required_argument, nullptr, 'e'},
       {"endpoint-port", required_argument, nullptr, 'p'},
@@ -1113,8 +1112,8 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
        metadata_timeout_option},
       {"stats-interval", required_argument, nullptr,
        stats_interval_option},
-      {"receive-coalesce-threshold", required_argument, nullptr,
-       receive_coalesce_threshold_option},
+      {"socket-buffer-size", required_argument, nullptr,
+       socket_buffer_size_option},
       {"read-ahead", required_argument, nullptr, 'R'},
       {"dir-cache-timeout", required_argument, nullptr, 'T'},
       {"max-cached-inodes", required_argument, nullptr, 'I'},
@@ -1248,14 +1247,14 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
         config.stats_interval_seconds = uint32_t(value);
         break;
       }
-      case receive_coalesce_threshold_option: {
-        const uint64_t value =
-            parse_required_size("--receive-coalesce-threshold");
-        if (value > std::numeric_limits<size_t>::max()) {
+      case socket_buffer_size_option: {
+        const uint64_t value = parse_required_size("--socket-buffer-size");
+        if (value > uint64_t(std::numeric_limits<int>::max())) {
           throw std::invalid_argument(
-              "--receive-coalesce-threshold exceeds SIZE_MAX");
+              "--socket-buffer-size must be at most INT_MAX");
         }
-        config.receive_coalesce_threshold = size_t(value);
+        config.socket_receive_buffer_size = size_t(value);
+        config.socket_receive_buffer_explicit = true;
         break;
       }
       case 'R': {
@@ -1729,8 +1728,7 @@ void ensure_express_session(State& state) {
         state.config.authority, state.config.tls,
         state.config.request_timeout_ms, state.config.connect_timeout_ms,
         state.config.protocol_probe_timeout_ms,
-        state.config.http1_low_water_available,
-        state.config.receive_coalesce_threshold);
+        state.config.socket_receive_buffer_size);
     const Response response = client->request_no_body(
         "GET", "/?session", headers, kMaximumListResponseSize);
     if (response.status != 200) {
@@ -6453,9 +6451,9 @@ void print_help() {
       << "      --protocol-probe-timeout MS\n"
          "                             cleartext HTTP/2 probe timeout "
          "(default 1000)\n"
-      << "      --receive-coalesce-threshold BYTES\n"
-         "                             minimum remaining HTTP/1.1 body "
-         "for SO_RCVLOWAT; 0 disables (default 64 KiB)\n"
+      << "      --socket-buffer-size BYTES\n"
+         "                             TCP receive buffer per connection; "
+         "0 keeps kernel autotuning (default max(2 MiB, max_read))\n"
       << "      --metadata-timeout MS credential metadata timeout "
          "(default 1000)\n"
       << "      --stats-interval SEC emit aggregate JSON stats to stderr; "
@@ -6495,6 +6493,10 @@ int run(int argc, char** argv) {
     }
     Pipe pipe_probe = Pipe::create(kPreferredIoSize);
     config.maximum_read_size = pipe_probe.capacity();
+    if (!config.socket_receive_buffer_explicit) {
+      config.socket_receive_buffer_size = std::max(
+          kDefaultSocketReceiveBufferSize, config.maximum_read_size);
+    }
     Pipe write_pipe_probe = Pipe::create(kPreferredIoSize * 2);
     config.maximum_write_size = std::min(
         kPreferredIoSize, write_pipe_probe.capacity() / 2);
@@ -6572,19 +6574,6 @@ int run(int argc, char** argv) {
     std::cerr
         << "warning: splice(2) preflight failed: " << splice_error
         << "; FD-backed FUSE writes will use the copied fallback\n";
-  }
-  if (config.receive_coalesce_threshold == 0) {
-    config.http1_low_water_available = false;
-  } else {
-    std::string low_water_error;
-    config.http1_low_water_available =
-        http1_low_water_preflight(low_water_error);
-    if (!config.http1_low_water_available) {
-      fprintf(stderr,
-              "warning: SO_RCVLOWAT preflight failed: %s; "
-              "HTTP/1.1 reads will use immediate splice\n",
-              low_water_error.c_str());
-    }
   }
   std::cerr
       << "warning: fsync is intentionally non-durable; only the first flush "
