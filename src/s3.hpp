@@ -63,8 +63,8 @@ struct InodeDir;
 
 struct Directory : terark::hash_strmap<
     InodeBase*,
-    terark::fstring_func::IF_SP_ALIGN(hash_align, hash),
-    terark::fstring_func::IF_SP_ALIGN(equal_align, equal),
+    terark::fstring_func::hash_unalign,
+    terark::fstring_func::equal_unalign,
     terark::ValueInline,
     terark::FastCopy,
     unsigned int,
@@ -224,6 +224,14 @@ inline void InodeBase::set_fsize(uint64_t value) noexcept {
 }
 
 void delete_inode(InodeBase* item) noexcept;
+
+// Update an inode's directory entry while retaining the old inode's stale
+// slot safely. These operations only touch the inode tree and its directory
+// locks; they do not depend on FUSE or mount state.
+void detach_parent_slot_if_owned(InodeBase& item,
+                                 InodeBase* parent) noexcept;
+bool move_cached_item(InodeBase& item, InodeBase& new_parent,
+                      std::string_view new_name);
 
 static_assert(alignof(InodeBase) == 16);
 static_assert(sizeof(InodeBase) == 32);

@@ -16,9 +16,11 @@ Writes replace an object from offset zero and must be strictly sequential.
 Writable mmap, O_RDWR, O_DIRECT, random overwrite, symbolic links and hard
 links are unsupported. FUSE writeback cache must remain disabled.
 .PP
-fsync is intentionally non-durable. The first flush publishes and permanently
-seals a writable handle. Applications must check close errors and must not
-continue writing through descriptors retained by dup or fork after any close.
+Without a local cache, fsync is intentionally non-durable. With --cache-dir,
+fsync synchronizes the locally authoritative data and recovery metadata but
+does not publish the S3 object. The first flush publishes and permanently seals
+a writable handle. Applications must check close errors and must not continue
+writing through descriptors retained by dup or fork after any close.
 .SH REQUIRED OPTIONS
 .TP
 .BI "-e, --endpoint-host " host
@@ -67,6 +69,19 @@ Directory cache lifetime. Default is 1000.
 .TP
 .BI "-I, --max-cached-inodes " count
 Soft inode cache limit. Default is 1000000.
+.TP
+.BI "-L, --cache-dir " path
+Enable the persistent sparse local data cache at path. Disabled by default.
+.TP
+.BI "--cache-size " bytes
+Maximum physical cache allocation. Zero means no fixed limit.
+.TP
+.BI "--cache-reserve " size-or-percent
+Free space preserved on the cache filesystem. Default is 5%.
+.TP
+.BI "--max-cache-fetch-size " bytes
+Maximum adaptive cache fill. Default is 8 MiB; the minimum is 1 MiB and the
+value must be page aligned.
 .SH WRITE OPTIONS
 .TP
 .BI "-P, --part-size " bytes
@@ -87,7 +102,8 @@ crc64nvme, sha1, sha256, md5, xxhash64, xxhash3, xxhash128, sha512 and
 crc64xz.
 .TP
 .B --verify-read-checksum
-Verify a usable full-object response checksum. Range reads are not expanded.
+Enable background best-effort verification of complete independently
+verifiable units. The first read or mmap fault may finish before verification.
 .SH CREDENTIALS
 Credential precedence is AWS environment variables, Web Identity, the selected
 shared profile, credential_process, ECS/EKS container credentials and IMDSv2.
@@ -106,8 +122,9 @@ pipe bytes, copied-write bytes and the active credential source.
 .SH PRODUCTION NOTES
 Configure the bucket AbortIncompleteMultipartUpload lifecycle rule. Select a
 part size large enough that the largest expected object uses at most 10000
-parts. Directory rename is atomic only when the provider implements
-RenameObject; otherwise it is an explicitly non-atomic CopyObject/DeleteObject
+parts. Empty directory markers can be renamed as one object. Renaming a
+non-empty directory returns EXDEV so callers can use cross-filesystem
+copy/remove semantics; ngs3fs does not emulate an atomic S3 prefix rename
 operation.
 .SH SEE ALSO
 .BR fusermount3 (1),

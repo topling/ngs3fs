@@ -271,6 +271,7 @@ jobs:
           sudo env \
             GOOFYS_BIN="$GITHUB_WORKSPACE/build/tools/goofys" \
             BENCHMARK_REPETITIONS=4 \
+            CACHE_MODE=warm \
             ./scripts/benchmark_random_read.sh \
             "$GITHUB_WORKSPACE/build/benchmarks/github-random-read"
 
@@ -288,6 +289,7 @@ jobs:
           sudo env \
             WORKLOAD=random-read \
             RANDOM_READ_ADVICE=random \
+            CACHE_MODE=warm \
             PERF_BIN="$(command -v perf)" \
             PERF_LIB_DIR= \
             PERF_EVENT=cpu-clock \
@@ -302,6 +304,7 @@ jobs:
           sudo env \
             WORKLOAD=random-read \
             RANDOM_READ_ADVICE=normal \
+            CACHE_MODE=warm \
             PERF_BIN="$(command -v perf)" \
             PERF_LIB_DIR= \
             PERF_EVENT=cpu-clock \

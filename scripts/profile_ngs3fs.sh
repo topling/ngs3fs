@@ -18,16 +18,20 @@ perf_stat_events=${PERF_STAT_EVENTS:-}
 if [[ -z "$perf_stat_events" ]]; then
   perf_stat_events=task-clock
   perf_stat_events+=,context-switches,cpu-migrations,page-faults
-  perf_stat_events+=,syscalls:sys_enter_splice
-  perf_stat_events+=,syscalls:sys_enter_recvfrom
-  perf_stat_events+=,syscalls:sys_enter_sendto
-  perf_stat_events+=,syscalls:sys_enter_futex
-  perf_stat_events+=,syscalls:sys_enter_writev
-  perf_stat_events+=,syscalls:sys_enter_close
-  perf_stat_events+=,syscalls:sys_enter_pipe2
-  perf_stat_events+=,syscalls:sys_enter_fcntl
-  perf_stat_events+=,syscalls:sys_enter_poll
-  perf_stat_events+=,syscalls:sys_enter_setsockopt
+  if [[ -r /sys/kernel/tracing/events/syscalls/sys_enter_splice/id ]]; then
+    perf_stat_events+=,syscalls:sys_enter_splice
+    perf_stat_events+=,syscalls:sys_enter_recvfrom
+    perf_stat_events+=,syscalls:sys_enter_sendto
+    perf_stat_events+=,syscalls:sys_enter_futex
+    perf_stat_events+=,syscalls:sys_enter_writev
+    perf_stat_events+=,syscalls:sys_enter_close
+    perf_stat_events+=,syscalls:sys_enter_pipe2
+    perf_stat_events+=,syscalls:sys_enter_fcntl
+    perf_stat_events+=,syscalls:sys_enter_poll
+    perf_stat_events+=,syscalls:sys_enter_setsockopt
+  else
+    echo "warning: syscall tracepoints are not readable; profiling basic counters only" >&2
+  fi
 fi
 random_files=${RANDOM_READ_FILES:-32}
 random_threads=${RANDOM_READ_THREADS:-16}
@@ -36,6 +40,7 @@ random_file_size=${RANDOM_READ_FILE_SIZE:-4194304}
 random_maximum_read=${RANDOM_READ_MAXIMUM:-262144}
 random_seed=${RANDOM_READ_SEED:-0x4e47533346535244}
 random_advice=${RANDOM_READ_ADVICE:-random}
+cache_mode=${CACHE_MODE:-none}
 
 versitygw="$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64/versitygw"
 ngs3fs=${NGS3FS_BIN:-"$project_dir/build/dev/ngs3fs"}
@@ -49,9 +54,29 @@ backend="$run_dir/backend"
 bucket=ngs3fs-profile
 object=object.bin
 mount_dir="$run_dir/mnt"
+cache_dir="$run_dir/cache"
 access_key=ngs3fs-profile
 secret_key=ngs3fs-profile-secret
 endpoint="http://127.0.0.1:$port"
+
+case "$cache_mode" in
+  none)
+    cache_arg=()
+    cache_path=-
+    ;;
+  cold | warm)
+    cache_arg=(-L "$cache_dir" --cache-reserve 0)
+    cache_path="$cache_dir"
+    ;;
+  *)
+    echo "unsupported cache mode: $cache_mode (expected none, cold, or warm)" >&2
+    exit 2
+    ;;
+esac
+if [[ "$cache_mode" != none && -e "$cache_dir" ]]; then
+  echo "cache directory already exists: $cache_dir" >&2
+  exit 1
+fi
 
 server_pid=
 ngs3fs_pid=
@@ -155,10 +180,18 @@ if [[ "$workload" = mmap ]]; then
   dd if=/dev/urandom of="$backend/$bucket/$object" \
     bs=1M count=256 status=none
   dd if="$backend/$bucket/$object" of=/dev/null bs=8M status=none
+  if [[ "$cache_mode" = cold ]]; then
+    cp --reflink=auto "$backend/$bucket/$object" \
+      "$backend/$bucket/$object-cold-warmup"
+  fi
 else
   "$random_bench" -p -d "$backend/$bucket/random-read" \
     -f "$random_files" -t "$random_threads" -n "$random_operations" \
     -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed"
+  if [[ "$cache_mode" = cold ]]; then
+    cp -a "$backend/$bucket/random-read" \
+      "$backend/$bucket/random-read-cold-warmup"
+  fi
 fi
 
 ROOT_ACCESS_KEY_ID=$access_key ROOT_SECRET_ACCESS_KEY=$secret_key \
@@ -172,20 +205,40 @@ AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
   "$ngs3fs" -f -R "$read_ahead" -e 127.0.0.1 -p "$port" \
     -C "$max_connections" \
     -a "127.0.0.1:$port" \
-    -b "$bucket" "$mount_dir" \
+    -b "$bucket" "${cache_arg[@]}" "$mount_dir" \
     >"$run_dir/ngs3fs.log" 2>&1 &
 ngs3fs_pid=$!
 wait_for_mount
 
 if [[ "$workload" = mmap ]]; then
-  "$bench" "$mount_dir/$object" "$bytes" 50 17825792 \
+  warmup_object=$object
+  warmup_iterations=50
+  if [[ "$cache_mode" = warm ]]; then
+    warmup_iterations=$iterations
+  fi
+  if [[ "$cache_mode" = cold ]]; then
+    warmup_object="$object-cold-warmup"
+  fi
+  "$bench" "$mount_dir/$warmup_object" "$bytes" "$warmup_iterations" 17825792 \
     >"$run_dir/warmup.jsonl"
-  title="ngs3fs $bytes-byte cold mmap faults"
+  title="ngs3fs $bytes-byte mmap faults ($cache_mode cache)"
   flame_svg="$run_dir/ngs3fs-$bytes.svg"
   flame_html="$run_dir/ngs3fs-$bytes-interactive.html"
 else
-  run_random_read 8 "$run_dir/warmup.txt"
-  title="ngs3fs concurrent multi-file random reads ($random_advice advice)"
+  warmup_dir="$mount_dir/random-read"
+  warmup_operations=8
+  if [[ "$cache_mode" = warm ]]; then
+    warmup_operations=$random_operations
+  fi
+  if [[ "$cache_mode" = cold ]]; then
+    warmup_dir="$mount_dir/random-read-cold-warmup"
+  fi
+  "$random_bench" -R "${random_advice_args[@]}" \
+    -d "$warmup_dir" \
+    -f "$random_files" -t "$random_threads" -n "$warmup_operations" \
+    -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed" \
+    >"$run_dir/warmup.txt"
+  title="ngs3fs concurrent multi-file random reads ($random_advice advice, $cache_mode cache)"
   flame_svg="$run_dir/ngs3fs-random-read.svg"
   flame_html="$run_dir/ngs3fs-random-read-interactive.html"
 fi
@@ -224,6 +277,12 @@ if ((profile_last_line > profile_first_line)); then
       "$run_dir/versity-access.log" | grep -c 's3_HeadObject' || true
   )
 fi
+{
+  printf 'cache_mode=%s\n' "$cache_mode"
+  printf 'cache_dir=%s\n' "$cache_path"
+  printf 's3_get_requests=%s\n' "$profile_get_requests"
+  printf 's3_head_requests=%s\n' "$profile_head_requests"
+} >"$run_dir/profile-metadata.txt"
 kill -INT "$perf_pid" 2>/dev/null || true
 wait "$perf_pid" 2>/dev/null || true
 perf_pid=
@@ -268,10 +327,11 @@ if [[ "$workload" = random-read ]]; then
     esac
   done
   printf '%s\n' \
-    'advice,files,threads,operations,pread_operations,mmap_operations,bytes,elapsed_ns,s3_get_requests,s3_head_requests,perf_event,perf_frequency' \
+    'advice,cache_mode,cache_dir,files,threads,operations,pread_operations,mmap_operations,bytes,elapsed_ns,s3_get_requests,s3_head_requests,perf_event,perf_frequency' \
     >"$run_dir/profile-summary.csv"
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-    "$random_advice" "$random_files" "$random_threads" \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$random_advice" "$cache_mode" "$cache_path" \
+    "$random_files" "$random_threads" \
     "$((random_threads * random_operations))" "$pread_operations" \
     "$mmap_operations" "$bytes_read" "$elapsed_ns" \
     "$profile_get_requests" "$profile_head_requests" \

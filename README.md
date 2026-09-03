@@ -56,14 +56,16 @@ multi-file namespace. It remains experimental rather than production-ready.
   that require COMPOSITE checksums carry every Part checksum into completion
   XML. CRC64NVME uses a FULL_OBJECT checksum combined from the Part CRCs, so
   completion does not scan the object data again.
-- Read verification is off by default. `--verify-read-checksum` requests and
-  validates a checksum only when one FUSE read covers the complete object and
-  the response checksum covers that same byte sequence. Arbitrary Range GETs
-  are not expanded or copied just to validate a whole-object checksum; S3 has
-  no standard checksum for an arbitrary range, and OSS returns the whole
-  object's CRC64 even for a range response. Composite S3 checksums are skipped
-  when the original Part boundaries are unavailable. A missing or unusable
-  response checksum does not fail the read; a checksum mismatch does.
+- Read verification is off by default. `--verify-read-checksum` enables
+  background best-effort verification when a complete independently
+  verifiable object or multipart unit is available. The first read or mmap
+  fault may complete before verification. Arbitrary Range GETs are not treated
+  as whole-object checksums. With local caching, multipart ObjectParts
+  checksums are loaded lazily with GetObjectAttributes; a missing, unsupported,
+  or unusable manifest skips part verification. A mismatch triggers one exact
+  part retry and marks a persistent failure BAD, so later requests reaching
+  ngs3fs fail with `EIO`. Invalidating pages already returned to the kernel is
+  still a TODO because FUSE invalidation can race the locked read folio.
 - FUSE remains in cached mode; `direct_io` is never enabled.
 - After each upload succeeds, `FUSE_NOTIFY_STORE` consumes the retained
   FD-backed pipe chain into the ordinary kernel page cache, covering partial
@@ -174,11 +176,10 @@ multi-file namespace. It remains experimental rather than production-ready.
   enabled, so an older version is not exposed as the current source key. Copy
   sources are formed as an encoded `bucket/key` without re-encoding an already
   encoded object path.
-- Directory rename paginates every object below the source prefix without a
-  1,000-key cap and applies the same RenameObject-or-Copy/Delete operation to
-  each key. S3 has no atomic prefix rename: a failure returns `EIO`, logs the
-  completed/total counts, and may leave a partially moved directory. A final
-  source-prefix check returns `EAGAIN` if objects appeared during the move.
+- Empty directory markers use the same single-object rename path as files.
+  Non-empty directory rename returns `EXDEV`, so tools such as `mv` can use
+  their ordinary cross-filesystem copy/remove path. S3 has no atomic prefix
+  rename, and ngs3fs does not persist a multi-object rename journal.
 - Symbolic and hard links are unsupported; hard links return `ENOTSUP`.
 - A real WSL FUSE integration test verifies read mmap, rejection of writable
   mmap, small `PutObject`, an 8 MiB full part plus multipart tail, duplicate-
@@ -189,17 +190,17 @@ multi-file namespace. It remains experimental rather than production-ready.
   it starts with more than 1,000 root keys to force paginated
   `ListObjectsV2`, concurrently creates and multipart-uploads two distinct
   objects, reopens and mmap-verifies them, then exercises mkdir, nested
-  objects, cross-directory file rename, and nonempty directory rename. A
-  separate 1,001-object directory verifies that recursive rename consumes its
-  second listing page and moves the final key before unlink and rmdir checks.
+  objects, cross-directory file rename, and `EXDEV` for non-empty directory
+  rename. A separate 1,001-object directory verifies paginated readdir and
+  that a rejected directory rename leaves its second-page entries intact.
 
 ## Important current limits
 
 - TLS and ALPN are supported through OpenSSL. The encrypted side necessarily
   passes through OpenSSL userspace buffers; the cleartext Unix-socket side of
   that tunnel retains the same pipe/splice transport used by the HTTP clients.
-- Symbolic and hard links are not supported. File and recursive directory
-  rename, create, unlink, mkdir, and empty-directory rmdir are supported.
+- Symbolic and hard links are not supported. File rename, create, unlink,
+  mkdir, empty-directory rename, and empty-directory rmdir are supported.
 - Writes never download or locally stage the old object. They support only
   replacement from offset zero. The configured fixed part size and S3's
   10,000-part limit bound the object size (about 78 GiB with the 8 MiB
@@ -272,10 +273,11 @@ ngs3fs FUSE mount backed by VersityGW. The small compatibility patch
 `scripts/xfstests-fuse-subtype.patch` makes the upstream harness recognize
 `fuse.ngs3fs` as its generic `fuse` filesystem type.
 
-The correctness allowlist is `generic/001` and `generic/245`. Together they
-cover sequential data creation and copying, byte-for-byte read verification,
-unlink, directory operations, rename, and rejection of a rename onto a
-non-empty directory. The stress phase uses the suite's own `ltp/fsstress` with
+The correctness allowlist is `generic/001`, covering sequential data creation
+and copying, byte-for-byte read verification, unlink, directory operations,
+and file rename. `generic/245` is excluded because it relies on an atomic
+non-empty directory rename, for which ngs3fs deliberately returns `EXDEV`.
+The stress phase uses the suite's own `ltp/fsstress` with
 all defaults disabled, then enables only `creat`, `getattr`, `getdents`,
 `mkdir`, `rename`, `rnoreplace`, `rmdir`, `stat`, and `unlink`. CI runs eight
 worker processes with 500 operations each.
@@ -375,6 +377,25 @@ selection and is disabled unless explicitly requested.
 `--read-ahead` must be page-aligned; `0` disables it. Values above the
 per-request pipe capacity are split by kernel FUSE read limits when kernel BDI
 tuning is available.
+
+`-L/--cache-dir` enables the persistent sparse local cache. Each S3 key maps to
+a sparse data file plus mmap-backed metadata with a two-bit state per host
+page. Clean hits are returned from the cache FD; misses fetch adaptively from
+1 MiB through `--max-cache-fetch-size` (8 MiB by default), rather than forcing
+S3 to mirror every small FUSE read. `--cache-size` limits physical allocation
+and `--cache-reserve` preserves filesystem free space (5% by default). Clean
+regions use second-chance CLOCK eviction; a read bypasses the cache if clean
+space cannot be reclaimed.
+
+With local caching enabled, sequential replacement writes become locally
+authoritative before FUSE acknowledges them. The first byte reserves one full
+multipart unit (8 MiB by default). `fsync` synchronizes only the local data,
+metadata, and recovery marker. The first `flush` uploads the final tail,
+completes the object, and permanently seals the handle; later writes fail.
+Dirty state survives an ngs3fs process crash and is resumed at the next mount,
+but this is not a power-loss or operating-system-crash durability promise.
+See [the normative cache specification](docs/local-cache-spec.md) for the
+generation, unlink, rename, recovery, and failure contracts.
 
 Use `-S/--tls` for HTTPS on a non-443 port. Protocol selection remains
 automatic: ALPN or the cleartext probe prefers HTTP/2 and falls back to

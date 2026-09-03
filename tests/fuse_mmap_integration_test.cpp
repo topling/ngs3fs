@@ -26,6 +26,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -142,19 +143,40 @@ struct Request {
   std::string checksum_type;
   std::string checksum_value;
   std::string checksum_mode;
+  std::string object_attributes;
+  std::string max_parts;
+  std::string part_number_marker;
   std::string multipart_object_size;
+  std::string write_id;
   RequestRange range;
   std::vector<std::byte> body;
 };
 
 struct ResponseSource {
   const std::vector<std::byte>* object = nullptr;
+  std::shared_ptr<struct SpecialObject> keepalive;
   std::vector<std::byte> body;
   size_t cursor = 0;
   size_t end = 0;
   std::string content_length;
+  std::string content_range;
   bool delay = false;
   bool delayed = false;
+};
+
+struct SpecialObject {
+  std::vector<std::byte> bytes;
+  std::vector<std::byte> corrupted_bytes;
+  std::string etag;
+  std::string version_id;
+  std::string last_modified;
+  std::string last_modified_iso;
+  int corrupt_gets_remaining = 0;
+  int get_requests           = 0;
+  int attributes_requests    = 0;
+  size_t checksum_part_size  = 0;
+  bool attributes_unsupported = false;
+  std::vector<RequestRange> get_ranges;
 };
 
 struct SharedServerState {
@@ -166,8 +188,10 @@ struct SharedServerState {
   std::string version_id = "version-1";
   std::string last_modified = "Sun, 06 Nov 1994 08:49:37 GMT";
   std::string last_modified_iso = "1994-11-06T08:49:37.000Z";
+  std::string write_id;
   int rename_attempts = 0;
   int rename_probe_attempts = 0;
+  std::string hidden_key;
   int active_gets = 0;
   int maximum_active_gets = 0;
   int get_requests = 0;
@@ -178,14 +202,35 @@ struct SharedServerState {
   int upload_part_requests = 0;
   int complete_multipart_requests = 0;
   int checksum_mode_requests = 0;
+  int object_attributes_requests = 0;
   std::map<unsigned, std::vector<std::byte>> uploaded_parts;
   std::map<unsigned, unsigned> upload_attempts;
+  std::map<std::string, std::shared_ptr<SpecialObject>> special_objects;
+  std::string overwrite_hidden_key;
+  size_t overwrite_destination_size = 0;
+  size_t overwrite_destination_max_read_end = 0;
+  int overwrite_destination_gets = 0;
+  bool overwrite_rename_committed = false;
   bool copy_completed = false;
   bool delete_completed = false;
+  bool active_writer_delete_completed = false;
+  bool hidden_rename_completed = false;
+  bool hidden_delete_completed = false;
   bool deep_present = true;
   std::atomic<bool> stop = false;
   std::exception_ptr failure;
 };
+
+std::string request_object_key(std::string_view path) {
+  constexpr std::string_view prefix = "/bucket/";
+  require(path.starts_with(prefix), "request used an unexpected bucket");
+  path.remove_prefix(prefix.size());
+  const size_t query = path.find('?');
+  if (query != std::string_view::npos) {
+    path = path.substr(0, query);
+  }
+  return std::string(path);
+}
 
 struct ServerState {
   SharedServerState* shared = nullptr;
@@ -284,6 +329,22 @@ int on_header(nghttp2_session*, const nghttp2_frame* frame,
   } else if (header_name == "x-amz-checksum-mode") {
     auto& state = *static_cast<ServerState*>(user_data);
     state.requests[frame->hd.stream_id].checksum_mode.assign(
+        reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "x-amz-object-attributes") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].object_attributes.assign(
+        reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "x-amz-max-parts") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].max_parts.assign(
+        reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "x-amz-part-number-marker") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].part_number_marker.assign(
+        reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "x-amz-meta-ngs3fs-write-id") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].write_id.assign(
         reinterpret_cast<const char*>(value), value_length);
   } else if (header_name.starts_with("x-amz-checksum-")) {
     auto& state = *static_cast<ServerState*>(user_data);
@@ -426,6 +487,7 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
             "CreateMultipartUpload used the wrong checksum algorithm");
     require(request.checksum_type == checksum_multipart_type(state.checksum),
             "CreateMultipartUpload used the wrong checksum type");
+    state.write_id = request.write_id;
     ++state.create_multipart_requests;
     const int submitted = submit_text_response(
         session, connection, frame->hd.stream_id, "200",
@@ -556,15 +618,81 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
           "<s3:Code>NoSuchKey</s3:Code></s3:Error>");
       return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
     }
-    const std::string expected_source =
-        state.rename_attempts == 0 ? "/bucket/mmap.bin"
-                                   : "/bucket/renamed.bin";
-    require(request.rename_source == expected_source,
-            "RenameObject source was encoded twice or changed");
-    require(request.rename_source_if_match == state.etag,
+    const size_t query = request.path.find('?');
+    require(query != std::string::npos,
+            "RenameObject request omitted its query");
+    const std::string_view destination(request.path.data(), query);
+    const std::string source_key = request_object_key(request.rename_source);
+    const std::string destination_key = request_object_key(destination);
+    const auto source_object = state.special_objects.find(source_key);
+    const std::string_view expected_etag = source_object ==
+            state.special_objects.end()
+        ? std::string_view(state.etag)
+        : std::string_view(source_object->second->etag);
+    require(request.rename_source_if_match == expected_etag,
             "RenameObject omitted the pinned source ETag");
-    ++state.rename_attempts;
-    if (state.rename_attempts == 2) {
+    if (source_key == "overwrite-dest.bin" &&
+        destination_key.starts_with(".~ngs3fs~.pending-delete/")) {
+      require(source_object != state.special_objects.end(),
+              "native overwrite hide source was not present");
+      state.overwrite_hidden_key = destination_key;
+      state.special_objects.emplace(
+          destination_key, std::move(source_object->second));
+      state.special_objects.erase(source_key);
+      state.overwrite_destination_size =
+          state.special_objects.at(destination_key)->bytes.size();
+      const std::array response_headers{
+          header(":status", "200"),
+          header("content-length", "0"),
+      };
+      state.hidden_rename_completed = true;
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    if (source_key == "overwrite-source.bin" &&
+        destination_key == "overwrite-dest.bin") {
+      require(source_object != state.special_objects.end(),
+              "native overwrite source was not present");
+      state.special_objects[destination_key] =
+          std::move(source_object->second);
+      state.special_objects.erase(source_key);
+      state.overwrite_rename_committed = true;
+      const std::array response_headers{
+          header(":status", "200"),
+          header("content-length", "0"),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    if (request.rename_source == "/bucket/unlink-open.bin") {
+      require(destination.starts_with(
+                  "/bucket/.~ngs3fs~.pending-delete/"),
+              "native unlink did not move the reader to the private key");
+      state.hidden_key.assign(destination.substr(std::string_view(
+          "/bucket/").size()));
+      state.hidden_rename_completed = true;
+      state.object_key = state.hidden_key;
+      const std::array response_headers{
+          header(":status", "200"),
+          header("content-length", "0"),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    if (request.rename_source == "/bucket/mmap.bin") {
+      require(destination == "/bucket/renamed.bin",
+              "RenameObject used the wrong destination for mmap.bin");
+      ++state.rename_attempts;
+    } else if (request.rename_source == "/bucket/renamed.bin") {
+      require(destination == "/bucket/copied.bin",
+              "RenameObject used the wrong destination for renamed.bin");
+      ++state.rename_attempts;
       const std::array unsupported_headers{
           header(":status", "501"),
           header("content-length", "0"),
@@ -573,7 +701,11 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
           session, frame->hd.stream_id, unsupported_headers.data(),
           unsupported_headers.size(), nullptr);
       return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    } else {
+      throw std::runtime_error("RenameObject used an unexpected source");
     }
+    require(destination == "/bucket/renamed.bin",
+            "RenameObject source was encoded twice or changed");
     state.object_key = "renamed.bin";
     const std::array response_headers{
         header(":status", "200"),
@@ -606,6 +738,43 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   if (request.method == "DELETE" && frame->hd.type == NGHTTP2_HEADERS) {
+    if (request.path == "/bucket/active-unlink-writer.bin") {
+      state.active_writer_delete_completed = true;
+      const std::array response_headers{
+          header(":status", "204"),
+          header("content-length", "0"),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    if (!state.overwrite_hidden_key.empty() &&
+        request.path == "/bucket/" + state.overwrite_hidden_key) {
+      state.special_objects.erase(state.overwrite_hidden_key);
+      state.hidden_delete_completed = true;
+      const std::array response_headers{
+          header(":status", "204"),
+          header("content-length", "0"),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    if (state.hidden_rename_completed &&
+        request.path == "/bucket/" + state.hidden_key) {
+      state.hidden_delete_completed = true;
+      state.object.clear();
+      const std::array response_headers{
+          header(":status", "204"),
+          header("content-length", "0"),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     require(state.copy_completed,
             "DeleteObject ran before CopyObject completed");
     require(request.path == "/bucket/renamed.bin",
@@ -624,14 +793,47 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   }
   if (request.method == "HEAD" && frame->hd.type == NGHTTP2_HEADERS) {
     ++state.head_requests;
+    const std::string key = request_object_key(request.path);
+    const auto special = state.special_objects.find(key);
+    if (special != state.special_objects.end()) {
+      const SpecialObject& object = *special->second;
+      const std::string content_length = std::to_string(object.bytes.size());
+      const std::array response_headers{
+          header(":status", "200"),
+          header("content-length", content_length),
+          header("etag", object.etag),
+          header("x-amz-version-id", object.version_id),
+          header("last-modified", object.last_modified),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    if (key == "overwrite-dest.bin" || key == "overwrite-source.bin" ||
+        (!state.overwrite_hidden_key.empty() &&
+         key == state.overwrite_hidden_key)) {
+      const std::array response_headers{
+          header(":status", "404"),
+          header("content-length", "0"),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     const std::string content_length = std::to_string(state.object.size());
-    const std::array response_headers{
+    std::vector<nghttp2_nv> response_headers{
         header(":status", "200"),
         header("content-length", content_length),
         header("etag", state.etag),
         header("x-amz-version-id", state.version_id),
         header("last-modified", state.last_modified),
     };
+    if (!state.write_id.empty()) {
+      response_headers.push_back(header(
+          "x-amz-meta-ngs3fs-write-id", state.write_id));
+    }
     const int submitted = nghttp2_submit_response(
         session, frame->hd.stream_id, response_headers.data(),
         response_headers.size(), nullptr);
@@ -656,7 +858,8 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       xml.append(5U * 1024U * 1024U, 'x');
       xml += "-->";
     }
-    if (!deep && !second_root_page) {
+    if (!deep && !second_root_page &&
+        !state.object_key.starts_with(".~ngs3fs~.pending-delete/")) {
       xml += "<s3:IsTruncated>1</s3:IsTruncated>"
              "<s3:NextContinuationToken>root-page&#x2D;2"
              "</s3:NextContinuationToken>";
@@ -669,6 +872,20 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       xml += "</s3:LastModified><s3:Size>";
       xml += std::to_string(state.object.size());
       xml += "</s3:Size></s3:Contents>";
+      for (const auto& [key, object] : state.special_objects) {
+        if (key.starts_with(".~ngs3fs~.pending-delete/")) {
+          continue;
+        }
+        xml += "<s3:Contents><s3:Key>";
+        xml += key;
+        xml += "</s3:Key><s3:ETag>";
+        xml += object->etag;
+        xml += "</s3:ETag><s3:LastModified>";
+        xml += object->last_modified_iso;
+        xml += "</s3:LastModified><s3:Size>";
+        xml += std::to_string(object->bytes.size());
+        xml += "</s3:Size></s3:Contents>";
+      }
       if (state.deep_present) {
         xml += "<s3:Contents><s3:Key>deep</s3:Key>"
                "<s3:ETag>\"file\"</s3:ETag>"
@@ -696,6 +913,78 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
         session, connection, frame->hd.stream_id, "200", xml);
     return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
   }
+  if (request.method == "GET" && frame->hd.type == NGHTTP2_HEADERS &&
+      request.path.find("?attributes") != std::string::npos) {
+    require(request.object_attributes == "ObjectParts,Checksum",
+            "GetObjectAttributes omitted requested attributes");
+    require(request.max_parts == "1000",
+            "GetObjectAttributes omitted max-parts=1000");
+    const std::string key = request_object_key(request.path);
+    const auto special = state.special_objects.find(key);
+    const std::vector<std::byte>* object = &state.object;
+    SpecialObject* special_object = nullptr;
+    if (special != state.special_objects.end()) {
+      special_object = special->second.get();
+      object = &special->second->bytes;
+    }
+    ++state.object_attributes_requests;
+    if (special_object != nullptr) {
+      ++special_object->attributes_requests;
+    }
+    if (special_object != nullptr &&
+        special_object->attributes_unsupported) {
+      return submit_text_response(session, connection, frame->hd.stream_id,
+                                  "403", {});
+    }
+    if (object->empty()) {
+      return submit_text_response(session, connection, frame->hd.stream_id,
+                                  "501", {});
+    }
+    size_t first = 0;
+    size_t last  = object->size();
+    unsigned part_number = 1;
+    bool truncated = false;
+    if (special_object != nullptr &&
+        special_object->checksum_part_size != 0) {
+      if (request.part_number_marker.empty()) {
+        last = special_object->checksum_part_size;
+        truncated = last < object->size();
+      } else {
+        require(request.part_number_marker == "1",
+                "GetObjectAttributes used the wrong part marker");
+        first = special_object->checksum_part_size;
+        part_number = 2;
+      }
+    } else {
+      require(request.part_number_marker.empty(),
+              "single-page GetObjectAttributes used a part marker");
+    }
+    std::string xml =
+        "<s3:GetObjectAttributesOutput xmlns:s3=\"urn:s3\">"
+        "<s3:ObjectParts><s3:IsTruncated>";
+    xml += truncated ? "true" : "false";
+    xml += "</s3:IsTruncated>";
+    if (truncated) {
+      xml += "<s3:NextPartNumberMarker>1</s3:NextPartNumberMarker>";
+    }
+    xml += "<s3:Part><s3:PartNumber>";
+    xml += std::to_string(part_number);
+    xml += "</s3:PartNumber><s3:Size>";
+    xml += std::to_string(last - first);
+    xml += "</s3:Size><s3:";
+    xml += checksum_xml_name(state.checksum);
+    xml += '>';
+    xml += encoded_checksum(
+        state.checksum,
+        std::span(*object).subspan(first, last - first));
+    xml += "</s3:";
+    xml += checksum_xml_name(state.checksum);
+    xml += "></s3:Part></s3:ObjectParts>"
+           "</s3:GetObjectAttributesOutput>";
+    const int submitted = submit_text_response(
+        session, connection, frame->hd.stream_id, "200", xml);
+    return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+  }
   if (request.method == "PUT" && frame->hd.type == NGHTTP2_DATA) {
     require(request.content_length == std::to_string(request.body.size()),
             "PutObject omitted an exact Content-Length");
@@ -705,7 +994,41 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
             : std::string{};
     require(request.checksum_value == expected_request_checksum,
             "PutObject sent an invalid checksum");
+    const std::string key = request_object_key(request.path);
+    if (key == "overwrite-dest.bin" || key == "overwrite-source.bin") {
+      auto object = std::make_shared<SpecialObject>();
+      object->bytes = std::move(request.body);
+      object->etag = key == "overwrite-dest.bin"
+          ? "\"overwrite-destination\""
+          : "\"overwrite-source\"";
+      object->version_id = key == "overwrite-dest.bin"
+          ? "overwrite-destination-v1"
+          : "overwrite-source-v1";
+      object->last_modified = "Wed, 09 Nov 1994 08:49:37 GMT";
+      object->last_modified_iso = "1994-11-09T08:49:37.000Z";
+      state.special_objects[key] = object;
+      ++state.put_requests;
+      const std::string checksum = response_checksum(
+          state.checksum, object->bytes);
+      const std::array response_headers{
+          header(":status", "200"),
+          header("content-length", "0"),
+          header("etag", object->etag),
+          header("x-amz-version-id", object->version_id),
+          header("last-modified", object->last_modified),
+          header(checksum_header_name(state.checksum), checksum),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     state.object = std::move(request.body);
+    constexpr std::string_view bucket_prefix = "/bucket/";
+    require(request.path.starts_with(bucket_prefix),
+            "PutObject used an unexpected request path");
+    state.object_key.assign(request.path.substr(bucket_prefix.size()));
+    state.write_id = request.write_id;
     state.etag = "\"after-put\"";
     state.version_id = "version-2";
     state.last_modified = "Mon, 07 Nov 1994 08:49:37 GMT";
@@ -735,6 +1058,10 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     require(request.checksum_value == expected_request_checksum,
             "empty PutObject sent an invalid checksum");
     state.object.clear();
+    constexpr std::string_view bucket_prefix = "/bucket/";
+    require(request.path.starts_with(bucket_prefix),
+            "empty PutObject used an unexpected request path");
+    state.object_key.assign(request.path.substr(bucket_prefix.size()));
     state.etag = "\"after-put\"";
     state.version_id = "version-2";
     state.last_modified = "Mon, 07 Nov 1994 08:49:37 GMT";
@@ -760,45 +1087,90 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     return NGHTTP2_ERR_CALLBACK_FAILURE;
   }
 
+  const std::string key = request_object_key(request.path);
+  const auto special = state.special_objects.find(key);
+  if (special == state.special_objects.end() &&
+      (key == "overwrite-dest.bin" || key == "overwrite-source.bin" ||
+       (!state.overwrite_hidden_key.empty() &&
+        key == state.overwrite_hidden_key))) {
+    return submit_text_response(session, connection, frame->hd.stream_id,
+                                "404", {});
+  }
+  const bool is_special = special != state.special_objects.end();
+  std::shared_ptr<SpecialObject> response_object;
+  if (is_special) {
+    response_object = special->second;
+  } else {
+    response_object                = std::make_shared<SpecialObject>();
+    response_object->bytes         = state.object;
+    response_object->etag          = state.etag;
+    response_object->version_id    = state.version_id;
+    response_object->last_modified = state.last_modified;
+    response_object->last_modified_iso = state.last_modified_iso;
+  }
+  const std::vector<std::byte>* object = &response_object->bytes;
   const RequestRange range = request.range;
-  if (!range.valid || range.last >= state.object.size()) {
+  if (is_special) {
+    ++response_object->get_requests;
+    response_object->get_ranges.push_back(range);
+    if (response_object->corrupt_gets_remaining != 0) {
+      --response_object->corrupt_gets_remaining;
+      object = &response_object->corrupted_bytes;
+    }
+  }
+  const std::string_view object_etag   = response_object->etag;
+  const std::string_view object_version = response_object->version_id;
+  if (!range.valid || range.last >= object->size()) {
     return NGHTTP2_ERR_CALLBACK_FAILURE;
   }
-
   auto response = std::make_unique<ResponseSource>();
-  response->object = &state.object;
+  response->keepalive = std::move(response_object);
+  response->object = object;
   response->delay = true;
   response->cursor = static_cast<size_t>(range.first);
   response->end = static_cast<size_t>(range.last + 1);
   response->content_length =
       std::to_string(response->end - response->cursor);
+  response->content_range =
+      "bytes " + std::to_string(range.first) + '-' +
+      std::to_string(range.last) + '/' +
+      std::to_string(object->size());
   ResponseSource* source = response.get();
   connection.responses[frame->hd.stream_id] = std::move(response);
   ++state.active_gets;
   ++state.get_requests;
+  if (key == "overwrite-dest.bin" || key == state.overwrite_hidden_key) {
+    if (is_special) {
+      ++state.overwrite_destination_gets;
+      state.overwrite_destination_max_read_end = std::max(
+          state.overwrite_destination_max_read_end,
+          static_cast<size_t>(range.last + 1));
+    }
+  }
   state.maximum_active_gets =
       std::max(state.maximum_active_gets, state.active_gets);
 
   const bool complete_object = range.first == 0 &&
-      range.last + 1 == state.object.size();
+      range.last + 1 == object->size();
   std::string checksum;
   std::vector<nghttp2_nv> response_headers{
       header(":status", "206"),
       header("content-length", source->content_length),
-      header("etag", state.etag),
-      header("x-amz-version-id", state.version_id),
+      header("content-range", source->content_range),
+      header("etag", object_etag),
+      header("x-amz-version-id", object_version),
   };
   if (!request.checksum_mode.empty()) {
     require(request.checksum_mode == "ENABLED" && complete_object,
             "checksum mode was used for a partial object range");
     ++state.checksum_mode_requests;
-    checksum = encoded_checksum(state.checksum, state.object);
+    checksum = encoded_checksum(state.checksum, *object);
     response_headers.push_back(
         header(checksum_header_name(state.checksum), checksum));
     response_headers.push_back(
         header("x-amz-checksum-type", "FULL_OBJECT"));
   } else if (state.checksum == CHECKSUM_CRC64XZ) {
-    checksum = response_checksum(state.checksum, state.object);
+    checksum = response_checksum(state.checksum, *object);
     response_headers.push_back(
         header(checksum_header_name(state.checksum), checksum));
   }
@@ -884,6 +1256,17 @@ void record_server_failure(SharedServerState& shared,
   }
 }
 
+void rethrow_server_failure(SharedServerState& shared) {
+  std::exception_ptr failure;
+  {
+    std::lock_guard state_guard(shared.mutex);
+    failure = shared.failure;
+  }
+  if (failure) {
+    std::rethrow_exception(failure);
+  }
+}
+
 void serve_connection(UniqueFd socket, SharedServerState& shared) noexcept {
   try {
     nghttp2_session_callbacks* raw_callbacks = nullptr;
@@ -921,6 +1304,9 @@ void serve_connection(UniqueFd socket, SharedServerState& shared) noexcept {
       }
       if (count < 0 && errno == EINTR) {
         continue;
+      }
+      if (count < 0 && errno == ECONNRESET) {
+        return;
       }
       if (count < 0) {
         fail_errno("server read");
@@ -969,21 +1355,25 @@ class MountedProcess {
 
   ~MountedProcess() { stop(); }
 
+  void crash() noexcept {
+    if (process_ <= 0) {
+      return;
+    }
+    ::kill(process_, SIGKILL);
+    int status = 0;
+    while (::waitpid(process_, &status, 0) < 0 && errno == EINTR) {
+    }
+    process_ = -1;
+    unmount(true);
+  }
+
+  void restart(pid_t process) noexcept { process_ = process; }
+
   void stop() noexcept {
     if (process_ <= 0) {
       return;
     }
-    const pid_t unmount = ::fork();
-    if (unmount == 0) {
-      ::execlp("fusermount3", "fusermount3", "-u", mountpoint_.c_str(),
-               static_cast<char*>(nullptr));
-      _exit(127);
-    }
-    if (unmount > 0) {
-      int unmount_status = 0;
-      while (::waitpid(unmount, &unmount_status, 0) < 0 && errno == EINTR) {
-      }
-    }
+    unmount(false);
 
     for (int attempt = 0; attempt < 200; ++attempt) {
       int status = 0;
@@ -1002,6 +1392,20 @@ class MountedProcess {
   }
 
  private:
+  void unmount(bool lazy) noexcept {
+    const pid_t unmount_process = ::fork();
+    if (unmount_process == 0) {
+      ::execlp("fusermount3", "fusermount3", lazy ? "-uz" : "-u",
+               mountpoint_.c_str(), static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    if (unmount_process > 0) {
+      int unmount_status = 0;
+      while (::waitpid(unmount_process, &unmount_status, 0) < 0 &&
+             errno == EINTR) {
+      }
+    }
+  }
   std::string mountpoint_;
   pid_t process_ = -1;
 };
@@ -1017,7 +1421,8 @@ std::string make_mountpoint() {
 }
 
 pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
-                   uint16_t port, std::string_view checksum) {
+                   uint16_t port, std::string_view checksum,
+                   std::string_view cache_dir) {
   const std::string port_text = std::to_string(port);
   const std::string uid_text  = std::to_string(::getuid());
   const std::string gid_text  = std::to_string(::getgid());
@@ -1026,13 +1431,25 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
     fail_errno("fork");
   }
   if (process == 0) {
-    ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
-            port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
-            uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
-            "0750", "--io-size", "384KiB", "-R", "256KiB", "-I", "1",
-            "--checksum", checksum.data(), "--verify-read-checksum",
-            "--stats-interval", "86400", "-f", mountpoint.data(),
-            static_cast<char*>(nullptr));
+    if (cache_dir.empty()) {
+      ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
+              port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
+              uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
+              "0750", "--io-size", "384KiB", "-R", "256KiB", "-I", "1",
+              "--checksum", checksum.data(), "--verify-read-checksum",
+              "--stats-interval", "86400", "-f", mountpoint.data(),
+              static_cast<char*>(nullptr));
+    } else {
+      ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
+              port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
+              uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
+              "0750", "--io-size", "384KiB", "-R", "256KiB", "-I", "1",
+              "--checksum", checksum.data(), "--verify-read-checksum",
+              "--stats-interval", "86400", "--max-cache-fetch-size", "1MiB",
+              "-L", cache_dir.data(),
+              "--cache-reserve", "0", "-f", mountpoint.data(),
+              static_cast<char*>(nullptr));
+    }
     _exit(127);
   }
   return process;
@@ -1054,8 +1471,9 @@ void wait_until_mounted(std::string_view file_path, pid_t process) {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 2 || argc > 3) {
-    std::cerr << "usage: fuse_mmap_integration_test NGS3FS [CHECKSUM]\n";
+  if (argc < 2 || argc > 4) {
+    std::cerr << "usage: fuse_mmap_integration_test NGS3FS "
+                 "[CHECKSUM [cache]]\n";
     return 2;
   }
   if (::access("/dev/fuse", R_OK | W_OK) != 0) {
@@ -1064,9 +1482,10 @@ int main(int argc, char** argv) {
   }
 
   std::string mountpoint;
+  std::string cache_dir;
   try {
     ChecksumAlgorithm checksum = CHECKSUM_XXHASH128;
-    if (argc == 3 &&
+    if (argc >= 3 &&
         (!parse_checksum_algorithm(argv[2], checksum) ||
          (checksum != CHECKSUM_XXHASH128 &&
           checksum != CHECKSUM_CRC64NVME &&
@@ -1088,17 +1507,67 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < final_expected.size(); ++i) {
       final_expected[i] = static_cast<std::byte>((i * 17U + 11U) & 0xffU);
     }
+    std::vector<std::byte> overwrite_old(2U * 1024U * 1024U);
+    std::vector<std::byte> overwrite_source(2U * 1024U * 1024U);
+    for (size_t i = 0; i < overwrite_old.size(); ++i) {
+      overwrite_old[i] = static_cast<std::byte>((i * 31U + 19U) & 0xffU);
+      overwrite_source[i] = static_cast<std::byte>((i * 47U + 23U) & 0xffU);
+    }
 
     Listener listener = make_listener();
     SharedServerState shared;
     shared.checksum = checksum;
     shared.object   = expected;
+    auto add_overwrite_object = [&](std::string key,
+                                    std::vector<std::byte> bytes,
+                                    std::string etag) {
+      auto object = std::make_shared<SpecialObject>();
+      object->bytes = std::move(bytes);
+      object->etag = std::move(etag);
+      object->version_id = key + "-v1";
+      object->last_modified = "Wed, 09 Nov 1994 08:49:37 GMT";
+      object->last_modified_iso = "1994-11-09T08:49:37.000Z";
+      shared.special_objects.emplace(std::move(key), std::move(object));
+    };
+    add_overwrite_object("overwrite-dest.bin", overwrite_old,
+                         "\"overwrite-destination\"");
+    add_overwrite_object("overwrite-source.bin", overwrite_source,
+                         "\"overwrite-source\"");
+    std::vector<std::byte> checksum_test(256U * 1024U + 37U);
+    for (size_t i = 0; i < checksum_test.size(); ++i) {
+      checksum_test[i] = static_cast<std::byte>((i * 13U + 41U) & 0xffU);
+    }
+    auto add_checksum_object = [&](std::string key, int corrupt_gets,
+                                   size_t part_size = 0,
+                                   bool unsupported = false) {
+      auto object = std::make_shared<SpecialObject>();
+      object->bytes           = checksum_test;
+      object->corrupted_bytes = checksum_test;
+      object->corrupted_bytes[12345] ^= std::byte{0x80};
+      object->etag              = '"' + key + '"';
+      object->version_id        = key + "-v1";
+      object->last_modified     = "Thu, 10 Nov 1994 08:49:37 GMT";
+      object->last_modified_iso = "1994-11-10T08:49:37.000Z";
+      object->corrupt_gets_remaining = corrupt_gets;
+      object->checksum_part_size      = part_size;
+      object->attributes_unsupported = unsupported;
+      shared.special_objects.emplace(std::move(key), std::move(object));
+    };
+    add_checksum_object("checksum-retry.bin", 1, 128U * 1024U);
+    add_checksum_object("checksum-fail.bin", 2);
+    add_checksum_object("checksum-unsupported.bin", 0, 0, true);
     std::jthread server(run_server, listener.socket.get(), std::ref(shared));
 
     mountpoint = make_mountpoint();
+    if (argc == 4) {
+      if (std::string_view(argv[3]) != "cache") {
+        throw std::invalid_argument("unknown integration-test mode");
+      }
+      cache_dir = make_mountpoint();
+    }
     const std::string checksum_option(checksum_option_name(checksum));
     const pid_t process = start_daemon(
-        argv[1], mountpoint, listener.port, checksum_option);
+        argv[1], mountpoint, listener.port, checksum_option, cache_dir);
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
@@ -1173,6 +1642,16 @@ int main(int argc, char** argv) {
       std::lock_guard state_guard(shared.mutex);
       require(shared.list_requests == lists_before_deep_lookup + 1,
               "child lookup did not issue one direct-child ListObjectsV2");
+    }
+    const std::string nonempty_directory_rename =
+        mountpoint + "/deep-renamed";
+    errno = 0;
+    require(::rename((mountpoint + "/deep").c_str(),
+                     nonempty_directory_rename.c_str()) != 0 &&
+                errno == EXDEV,
+            "renaming a non-empty directory must fail with EXDEV");
+    {
+      std::lock_guard state_guard(shared.mutex);
       shared.deep_present = false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
@@ -1246,6 +1725,115 @@ int main(int argc, char** argv) {
     ::munmap(mapping, expected.size());
     require(equal, "mmap bytes differ from HTTP/2 object");
     file.reset();
+
+    if (!cache_dir.empty()) {
+      const std::string retry_path =
+          mountpoint + "/checksum-retry.bin";
+      UniqueFd retry_first(
+          ::open(retry_path.c_str(), O_RDONLY | O_CLOEXEC));
+      UniqueFd retry_second(
+          ::open(retry_path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!retry_first || !retry_second) {
+        fail_errno("open checksum retry object");
+      }
+      std::array<std::byte, 4096> retry_a{};
+      std::array<std::byte, 4096> retry_b{};
+      std::exception_ptr retry_a_failure;
+      std::exception_ptr retry_b_failure;
+      std::jthread retry_a_thread([&] {
+        try {
+          pread_all(retry_first.get(), retry_a, 0);
+        } catch (...) {
+          retry_a_failure = std::current_exception();
+        }
+      });
+      std::jthread retry_b_thread([&] {
+        try {
+          pread_all(retry_second.get(), retry_b, 128U * 1024U);
+        } catch (...) {
+          retry_b_failure = std::current_exception();
+        }
+      });
+      retry_a_thread.join();
+      retry_b_thread.join();
+      if (retry_a_failure) {
+        std::rethrow_exception(retry_a_failure);
+      }
+      if (retry_b_failure) {
+        std::rethrow_exception(retry_b_failure);
+      }
+      std::array<std::byte, 4096> retry_verified{};
+      pread_all(retry_first.get(), retry_verified, 64U * 1024U);
+      require(std::equal(retry_verified.begin(), retry_verified.end(),
+                         checksum_test.begin() + 64U * 1024U),
+              "checksum retry did not replace the corrupt cached part");
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.special_objects.at("checksum-retry.bin")
+                        ->get_requests == 2,
+                "concurrent readers did not share exactly one checksum retry");
+        const SpecialObject& retried =
+            *shared.special_objects.at("checksum-retry.bin");
+        require(retried.attributes_requests == 2,
+                "GetObjectAttributes pagination was not completed once");
+        require(retried.get_ranges.size() == 2 &&
+                    retried.get_ranges[1].first == 0 &&
+                    retried.get_ranges[1].last == 128U * 1024U - 1,
+                "checksum retry did not GET the exact multipart part");
+      }
+
+      const std::string unsupported_path =
+          mountpoint + "/checksum-unsupported.bin";
+      UniqueFd unsupported(
+          ::open(unsupported_path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!unsupported) {
+        fail_errno("open checksum-unsupported object");
+      }
+      std::vector<std::byte> unsupported_bytes(checksum_test.size());
+      pread_all(unsupported.get(), unsupported_bytes, 0);
+      require(unsupported_bytes == checksum_test,
+              "unsupported ObjectParts checksum made cached read fail");
+      {
+        std::lock_guard state_guard(shared.mutex);
+        const SpecialObject& object =
+            *shared.special_objects.at("checksum-unsupported.bin");
+        require(object.attributes_requests == 1 &&
+                    object.get_requests == 1,
+                "unsupported checksum manifest was retried or blocked read");
+      }
+
+      const std::string fail_path = mountpoint + "/checksum-fail.bin";
+      UniqueFd fail_file(::open(fail_path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!fail_file) {
+        fail_errno("open permanently corrupt checksum object");
+      }
+      std::array<std::byte, 4096> failed_bytes{};
+      ssize_t first_failed = ::pread(fail_file.get(), failed_bytes.data(),
+                                     failed_bytes.size(), 0);
+      if (first_failed < 0 && errno != EIO) {
+        fail_errno("first read of permanently corrupt checksum object");
+      }
+      const int advised = ::posix_fadvise(
+          fail_file.get(), 0, 0, POSIX_FADV_DONTNEED);
+      require(advised == 0,
+              "unable to drop the deliberately corrupt test page");
+      errno = 0;
+      require(::pread(fail_file.get(), failed_bytes.data(), 1,
+                      256U * 1024U) < 0 && errno == EIO,
+              "a permanently bad cached part did not fail a later read");
+      errno = 0;
+      require(::pread(fail_file.get(), failed_bytes.data(), 1,
+                      256U * 1024U) < 0 && errno == EIO,
+              "a permanently bad cached part was retried more than once");
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.special_objects.at("checksum-fail.bin")
+                        ->get_requests == 2,
+                "permanent checksum mismatch did not stop after one retry");
+        require(shared.object_attributes_requests >= 3,
+                "cached checksum reads did not load ObjectParts manifests");
+      }
+    }
 
     errno = 0;
     UniqueFd read_write(::open(file_path.c_str(), O_RDWR | O_CLOEXEC));
@@ -1343,6 +1931,32 @@ int main(int argc, char** argv) {
     if (!visible_after_flush) {
       fail_errno("close-to-open while duplicated writer remains");
     }
+    if (!cache_dir.empty()) {
+      const long page_size = ::sysconf(_SC_PAGESIZE);
+      require(page_size > 0, "sysconf(_SC_PAGESIZE) failed");
+      const size_t mapped_size =
+          (small_expected.size() + size_t(page_size) - 1) /
+          size_t(page_size) * size_t(page_size);
+      void* resident_mapping = ::mmap(
+          nullptr, small_expected.size(), PROT_READ, MAP_PRIVATE,
+          visible_after_flush.get(), 0);
+      if (resident_mapping == MAP_FAILED) {
+        fail_errno("mmap locally written object for mincore");
+      }
+      std::vector<unsigned char> residency(
+          mapped_size / size_t(page_size));
+      if (::mincore(resident_mapping, mapped_size, residency.data()) != 0) {
+        const int error = errno;
+        ::munmap(resident_mapping, small_expected.size());
+        errno = error;
+        fail_errno("mincore locally written object");
+      }
+      require(std::all_of(
+                  residency.begin(), residency.end(),
+                  [](unsigned char page) { return (page & 1U) != 0; }),
+              "partial cached writes were not retained in page cache");
+      ::munmap(resident_mapping, small_expected.size());
+    }
     std::vector<std::byte> visible_bytes(small_expected.size());
     pread_all(visible_after_flush.get(), visible_bytes, 0);
     require(visible_bytes == small_expected,
@@ -1409,6 +2023,7 @@ int main(int argc, char** argv) {
     UniqueFd multipart_writer(
         ::open(file_path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC));
     if (!multipart_writer) {
+      rethrow_server_failure(shared);
       fail_errno("open mounted object for multipart write");
     }
     constexpr size_t write_chunk = 256U * 1024U;
@@ -1432,7 +2047,9 @@ int main(int argc, char** argv) {
       require(shared.create_multipart_requests == 1,
               "large write did not create one multipart upload");
       require(shared.upload_part_requests == 2,
-              "large write did not upload one full part and one tail part");
+              "large write completed " +
+                  std::to_string(shared.upload_part_requests) +
+                  " parts instead of one full part and one tail part");
       require(shared.upload_attempts[1] == 2 &&
                   shared.upload_attempts[2] == 1,
               "multipart UploadPart retry counts are wrong");
@@ -1475,14 +2092,26 @@ int main(int argc, char** argv) {
               "multipart read-open discarded locally written page cache");
     }
     const std::string renamed_path = mountpoint + "/renamed.bin";
-    errno = 0;
-    require(::rename(file_path.c_str(), renamed_path.c_str()) != 0 &&
-                errno == EBUSY,
-            "rename with an open handle must fail with EBUSY");
+    if (cache_dir.empty()) {
+      errno = 0;
+      require(::rename(file_path.c_str(), renamed_path.c_str()) != 0 &&
+                  errno == EBUSY,
+              "uncached rename with an open handle must fail with EBUSY");
+    } else {
+      require(::rename(file_path.c_str(), renamed_path.c_str()) == 0,
+              "cached rename did not preserve an open reader");
+      std::array<std::byte, 4096> after_rename{};
+      pread_all(reopened.get(), after_rename, 0);
+      require(std::equal(after_rename.begin(), after_rename.end(),
+                         final_expected.begin()),
+              "open reader changed generation after cached rename");
+    }
     reopened.reset();
-    retry_after_fuse_release("rename mounted object", [&] {
-      return ::rename(file_path.c_str(), renamed_path.c_str());
-    });
+    if (cache_dir.empty()) {
+      retry_after_fuse_release("rename mounted object", [&] {
+        return ::rename(file_path.c_str(), renamed_path.c_str());
+      });
+    }
     struct stat old_status{};
     errno = 0;
     require(::stat(file_path.c_str(), &old_status) != 0 && errno == ENOENT,
@@ -1508,6 +2137,135 @@ int main(int argc, char** argv) {
     }
     copied.reset();
 
+    std::vector<std::byte> recovery_expected;
+    if (!cache_dir.empty()) {
+      recovery_expected.resize(192U * 1024U + 19U);
+      for (size_t i = 0; i < recovery_expected.size(); ++i) {
+        recovery_expected[i] = std::byte((i * 43U + 3U) & 255U);
+      }
+      UniqueFd recovery_writer(
+          ::open(copied_path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC));
+      if (!recovery_writer) {
+        fail_errno("open cached crash-recovery writer");
+      }
+      write_all(recovery_writer.get(), recovery_expected);
+      mounted.crash();
+      recovery_writer.reset();
+
+      const pid_t restarted = start_daemon(
+          argv[1], mountpoint, listener.port, checksum_option, cache_dir);
+      mounted.restart(restarted);
+      wait_until_mounted(copied_path, restarted);
+      UniqueFd recovered;
+      for (unsigned attempt = 0; attempt < 500; ++attempt) {
+        recovered.reset(::open(
+            copied_path.c_str(), O_RDONLY | O_CLOEXEC));
+        if (recovered) {
+          break;
+        }
+        if (errno != EBUSY && errno != EAGAIN && errno != ESTALE) {
+          fail_errno("open recovered cached object");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      require(bool(recovered), "cached recovery data was not readable");
+      std::vector<std::byte> recovered_bytes(recovery_expected.size());
+      pread_all(recovered.get(), recovered_bytes, 0);
+      require(recovered_bytes == recovery_expected,
+              "cached write recovery published the wrong bytes");
+      recovered.reset();
+      bool published = false;
+      for (unsigned attempt = 0; attempt < 500; ++attempt) {
+        {
+          std::lock_guard state_guard(shared.mutex);
+          published = shared.object == recovery_expected;
+        }
+        if (published) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(published && shared.object == recovery_expected,
+                "recovered server object differs from local cache (size=" +
+                    std::to_string(shared.object.size()) + ")");
+      }
+    }
+
+    if (!cache_dir.empty()) {
+      const std::string new_append_path = mountpoint + "/new-append.bin";
+      const std::array new_append_bytes{
+          std::byte{'n'}, std::byte{'e'}, std::byte{'w'},
+      };
+      UniqueFd new_append(::open(
+          new_append_path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+          0640));
+      if (!new_append) {
+        fail_errno("open new file with O_APPEND");
+      }
+      write_all(new_append.get(), new_append_bytes);
+      new_append.reset();
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.object == std::vector<std::byte>(
+                                new_append_bytes.begin(), new_append_bytes.end()),
+                "new O_APPEND file published the wrong bytes");
+      }
+
+      errno = 0;
+      UniqueFd nonempty_append(::open(
+          new_append_path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC));
+      require(!nonempty_append && errno == EOPNOTSUPP,
+              "O_APPEND on an existing non-empty file must fail");
+
+      const std::array truncate_append_bytes{
+          std::byte{'t'}, std::byte{'r'}, std::byte{'u'}, std::byte{'n'},
+      };
+      UniqueFd truncate_append(::open(
+          new_append_path.c_str(),
+          O_WRONLY | O_TRUNC | O_APPEND | O_CLOEXEC));
+      if (!truncate_append) {
+        fail_errno("open non-empty file with O_TRUNC|O_APPEND");
+      }
+      write_all(truncate_append.get(), truncate_append_bytes);
+      truncate_append.reset();
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.object == std::vector<std::byte>(
+                                truncate_append_bytes.begin(),
+                                truncate_append_bytes.end()),
+                "O_TRUNC|O_APPEND published the wrong bytes");
+        // This compact mock stores only one ordinary object. Restore the main
+        // object after finishing the independent open-flag scenario.
+        shared.object     = recovery_expected;
+        shared.object_key = "copied.bin";
+      }
+
+      const std::string empty_append_path =
+          mountpoint + "/empty-append.bin";
+      UniqueFd empty_creator(::open(
+          empty_append_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+          0640));
+      if (!empty_creator) {
+        fail_errno("create empty file for O_APPEND");
+      }
+      empty_creator.reset();
+      UniqueFd empty_append(::open(
+          empty_append_path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC));
+      if (!empty_append) {
+        fail_errno("open existing empty file with O_APPEND");
+      }
+      const std::array empty_append_bytes{std::byte{'e'}};
+      write_all(empty_append.get(), empty_append_bytes);
+      empty_append.reset();
+      {
+        std::lock_guard state_guard(shared.mutex);
+        shared.object     = recovery_expected;
+        shared.object_key = "copied.bin";
+      }
+    }
+
     size_t puts_before_truncate;
     {
       std::lock_guard state_guard(shared.mutex);
@@ -1529,6 +2287,252 @@ int main(int argc, char** argv) {
               "standalone truncate did not publish one empty PutObject");
     }
 
+    if (!cache_dir.empty()) {
+      const std::string active_unlink_path =
+          mountpoint + "/active-unlink-writer.bin";
+      std::array<std::byte, 4096> active_unlink_bytes{};
+      for (size_t i = 0; i < active_unlink_bytes.size(); ++i) {
+        active_unlink_bytes[i] =
+            std::byte((i * 31U + 13U) & 255U);
+      }
+      UniqueFd active_unlink_writer(::open(
+          active_unlink_path.c_str(),
+          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640));
+      if (!active_unlink_writer) {
+        fail_errno("create active-unlink writer");
+      }
+      write_all(active_unlink_writer.get(), active_unlink_bytes);
+      require(::unlink(active_unlink_path.c_str()) == 0,
+              "cached unlink with an active writer failed");
+
+      const auto write_error = [](int error) {
+        return error == ESTALE || error == EIO;
+      };
+      std::byte rejected_byte{};
+      errno = 0;
+      require(::write(active_unlink_writer.get(), &rejected_byte, 1) < 0 &&
+                  write_error(errno),
+              "write after unlink did not fail with ESTALE/EIO");
+      errno = 0;
+      require(::fsync(active_unlink_writer.get()) != 0 &&
+                  write_error(errno),
+              "fsync after unlink did not fail with ESTALE/EIO");
+
+      const int active_unlink_fd = active_unlink_writer.release();
+      errno = 0;
+      const int close_result = ::close(active_unlink_fd);
+      const int close_error  = errno;
+      require(close_result != 0 && write_error(close_error),
+              "flush on close after unlink did not fail with ESTALE/EIO");
+
+      // close(2) may return before the asynchronous FUSE_RELEASE is retired.
+      // A same-name O_EXCL create is a cheap observable release barrier: the
+      // old writer still registered in the mount makes it return EBUSY.
+      UniqueFd release_probe;
+      for (unsigned attempt = 0; attempt < 200; ++attempt) {
+        errno = 0;
+        release_probe.reset(::open(
+            active_unlink_path.c_str(),
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0640));
+        if (release_probe) {
+          break;
+        }
+        require(errno == EBUSY || errno == EAGAIN || errno == ESTALE,
+                "unexpected error while waiting for active writer release");
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      require(bool(release_probe),
+              "timed out waiting for active writer FUSE_RELEASE");
+      require(::unlink(active_unlink_path.c_str()) == 0,
+              "unlink of release barrier writer failed");
+      release_probe.reset();
+
+      int puts_before_active_restart;
+      int multipart_before_active_restart;
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.active_writer_delete_completed,
+                "active-writer unlink did not issue DeleteObject");
+        puts_before_active_restart = shared.put_requests;
+        multipart_before_active_restart =
+            shared.create_multipart_requests +
+            shared.upload_part_requests +
+            shared.complete_multipart_requests;
+      }
+      mounted.crash();
+      const pid_t restarted = start_daemon(
+          argv[1], mountpoint, listener.port, checksum_option, cache_dir);
+      mounted.restart(restarted);
+      wait_until_mounted(copied_path, restarted);
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.put_requests == puts_before_active_restart &&
+                    shared.create_multipart_requests +
+                            shared.upload_part_requests +
+                            shared.complete_multipart_requests ==
+                        multipart_before_active_restart,
+                "unlinked active writer left recoverable cached data");
+      }
+
+      const std::string unlink_path = mountpoint + "/unlink-open.bin";
+      UniqueFd unlink_writer(::open(
+          unlink_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+          0640));
+      if (!unlink_writer) {
+        fail_errno("create object for native unlink");
+      }
+      write_all(unlink_writer.get(), expected);
+      unlink_writer.reset();
+
+      UniqueFd unlink_reader(
+          ::open(unlink_path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!unlink_reader) {
+        fail_errno("open native-unlink reader");
+      }
+      std::array<std::byte, 4096> cached_prefix{};
+      pread_all(unlink_reader.get(), cached_prefix, 0);
+      require(std::equal(cached_prefix.begin(), cached_prefix.end(),
+                         expected.begin()),
+              "native-unlink reader returned wrong cached bytes");
+
+      require(::unlink(unlink_path.c_str()) == 0,
+              "cached unlink with an open reader failed");
+      struct stat unlinked_status{};
+      errno = 0;
+      require(::stat(unlink_path.c_str(), &unlinked_status) != 0 &&
+                  errno == ENOENT,
+              "native unlink left the visible name in the mount");
+
+      directory = ::opendir(mountpoint.c_str());
+      if (directory == nullptr) {
+        fail_errno("opendir mountpoint after native unlink");
+      }
+      bool leaked_unlinked_file = false;
+      bool leaked_pending_directory = false;
+      while (dirent* entry = ::readdir(directory)) {
+        leaked_unlinked_file = leaked_unlinked_file ||
+            std::string_view(entry->d_name) == "unlink-open.bin";
+        leaked_pending_directory = leaked_pending_directory ||
+            std::string_view(entry->d_name) == ".~ngs3fs~.pending-delete";
+      }
+      ::closedir(directory);
+      require(!leaked_unlinked_file && !leaked_pending_directory,
+              "native unlink exposed its hidden object or directory");
+
+      std::array<std::byte, 4096> hidden_read{};
+      pread_all(unlink_reader.get(), hidden_read, 256U * 1024U);
+      require(std::equal(hidden_read.begin(), hidden_read.end(),
+                         expected.begin() + 256U * 1024U),
+              "open reader could not read after native unlink");
+      unlink_reader.reset();
+      for (unsigned attempt = 0; attempt < 500; ++attempt) {
+        {
+          std::lock_guard state_guard(shared.mutex);
+          if (shared.hidden_delete_completed) {
+            break;
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.hidden_rename_completed,
+                "native unlink did not issue RenameObject");
+        require(shared.hidden_delete_completed,
+                "native unlink did not delete the hidden object after close");
+      }
+    }
+
+    if (!cache_dir.empty()) {
+      {
+        std::lock_guard state_guard(shared.mutex);
+        shared.hidden_rename_completed = false;
+        shared.hidden_delete_completed = false;
+        shared.overwrite_hidden_key.clear();
+        shared.overwrite_rename_committed = false;
+        shared.overwrite_destination_gets = 0;
+        shared.overwrite_destination_max_read_end = 0;
+      }
+      const std::string overwrite_source_path =
+          mountpoint + "/overwrite-source.bin";
+      const std::string overwrite_destination_path =
+          mountpoint + "/overwrite-dest.bin";
+      UniqueFd old_destination(::open(
+          overwrite_destination_path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!old_destination) {
+        fail_errno("open old overwrite destination");
+      }
+      std::array<std::byte, 4096> old_prefix{};
+      pread_all(old_destination.get(), old_prefix, 0);
+      require(std::equal(old_prefix.begin(), old_prefix.end(),
+                         overwrite_old.begin()),
+              "old overwrite destination returned wrong cached prefix");
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.overwrite_destination_gets != 0 &&
+                    shared.overwrite_destination_max_read_end <
+                        overwrite_old.size(),
+                "old overwrite destination was not only partially cached");
+      }
+
+      require(::rename(overwrite_source_path.c_str(),
+                       overwrite_destination_path.c_str()) == 0,
+              "native rename over an open cached destination failed");
+      struct stat overwrite_status{};
+      if (::stat(overwrite_destination_path.c_str(), &overwrite_status) != 0) {
+        fail_errno("stat overwritten destination");
+      }
+      require(static_cast<size_t>(overwrite_status.st_size) ==
+                  overwrite_source.size(),
+              "overwritten destination has the wrong size");
+
+      UniqueFd new_destination(::open(
+          overwrite_destination_path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!new_destination) {
+        fail_errno("open new overwrite destination");
+      }
+      std::array<std::byte, 4096> new_prefix{};
+      pread_all(new_destination.get(), new_prefix, 0);
+      require(std::equal(new_prefix.begin(), new_prefix.end(),
+                         overwrite_source.begin()),
+              "new overwrite destination did not read source content");
+
+      constexpr uint64_t old_tail_offset = 1536U * 1024U;
+      std::array<std::byte, 4096> old_tail{};
+      pread_all(old_destination.get(), old_tail, old_tail_offset);
+      require(std::equal(old_tail.begin(), old_tail.end(),
+                         overwrite_old.begin() + old_tail_offset),
+              "open old reader did not follow the hidden object");
+      old_destination.reset();
+      for (unsigned attempt = 0; attempt < 500; ++attempt) {
+        bool deleted;
+        {
+          std::lock_guard state_guard(shared.mutex);
+          deleted = shared.hidden_delete_completed;
+        }
+        if (deleted) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.hidden_rename_completed &&
+                    shared.overwrite_rename_committed &&
+                    shared.hidden_delete_completed,
+                "native overwrite did not hide, replace, and delete reader "
+                "generation");
+        require(shared.special_objects.find("overwrite-source.bin") ==
+                    shared.special_objects.end() &&
+                    shared.special_objects.find("overwrite-dest.bin") !=
+                    shared.special_objects.end() &&
+                    shared.special_objects.find(shared.overwrite_hidden_key) ==
+                    shared.special_objects.end(),
+                "native overwrite left the wrong remote object set");
+      }
+      new_destination.reset();
+    }
+
     mounted.stop();
     shared.stop.store(true);
     server.request_stop();
@@ -1540,15 +2544,26 @@ int main(int argc, char** argv) {
       }
       require(shared.object.empty(),
               "server object does not contain the truncated result");
-      require(shared.rename_probe_attempts == 1 &&
+      const size_t expected_probes = cache_dir.empty() ? 1 : 2;
+      require(shared.rename_probe_attempts == expected_probes &&
                   shared.rename_attempts == 2 && shared.copy_completed &&
                   shared.delete_completed,
               "rename protocol coverage was incomplete");
-      require(shared.maximum_active_gets >= 2,
-              "read requests did not overlap across FUSE workers");
+      if (!cache_dir.empty()) {
+        require(shared.hidden_rename_completed &&
+                    shared.hidden_delete_completed,
+                "native unlink protocol coverage was incomplete");
+      }
+      if (cache_dir.empty()) {
+        require(shared.maximum_active_gets >= 2,
+                "read requests did not overlap across FUSE workers");
+      }
     }
     if (::rmdir(mountpoint.c_str()) != 0) {
       fail_errno("rmdir mountpoint");
+    }
+    if (!cache_dir.empty()) {
+      std::filesystem::remove_all(cache_dir);
     }
     std::cout << "FUSE mmap integration passed: " << expected.size()
               << " bytes\n";
@@ -1556,6 +2571,9 @@ int main(int argc, char** argv) {
   } catch (const std::exception& error) {
     if (!mountpoint.empty()) {
       ::rmdir(mountpoint.c_str());
+    }
+    if (!cache_dir.empty()) {
+      std::filesystem::remove_all(cache_dir);
     }
     std::cerr << "fuse_mmap_integration_test: " << error.what() << '\n';
     return 1;

@@ -104,6 +104,20 @@ void send_text(int socket, std::string_view text) {
       std::span(reinterpret_cast<const std::byte*>(text.data()), text.size()));
 }
 
+class TestFileSink final : public RangeFileSink {
+ public:
+  TestFileSink(int fd, uint64_t offset) noexcept
+      : RangeFileSink(fd, offset) {}
+
+  void progress(const Response&, bool complete) override {
+    ++calls;
+    completed |= complete;
+  }
+
+  size_t calls = 0;
+  bool completed = false;
+};
+
 void finish_probe_response(int socket) {
   if (::shutdown(socket, SHUT_WR) != 0) {
     assert(errno == ENOTCONN);
@@ -494,6 +508,67 @@ int main() {
   assert(closing_head.status == 200);
   assert(closing_head.body_bytes == 0);
   delayed_server.join();
+
+  std::vector<std::byte> file_body(1024U * 1024U);
+  for (size_t i = 0; i < file_body.size(); ++i) {
+    file_body[i] = static_cast<std::byte>((i * 37U + 5U) & 0xffU);
+  }
+  assert(file_body.size() > Pipe::create().capacity());
+  std::jthread file_server([&] {
+    UniqueFd probe = accept_one(listener.get());
+    std::array<std::byte, 24> client_magic{};
+    read_all(probe.get(), client_magic);
+    send_text(probe.get(),
+              "HTTP/1.1 505 HTTP Version Not Supported\r\n"
+              "content-length: 0\r\nconnection: close\r\n\r\n");
+    finish_probe_response(probe.get());
+    probe.reset();
+
+    UniqueFd socket = accept_one(listener.get());
+    const std::string get = read_request_head(socket.get(), "file GET");
+    assert(get.starts_with("GET /bucket/file HTTP/1.1\r\n"));
+    assert(get.find("range: bytes=0-" +
+                    std::to_string(file_body.size() - 1) + "\r\n") !=
+           std::string::npos);
+    const std::string response =
+        "HTTP/1.1 206 Partial Content\r\n"
+        "content-length: " + std::to_string(file_body.size()) +
+        "\r\ncontent-range: bytes 0-" +
+        std::to_string(file_body.size() - 1) + "/" +
+        std::to_string(file_body.size()) + "\r\n"
+        "etag: \"h1-file-etag\"\r\n\r\n";
+    std::vector<std::byte> first(response.size() + 4096);
+    memcpy(first.data(), response.data(), response.size());
+    memcpy(first.data() + response.size(), file_body.data(), 4096);
+    write_all(socket.get(), first);
+    write_all(socket.get(), std::span(file_body).subspan(4096));
+  });
+
+  auto file_client = HttpClient::connect(
+      "127.0.0.1", port, "mock-s3", false, kRequestIoTimeoutMs,
+      kConnectTimeoutMs, kProtocolProbeTimeoutMs);
+  UniqueFd file(::memfd_create("h1-range-file", MFD_CLOEXEC));
+  assert(file);
+  TestFileSink sink(file.get(), 0);
+  const Response file_response = file_client->get_range_to_fd(
+      "/bucket/file", 0, file_body.size(), sink, {}, true, true);
+  assert(file_response.status == 206);
+  assert(file_response.body_bytes == file_body.size());
+  assert(file_response.fallback_copied_bytes > 0);
+  assert(file_response.externally_spliced_bytes > 0);
+  assert(file_response.externally_spliced_bytes +
+             file_response.fallback_copied_bytes == file_body.size());
+  assert(file_response.transport_splice_calls > 0);
+  assert(file_response.wire_start_ns != 0);
+  assert(file_response.wire_last_data_ns >= file_response.wire_start_ns);
+  assert(file_response.headers.at("etag") == "\"h1-file-etag\"");
+  assert(sink.calls > 1);
+  assert(sink.completed);
+  std::vector<std::byte> actual_file(file_body.size());
+  assert(::lseek(file.get(), 0, SEEK_SET) == 0);
+  read_all(file.get(), actual_file);
+  assert(actual_file == file_body);
+  file_server.join();
 
   std::jthread stalled_server([&] {
     UniqueFd probe = accept_one(listener.get());

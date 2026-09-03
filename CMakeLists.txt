@@ -109,6 +109,7 @@ target_include_directories(ngs3fs_yyjson SYSTEM PUBLIC
 
 add_library(ngs3fs_core
   ${TOPLING_ZIP_SOURCE_DIR}/src/terark/hash_common.cpp
+  src/cache.cpp
   src/credentials.cpp
   src/http.cpp
   src/io.cpp
@@ -152,7 +153,7 @@ install(TARGETS ngs3fs
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES docs/ngs3fs.1
   DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
-install(FILES README.md LICENSE docs/operations.md
+install(FILES README.md LICENSE docs/operations.md docs/local-cache-spec.md
   DESTINATION ${CMAKE_INSTALL_DOCDIR})
 install(FILES packaging/ngs3fs@.service
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system)
@@ -198,6 +199,10 @@ if(NGS3FS_BUILD_TESTS)
   target_link_libraries(ngs3fs_core_tests PRIVATE ngs3fs_core)
   add_test(NAME ngs3fs_core_tests COMMAND ngs3fs_core_tests)
 
+  add_executable(cache_test tests/cache_test.cpp)
+  target_link_libraries(cache_test PRIVATE ngs3fs_core)
+  add_test(NAME cache_test COMMAND cache_test)
+
   add_executable(nghttp2_external_data_test
     tests/nghttp2_external_data_test.cpp)
   target_link_libraries(nghttp2_external_data_test PRIVATE ngs3fs_core)
@@ -223,6 +228,9 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME fuse_oss_crc64_integration_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs> crc64xz)
   set_tests_properties(fuse_oss_crc64_integration_test PROPERTIES TIMEOUT 60)
+  add_test(NAME fuse_cached_mmap_integration_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs> xxhash128 cache)
+  set_tests_properties(fuse_cached_mmap_integration_test PROPERTIES TIMEOUT 90)
 
   add_test(NAME read_ahead_option_test
     COMMAND ngs3fs -R 1MiB --help)
@@ -251,6 +259,21 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME checksum_invalid_test
     COMMAND ngs3fs --checksum not-a-checksum --help)
   set_tests_properties(checksum_invalid_test PROPERTIES WILL_FAIL TRUE)
+
+  add_test(NAME cache_options_test
+    COMMAND ngs3fs -L /tmp/ngs3fs-option-test --cache-size 1GiB
+                   --cache-reserve 5% --max-cache-fetch-size 8MiB --help)
+  add_test(NAME cache_reserve_size_test
+    COMMAND ngs3fs -L /tmp/ngs3fs-option-test --cache-reserve 256MiB --help)
+  add_test(NAME cache_fetch_minimum_test
+    COMMAND ngs3fs --max-cache-fetch-size 512KiB --help)
+  set_tests_properties(cache_fetch_minimum_test PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME cache_fetch_alignment_test
+    COMMAND ngs3fs --max-cache-fetch-size 1025KiB --help)
+  set_tests_properties(cache_fetch_alignment_test PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME cache_reserve_invalid_test
+    COMMAND ngs3fs --cache-reserve 100% --help)
+  set_tests_properties(cache_reserve_invalid_test PROPERTIES WILL_FAIL TRUE)
 
   add_test(NAME write_options_test
     COMMAND ngs3fs --part-size 8MiB --max-uploads 4

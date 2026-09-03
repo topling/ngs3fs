@@ -29,6 +29,9 @@ readdir_inode_source=$libfuse_dir/test/readdir_inode.c
 port=${PORT:-17174}
 stress_jobs=${NGS3FS_STRESS_JOBS:-8}
 stress_iterations=${NGS3FS_STRESS_ITERATIONS:-20}
+# Set NGS3FS_CACHE_DIR to exercise the persistent cache; unset keeps the
+# original uncached test path. It only applies when NGS3FS_TEST_CLIENT=ngs3fs.
+cache_dir=${NGS3FS_CACHE_DIR:-}
 backend=$run_dir/backend
 bucket=ngs3fs-libfuse
 prefix=data
@@ -54,6 +57,9 @@ case $client in
     exit 2
     ;;
 esac
+if [[ $client != ngs3fs && -n "$cache_dir" ]]; then
+  echo "NGS3FS_CACHE_DIR ignored for test client: $client" >&2
+fi
 
 cleanup() {
   status=$?
@@ -128,9 +134,15 @@ if ! curl --silent --output /dev/null "$endpoint/"; then
 fi
 
 if [[ $client == ngs3fs ]]; then
+  ngs3fs_mount_args=(-f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port"
+    -b "$bucket" -k "$prefix" -T 0 -m 0644 -D 0755)
+  if [[ -n "$cache_dir" ]]; then
+    mkdir -p "$cache_dir"
+    ngs3fs_mount_args+=(--cache-dir "$cache_dir")
+    echo "ngs3fs local cache: $cache_dir"
+  fi
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
-    "$ngs3fs" -f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port" \
-      -b "$bucket" -k "$prefix" -T 0 -m 0644 -D 0755 "$mount_dir" \
+    "$ngs3fs" "${ngs3fs_mount_args[@]}" "$mount_dir" \
       >"$client_log" 2>&1 &
 else
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
@@ -157,6 +169,12 @@ fi
 export FUSE_TEST_BIN_DIR=$test_bin_dir
 
 case_skipped() {
+  # ngs3fs deliberately reports EXDEV for a non-empty directory rename.  This
+  # lets callers such as mv use their normal cross-filesystem copy/remove path
+  # instead of pretending that an S3 prefix rename is atomic.
+  if [[ $client = ngs3fs && $1 = rename-directory ]]; then
+    return 0
+  fi
   [[ " $skip_cases " == *" $1 "* ]]
 }
 

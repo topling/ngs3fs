@@ -271,49 +271,42 @@ int main(int argc, char** argv) {
     }
     verify_file(moved, first_expected, "cross-directory renamed object");
     const std::string renamed_directory = mount + "/renamed-dir";
-    if (::rename(directory.c_str(), renamed_directory.c_str()) != 0) {
-      fail_errno("rename nonempty mounted directory");
+    if (::rename(directory.c_str(), renamed_directory.c_str()) == 0 ||
+        errno != EXDEV) {
+      throw std::runtime_error(
+          "nonempty mounted directory rename did not return EXDEV");
     }
-    const std::string renamed_nested = renamed_directory + "/nested.bin";
-    const std::string renamed_moved  = renamed_directory + "/moved.bin";
-    verify_file(renamed_nested, nested_expected,
-                "object in renamed directory");
-    verify_file(renamed_moved, first_expected,
-                "large object in renamed directory");
-    if (::access(directory.c_str(), F_OK) == 0 || errno != ENOENT) {
-      throw std::runtime_error("old directory still exists after rename");
-    }
+    verify_file(nested, nested_expected,
+                "object after rejected directory rename");
+    verify_file(moved, first_expected,
+                "large object after rejected directory rename");
     if (::unlink(second_path.c_str()) != 0 ||
-        ::unlink(renamed_nested.c_str()) != 0 ||
-        ::unlink(renamed_moved.c_str()) != 0) {
+        ::unlink(nested.c_str()) != 0 || ::unlink(moved.c_str()) != 0) {
       fail_errno("unlink mounted objects");
     }
-    if (::rmdir(renamed_directory.c_str()) != 0) {
+    if (::rmdir(directory.c_str()) != 0) {
       fail_errno("rmdir mounted directory");
     }
 
     const std::string paged_directory = mount + "/paged-dir";
     const std::string paged_renamed   = mount + "/paged-renamed";
     verify_paged_directory(paged_directory);
-    if (::rename(paged_directory.c_str(), paged_renamed.c_str()) != 0) {
-      fail_errno("rename paginated mounted directory");
+    if (::rename(paged_directory.c_str(), paged_renamed.c_str()) == 0 ||
+        errno != EXDEV) {
+      throw std::runtime_error(
+          "paginated mounted directory rename did not return EXDEV");
     }
-    const std::string second_page = paged_renamed + "/page-1000";
+    const std::string second_page = paged_directory + "/page-1000";
     struct stat second_page_status{};
     if (::stat(second_page.c_str(), &second_page_status) != 0) {
-      fail_errno("stat second-page renamed object");
+      fail_errno("stat second-page object after rejected rename");
     }
     if (!S_ISREG(second_page_status.st_mode)) {
       throw std::runtime_error("second-page renamed object is not a file");
     }
-    if (::access((paged_directory + "/page-1000").c_str(), F_OK) == 0 ||
-        errno != ENOENT) {
-      throw std::runtime_error(
-          "second-page object remains under old directory prefix");
-    }
 
     std::cout << "mounted multi-object mmap/read/write/concurrent-create/"
-                 "paginated-rename/unlink passed: "
+                 "directory-rename-EXDEV/unlink passed: "
               << expected.size() << " bytes per large object\n";
     return 0;
   } catch (const std::exception& error) {

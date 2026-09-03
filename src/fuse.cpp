@@ -1,3 +1,4 @@
+#include "cache.hpp"
 #include "credentials.hpp"
 #include "http.hpp"
 #include "io.hpp"
@@ -23,7 +24,6 @@
 #include <ctype.h>
 #include <deque>
 #include <functional>
-#include <future>
 #include <fstream>
 #include <inttypes.h>
 #include <limits.h>
@@ -38,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -62,6 +63,7 @@ struct MountConfig {
   std::string bucket;
   std::string bucket_path;
   std::string prefix;
+  std::string cache_dir;
   std::string region                = "us-east-1";
   size_t maximum_read_size          = kPreferredIoSize;
   size_t maximum_write_size         = kPreferredIoSize;
@@ -69,10 +71,13 @@ struct MountConfig {
   uint32_t read_ahead_size          = kPreferredIoSize;
   size_t socket_receive_buffer_size = kDefaultSocketReceiveBufferSize;
   uint64_t part_size                = 8ULL * 1024ULL * 1024ULL;
+  uint64_t cache_size               = 0;
+  uint64_t cache_reserve            = 5;
   uint64_t max_pinned_memory        = 256ULL * 1024ULL * 1024ULL;
   uint64_t directory_cache_ns       = 1000ULL * 1000ULL * 1000ULL;
   size_t max_cached_inodes          = 1'000'000;
   uint32_t stats_interval_seconds   = 0;
+  size_t maximum_cache_fetch_size   = 8U * 1024U * 1024U;
   unsigned max_uploads              = 4;
   unsigned max_connections          = 8;
   int connect_timeout_ms            = kConnectTimeoutMs;
@@ -90,7 +95,28 @@ struct MountConfig {
   bool tls                             = false;
   bool verify_read_checksum            = false;
   bool socket_receive_buffer_explicit  = false;
+  bool cache_reserve_is_percent        = true;
 };
+
+std::string cache_namespace_id(const MountConfig& config) {
+  std::string result;
+  result.reserve(config.endpoint_host.size() + config.authority.size() +
+                 config.bucket.size() + config.bucket_path.size() +
+                 config.prefix.size() + 64);
+  const auto append = [&](std::string_view value) {
+    result.append(value);
+    result.push_back('\0');
+  };
+  append(config.tls ? "https" : "http");
+  append(config.endpoint_host);
+  append(std::to_string(config.endpoint_port));
+  append(config.authority);
+  append(config.bucket);
+  append(config.bucket_path);
+  append(config.prefix);
+  append(config.directory_bucket ? "directory" : "general");
+  return result;
+}
 
 enum WriteState {
   WRITE_OPEN,
@@ -117,6 +143,33 @@ struct RetainedPart {
   uint64_t bytes  = 0;
   unsigned number = 0;
 };
+
+struct State;
+struct OpenHandle;
+
+class FileReader {
+ public:
+  virtual ~FileReader() = default;
+  virtual void read(State& state, OpenHandle& handle,
+                    fuse_req_t request, fuse_ino_t inode,
+                    size_t size, off_t offset) = 0;
+};
+
+class FileWriter {
+ public:
+  virtual ~FileWriter() = default;
+  virtual void write(State& state, OpenHandle& handle,
+                     fuse_req_t request, fuse_ino_t inode,
+                     fuse_bufvec* input, off_t offset) = 0;
+  virtual void flush(State& state, OpenHandle& handle) = 0;
+  virtual void fsync(State& state, OpenHandle& handle, bool data_only) = 0;
+  virtual void release(State& state, OpenHandle& handle) noexcept = 0;
+};
+
+std::unique_ptr<FileReader> make_file_reader(State& state,
+                                              OpenHandle& handle);
+std::unique_ptr<FileWriter> make_file_writer(State& state,
+                                              OpenHandle& handle);
 
 class HttpPool {
  private:
@@ -150,6 +203,7 @@ class HttpPool {
 
     HttpClient& client() const { return *owner_->slots_[slot_]->client; }
     HttpClient* operator->() const { return &client(); }
+    explicit operator bool() const noexcept { return owner_ != nullptr; }
 
    private:
     void reset() noexcept {
@@ -199,6 +253,22 @@ class HttpPool {
 
   Lease acquire_bulk() {
     return acquire_slots(slots_.size() - 1);
+  }
+
+  Lease try_acquire_bulk() noexcept {
+    const size_t usable = slots_.size() - 1;
+    const size_t begin = next_.fetch_add(1, std::memory_order_relaxed) %
+        usable;
+    for (size_t n = 0; n < usable; ++n) {
+      const size_t i = (begin + n) % usable;
+      bool available = false;
+      if (slots_[i]->busy.compare_exchange_strong(
+              available, true, std::memory_order_acquire,
+              std::memory_order_relaxed)) {
+        return Lease(this, i);
+      }
+    }
+    return {};
   }
 
  private:
@@ -320,16 +390,25 @@ struct OpenHandle {
   uint64_t id       = 0;
   InodeFile* item   = nullptr;
   std::string object_path;
+  std::string key;
   std::string etag;
   std::string version_id;
   std::string upload_id;
+  std::string write_id;
+  std::shared_ptr<CacheEntry> cache_entry;
+  std::unique_ptr<FileReader> reader;
+  std::unique_ptr<FileWriter> writer;
   std::vector<std::string> part_etags;
   std::vector<ssostr<96>> part_checksums;
   std::vector<uint64_t> part_checksum_values;
   std::vector<uint64_t> part_sizes;
+  std::vector<std::pair<uint64_t, uint64_t>> partial_write_pages;
   std::unique_ptr<RetainedPart> current_part;
+  Pipe cache_write_pipe;
   uint64_t size                = 0;
   uint64_t stream_offset       = 0;
+  uint64_t cache_last_read_end = 0;
+  size_t cache_read_window     = 0;
   size_t pending_parts         = 0;
   unsigned next_part_number    = 1;
   WriteState write_state       = WRITE_OPEN;
@@ -342,9 +421,52 @@ struct OpenHandle {
   bool writable                = false;
   bool create_exclusive        = false;
   bool registered              = false;
+  bool inode_counted           = false;
+  bool recovery_read           = false;
   bool page_cache_store_failed = false;
+  bool cache_read_seen         = false;
+  bool write_after_flush_warned = false;
+  std::atomic<uint64_t> request_state{0};
+  std::atomic<bool> stale{false};
+  std::atomic<bool> unlinked{false};
+  mutable std::shared_mutex identity_mutex;
   std::mutex mutex;
   std::condition_variable condition;
+};
+
+class OpenRequestGuard {
+ public:
+  explicit OpenRequestGuard(OpenHandle& handle) : handle_(handle) {
+    uint64_t state = handle_.request_state.load(std::memory_order_relaxed);
+    for (;;) {
+      if ((state & kClosing) != 0) {
+        throw std::system_error(EBADF, std::generic_category(),
+                                "closing file handle");
+      }
+      if (state == kActiveMask) {
+        throw std::system_error(EOVERFLOW, std::generic_category(),
+                                "too many active file requests");
+      }
+      if (handle_.request_state.compare_exchange_weak(
+              state, state + 1, std::memory_order_acquire,
+              std::memory_order_relaxed)) {
+        break;
+      }
+    }
+  }
+
+  ~OpenRequestGuard() {
+    const uint64_t previous =
+        handle_.request_state.fetch_sub(1, std::memory_order_release);
+    if ((previous & kActiveMask) == 1) {
+      handle_.request_state.notify_all();
+    }
+  }
+
+ private:
+  static constexpr uint64_t kClosing    = 1ULL << 63;
+  static constexpr uint64_t kActiveMask = kClosing - 1;
+  OpenHandle& handle_;
 };
 
 struct DirHandle {
@@ -428,6 +550,7 @@ class AmzDateTimeCache {
 
 struct State;
 void cache_reclaim_loop(std::stop_token stop, State* state) noexcept;
+void cache_recovery_loop(std::stop_token stop, State* state) noexcept;
 void stats_report_loop(std::stop_token stop, State* state) noexcept;
 
 struct State {
@@ -457,6 +580,10 @@ struct State {
   }
 
   ~State() {
+    cache_recovery.request_stop();
+    if (cache_recovery.joinable()) {
+      cache_recovery.join();
+    }
     {
       std::lock_guard guard(stats_wait_mutex);
       stats_reporter.request_stop();
@@ -474,14 +601,16 @@ struct State {
       cache_reclaimer.join();
     }
     uploads.reset();
-    for (const auto& [inode, item] : retired_items) {
+    for (const auto& [inode, retired] : retired_items) {
       (void)inode;
-      delete_inode(item);
+      detach_parent_slot_if_owned(*retired.item, retired.parent);
+      delete_inode(retired.item);
     }
     retired_items.clear();
   }
 
   struct OpenFileState {
+    std::vector<OpenHandle*> handles;
     size_t readers = 0;
     bool writer     = false;
   };
@@ -492,10 +621,24 @@ struct State {
     bool prefix;
   };
 
+  struct RetiredItem {
+    InodeBase* item;
+    InodeBase* parent;
+  };
+
+  struct PendingDelete {
+    std::string key;
+    std::string restore_key;
+    std::string replacement_etag;
+    bool rollback = false;
+    bool deleting = false;
+  };
+
   MountConfig config;
   CredentialProvider credentials;
   time_t directory_mtime;
   std::unique_ptr<InodeDir> root_item;
+  std::unique_ptr<LocalCache> local_cache;
   AmzDateTimeCache date_time;
   std::mutex retired_mutex;
   std::mutex open_files_mutex;
@@ -511,10 +654,13 @@ struct State {
   std::condition_variable cache_condition;
   std::condition_variable stats_condition;
   std::mutex stats_wait_mutex;
-  std::map<fuse_ino_t, InodeBase*> retired_items;
+  std::map<fuse_ino_t, RetiredItem> retired_items;
   std::atomic<size_t> retired_count{0};
   std::map<std::string, OpenFileState, std::less<>> open_files;
+  std::map<std::string, PendingDelete, std::less<>> pending_deletes;
+  std::set<std::string, std::less<>> recovery_paths;
   std::vector<BlockedPath> blocked_paths;
+  std::vector<std::shared_ptr<CacheEntry>> recovery_entries;
   std::unique_ptr<HttpPool> http;
   std::unique_ptr<UploadScheduler> uploads;
   fuse_session* session = nullptr;
@@ -541,6 +687,7 @@ struct State {
   bool cache_budget_warned         = false;
   uint64_t cache_warning_ns        = 0;
   std::atomic<uint64_t> random_read_warning_ns{0};
+  std::atomic<uint64_t> cache_bypass_warning_ns{0};
   std::atomic<bool> page_cache_store_warned{false};
   std::atomic<bool> page_cache_invalidate_warned{false};
   bool splice_available            = true;
@@ -548,6 +695,7 @@ struct State {
   std::atomic<int> rename_object_support{0};
   std::atomic<int> range_signing_mode{0};
   std::jthread cache_reclaimer;
+  std::jthread cache_recovery;
   std::jthread stats_reporter;
 };
 
@@ -607,7 +755,8 @@ void stats_report_loop(std::stop_token stop, State* state) noexcept {
   emit_runtime_stats(*state, "shutdown_stats");
 }
 
-void invalidate_page_cache(State& state, fuse_ino_t inode) noexcept {
+void invalidate_page_cache(State& state, fuse_ino_t inode,
+                           off_t offset = 0, off_t length = 0) noexcept {
   int error = 0;
   {
     std::lock_guard guard(state.session_mutex);
@@ -615,7 +764,7 @@ void invalidate_page_cache(State& state, fuse_ino_t inode) noexcept {
       return;
     }
     const int result = fuse_lowlevel_notify_inval_inode(
-        state.session, inode, 0, 0);
+        state.session, inode, offset, length);
     if (result == 0 || result == -ENOENT) {
       return;
     }
@@ -641,7 +790,8 @@ class PathMutationGuard {
   PathMutationGuard(State& state,
                     std::string_view first, bool first_prefix,
                     std::string_view second, bool second_prefix,
-                    const char* operation)
+                    const char* operation, bool allow_readers = false,
+                    bool allow_writers = false)
       : state_(&state), count_(second.empty() ? 1 : 2) {
     pending_[0] = State::BlockedPath{this, std::string(first), first_prefix};
     if (count_ == 2) {
@@ -650,10 +800,18 @@ class PathMutationGuard {
     }
 
     std::lock_guard guard(state.open_files_mutex);
-    for (const auto& [path, opened] : state.open_files) {
-      (void)opened;
+    for (const std::string& path : state.recovery_paths) {
       for (size_t i = 0; i < count_; ++i) {
         if (blocked_path_contains(pending_[i], path)) {
+          throw std::system_error(EBUSY, std::generic_category(), operation);
+        }
+      }
+    }
+    for (const auto& [path, opened] : state.open_files) {
+      for (size_t i = 0; i < count_; ++i) {
+        if (blocked_path_contains(pending_[i], path) &&
+            ((opened.writer && !allow_writers) ||
+             (opened.readers != 0 && !allow_readers))) {
           throw std::system_error(EBUSY, std::generic_category(), operation);
         }
       }
@@ -966,6 +1124,27 @@ void warn_random_read(State& state, std::string_view path,
           offset, size);
 }
 
+void warn_cache_bypass(State& state, std::string_view path) noexcept {
+  const uint64_t now = fuse_monotonic_ns_noexcept();
+  if (now == 0) {
+    return;
+  }
+  constexpr uint64_t interval = 60ULL * 1000ULL * 1000ULL * 1000ULL;
+  uint64_t previous =
+      state.cache_bypass_warning_ns.load(std::memory_order_relaxed);
+  if (previous != 0 && now - previous < interval) {
+    return;
+  }
+  if (!state.cache_bypass_warning_ns.compare_exchange_strong(
+          previous, now, std::memory_order_relaxed)) {
+    return;
+  }
+  fprintf(stderr,
+          "warning: local cache capacity unavailable; bypassing cache for "
+          "read: path=%.*s\n",
+          int(path.size()), path.data());
+}
+
 void retry_delay(unsigned attempt) noexcept {
   const uint64_t jitter = fuse_monotonic_ns_noexcept() % 25;
   const uint64_t milliseconds = (25ULL << attempt) + jitter;
@@ -999,14 +1178,42 @@ bool retry_after_delay(const Response& response) noexcept {
   return true;
 }
 
+thread_local const std::stop_token* request_stop_token = nullptr;
+
+void check_request_stop() {
+  if (request_stop_token != nullptr &&
+      request_stop_token->stop_requested()) {
+    throw std::system_error(ECANCELED, std::generic_category(),
+                            "request cancelled");
+  }
+}
+
+class RequestStopScope {
+ public:
+  explicit RequestStopScope(const std::stop_token& stop) noexcept
+      : previous_(request_stop_token) {
+    request_stop_token = &stop;
+  }
+
+  ~RequestStopScope() { request_stop_token = previous_; }
+
+  RequestStopScope(const RequestStopScope&) = delete;
+  RequestStopScope& operator=(const RequestStopScope&) = delete;
+
+ private:
+  const std::stop_token* previous_;
+};
+
 template<class Request>
 Response request_with_retries(Request&& request, const char* operation,
                               bool* ambiguous = nullptr) {
   std::exception_ptr last_error;
   for (unsigned attempt = 0; attempt != 4; ++attempt) {
+    check_request_stop();
     bool delayed = false;
     try {
       Response response = request();
+      check_request_stop();
       if (!retryable_status(response.status) || attempt == 3) {
         return response;
       }
@@ -1018,6 +1225,7 @@ Response request_with_retries(Request&& request, const char* operation,
                 << " attempt=" << attempt + 1 << '\n';
       delayed = retry_after_delay(response);
     } catch (...) {
+      check_request_stop();
       last_error = std::current_exception();
       if (ambiguous != nullptr) {
         *ambiguous = true;
@@ -1029,6 +1237,7 @@ Response request_with_retries(Request&& request, const char* operation,
                 << " after transport failure attempt="
                 << attempt + 1 << '\n';
     }
+    check_request_stop();
     if (!delayed) {
       retry_delay(attempt);
     }
@@ -1091,6 +1300,9 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   constexpr int metadata_timeout_option           = 261;
   constexpr int stats_interval_option             = 262;
   constexpr int socket_buffer_size_option          = 263;
+  constexpr int cache_size_option                  = 264;
+  constexpr int cache_reserve_option               = 265;
+  constexpr int maximum_cache_fetch_size_option    = 266;
   constexpr option long_options[] = {
       {"endpoint-host", required_argument, nullptr, 'e'},
       {"endpoint-port", required_argument, nullptr, 'p'},
@@ -1114,6 +1326,12 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
        stats_interval_option},
       {"socket-buffer-size", required_argument, nullptr,
        socket_buffer_size_option},
+      {"cache-dir", required_argument, nullptr, 'L'},
+      {"cache-size", required_argument, nullptr, cache_size_option},
+      {"cache-reserve", required_argument, nullptr,
+       cache_reserve_option},
+      {"max-cache-fetch-size", required_argument, nullptr,
+       maximum_cache_fetch_size_option},
       {"read-ahead", required_argument, nullptr, 'R'},
       {"dir-cache-timeout", required_argument, nullptr, 'T'},
       {"max-cached-inodes", required_argument, nullptr, 'I'},
@@ -1132,7 +1350,7 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       {nullptr, 0, nullptr, 0},
   };
   constexpr std::string_view short_options =
-      "-e:p:a:b:k:r:K:R:T:I:P:c:C:B:u:g:m:D:MShVdfso:";
+      "-e:p:a:b:k:r:K:L:R:T:I:P:c:C:B:u:g:m:D:MShVdfso:";
 
   auto add_fuse_short_option = [&](int value) {
     const char argument[] = {'-', static_cast<char>(value), '\0'};
@@ -1255,6 +1473,48 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
         }
         config.socket_receive_buffer_size = size_t(value);
         config.socket_receive_buffer_explicit = true;
+        break;
+      }
+      case 'L':
+        if (optarg == nullptr || *optarg == '\0') {
+          throw std::invalid_argument("--cache-dir must not be empty");
+        }
+        config.cache_dir = optarg;
+        break;
+      case cache_size_option:
+        config.cache_size = parse_required_size("--cache-size");
+        break;
+      case cache_reserve_option: {
+        if (optarg == nullptr || *optarg == '\0') {
+          throw std::invalid_argument("invalid --cache-reserve");
+        }
+        std::string_view value(optarg);
+        if (value.ends_with('%')) {
+          value.remove_suffix(1);
+          uint64_t percent = 0;
+          if (!parse_unsigned(value, percent) || percent > 99) {
+            throw std::invalid_argument(
+                "--cache-reserve percentage must be between 0% and 99%");
+          }
+          config.cache_reserve = percent;
+          config.cache_reserve_is_percent = true;
+        } else {
+          uint64_t bytes = 0;
+          if (!parse_byte_size(value, bytes)) {
+            throw std::invalid_argument("invalid --cache-reserve");
+          }
+          config.cache_reserve = bytes;
+          config.cache_reserve_is_percent = false;
+        }
+        break;
+      }
+      case maximum_cache_fetch_size_option: {
+        const uint64_t value =
+            parse_required_size("--max-cache-fetch-size");
+        if (value > std::numeric_limits<size_t>::max()) {
+          throw std::invalid_argument("--max-cache-fetch-size is too large");
+        }
+        config.maximum_cache_fetch_size = size_t(value);
         break;
       }
       case 'R': {
@@ -1417,6 +1677,16 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   if (config.max_pinned_memory < config.part_size) {
     throw std::invalid_argument(
         "--max-pinned-memory must be at least --part-size");
+  }
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    throw std::runtime_error("unable to determine PAGE_SIZE");
+  }
+  constexpr size_t minimum_cache_fetch_size = 1024U * 1024U;
+  if (config.maximum_cache_fetch_size < minimum_cache_fetch_size ||
+      config.maximum_cache_fetch_size % size_t(page_size) != 0) {
+    throw std::invalid_argument(
+        "--max-cache-fetch-size must be page-aligned and at least 1 MiB");
   }
   return true;
 }
@@ -1947,6 +2217,76 @@ void configure_checksum(State& state) {
   state.config.checksum_service = service;
 }
 
+void initialize_local_cache(State& state) {
+  if (state.config.cache_dir.empty()) {
+    return;
+  }
+  state.local_cache = std::make_unique<LocalCache>(CacheConfig{
+      .root = state.config.cache_dir,
+      .namespace_id = cache_namespace_id(state.config),
+      .maximum_bytes = state.config.cache_size,
+      .reserve_bytes = state.config.cache_reserve,
+      .reserve_percent = unsigned(state.config.cache_reserve),
+      .maximum_fetch_size = state.config.maximum_cache_fetch_size,
+      .page_size = size_t(::sysconf(_SC_PAGESIZE)),
+      .upload_part_size = state.config.part_size,
+      .checksum_algorithm = uint32_t(state.config.checksum),
+      .reserve_is_percent = state.config.cache_reserve_is_percent,
+  });
+  std::vector<std::string> isolated_keys;
+  state.recovery_entries = state.local_cache->recover_dirty(&isolated_keys);
+  for (CachePendingDelete& record :
+       state.local_cache->recover_pending_deletes()) {
+    const std::string path = object_request_path(state, record.key);
+    state.pending_deletes.try_emplace(
+        path, State::PendingDelete{
+            .key = std::move(record.key),
+            .restore_key = std::move(record.restore_key),
+            .replacement_etag = std::move(record.replacement_etag),
+            .rollback = record.rollback,
+        });
+  }
+  for (auto i = state.recovery_entries.begin();
+       i != state.recovery_entries.end();) {
+    const std::string path = object_request_path(state, (*i)->key());
+    if (!state.pending_deletes.contains(path)) {
+      ++i;
+      continue;
+    }
+    const std::string key((*i)->key());
+    (*i)->discard_write();
+    state.local_cache->remove(key, false);
+    fprintf(stderr,
+            "warning: pending unlink superseded cached write recovery: "
+            "path=%s\n",
+            path.c_str());
+    i = state.recovery_entries.erase(i);
+  }
+  for (const std::shared_ptr<CacheEntry>& entry : state.recovery_entries) {
+    std::string path = state.config.bucket_path;
+    path.push_back('/');
+    path += uri_encode(entry->key(), true);
+    state.recovery_paths.insert(std::move(path));
+  }
+  for (const std::string& key : isolated_keys) {
+    std::string path = state.config.bucket_path;
+    path.push_back('/');
+    path += uri_encode(key, true);
+    state.recovery_paths.insert(std::move(path));
+  }
+  if (!isolated_keys.empty()) {
+    fprintf(stderr,
+            "error: isolated %zu invalid cached write%s; affected paths "
+            "remain blocked until their dirty markers are repaired or removed\n",
+            isolated_keys.size(), isolated_keys.size() == 1 ? "" : "s");
+  }
+  if (!state.recovery_entries.empty() || !state.pending_deletes.empty()) {
+    state.cache_recovery = std::jthread([&state](std::stop_token stop) {
+      cache_recovery_loop(stop, &state);
+    });
+  }
+}
+
 int errno_for_s3_status(int status) noexcept {
   switch (status) {
     case 400:
@@ -1984,6 +2324,7 @@ struct ObjectMetadata {
   ssostr<32> last_modified;
   std::string etag;
   std::string version_id;
+  std::string write_id;
 };
 
 ObjectMetadata head_object(State& state, std::string_view path) {
@@ -2024,6 +2365,10 @@ ObjectMetadata head_object(State& state, std::string_view path) {
   if (version != response.headers.end() && version->second != "null") {
     assign_string(metadata.version_id, version->second);
   }
+  const auto write_id = response.headers.find("x-amz-meta-ngs3fs-write-id");
+  if (write_id != response.headers.end()) {
+    assign_string(metadata.write_id, write_id->second);
+  }
   return metadata;
 }
 
@@ -2032,7 +2377,9 @@ bool recover_write_commit(State& state, const OpenHandle& handle,
   try {
     const ObjectMetadata metadata = head_object(state, handle.object_path);
     if (metadata.size != handle.stream_offset ||
-        (!handle.etag.empty() && metadata.etag == handle.etag)) {
+        (!handle.write_id.empty() && metadata.write_id != handle.write_id) ||
+        (handle.write_id.empty() && !handle.etag.empty() &&
+         metadata.etag == handle.etag)) {
       return false;
     }
     response = {};
@@ -2081,8 +2428,29 @@ void register_open_handle(State& state, fuse_ino_t inode,
   const std::string key = item_key(state, item);
   handle.inode       = inode;
   handle.item        = &item;
+  handle.key         = key;
   handle.object_path = object_request_path(state, key);
   handle.size        = item.fsize.load(std::memory_order_relaxed);
+  if (state.recovery_paths.contains(handle.object_path)) {
+    if (handle.writable) {
+      throw std::system_error(EBUSY, std::generic_category(),
+                              "cached object recovery is in progress");
+    }
+    for (const std::shared_ptr<CacheEntry>& entry :
+         state.recovery_entries) {
+      if (entry && entry->key() == handle.key) {
+        handle.cache_entry  = entry;
+        handle.size         = entry->written_end();
+        handle.recovery_read = true;
+        item.set_fsize(handle.size);
+        break;
+      }
+    }
+    if (!handle.recovery_read) {
+      throw std::system_error(EIO, std::generic_category(),
+                              "cached object recovery is isolated");
+    }
+  }
   for (const State::BlockedPath& blocked : state.blocked_paths) {
     if (blocked_path_contains(blocked, handle.object_path)) {
       throw std::system_error(EBUSY, std::generic_category(),
@@ -2105,6 +2473,12 @@ void register_open_handle(State& state, fuse_ino_t inode,
     state.open_files_condition.wait_for(
         open_files_guard, std::chrono::milliseconds(100),
         [&] { return !conflicts(); });
+  }
+  if (state.recovery_paths.contains(handle.object_path)) {
+    if (handle.writable || !handle.recovery_read) {
+      throw std::system_error(EBUSY, std::generic_category(),
+                              "cached object recovery is in progress");
+    }
   }
   for (const State::BlockedPath& blocked : state.blocked_paths) {
     if (blocked_path_contains(blocked, handle.object_path)) {
@@ -2144,10 +2518,24 @@ void register_open_handle(State& state, fuse_ino_t inode,
   } else {
     ++opened.readers;
   }
+  try {
+    opened.handles.push_back(&handle);
+  } catch (...) {
+    if (handle.writable) {
+      opened.writer = false;
+    } else {
+      --opened.readers;
+    }
+    if (!opened.writer && opened.readers == 0) {
+      state.open_files.erase(position);
+    }
+    throw;
+  }
   while (!item.open_count.compare_exchange_weak(
       count, count + 1, std::memory_order_relaxed,
       std::memory_order_relaxed)) {
     if (count == UINT32_MAX) {
+        std::erase(opened.handles, &handle);
       if (handle.writable) {
         opened.writer = false;
       } else {
@@ -2160,18 +2548,49 @@ void register_open_handle(State& state, fuse_ino_t inode,
           EMFILE, std::generic_category(), "inode open count");
     }
   }
-  handle.id         = ++state.next_handle_id;
-  handle.registered = true;
+  handle.id            = ++state.next_handle_id;
+  handle.registered    = true;
+  handle.inode_counted = true;
+}
+
+void release_open_inode(State& state, OpenHandle& handle) noexcept {
+  if (!handle.inode_counted) {
+    return;
+  }
+  handle.inode_counted = false;
+  if (handle.item != nullptr && release_inode_count(handle.item->open_count)) {
+    sweep_retired_items(state);
+  }
 }
 
 void unregister_open_handle(State& state, std::string_view path,
-                            bool writable, InodeFile* item) noexcept {
+                            OpenHandle& handle,
+                            bool release_inode = true) noexcept {
   {
     std::lock_guard open_files_guard(state.open_files_mutex);
-    const auto position = state.open_files.find(path);
+    auto position = state.open_files.find(path);
+    if (position == state.open_files.end() ||
+        std::find(position->second.handles.begin(),
+                  position->second.handles.end(), &handle) ==
+            position->second.handles.end()) {
+      position = std::find_if(
+          state.open_files.begin(), state.open_files.end(),
+          [&](const auto& opened) {
+            return std::find(opened.second.handles.begin(),
+                             opened.second.handles.end(), &handle) !=
+                opened.second.handles.end();
+          });
+    }
     if (position != state.open_files.end()) {
       State::OpenFileState& opened = position->second;
-      if (writable) {
+      const size_t erased = std::erase(opened.handles, &handle);
+      if (erased != 1) {
+        fprintf(stderr,
+                "warning: open-handle registry contained %zu copies of "
+                "one handle\n",
+                erased);
+      }
+      if (handle.writable) {
         opened.writer = false;
       } else if (opened.readers != 0) {
         --opened.readers;
@@ -2182,11 +2601,119 @@ void unregister_open_handle(State& state, std::string_view path,
     }
   }
   state.open_files_condition.notify_all();
-  if (item != nullptr) {
-    if (release_inode_count(item->open_count)) {
-      sweep_retired_items(state);
+  if (release_inode) {
+    release_open_inode(state, handle);
+  }
+}
+
+struct OpenHandleIdentityLocks {
+  std::vector<OpenHandle*> handles;
+  std::vector<std::unique_ptr<OpenRequestGuard>> pins;
+  std::vector<std::unique_lock<std::shared_mutex>> identities;
+};
+
+OpenHandleIdentityLocks lock_open_handle_identities(
+    State& state, std::string_view path, const char* operation) {
+  OpenHandleIdentityLocks result;
+  {
+    std::lock_guard guard(state.open_files_mutex);
+    const auto opened = state.open_files.find(path);
+    if (opened == state.open_files.end()) {
+      return result;
+    }
+    if (opened->second.writer ||
+        opened->second.handles.size() != opened->second.readers) {
+      throw std::logic_error(
+          std::string(operation) + " reader registry is inconsistent");
+    }
+    result.handles.reserve(opened->second.handles.size());
+    result.pins.reserve(opened->second.handles.size());
+    for (OpenHandle* handle : opened->second.handles) {
+      if (handle == nullptr || handle->writable) {
+        throw std::logic_error(
+            std::string(operation) + " reader registry is invalid");
+      }
+      result.handles.push_back(handle);
+      result.pins.push_back(std::make_unique<OpenRequestGuard>(*handle));
     }
   }
+  result.identities.reserve(result.handles.size());
+  for (OpenHandle* handle : result.handles) {
+    result.identities.emplace_back(handle->identity_mutex);
+  }
+  return result;
+}
+
+bool preserve_renamed_destination(State& state, std::string_view path,
+                                  std::string_view key) {
+  if (!state.local_cache) {
+    return false;
+  }
+  bool can_preserve = false;
+  {
+    std::lock_guard guard(state.open_files_mutex);
+    const auto opened = state.open_files.find(path);
+    if (opened == state.open_files.end() || opened->second.readers == 0) {
+      return false;
+    }
+    can_preserve = std::all_of(
+        opened->second.handles.begin(), opened->second.handles.end(),
+        [](const OpenHandle* handle) {
+          return handle != nullptr && !handle->writable &&
+              handle->cache_entry && handle->cache_entry->fully_clean();
+        });
+  }
+  return can_preserve && state.local_cache->remove(key, true);
+}
+
+void finish_open_file_rename(State& state,
+                             std::string_view source_path,
+                             std::string_view destination_path,
+                             std::string_view destination_key,
+                             bool destination_preserved,
+                             const std::vector<OpenHandle*>& source_handles) {
+  std::lock_guard guard(state.open_files_mutex);
+  auto destination = state.open_files.find(destination_path);
+  if (destination != state.open_files.end() && !destination_preserved) {
+    for (OpenHandle* handle : destination->second.handles) {
+      if (handle != nullptr) {
+        handle->stale.store(true, std::memory_order_release);
+      }
+    }
+  }
+
+  auto source = state.open_files.find(source_path);
+  if (source == state.open_files.end()) {
+    if (!source_handles.empty()) {
+      throw std::logic_error("rename source reader registry disappeared");
+    }
+    return;
+  }
+  if (source->second.handles != source_handles) {
+    throw std::logic_error("rename source reader registry changed");
+  }
+  for (OpenHandle* handle : source->second.handles) {
+    if (handle == nullptr) {
+      continue;
+    }
+    handle->object_path.assign(destination_path);
+    handle->key.assign(destination_key);
+  }
+  if (destination == state.open_files.end()) {
+    auto node = state.open_files.extract(source);
+    node.key().assign(destination_path);
+    state.open_files.insert(std::move(node));
+    return;
+  }
+  destination->second.handles.reserve(
+      destination->second.handles.size() + source->second.handles.size());
+  destination->second.handles.insert(
+      destination->second.handles.end(), source->second.handles.begin(),
+      source->second.handles.end());
+  destination->second.readers += source->second.readers;
+  destination->second.writer = destination->second.writer ||
+      source->second.writer;
+  state.open_files.erase(source);
 }
 
 class ResponseCreditGuard {
@@ -2343,6 +2870,8 @@ AuthorizedRangeRequest make_range_request(State& state,
 constexpr unsigned kMaximumMultipartParts = 10'000;
 constexpr uint64_t kMaximumObjectSize =
     5ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr std::string_view kInternalDeleteDirectory =
+    ".~ngs3fs~.pending-delete";
 
 std::string query_path(std::string_view path, std::string_view query) {
   std::string result(path);
@@ -2362,6 +2891,7 @@ unsigned hex_value(char ch) {
 bool valid_fuse_component(std::string_view name) {
   return !name.empty() && name.size() <= NAME_MAX &&
          name != "." && name != ".." &&
+         name != kInternalDeleteDirectory &&
          name.find('\0') == std::string_view::npos &&
          name.find('/') == std::string_view::npos;
 }
@@ -2539,112 +3069,6 @@ void for_each_directory_page(State& state, std::string_view prefix,
   }
 }
 
-std::vector<ListedObject> list_prefix_objects(State& state,
-                                              std::string_view prefix) {
-  std::vector<ListedObject> objects;
-  std::string token;
-  for (;;) {
-    std::string query = "encoding-type=url&list-type=2&prefix=";
-    query += uri_encode(prefix, false);
-    if (!token.empty()) {
-      query += "&continuation-token=" + uri_encode(token, false);
-    }
-    const std::string path = query_path(
-        state.config.bucket_path.empty() ? "/" : state.config.bucket_path,
-        query);
-    const Response response = request_with_retries([&] {
-      const HeaderList headers = authorization_headers(
-          state, "GET", path, {}, kEmptyPayloadSha256);
-      HttpPool::Lease client = state.http->acquire();
-      return client->request_no_body(
-          "GET", path, headers, kMaximumListResponseSize);
-    }, "ListObjectsV2 prefix scan");
-    if (response.status != 200) {
-      throw_s3_status(response.status, "ListObjectsV2 prefix scan");
-    }
-    ListedXmlPage page =
-        parse_list_xml(response, "ListObjectsV2 prefix scan");
-    for (ListedObject& object : page.objects) {
-      if (!object.key.starts_with(prefix)) {
-        continue;
-      }
-      objects.push_back(std::move(object));
-    }
-    if (!page.truncated) {
-      break;
-    }
-    token = std::move(page.token);
-  }
-  return objects;
-}
-
-template<class Function>
-void for_each_prefix_page(State& state, std::string_view prefix,
-                          Function function) {
-  std::string token;
-  for (;;) {
-    std::string query = "encoding-type=url&list-type=2&prefix=";
-    query += uri_encode(prefix, false);
-    if (!token.empty()) {
-      query += "&continuation-token=" + uri_encode(token, false);
-    }
-    const std::string path = query_path(
-        state.config.bucket_path.empty() ? "/" : state.config.bucket_path,
-        query);
-    const Response response = request_with_retries([&] {
-      const HeaderList headers = authorization_headers(
-          state, "GET", path, {}, kEmptyPayloadSha256);
-      HttpPool::Lease client = state.http->acquire();
-      return client->request_no_body(
-          "GET", path, headers, kMaximumListResponseSize);
-    }, "ListObjectsV2 streaming prefix scan");
-    if (response.status != 200) {
-      throw_s3_status(response.status,
-                      "ListObjectsV2 streaming prefix scan");
-    }
-    ListedXmlPage listed =
-        parse_list_xml(response, "ListObjectsV2 streaming prefix scan");
-    std::vector<ListedObject> page;
-    page.reserve(listed.objects.size());
-    for (ListedObject& object : listed.objects) {
-      if (!object.key.starts_with(prefix)) {
-        continue;
-      }
-      page.push_back(std::move(object));
-    }
-    function(std::move(page));
-    if (!listed.truncated) {
-      return;
-    }
-    token = std::move(listed.token);
-  }
-}
-
-bool prefix_has_objects(State& state, std::string_view prefix) {
-  std::string query = "encoding-type=url&list-type=2&max-keys=1&prefix=";
-  query += uri_encode(prefix, false);
-  const std::string path = query_path(
-      state.config.bucket_path.empty() ? "/" : state.config.bucket_path,
-      query);
-  const Response response = request_with_retries([&] {
-    const HeaderList headers = authorization_headers(
-        state, "GET", path, {}, kEmptyPayloadSha256);
-    HttpPool::Lease client = state.http->acquire();
-    return client->request_no_body(
-        "GET", path, headers, kMaximumListResponseSize);
-  }, "ListObjectsV2 rename verification");
-  if (response.status != 200) {
-    throw_s3_status(response.status, "ListObjectsV2 rename verification");
-  }
-  const ListedXmlPage page =
-      parse_list_xml(response, "ListObjectsV2 rename verification");
-  return std::any_of(
-      page.objects.begin(), page.objects.end(),
-      [&](const ListedObject& object) {
-        return object.key.starts_with(prefix);
-      });
-}
-
 InodeBase* allocate_inode(InodeBase* parent, bool directory) {
   return directory ? static_cast<InodeBase*>(new InodeDir(parent))
                    : static_cast<InodeBase*>(new InodeFile(parent));
@@ -2758,7 +3182,9 @@ bool item_tree_unreferenced(const InodeBase& item) noexcept {
     return false;
   }
   if (item.directory()) {
-    for (auto [name, child] : item.dir_children()) {
+    const Directory& children = item.dir_children();
+    std::shared_lock guard(children.mutex);
+    for (auto [name, child] : children) {
       (void)name;
       if (!item_tree_unreferenced(*child)) {
         return false;
@@ -2775,7 +3201,9 @@ bool item_tree_reclaimable(const InodeBase& item) noexcept {
 size_t item_tree_size(const InodeBase& item) noexcept {
   size_t count = 1;
   if (item.directory()) {
-    for (auto [name, child] : item.dir_children()) {
+    const Directory& children = item.dir_children();
+    std::shared_lock guard(children.mutex);
+    for (auto [name, child] : children) {
       (void)name;
       count += item_tree_size(*child);
     }
@@ -2885,25 +3313,45 @@ void sweep_retired_items(State& state) noexcept {
     return;
   }
   std::lock_guard guard(state.retired_mutex);
-  for (auto i = state.retired_items.begin();
-       i != state.retired_items.end();) {
-    InodeBase* item = i->second;
-    if (!item_tree_reclaimable(*item)) {
-      ++i;
-      continue;
+  bool progress;
+  do {
+    progress = false;
+    for (auto i = state.retired_items.begin();
+         i != state.retired_items.end();) {
+      InodeBase* item   = i->second.item;
+      InodeBase* parent = i->second.parent;
+      if (!item_tree_reclaimable(*item)) {
+        ++i;
+        continue;
+      }
+      detach_parent_slot_if_owned(*item, parent);
+      i = state.retired_items.erase(i);
+      state.retired_count.fetch_sub(1, std::memory_order_relaxed);
+      cache_inode_tree_deleted(state, *item);
+      delete_inode(item);
+      if (parent != nullptr) {
+        release_inode_count(parent->open_count);
+      }
+      progress = true;
     }
-    i = state.retired_items.erase(i);
-    state.retired_count.fetch_sub(1, std::memory_order_relaxed);
-    cache_inode_tree_deleted(state, *item);
-    delete_inode(item);
-  }
+  } while (progress);
 }
 
 void retire_item(State& state, InodeBase& item) {
+  InodeBase* parent = item.parent();
   mark_item_tree_detached(state, item);
+  if (parent != nullptr && parent != &item) {
+    retain_inode_count(parent->open_count, "retired inode parent count");
+  } else {
+    parent = nullptr;
+  }
   std::lock_guard guard(state.retired_mutex);
-  const auto retired = state.retired_items.emplace(item_inode(&item), &item);
+  const auto retired = state.retired_items.emplace(
+      item_inode(&item), State::RetiredItem{&item, parent});
   if (!retired.second) {
+    if (parent != nullptr) {
+      release_inode_count(parent->open_count);
+    }
     throw std::logic_error("inode is already retired");
   }
   state.retired_count.fetch_add(1, std::memory_order_release);
@@ -2924,7 +3372,7 @@ bool detach_cached_item(State& state, InodeBase& item) {
       throw std::logic_error("detached inode dentry changed");
     }
     children.erase_i(item.dentry_slot);
-    item.dentry_slot = UINT32_MAX;
+    item.set_detached(true);
   }
   item.set_pending(false);
   item.set_truncate_pending(false);
@@ -2972,7 +3420,7 @@ fuse_ino_t install_item(State& state, fuse_ino_t parent,
       item                   = replacement;
       position->second       = item;
       item->dentry_slot      = uint32_t(position.get_index());
-      stale->dentry_slot     = UINT32_MAX;
+      stale->set_detached(true);
       allocated              = true;
     }
     if (item == nullptr) {
@@ -3087,7 +3535,7 @@ void prune_directory_generation(State& state, InodeBase& directory,
         continue;
       }
       children.erase_i(slot);
-      child->dentry_slot = UINT32_MAX;
+      child->set_detached(true);
       stale.push_back(child);
     }
   }
@@ -3508,12 +3956,16 @@ void verify_read_checksum(const Response& response, Pipe& pipe,
 void update_written_metadata(State& state, OpenHandle& handle,
                              const Response& response,
                              std::string_view body_etag = {}) {
+  ObjectMetadata metadata;
+  bool used_head = false;
   time_t mtime;
   const auto modified = response.headers.find("last-modified");
   if (modified != response.headers.end()) {
     mtime = parse_http_mtime(sso_view(modified->second));
   } else {
-    mtime = head_object(state, handle.object_path).mtime;
+    metadata  = head_object(state, handle.object_path);
+    used_head = true;
+    mtime     = metadata.mtime;
   }
   InodeFile& item = *handle.item;
   item.fsize.store(handle.stream_offset, std::memory_order_relaxed);
@@ -3525,12 +3977,16 @@ void update_written_metadata(State& state, OpenHandle& handle,
     assign_string(handle.etag, etag->second);
   } else if (!body_etag.empty()) {
     handle.etag.assign(body_etag);
+  } else if (used_head) {
+    handle.etag = std::move(metadata.etag);
   } else {
     handle.etag.clear();
   }
   const auto version = response.headers.find("x-amz-version-id");
   if (version != response.headers.end() && version->second != "null") {
     assign_string(handle.version_id, version->second);
+  } else if (used_head) {
+    handle.version_id = std::move(metadata.version_id);
   } else {
     handle.version_id.clear();
   }
@@ -3790,6 +4246,82 @@ bool store_page_cache(State& state, const OpenHandle& handle,
   return false;
 }
 
+void remember_partial_write_pages(OpenHandle& handle, uint64_t start,
+                                  uint64_t end, size_t page_size) {
+  const auto append = [&](uint64_t offset) {
+    const uint64_t page_end = offset > UINT64_MAX - page_size
+                                  ? UINT64_MAX
+                                  : offset + page_size;
+    if (!handle.partial_write_pages.empty() &&
+        offset <= handle.partial_write_pages.back().second) {
+      handle.partial_write_pages.back().second = std::max(
+          handle.partial_write_pages.back().second, page_end);
+    } else {
+      handle.partial_write_pages.emplace_back(offset, page_end);
+    }
+  };
+  if (start % page_size != 0) {
+    append(start - start % page_size);
+  }
+  if (end % page_size != 0) {
+    append(end - end % page_size);
+  }
+}
+
+bool store_cached_partial_pages(State& state,
+                                const OpenHandle& handle) noexcept {
+  const uint64_t maximum_chunk = state.config.part_size;
+  int error = 0;
+  try {
+    for (const auto& [range_start, range_end] :
+         handle.partial_write_pages) {
+      uint64_t offset = range_start;
+      const uint64_t end = std::min<uint64_t>(
+          range_end, handle.stream_offset);
+      while (offset < end) {
+        const size_t length = size_t(std::min<uint64_t>(
+            end - offset, maximum_chunk));
+        fuse_bufvec buffers = FUSE_BUFVEC_INIT(length);
+        buffers.buf[0].flags = fuse_buf_flags(
+            FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
+        buffers.buf[0].fd  = handle.cache_entry->data_fd();
+        buffers.buf[0].pos = off_t(offset);
+        {
+          std::lock_guard guard(state.session_mutex);
+          if (state.session == nullptr) {
+            throw std::system_error(
+                ENOTCONN, std::generic_category(), "FUSE_NOTIFY_STORE");
+          }
+          const int result = fuse_lowlevel_notify_store(
+              state.session, handle.inode, off_t(offset), &buffers,
+              FUSE_BUF_SPLICE_MOVE);
+          if (result != 0) {
+            error = -result;
+            throw std::system_error(
+                error, std::generic_category(), "FUSE_NOTIFY_STORE");
+          }
+        }
+        offset += length;
+      }
+    }
+    return true;
+  } catch (const std::bad_alloc&) {
+    error = ENOMEM;
+  } catch (const std::system_error& exception) {
+    error = exception.code().value();
+  } catch (...) {
+    error = EIO;
+  }
+  if (!state.page_cache_store_warned.exchange(
+          true, std::memory_order_relaxed)) {
+    fprintf(stderr,
+            "warning: unable to retain partial cached writes in page cache: "
+            "path=%s: %s\n",
+            handle.object_path.c_str(), strerror(error));
+  }
+  return false;
+}
+
 void ensure_multipart(State& state, OpenHandle& handle) {
   {
     std::unique_lock guard(handle.mutex);
@@ -3817,6 +4349,10 @@ void ensure_multipart(State& state, OpenHandle& handle) {
         headers.push_back(Header{"x-amz-checksum-algorithm",
                                  checksum_s3_name(state.config.checksum)});
         headers.push_back(Header{"x-amz-checksum-type", type});
+      }
+      if (!handle.write_id.empty()) {
+        headers.push_back(Header{
+            "x-amz-meta-ngs3fs-write-id", handle.write_id});
       }
       append_authorization(headers, state, "POST", path,
                            kEmptyPayloadSha256);
@@ -3855,6 +4391,9 @@ void ensure_multipart(State& state, OpenHandle& handle) {
     if (upload_id.empty()) {
       throw std::runtime_error(
           "CreateMultipartUpload response omitted UploadId");
+    }
+    if (handle.cache_entry) {
+      handle.cache_entry->set_upload_id(upload_id);
     }
     {
       std::lock_guard guard(handle.mutex);
@@ -3923,6 +4462,10 @@ void upload_part_job(State& state, OpenHandle& handle,
   try {
     {
       std::lock_guard guard(handle.mutex);
+      if (handle.unlinked.load(std::memory_order_acquire)) {
+        throw std::system_error(ESTALE, std::generic_category(),
+                                "write was unlinked");
+      }
       if (handle.write_state == WRITE_FAILED) {
         throw std::system_error(handle.write_error,
                                 std::generic_category(),
@@ -3943,6 +4486,9 @@ void upload_part_job(State& state, OpenHandle& handle,
   part.reset();
   release_part_budget(state);
   std::lock_guard guard(handle.mutex);
+  if (handle.unlinked.load(std::memory_order_acquire)) {
+    error_code = ESTALE;
+  }
   if (error_code == 0) {
     handle.page_cache_store_failed |= cache_store_failed;
     handle.part_etags[part_number - 1] = std::move(etag);
@@ -4131,6 +4677,10 @@ Response put_object(State& state, OpenHandle& handle,
       std::vector<Header> headers{
           Header{"content-type", "application/octet-stream"},
       };
+      if (!handle.write_id.empty()) {
+        headers.push_back(Header{
+            "x-amz-meta-ngs3fs-write-id", handle.write_id});
+      }
       if (!handle.etag.empty()) {
         headers.push_back(Header{"if-match", handle.etag});
       } else if (handle.create_exclusive) {
@@ -4694,15 +5244,7 @@ void multipart_copy_object(State& state, uint64_t size,
   }
 }
 
-void rename_remote_object(State& state, std::string_view key,
-                          uint64_t size, std::string_view etag,
-                          std::string_view version_id,
-                          std::string_view destination,
-                          bool no_replace) {
-  const std::string source = object_request_path(state, key);
-  const std::string rename_source = request_path_without_query(source);
-  const std::string_view source_etag = etag;
-
+bool native_rename_supported(State& state, std::string_view source) {
   if (state.rename_object_support.load(std::memory_order_acquire) == 0) {
     std::lock_guard probe_guard(state.rename_probe_mutex);
     if (state.rename_object_support.load(std::memory_order_relaxed) == 0) {
@@ -4711,54 +5253,77 @@ void rename_remote_object(State& state, std::string_view key,
           std::memory_order_release);
     }
   }
+  return state.rename_object_support.load(std::memory_order_acquire) > 0;
+}
 
-  if (state.rename_object_support.load(std::memory_order_acquire) > 0) {
-    const std::string rename_path = std::string(destination) + "?renameObject";
-    const std::string client_token = rename_client_token();
-    std::vector headers{
-        Header{"x-amz-rename-source", rename_source},
-        Header{"x-amz-client-token", client_token},
-    };
-    if (!source_etag.empty()) {
-      headers.push_back(
-          Header{"x-amz-rename-source-if-match", source_etag});
+bool try_native_rename_object(State& state, std::string_view key,
+                              std::string_view etag,
+                              std::string_view destination,
+                              bool no_replace) {
+  const std::string source = object_request_path(state, key);
+  if (!native_rename_supported(state, source)) {
+    return false;
+  }
+  const std::string rename_source = request_path_without_query(source);
+  const std::string rename_path   = std::string(destination) +
+      "?renameObject";
+  std::vector headers{
+      Header{"x-amz-rename-source", rename_source},
+      Header{"x-amz-client-token", rename_client_token()},
+  };
+  if (!etag.empty()) {
+    headers.push_back(Header{"x-amz-rename-source-if-match", etag});
+  }
+  if (no_replace) {
+    headers.push_back(Header{"if-none-match", "*"});
+  }
+  const Response response = request_with_retries([&] {
+    std::vector<Header> request_headers = headers;
+    HeaderList authorization = authorization_headers(
+        state, "PUT", rename_path, request_headers, kEmptyPayloadSha256);
+    request_headers.insert(
+        request_headers.end(),
+        std::make_move_iterator(authorization.begin()),
+        std::make_move_iterator(authorization.end()));
+    HttpPool::Lease client = state.http->acquire();
+    Response result = client->request_no_body(
+        "PUT", rename_path, request_headers);
+    if ((result.status == 401 || result.status == 403) &&
+        state.config.directory_bucket) {
+      invalidate_express_session(state);
+      throw std::runtime_error("RenameObject session rejected");
     }
-    if (no_replace) {
-      headers.push_back(Header{"if-none-match", "*"});
-    }
-    const Response response = request_with_retries([&] {
-      std::vector<Header> request_headers = headers;
-      auto authorization = authorization_headers(
-          state, "PUT", rename_path, request_headers, kEmptyPayloadSha256);
-      request_headers.insert(
-          request_headers.end(),
-          std::make_move_iterator(authorization.begin()),
-          std::make_move_iterator(authorization.end()));
-      HttpPool::Lease client = state.http->acquire();
-      Response result = client->request_no_body(
-          "PUT", rename_path, request_headers);
-      if ((result.status == 401 || result.status == 403) &&
-          state.config.directory_bucket) {
-        invalidate_express_session(state);
-        throw std::runtime_error("RenameObject session rejected");
-      }
-      return result;
-    }, "RenameObject");
-    if (response.status == 200) {
-      state.rename_object_support.store(1, std::memory_order_release);
-      return;
-    }
-    if (response.status == 412) {
-      throw std::system_error(
-          no_replace ? EEXIST : ESTALE, std::generic_category(),
-          no_replace ? "RenameObject destination exists"
-                     : "RenameObject source changed");
-    }
-    if (!rename_object_unsupported(response)) {
-      throw std::runtime_error("RenameObject failed with status " +
-                               std::to_string(response.status));
-    }
-    state.rename_object_support.store(-1, std::memory_order_release);
+    return result;
+  }, "RenameObject");
+  if (response.status == 200) {
+    state.rename_object_support.store(1, std::memory_order_release);
+    return true;
+  }
+  if (response.status == 412) {
+    throw std::system_error(
+        no_replace ? EEXIST : ESTALE, std::generic_category(),
+        no_replace ? "RenameObject destination exists"
+                   : "RenameObject source changed");
+  }
+  if (!rename_object_unsupported(response)) {
+    throw std::runtime_error("RenameObject failed with status " +
+                             std::to_string(response.status));
+  }
+  state.rename_object_support.store(-1, std::memory_order_release);
+  return false;
+}
+
+void rename_remote_object(State& state, std::string_view key,
+                          uint64_t size, std::string_view etag,
+                          std::string_view version_id,
+                          std::string_view destination,
+                          bool no_replace) {
+  const std::string source = object_request_path(state, key);
+  const std::string_view source_etag = etag;
+
+  if (try_native_rename_object(
+          state, key, etag, destination, no_replace)) {
+    return;
   }
 
   constexpr uint64_t kMaximumSingleCopySize =
@@ -4853,104 +5418,6 @@ void rename_remote_object(State& state, std::string_view key,
   }
 }
 
-void rename_remote_directory(State& state, std::string_view source_prefix,
-                             std::string_view destination_prefix) {
-  std::cerr << "warning: starting non-atomic directory rename: source="
-            << source_prefix << " destination=" << destination_prefix
-            << '\n';
-  const size_t concurrency = std::max<size_t>(
-      1, std::min<size_t>(state.config.max_uploads,
-                          state.config.max_connections - 1));
-  std::deque<std::future<void>> active;
-  std::atomic<size_t> completed{0};
-  size_t discovered = 0;
-  std::exception_ptr failure;
-  const auto wait_one = [&] {
-    if (active.empty()) {
-      return;
-    }
-    try {
-      active.front().get();
-    } catch (...) {
-      if (!failure) {
-        failure = std::current_exception();
-      }
-    }
-    active.pop_front();
-  };
-  try {
-    for_each_prefix_page(state, source_prefix,
-                         [&](std::vector<ListedObject> page) {
-      for (ListedObject& object : page) {
-        while (active.size() >= concurrency) {
-          wait_one();
-          if (failure) {
-            std::rethrow_exception(failure);
-          }
-        }
-        ++discovered;
-        active.push_back(std::async(
-            std::launch::async,
-            [&state, object = std::move(object),
-             source_prefix = std::string(source_prefix),
-             destination_prefix = std::string(destination_prefix),
-             &completed] () mutable {
-          const std::string_view suffix(
-              object.key.data() + source_prefix.size(),
-              object.key.size() - source_prefix.size());
-          const std::string destination_key =
-              destination_prefix + std::string(suffix);
-          rename_remote_object(
-              state, object.key, object.size, object.etag, {},
-              object_request_path(state, destination_key), false);
-          completed.fetch_add(1, std::memory_order_relaxed);
-        }));
-      }
-    });
-  } catch (const std::exception& error) {
-    while (!active.empty()) {
-      wait_one();
-    }
-    std::cerr << "error: non-atomic directory rename partially completed: "
-              << "source=" << source_prefix
-              << " destination=" << destination_prefix
-              << " completed=" << completed.load(std::memory_order_relaxed)
-              << " discovered=" << discovered
-              << " error=" << error.what() << '\n';
-    throw std::system_error(EIO, std::generic_category(),
-                            "directory rename partially completed");
-  }
-  while (!active.empty()) {
-    wait_one();
-  }
-  if (failure) {
-    try {
-      std::rethrow_exception(failure);
-    } catch (const std::exception& error) {
-      std::cerr << "error: non-atomic directory rename partially completed: "
-                << "source=" << source_prefix
-                << " destination=" << destination_prefix
-                << " completed="
-                << completed.load(std::memory_order_relaxed)
-                << " discovered=" << discovered
-                << " error=" << error.what() << '\n';
-    }
-    throw std::system_error(EIO, std::generic_category(),
-                            "directory rename partially completed");
-  }
-  if (discovered == 0) {
-    throw std::system_error(ENOENT, std::generic_category(),
-                            "directory prefix has no objects");
-  }
-  if (prefix_has_objects(state, source_prefix)) {
-    std::cerr << "error: objects appeared or remained under the source "
-                 "prefix during directory rename: "
-              << source_prefix << '\n';
-    throw std::system_error(EAGAIN, std::generic_category(),
-                            "directory changed during rename");
-  }
-}
-
 void ngs3fs_init(void* userdata, fuse_conn_info* connection) {
   auto& state = *static_cast<State*>(userdata);
   unsigned int desired = FUSE_CAP_ASYNC_READ | FUSE_CAP_ATOMIC_O_TRUNC;
@@ -5023,8 +5490,8 @@ void ngs3fs_lookup(fuse_req_t request, fuse_ino_t parent, const char* name) {
     if (!directory.directory()) {
       throw std::system_error(ENOTDIR, std::generic_category(), "lookup");
     }
-    refresh_directory(state, parent);
     cache_touch(static_cast<InodeDir&>(directory));
+    refresh_directory(state, parent);
     const double timeout = remaining_directory_timeout(directory);
     fuse_ino_t inode = 0;
     fuse_entry_param entry{};
@@ -5200,44 +5667,82 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
   bool registered      = false;
   bool budget_reserved = false;
   bool keep_cache      = false;
-  InodeFile* registered_item = nullptr;
+  std::unique_ptr<OpenHandle> handle;
   std::string registered_path;
   try {
-    auto handle = std::make_unique<OpenHandle>();
+    handle = std::make_unique<OpenHandle>();
     handle->writable = writable;
     InodeBase& item = inode_item(state, inode);
     if (item.directory()) {
       throw std::system_error(EISDIR, std::generic_category(), "open");
     }
-    if (writable && (file->flags & O_TRUNC) == 0 &&
-        !item.truncate_pending()) {
-      throw std::system_error(EOPNOTSUPP, std::generic_category(),
-                              "write open requires truncation");
-    }
+    const bool truncate_pending = item.truncate_pending();
     register_open_handle(state, inode, *handle);
     if (writable) {
       inode_item(state, inode).set_truncate_pending(false);
     }
+    registered = true;
+    std::shared_lock identity_guard(handle->identity_mutex);
     registered_path = handle->object_path;
-    registered_item = handle->item;
-    registered      = true;
-    if (!writable || !handle->create_exclusive) {
+    if (!handle->recovery_read &&
+        (!writable || !handle->create_exclusive)) {
       keep_cache = refresh_open_metadata(state, *handle);
+    }
+    if (writable && handle->size != 0 &&
+        (file->flags & O_TRUNC) == 0 && !truncate_pending) {
+      throw std::system_error(
+          EOPNOTSUPP, std::generic_category(),
+          "existing non-empty write open requires O_TRUNC");
+    }
+
+    if (!writable && state.local_cache && !handle->recovery_read) {
+      handle->cache_entry = state.local_cache->open(CacheIdentity{
+          .key = handle->key,
+          .etag = handle->etag,
+          .version_id = handle->version_id,
+          .size = handle->size,
+          .mtime = handle->item->mtime.load(std::memory_order_relaxed),
+      });
+      if (!handle->cache_entry) {
+        warn_cache_bypass(state, handle->object_path);
+      }
+    }
+    if (!writable) {
+      handle->reader = make_file_reader(state, *handle);
     }
 
     if (writable) {
       handle->item->set_page_cache_valid(false);
       keep_cache = false;
-      if (!reserve_part_budget(state, false)) {
-        throw std::system_error(EAGAIN, std::generic_category(),
-                                "pinned write budget exhausted");
+      if (state.local_cache) {
+        const uint64_t maximum_size = std::min(
+            state.config.part_size * kMaximumMultipartParts,
+            kMaximumObjectSize);
+        handle->cache_entry = state.local_cache->create_writer(
+            CacheIdentity{
+                .key = handle->key,
+                .etag = handle->etag,
+                .version_id = handle->version_id,
+                .size = handle->size,
+                .mtime = handle->item->mtime.load(
+                    std::memory_order_relaxed),
+            },
+            maximum_size);
+        handle->write_id = handle->cache_entry->write_id();
+      } else {
+        if (!reserve_part_budget(state, false)) {
+          throw std::system_error(EAGAIN, std::generic_category(),
+                                  "pinned write budget exhausted");
+        }
+        budget_reserved = true;
+        handle->current_reservation = true;
       }
-      budget_reserved = true;
-      handle->current_reservation = true;
       handle->size = 0;
       handle->stream_offset = 0;
+      handle->writer = make_file_writer(state, *handle);
     }
 
+    identity_guard.unlock();
     file->fh = reinterpret_cast<uint64_t>(handle.release());
     budget_reserved = false;
     // All handles stay buffered. O_RDWR is rejected above, so Linux rejects
@@ -5253,8 +5758,12 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
         release_part_budget(state);
         failed_handle->current_reservation = false;
       }
-      unregister_open_handle(state, failed_handle->object_path, writable,
-                             failed_handle->item);
+      std::string failed_path;
+      {
+        std::shared_lock failed_identity(failed_handle->identity_mutex);
+        failed_path = failed_handle->object_path;
+      }
+      unregister_open_handle(state, failed_path, *failed_handle);
       registered = false;
     }
   } catch (...) {
@@ -5262,8 +5771,7 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
       release_part_budget(state);
     }
     if (registered) {
-      unregister_open_handle(state, registered_path, writable,
-                             registered_item);
+      unregister_open_handle(state, registered_path, *handle);
     }
     reply_callback_error(request);
   }
@@ -5312,14 +5820,14 @@ void ngs3fs_create(fuse_req_t request, fuse_ino_t parent, const char* name,
   bool registered      = false;
   bool budget_reserved = false;
   fuse_ino_t inode     = 0;
-  InodeFile* item      = nullptr;
+  std::unique_ptr<OpenHandle> handle;
   std::string path;
   try {
     InodeBase& directory = inode_item(state, parent);
     if (!directory.directory()) {
       throw std::system_error(ENOTDIR, std::generic_category(), "create");
     }
-    auto handle = std::make_unique<OpenHandle>();
+    handle = std::make_unique<OpenHandle>();
     handle->writable = true;
     handle->create_exclusive = true;
     double timeout;
@@ -5334,16 +5842,32 @@ void ngs3fs_create(fuse_req_t request, fuse_ino_t parent, const char* name,
       inode_item(state, inode).set_fsize(0);
       register_open_handle(state, inode, *handle);
       path       = handle->object_path;
-      item       = handle->item;
       registered = true;
       timeout    = remaining_directory_timeout(directory);
     }
-    if (!reserve_part_budget(state, false)) {
-      throw std::system_error(EAGAIN, std::generic_category(),
-                              "pinned write budget exhausted");
+    if (state.local_cache) {
+      const uint64_t maximum_size = std::min(
+          state.config.part_size * kMaximumMultipartParts,
+          kMaximumObjectSize);
+      handle->cache_entry = state.local_cache->create_writer(
+          CacheIdentity{
+              .key = handle->key,
+              .etag = {},
+              .version_id = {},
+              .size = 0,
+              .mtime = 0,
+          },
+          maximum_size);
+      handle->write_id = handle->cache_entry->write_id();
+    } else {
+      if (!reserve_part_budget(state, false)) {
+        throw std::system_error(EAGAIN, std::generic_category(),
+                                "pinned write budget exhausted");
+      }
+      budget_reserved             = true;
+      handle->current_reservation = true;
     }
-    budget_reserved             = true;
-    handle->current_reservation = true;
+    handle->writer = make_file_writer(state, *handle);
 
     fuse_entry_param entry{};
     entry.ino           = inode;
@@ -5364,8 +5888,7 @@ void ngs3fs_create(fuse_req_t request, fuse_ino_t parent, const char* name,
         failed->current_reservation = false;
       }
       abandon_created_inode(state, parent, inode);
-      unregister_open_handle(state, failed->object_path, true,
-                             failed->item);
+      unregister_open_handle(state, failed->object_path, *failed);
       registered = false;
     }
   } catch (...) {
@@ -5376,22 +5899,606 @@ void ngs3fs_create(fuse_req_t request, fuse_ino_t parent, const char* name,
       abandon_created_inode(state, parent, inode);
     }
     if (registered) {
-      unregister_open_handle(state, path, true, item);
+      unregister_open_handle(state, path, *handle);
     }
     reply_callback_error(request);
   }
 }
 
-void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
-                 off_t offset, fuse_file_info* file) {
+int reply_pinned_cached_range(fuse_req_t request, CacheEntry& entry,
+                              uint64_t offset, size_t length) {
+  fuse_bufvec buffers{};
+  buffers.count        = 1;
+  buffers.buf[0].size  = length;
+  buffers.buf[0].flags = fuse_buf_flags(
+      FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
+  buffers.buf[0].fd    = entry.data_fd();
+  buffers.buf[0].pos   = off_t(offset);
+  const int result = fuse_reply_data(
+      request, &buffers, FUSE_BUF_SPLICE_MOVE);
+  entry.unpin(offset, length);
+  return result;
+}
+
+int reply_cached_range(fuse_req_t request, CacheEntry& entry,
+                       uint64_t offset, size_t length) {
+  entry.pin(offset, length);
+  entry.touch(offset, length);
+  return reply_pinned_cached_range(request, entry, offset, length);
+}
+
+bool cache_content_range_matches(const Response& response,
+                                 const CacheFetchClaim& claim,
+                                 uint64_t object_size) noexcept {
+  if (response.status != 206) {
+    return response.status == 200 && claim.offset == 0 &&
+        uint64_t(claim.length) == object_size;
+  }
+  const auto found = response.headers.find("content-range");
+  if (found == response.headers.end()) {
+    return false;
+  }
+  std::string_view value = sso_view(found->second);
+  constexpr std::string_view prefix = "bytes ";
+  if (!value.starts_with(prefix)) {
+    return false;
+  }
+  value.remove_prefix(prefix.size());
+  const size_t dash  = value.find('-');
+  const size_t slash = value.find('/', dash == std::string_view::npos
+                                         ? 0 : dash + 1);
+  if (dash == std::string_view::npos || slash == std::string_view::npos) {
+    return false;
+  }
+  uint64_t first = 0;
+  uint64_t last  = 0;
+  uint64_t total = 0;
+  return parse_unsigned(value.substr(0, dash), first) &&
+      parse_unsigned(value.substr(dash + 1, slash - dash - 1), last) &&
+      parse_unsigned(value.substr(slash + 1), total) &&
+      first == claim.offset && total == object_size &&
+      last >= first && last - first + 1 == claim.length;
+}
+
+class CacheReadSink final : public RangeFileSink {
+ public:
+  CacheReadSink(CacheEntry& entry, const CacheFetchClaim& claim,
+                fuse_req_t request,
+                uint64_t wanted_offset, size_t wanted_length)
+      : RangeFileSink(entry.data_fd(), claim.offset),
+        entry_(entry),
+        claim_(claim),
+        request_(request),
+        wanted_offset_(wanted_offset),
+        wanted_length_(wanted_length) {}
+
+  void progress(const Response& response, bool complete) override {
+    if (!cache_content_range_matches(response, claim_, entry_.size())) {
+      return;
+    }
+    if (response.body_bytes > claim_.length) {
+      throw std::runtime_error("cache GET exceeded its claimed range");
+    }
+    entry_.publish_clean(
+        claim_, published_, response.body_bytes,
+        complete && response.body_bytes == claim_.length);
+    published_ = std::max(published_, response.body_bytes);
+    if (!replied_ && entry_.pin_clean(wanted_offset_, wanted_length_)) {
+      replied_ = true;
+      result_ = reply_pinned_cached_range(
+          request_, entry_, wanted_offset_, wanted_length_);
+    }
+  }
+
+  [[nodiscard]] bool replied() const noexcept { return replied_; }
+  [[nodiscard]] int result() const noexcept { return result_; }
+
+ private:
+  CacheEntry& entry_;
+  CacheFetchClaim claim_;
+  fuse_req_t request_;
+  uint64_t wanted_offset_;
+  size_t wanted_length_;
+  size_t published_ = 0;
+  bool replied_ = false;
+  int result_   = 0;
+};
+
+class CacheRetrySink final : public RangeFileSink {
+ public:
+  CacheRetrySink(CacheEntry& entry, uint64_t offset) noexcept
+      : RangeFileSink(entry.data_fd(), offset) {}
+
+  void progress(const Response&, bool) override {}
+};
+
+enum CacheChecksumResult {
+  CACHE_CHECKSUM_UNAVAILABLE,
+  CACHE_CHECKSUM_VALID,
+  CACHE_CHECKSUM_INVALID,
+};
+
+CacheChecksumResult verify_cached_checksum(
+    const Response& response, CacheEntry& entry, uint64_t offset,
+    size_t length, ChecksumAlgorithm preferred) {
+  ChecksumAlgorithm algorithm = CHECKSUM_NONE;
+  std::string_view expected;
+  if (!read_checksum_from_response(response, preferred,
+                                   algorithm, expected)) {
+    return CACHE_CHECKSUM_UNAVAILABLE;
+  }
+  DataChecksum checksum(algorithm);
+  std::array<std::byte, kPreferredIoSize> bytes;
+  size_t consumed = 0;
+  while (consumed != length) {
+    const size_t count = std::min(bytes.size(), length - consumed);
+    ssize_t result;
+    do {
+      result = ::pread(entry.data_fd(), bytes.data(), count,
+                       off_t(offset + consumed));
+    } while (result < 0 && errno == EINTR);
+    if (result < 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "pread(cache checksum)");
+    }
+    if (result == 0) {
+      throw std::runtime_error("cache data ended during checksum");
+    }
+    checksum.update(std::span(bytes).first(size_t(result)));
+    consumed += size_t(result);
+  }
+  const ChecksumValue actual = checksum.finish();
+  if (algorithm == CHECKSUM_CRC64XZ) {
+    uint64_t received = 0;
+    return parse_unsigned(expected, received) &&
+                   received == actual.integer
+               ? CACHE_CHECKSUM_VALID : CACHE_CHECKSUM_INVALID;
+  }
+  return expected == sso_view(actual.base64)
+             ? CACHE_CHECKSUM_VALID : CACHE_CHECKSUM_INVALID;
+}
+
+bool verify_cached_part(CacheEntry& entry,
+                        const CacheChecksumClaim& claim) {
+  DataChecksum checksum(ChecksumAlgorithm(claim.algorithm));
+  std::array<std::byte, kPreferredIoSize> bytes;
+  uint64_t consumed = 0;
+  while (consumed != claim.size) {
+    const size_t count = size_t(std::min<uint64_t>(
+        bytes.size(), claim.size - consumed));
+    ssize_t result;
+    do {
+      result = ::pread(entry.data_fd(), bytes.data(), count,
+                       off_t(claim.offset + consumed));
+    } while (result < 0 && errno == EINTR);
+    if (result < 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "pread(cache part checksum)");
+    }
+    if (result == 0) {
+      throw std::runtime_error("cache part ended during checksum");
+    }
+    checksum.update(std::span(bytes).first(size_t(result)));
+    consumed += size_t(result);
+  }
+  return sso_view(checksum.finish().base64) == claim.value;
+}
+
+bool part_checksum(const S3Xml& xml,
+                   const tinyxml2::XMLElement& part,
+                   ChecksumAlgorithm preferred,
+                   ChecksumAlgorithm& algorithm,
+                   std::string& value) {
+  const auto read = [&](ChecksumAlgorithm candidate) {
+    value = xml.optional_text(part, checksum_xml_name(candidate));
+    const std::string_view trimmed = trim_xml_space(value);
+    if (trimmed.data() != value.data() || trimmed.size() != value.size()) {
+      value = std::string(trimmed);
+    }
+    return !value.empty();
+  };
+  constexpr std::array algorithms{
+      CHECKSUM_CRC64NVME, CHECKSUM_CRC32C, CHECKSUM_CRC32,
+      CHECKSUM_SHA256, CHECKSUM_SHA1, CHECKSUM_XXHASH128,
+      CHECKSUM_XXHASH3, CHECKSUM_XXHASH64, CHECKSUM_SHA512,
+      CHECKSUM_MD5,
+  };
+  if (checksum_is_s3(preferred)) {
+    if (read(preferred)) {
+      algorithm = preferred;
+      return true;
+    }
+  }
+  for (ChecksumAlgorithm candidate : algorithms) {
+    if (candidate == preferred) {
+      continue;
+    }
+    if (read(candidate)) {
+      algorithm = candidate;
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<CacheChecksumPart> get_checksum_manifest(
+    State& state, const OpenHandle& handle) {
+  std::vector<CacheChecksumPart> result;
+  unsigned expected_number = 1;
+  unsigned marker          = 0;
+  uint64_t offset          = 0;
+  for (;;) {
+    std::string path = query_path(handle.object_path, "attributes");
+    if (!handle.version_id.empty()) {
+      path += "&versionId=" + uri_encode(handle.version_id, false);
+    }
+    std::array<Header, 3> signed_headers;
+    size_t signed_count = 0;
+    signed_headers[signed_count++] =
+        Header{"x-amz-max-parts", "1000"};
+    signed_headers[signed_count++] =
+        Header{"x-amz-object-attributes", "ObjectParts,Checksum"};
+    std::string marker_text;
+    if (marker != 0) {
+      marker_text = std::to_string(marker);
+      signed_headers[signed_count++] =
+          Header{"x-amz-part-number-marker", marker_text};
+    }
+    HeaderList headers = authorization_headers(
+        state, "GET", path,
+        std::span(signed_headers.data(), signed_count),
+        kEmptyPayloadSha256);
+    for (size_t i = 0; i < signed_count; ++i) {
+      headers.push_back(signed_headers[i]);
+    }
+    HttpPool::Lease lease = state.http->acquire();
+    const Response response = request_with_retries([&] {
+      return lease->request_no_body(
+          "GET", path, std::span<const Header>(headers),
+          kMaximumListResponseSize);
+    }, "GetObjectAttributes");
+    if (response.status != 200) {
+      throw_s3_status(response.status, "GetObjectAttributes");
+    }
+    S3Xml xml(response_xml(response), "GetObjectAttributes");
+    const tinyxml2::XMLElement& root =
+        xml.result_root("GetObjectAttributesOutput");
+    const tinyxml2::XMLElement& parts =
+        xml.required_child(root, "ObjectParts");
+    for (const tinyxml2::XMLElement* part = parts.FirstChildElement();
+         part != nullptr; part = part->NextSiblingElement()) {
+      if (!S3Xml::named(*part, "Part")) {
+        continue;
+      }
+      uint64_t number = 0;
+      uint64_t size   = 0;
+      const std::string number_text =
+          xml.required_text(*part, "PartNumber");
+      const std::string size_text = xml.required_text(*part, "Size");
+      if (!parse_unsigned(trim_xml_space(number_text), number) ||
+          number != expected_number || number > kMaximumMultipartParts ||
+          !parse_unsigned(trim_xml_space(size_text), size) || size == 0 ||
+          offset > handle.size || size > handle.size - offset) {
+        throw std::runtime_error(
+            "GetObjectAttributes returned an invalid part sequence");
+      }
+      ChecksumAlgorithm algorithm = CHECKSUM_NONE;
+      std::string value;
+      if (!part_checksum(xml, *part, state.config.checksum,
+                         algorithm, value)) {
+        throw std::runtime_error(
+            "GetObjectAttributes omitted a usable part checksum");
+      }
+      result.push_back(CacheChecksumPart{
+          .offset    = offset,
+          .size      = size,
+          .algorithm = uint32_t(algorithm),
+          .value     = std::move(value),
+      });
+      offset += size;
+      ++expected_number;
+    }
+    const bool truncated = xml.required_bool(parts, "IsTruncated");
+    if (!truncated) {
+      if (offset != handle.size) {
+        throw std::runtime_error(
+            "GetObjectAttributes part sizes do not match the object");
+      }
+      return result;
+    }
+    uint64_t next = 0;
+    const std::string next_text =
+        xml.required_text(parts, "NextPartNumberMarker");
+    if (!parse_unsigned(trim_xml_space(next_text), next) ||
+        next <= marker || next != expected_number - 1 ||
+        next > kMaximumMultipartParts) {
+      throw std::runtime_error(
+          "GetObjectAttributes returned invalid part pagination");
+    }
+    marker = unsigned(next);
+  }
+}
+
+void ensure_checksum_manifest(State& state, OpenHandle& handle) {
+  CacheEntry& entry = *handle.cache_entry;
+  if (!entry.begin_checksum_manifest()) {
+    return;
+  }
+  try {
+    if (!checksum_is_s3(state.config.checksum)) {
+      throw std::runtime_error(
+          "selected checksum has no S3 ObjectParts representation");
+    }
+    entry.finish_checksum_manifest(get_checksum_manifest(state, handle));
+  } catch (const std::exception& error) {
+    entry.checksum_manifest_unavailable();
+    fprintf(stderr,
+            "warning: multipart read checksum unavailable; continuing "
+            "without part verification: path=%s: %s\n",
+            handle.object_path.c_str(), error.what());
+  } catch (...) {
+    entry.checksum_manifest_unavailable();
+    fprintf(stderr,
+            "warning: multipart read checksum unavailable; continuing "
+            "without part verification: path=%s\n",
+            handle.object_path.c_str());
+  }
+}
+
+bool service_cached_checksums(State& state, OpenHandle& handle,
+                              uint64_t offset, size_t length,
+                              HttpPool::Lease* existing = nullptr) {
+  CacheEntry& entry = *handle.cache_entry;
+  for (;;) {
+    const CacheChecksumClaim claim = entry.claim_checksum(offset, length);
+    if (claim.action == CACHE_CHECKSUM_NONE) {
+      return true;
+    }
+    if (claim.action == CACHE_CHECKSUM_BAD) {
+      return false;
+    }
+    if (claim.action == CACHE_CHECKSUM_WAIT) {
+      entry.wait_for_checksum(offset, length);
+      continue;
+    }
+
+    bool valid = false;
+    try {
+      valid = verify_cached_part(entry, claim);
+      if (valid) {
+        entry.finish_checksum(claim, true);
+        continue;
+      }
+      entry.checksum_mismatch(claim);
+      // TODO: invalidate kernel pages only after the FUSE_READ reply has
+      // completed. notify_inval_inode from this path can wait on that same
+      // request's locked folio and deadlock with an immediate following read.
+      HttpPool::Lease acquired;
+      if (existing == nullptr || !*existing) {
+        acquired = state.http->acquire();
+      }
+      HttpClient& client = existing != nullptr && *existing
+          ? existing->client() : acquired.client();
+      WorkerState& worker = worker_state(state);
+      const AuthorizedRangeRequest range = make_range_request(
+          state, handle, worker, claim.offset, size_t(claim.size));
+      CacheRetrySink sink(entry, claim.offset);
+      const Response response = client.get_range_to_fd(
+          range.path(), claim.offset, size_t(claim.size), sink,
+          range.headers, true, false);
+      const CacheFetchClaim fetched{
+          claim.offset, claim.epoch, 0, size_t(claim.size)};
+      valid = cache_content_range_matches(response, fetched, handle.size) &&
+          response.body_bytes == fetched.length &&
+          verify_cached_part(entry, claim);
+    } catch (...) {
+      entry.finish_checksum(claim, false);
+      throw;
+    }
+    entry.finish_checksum(claim, valid);
+    if (!valid) {
+      return false;
+    }
+  }
+}
+
+bool cache_response_matches(const Response& response,
+                            const CacheFetchClaim& claim,
+                            uint64_t object_size) noexcept {
+  return cache_content_range_matches(response, claim, object_size) &&
+      response.body_bytes == claim.length;
+}
+
+size_t cache_fetch_expansion(State& state, OpenHandle& handle,
+                             uint64_t offset, size_t wanted) {
+  constexpr size_t initial = 1024U * 1024U;
+  std::lock_guard guard(handle.mutex);
+  if (!handle.cache_read_seen) {
+    handle.cache_read_window = initial;
+    handle.cache_read_seen = true;
+  } else if (offset == handle.cache_last_read_end) {
+    handle.cache_read_window = std::min(
+        state.config.maximum_cache_fetch_size,
+        std::max(initial, handle.cache_read_window * 2));
+  } else {
+    handle.cache_read_window = initial;
+  }
+  handle.cache_last_read_end = offset + wanted;
+  return std::max(wanted, handle.cache_read_window);
+}
+
+bool read_cached(State& state, OpenHandle& handle,
+                 fuse_req_t request, uint64_t offset, size_t wanted) {
+  CacheEntry& entry = *handle.cache_entry;
+  if (state.config.verify_read_checksum && entry.stale()) {
+    throw std::system_error(ESTALE, std::generic_category(),
+                            "stale cached S3 generation");
+  }
+  if (state.config.verify_read_checksum) {
+    ensure_checksum_manifest(state, handle);
+  }
+  const size_t expansion = cache_fetch_expansion(
+      state, handle, offset, wanted);
+  for (;;) {
+    if (state.config.verify_read_checksum &&
+        !service_cached_checksums(state, handle, offset, wanted)) {
+      throw std::system_error(EIO, std::generic_category(),
+                              "cached S3 part checksum mismatch");
+    }
+    if (entry.pin_clean(offset, wanted)) {
+      const int result = reply_pinned_cached_range(
+          request, entry, offset, wanted);
+      if (result != 0) {
+        fprintf(stderr, "fuse_reply_data(cache hit) failed: %s\n",
+                strerror(-result));
+      }
+      return true;
+    }
+    if (entry.range_bad(offset, wanted)) {
+      throw std::system_error(EIO, std::generic_category(),
+                              "cached S3 checksum mismatch");
+    }
+    HttpPool::Lease lease;
+    size_t selected_expansion = wanted;
+    if (expansion > wanted) {
+      lease = state.http->try_acquire_bulk();
+      if (lease) {
+        selected_expansion = expansion;
+      }
+    }
+    const CacheFetchClaim claim = entry.claim_fetch(
+        offset, wanted, selected_expansion);
+    if (!claim) {
+      entry.wait_for_range(offset, wanted);
+      continue;
+    }
+
+    try {
+      if (!entry.prepare_read(claim.offset, claim.length)) {
+        entry.fail_fetch(claim);
+        return false;
+      }
+    } catch (...) {
+      entry.fail_fetch(claim);
+      throw;
+    }
+
+    CacheReadSink sink(entry, claim, request, offset, wanted);
+    Response response;
+    try {
+      WorkerState& worker = worker_state(state);
+      if (!lease) {
+        lease = state.http->acquire();
+      }
+      HttpClient& client = lease.client();
+      const AuthorizedRangeRequest range = make_range_request(
+          state, handle, worker, claim.offset, claim.length);
+      response = client.get_range_to_fd(
+          range.path(), claim.offset, claim.length, sink,
+          range.headers, true,
+          state.config.report_metrics);
+      if (!cache_response_matches(response, claim, handle.size)) {
+        if (response.status != 200 && response.status != 206) {
+          throw_s3_status(response.status, "cached GetObject range");
+        }
+        throw std::runtime_error("cached GetObject returned a short body");
+      }
+
+      const bool checksum_scope_matches =
+          claim.offset == 0 && uint64_t(claim.length) == handle.size;
+      const CacheChecksumResult checked =
+          state.config.verify_read_checksum && checksum_scope_matches &&
+              !entry.checksum_manifest_available()
+              ? verify_cached_checksum(response, entry, claim.offset,
+                                       claim.length, state.config.checksum)
+              : CACHE_CHECKSUM_UNAVAILABLE;
+      if (checked == CACHE_CHECKSUM_INVALID) {
+        entry.begin_retry(claim);
+        CacheRetrySink retry_sink(entry, claim.offset);
+        const AuthorizedRangeRequest retry_range = make_range_request(
+            state, handle, worker, claim.offset, claim.length);
+        const Response retried = client.get_range_to_fd(
+            retry_range.path(), claim.offset, claim.length, retry_sink,
+            retry_range.headers, true, false);
+        const bool retry_valid = cache_response_matches(
+            retried, claim, handle.size) &&
+            verify_cached_checksum(retried, entry, claim.offset,
+                                   claim.length,
+                                   state.config.checksum) ==
+                CACHE_CHECKSUM_VALID;
+        entry.finish_retry(claim, retry_valid);
+        if (!retry_valid) {
+          if (sink.replied()) {
+            fprintf(stderr,
+                    "error: cached S3 checksum retry failed: path=%s "
+                    "offset=%" PRIu64 " bytes=%zu\n",
+                    handle.object_path.c_str(), claim.offset, claim.length);
+            return true;
+          }
+          throw std::system_error(EIO, std::generic_category(),
+                                  "cached S3 checksum retry failed");
+        }
+      } else {
+        entry.finish_fetch(claim);
+      }
+      if (state.config.verify_read_checksum &&
+          !service_cached_checksums(state, handle, claim.offset,
+                                    claim.length, &lease)) {
+        if (sink.replied()) {
+          fprintf(stderr,
+                  "error: cached S3 part checksum retry failed: path=%s "
+                  "offset=%" PRIu64 " bytes=%zu\n",
+                  handle.object_path.c_str(), claim.offset, claim.length);
+          return true;
+        }
+        throw std::system_error(EIO, std::generic_category(),
+                                "cached S3 part checksum retry failed");
+      }
+    } catch (...) {
+      entry.fail_fetch(claim);
+      if (sink.replied()) {
+        try {
+          throw;
+        } catch (const std::exception& error) {
+          fprintf(stderr,
+                  "warning: cache fill tail failed after FUSE reply: "
+                  "path=%s offset=%" PRIu64 " bytes=%zu: %s\n",
+                  handle.object_path.c_str(), claim.offset, claim.length,
+                  error.what());
+        } catch (...) {
+          fprintf(stderr,
+                  "warning: cache fill tail failed after FUSE reply: "
+                  "path=%s offset=%" PRIu64 " bytes=%zu\n",
+                  handle.object_path.c_str(), claim.offset, claim.length);
+        }
+        return true;
+      }
+      throw;
+    }
+    if (sink.replied()) {
+      if (sink.result() != 0) {
+        fprintf(stderr, "fuse_reply_data(cache fill) failed: %s\n",
+                strerror(-sink.result()));
+      }
+      return true;
+    }
+  }
+}
+
+void read_open_file(State& state, OpenHandle& handle, bool use_cache,
+                    fuse_req_t request, fuse_ino_t inode, size_t size,
+                    off_t offset) {
   if (offset < 0) {
     fuse_reply_err(request, EINVAL);
     return;
   }
 
   try {
-    State& state = state_from(request);
-    OpenHandle& handle = handle_required(file);
+    std::shared_lock identity_guard(handle.identity_mutex);
+    if (handle.stale.load(std::memory_order_acquire)) {
+      throw std::system_error(ESTALE, std::generic_category(),
+                              "stale open file");
+    }
     if (handle.inode != inode) {
       throw std::system_error(EBADF, std::generic_category(), "read inode");
     }
@@ -5415,6 +6522,20 @@ void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
         report_metrics ? fuse_monotonic_ns() : 0;
     const uint64_t cpu_start_ns =
         report_metrics ? fuse_thread_cpu_ns() : 0;
+
+    if (handle.recovery_read && handle.cache_entry) {
+      const int result = reply_cached_range(
+          request, *handle.cache_entry, unsigned_offset, wanted);
+      if (result != 0) {
+        fprintf(stderr, "fuse_reply_data(cache recovery) failed: %s\n",
+                strerror(-result));
+      }
+      return;
+    }
+    if (use_cache && handle.cache_entry != nullptr &&
+        read_cached(state, handle, request, unsigned_offset, wanted)) {
+      return;
+    }
 
     WorkerState& worker = worker_state(state);
     HttpPool::Lease lease = state.http->acquire();
@@ -5571,9 +6692,75 @@ void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
   }
 }
 
-void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
-                      fuse_bufvec* input, off_t offset,
-                      fuse_file_info* file) {
+class UncachedFileReader final : public FileReader {
+ public:
+  void read(State& state, OpenHandle& handle, fuse_req_t request,
+            fuse_ino_t inode, size_t size, off_t offset) override {
+    read_open_file(state, handle, false, request, inode, size, offset);
+  }
+};
+
+class CachedFileReader final : public FileReader {
+ public:
+  void read(State& state, OpenHandle& handle, fuse_req_t request,
+            fuse_ino_t inode, size_t size, off_t offset) override {
+    read_open_file(state, handle, true, request, inode, size, offset);
+  }
+};
+
+class UncachedFileWriter final : public FileWriter {
+ public:
+  void write(State& state, OpenHandle& handle, fuse_req_t request,
+             fuse_ino_t inode, fuse_bufvec* input, off_t offset) override;
+  void flush(State& state, OpenHandle& handle) override;
+  void fsync(State& state, OpenHandle& handle, bool data_only) override;
+  void release(State& state, OpenHandle& handle) noexcept override;
+};
+
+class CachedFileWriter final : public FileWriter {
+ public:
+  void write(State& state, OpenHandle& handle, fuse_req_t request,
+             fuse_ino_t inode, fuse_bufvec* input, off_t offset) override;
+  void flush(State& state, OpenHandle& handle) override;
+  void fsync(State& state, OpenHandle& handle, bool data_only) override;
+  void release(State& state, OpenHandle& handle) noexcept override;
+};
+
+std::unique_ptr<FileReader> make_file_reader(State& state,
+                                              OpenHandle&) {
+  if (state.local_cache) {
+    return std::make_unique<CachedFileReader>();
+  }
+  return std::make_unique<UncachedFileReader>();
+}
+
+std::unique_ptr<FileWriter> make_file_writer(State& state,
+                                              OpenHandle&) {
+  if (state.local_cache) {
+    return std::make_unique<CachedFileWriter>();
+  }
+  return std::make_unique<UncachedFileWriter>();
+}
+
+void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
+                 off_t offset, fuse_file_info* file) {
+  try {
+    State& state = state_from(request);
+    OpenHandle& handle = handle_required(file);
+    OpenRequestGuard active(handle);
+    if (!handle.reader) {
+      throw std::system_error(EBADF, std::generic_category(),
+                              "missing file reader");
+    }
+    handle.reader->read(state, handle, request, inode, size, offset);
+  } catch (...) {
+    reply_callback_error(request);
+  }
+}
+
+void UncachedFileWriter::write(State& state, OpenHandle& handle,
+                               fuse_req_t request, fuse_ino_t inode,
+                               fuse_bufvec* input, off_t offset) {
   if (offset < 0) {
     fuse_reply_err(request, EINVAL);
     return;
@@ -5584,13 +6771,15 @@ void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
   }
 
   try {
-    State& state = state_from(request);
-    OpenHandle& handle = handle_required(file);
     if (handle.inode != inode) {
       throw std::system_error(EBADF, std::generic_category(), "write inode");
     }
     if (!handle.writable) {
       throw std::system_error(EBADF, std::generic_category(), "write_buf");
+    }
+    if (handle.unlinked.load(std::memory_order_acquire)) {
+      throw std::system_error(ESTALE, std::generic_category(),
+                              "write unlinked file");
     }
     const size_t length = fuse_buf_size(input);
     if (length == 0) {
@@ -5623,6 +6812,10 @@ void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
     }
     while (handle.write_in_progress) {
       handle.condition.wait(handle_guard);
+    }
+    if (handle.unlinked.load(std::memory_order_acquire)) {
+      throw std::system_error(ESTALE, std::generic_category(),
+                              "write unlinked file");
     }
     if (handle.write_state == WRITE_FAILED) {
       throw std::system_error(handle.write_error,
@@ -5724,24 +6917,1016 @@ void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
   }
 }
 
+void pwrite_cache_exact(int fd, uint64_t offset,
+                        std::span<const std::byte> bytes) {
+  size_t written = 0;
+  while (written != bytes.size()) {
+    const ssize_t result = ::pwrite(
+        fd, bytes.data() + written, bytes.size() - written,
+        off_t(offset + written));
+    if (result > 0) {
+      written += size_t(result);
+    } else if (result < 0 && errno == EINTR) {
+      continue;
+    } else if (result == 0) {
+      throw std::system_error(EIO, std::generic_category(),
+                              "short cache pwrite");
+    } else {
+      throw std::system_error(errno, std::generic_category(),
+                              "pwrite(cache data)");
+    }
+  }
+}
+
+size_t copy_fd_to_cache(int source_fd, uint64_t& source_offset,
+                        bool seek, int cache_fd, uint64_t cache_offset,
+                        size_t length) {
+  std::array<std::byte, 64U * 1024U> bytes;
+  const size_t wanted = std::min(length, bytes.size());
+  for (;;) {
+    const ssize_t result = seek
+        ? ::pread(source_fd, bytes.data(), wanted, off_t(source_offset))
+        : ::read(source_fd, bytes.data(), wanted);
+    if (result > 0) {
+      pwrite_cache_exact(cache_fd, cache_offset,
+                         std::span(bytes).first(size_t(result)));
+      if (seek) {
+        source_offset += uint64_t(result);
+      }
+      return size_t(result);
+    }
+    if (result == 0) {
+      throw std::system_error(ECONNRESET, std::generic_category(),
+                              "FUSE write source reached EOF");
+    }
+    if (errno != EINTR) {
+      throw std::system_error(errno, std::generic_category(),
+                              "read(FUSE cache write fallback)");
+    }
+  }
+}
+
+size_t write_fuse_buffers_to_cache(State& state, fuse_bufvec& input,
+                                   Pipe& pipe, int cache_fd,
+                                   uint64_t cache_offset, size_t length) {
+  size_t remaining = length;
+  size_t copied    = 0;
+  bool fd_fallback = false;
+  while (remaining != 0) {
+    if (input.idx >= input.count) {
+      throw std::runtime_error("short FUSE write buffer");
+    }
+    fuse_buf& buf = input.buf[input.idx];
+    if (input.off > buf.size) {
+      throw std::runtime_error("invalid FUSE write buffer offset");
+    }
+    const size_t available = buf.size - input.off;
+    if (available == 0) {
+      ++input.idx;
+      input.off = 0;
+      continue;
+    }
+    const size_t count = std::min(remaining, available);
+    if ((buf.flags & FUSE_BUF_IS_FD) == 0) {
+      const auto* data = static_cast<const std::byte*>(buf.mem);
+      if (data == nullptr) {
+        throw std::system_error(EFAULT, std::generic_category(),
+                                "null memory-backed FUSE buffer");
+      }
+      pwrite_cache_exact(cache_fd, cache_offset,
+                         std::span(data + input.off, count));
+      copied += count;
+    } else {
+      if (pipe.capacity() == 0) {
+        pipe = Pipe::create(kPreferredIoSize);
+      }
+      const bool seek = (buf.flags & FUSE_BUF_FD_SEEK) != 0;
+      if (seek && buf.pos < 0) {
+        throw std::system_error(EINVAL, std::generic_category(),
+                                "negative FUSE buffer offset");
+      }
+      uint64_t source_offset = seek ? uint64_t(buf.pos) + input.off : 0;
+      if (seek && source_offset < uint64_t(buf.pos)) {
+        throw std::system_error(EOVERFLOW, std::generic_category(),
+                                "FUSE buffer offset overflow");
+      }
+      size_t moved = 0;
+      if (!fd_fallback) {
+        try {
+          uint64_t* position = seek ? &source_offset : nullptr;
+          moved = splice_some(buf.fd, position, pipe.write_fd(), count,
+                              SPLICE_F_MOVE);
+          if (moved == 0) {
+            throw std::system_error(EAGAIN, std::generic_category(),
+                                    "FUSE write source has no data");
+          }
+        } catch (const std::system_error& error) {
+          const int value = error.code().value();
+          if (value != EPERM && value != ENOSYS && value != EINVAL &&
+              value != EOPNOTSUPP && value != EXDEV) {
+            throw;
+          }
+          fd_fallback = true;
+        }
+      }
+      if (moved != 0) {
+        uint64_t destination = cache_offset;
+        try {
+          splice_to_fd_exact(pipe.read_fd(), cache_fd, destination,
+                             moved, SPLICE_F_MOVE);
+        } catch (const std::system_error& error) {
+          const int value = error.code().value();
+          if (value != EPERM && value != ENOSYS && value != EINVAL &&
+              value != EOPNOTSUPP && value != EXDEV) {
+            throw;
+          }
+          if (destination < cache_offset ||
+              destination - cache_offset > moved) {
+            throw std::runtime_error(
+                "invalid cache splice destination offset");
+          }
+          size_t pipe_remaining = moved - size_t(destination - cache_offset);
+          uint64_t unused_offset = 0;
+          while (pipe_remaining != 0) {
+            const size_t count = copy_fd_to_cache(
+                pipe.read_fd(), unused_offset, false, cache_fd,
+                destination, pipe_remaining);
+            destination    += count;
+            pipe_remaining -= count;
+            copied         += count;
+          }
+          fd_fallback = true;
+        }
+      } else if (fd_fallback) {
+        moved = copy_fd_to_cache(buf.fd, source_offset, seek, cache_fd,
+                                 cache_offset, count);
+        copied += moved;
+      }
+      if (moved != count) {
+        input.off  += moved;
+        cache_offset += moved;
+        remaining -= moved;
+        continue;
+      }
+    }
+    input.off    += count;
+    cache_offset += count;
+    remaining   -= count;
+    if (input.off == buf.size) {
+      ++input.idx;
+      input.off = 0;
+    }
+  }
+  if (copied != 0) {
+    record_memory_fallback(state, copied);
+  }
+  return copied;
+}
+
+ChecksumValue checksum_file_range(ChecksumAlgorithm algorithm, int fd,
+                                  uint64_t offset, size_t length) {
+  if (!checksum_has_digest(algorithm)) {
+    return {};
+  }
+  DataChecksum checksum(algorithm);
+  std::array<std::byte, kPreferredIoSize> bytes;
+  size_t consumed = 0;
+  while (consumed != length) {
+    const size_t count = std::min(bytes.size(), length - consumed);
+    ssize_t result;
+    do {
+      result = ::pread(fd, bytes.data(), count, off_t(offset + consumed));
+    } while (result < 0 && errno == EINTR);
+    if (result < 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "pread(cache upload checksum)");
+    }
+    if (result == 0) {
+      throw std::system_error(EIO, std::generic_category(),
+                              "short cache upload checksum input");
+    }
+    checksum.update(std::span(bytes).first(size_t(result)));
+    consumed += size_t(result);
+  }
+  return checksum.finish();
+}
+
+std::string upload_cached_part(State& state, OpenHandle& handle,
+                               unsigned number, uint64_t offset,
+                               size_t length, ChecksumValue& checksum) {
+  ensure_multipart(state, handle);
+  checksum = checksum_file_range(
+      state.config.checksum, handle.cache_entry->data_fd(), offset, length);
+  std::string upload_id;
+  {
+    std::lock_guard guard(handle.mutex);
+    upload_id = handle.upload_id;
+  }
+  std::string query = "partNumber=" + std::to_string(number);
+  query += "&uploadId=" + uri_encode(upload_id, false);
+  const std::string path = query_path(handle.object_path, query);
+  const Response response = request_with_retries([&] {
+    std::vector<Header> headers;
+    append_upload_checksum(headers, state.config.checksum, checksum);
+    append_authorization(headers, state, "PUT", path, kUnsignedPayload);
+    HttpPool::Lease client = state.http->acquire_bulk();
+    return client->put_from_fd(path, headers,
+                               handle.cache_entry->data_fd(),
+                               offset, length);
+  }, "UploadPart(cache)");
+  require_s3_success(response, "UploadPart(cache)");
+  verify_upload_checksum(response, state.config.checksum,
+                         checksum, "UploadPart(cache)");
+  const auto etag = response.headers.find("etag");
+  if (etag == response.headers.end() || etag->second.empty()) {
+    throw std::runtime_error("UploadPart(cache) response omitted ETag");
+  }
+  return std::string(etag->second.data(), etag->second.size());
+}
+
+void upload_cached_part_job(State& state, OpenHandle& handle,
+                            unsigned number, uint64_t offset,
+                            size_t length) noexcept {
+  std::string etag;
+  ChecksumValue checksum;
+  int error = 0;
+  try {
+    {
+      std::lock_guard guard(handle.mutex);
+      if (handle.unlinked.load(std::memory_order_acquire)) {
+        throw std::system_error(ESTALE, std::generic_category(),
+                                "cached write was unlinked");
+      }
+      if (handle.write_state == WRITE_FAILED) {
+        throw std::system_error(handle.write_error,
+                                std::generic_category(),
+                                "cached write handle failed");
+      }
+    }
+    etag = upload_cached_part(state, handle, number, offset, length,
+                              checksum);
+  } catch (const std::system_error& exception) {
+    error = exception.code().value();
+  } catch (...) {
+    error = EIO;
+  }
+  std::lock_guard guard(handle.mutex);
+  if (handle.unlinked.load(std::memory_order_acquire)) {
+    error = ESTALE;
+  }
+  if (error == 0) {
+    handle.part_etags[number - 1] = std::move(etag);
+    if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
+      handle.part_checksums[number - 1] = std::move(checksum.base64);
+    }
+    if (state.config.checksum == CHECKSUM_CRC64NVME ||
+        state.config.checksum == CHECKSUM_CRC64XZ) {
+      handle.part_checksum_values[number - 1] = checksum.integer;
+      handle.part_sizes[number - 1] = length;
+    }
+  } else {
+    fail_write(handle, error);
+  }
+  --handle.pending_parts;
+  handle.condition.notify_all();
+}
+
+void submit_cached_part(State& state, OpenHandle& handle,
+                        uint64_t offset, size_t length) {
+  const unsigned number = handle.next_part_number;
+  if (number > kMaximumMultipartParts) {
+    throw std::system_error(EFBIG, std::generic_category(),
+                            "S3 multipart part limit exceeded");
+  }
+  handle.part_etags.resize(number);
+  if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
+    handle.part_checksums.resize(number);
+  }
+  if (state.config.checksum == CHECKSUM_CRC64NVME ||
+      state.config.checksum == CHECKSUM_CRC64XZ) {
+    handle.part_checksum_values.resize(number);
+    handle.part_sizes.resize(number);
+  }
+  handle.next_part_number   = number + 1;
+  handle.multipart_required = true;
+  ++handle.pending_parts;
+  try {
+    state.uploads->submit(
+        &handle, [&state, &handle, number, offset, length] {
+          upload_cached_part_job(state, handle, number, offset, length);
+        });
+  } catch (...) {
+    --handle.pending_parts;
+    handle.next_part_number = number;
+    handle.part_etags.resize(number - 1);
+    handle.part_checksums.resize(std::min<size_t>(
+        handle.part_checksums.size(), number - 1));
+    handle.part_checksum_values.resize(std::min<size_t>(
+        handle.part_checksum_values.size(), number - 1));
+    handle.part_sizes.resize(std::min<size_t>(
+        handle.part_sizes.size(), number - 1));
+    throw;
+  }
+}
+
+void submit_ready_cached_parts(State& state, OpenHandle& handle,
+                               bool include_final) {
+  const uint64_t part_size = state.config.part_size;
+  for (;;) {
+    const uint64_t offset =
+        uint64_t(handle.next_part_number - 1) * part_size;
+    if (offset >= handle.stream_offset) {
+      return;
+    }
+    const uint64_t available = handle.stream_offset - offset;
+    if (!include_final && available < part_size) {
+      return;
+    }
+    const size_t length = size_t(std::min<uint64_t>(available, part_size));
+    submit_cached_part(state, handle, offset, length);
+  }
+}
+
+void CachedFileWriter::write(State& state, OpenHandle& handle,
+                             fuse_req_t request, fuse_ino_t inode,
+                             fuse_bufvec* input, off_t offset) {
+  if (offset < 0 || input == nullptr) {
+    fuse_reply_err(request, EINVAL);
+    return;
+  }
+  try {
+    if (handle.inode != inode || !handle.writable || !handle.cache_entry) {
+      throw std::system_error(EBADF, std::generic_category(),
+                              "cached write handle");
+    }
+    if (handle.unlinked.load(std::memory_order_acquire)) {
+      throw std::system_error(ESTALE, std::generic_category(),
+                              "write unlinked file");
+    }
+    const size_t length = fuse_buf_size(input);
+    if (length == 0) {
+      fuse_reply_write(request, 0);
+      return;
+    }
+    const uint64_t start = uint64_t(offset);
+    if (start > UINT64_MAX - length) {
+      throw std::system_error(EFBIG, std::generic_category(),
+                              "write offset overflow");
+    }
+    const uint64_t end = start + length;
+    const uint64_t maximum_size = std::min(
+        state.config.part_size * kMaximumMultipartParts,
+        kMaximumObjectSize);
+    if (end > maximum_size) {
+      throw std::system_error(EFBIG, std::generic_category(),
+                              "configured S3 multipart limit exceeded");
+    }
+
+    std::unique_lock guard(handle.mutex);
+    while (handle.write_in_progress) {
+      handle.condition.wait(guard);
+    }
+    if (handle.unlinked.load(std::memory_order_acquire)) {
+      throw std::system_error(ESTALE, std::generic_category(),
+                              "write unlinked file");
+    }
+    if (handle.write_state == WRITE_FAILED) {
+      throw std::system_error(handle.write_error,
+                              std::generic_category(),
+                              "cached write handle failed");
+    }
+    if (handle.write_state != WRITE_OPEN) {
+      if (!handle.write_after_flush_warned) {
+        fprintf(stderr,
+                "error: write after first flush is unsupported: path=%s\n",
+                handle.object_path.c_str());
+        handle.write_after_flush_warned = true;
+      }
+      throw std::system_error(EIO, std::generic_category(),
+                              "write after flush");
+    }
+    if (start != handle.stream_offset) {
+      throw std::system_error(ESPIPE, std::generic_category(),
+                              "non-sequential write offset");
+    }
+    handle.write_in_progress = true;
+    try {
+      handle.cache_entry->prepare_write(start, length);
+      write_fuse_buffers_to_cache(
+          state, *input, handle.cache_write_pipe,
+          handle.cache_entry->data_fd(), start, length);
+      remember_partial_write_pages(
+          handle, start, end, handle.cache_entry->page_size());
+      handle.cache_entry->publish_dirty(start, length, end);
+      handle.stream_offset = end;
+      handle.size          = end;
+      submit_ready_cached_parts(state, handle, false);
+    } catch (const std::system_error& error) {
+      handle.write_in_progress = false;
+      handle.cache_entry->isolate_write();
+      fail_write(handle, error.code().value());
+      throw;
+    } catch (...) {
+      handle.write_in_progress = false;
+      handle.cache_entry->isolate_write();
+      fail_write(handle, EIO);
+      throw;
+    }
+    handle.write_in_progress = false;
+    handle.condition.notify_all();
+    if (state.config.stats_interval_seconds != 0) {
+      state.fuse_writes.fetch_add(1, std::memory_order_relaxed);
+      state.fuse_write_bytes.fetch_add(length, std::memory_order_relaxed);
+    }
+    fuse_reply_write(request, length);
+  } catch (...) {
+    reply_callback_error(request);
+  }
+}
+
+Response put_cached_object(State& state, OpenHandle& handle) {
+  const size_t length = size_t(handle.stream_offset);
+  const ChecksumValue checksum = checksum_file_range(
+      state.config.checksum, handle.cache_entry->data_fd(), 0, length);
+  bool ambiguous = false;
+  try {
+    Response response = request_with_retries([&] {
+      std::vector<Header> headers{
+          Header{"content-type", "application/octet-stream"},
+      };
+      headers.push_back(Header{
+          "x-amz-meta-ngs3fs-write-id", handle.write_id});
+      if (!handle.etag.empty()) {
+        headers.push_back(Header{"if-match", handle.etag});
+      } else if (handle.create_exclusive) {
+        headers.push_back(Header{"if-none-match", "*"});
+      }
+      append_upload_checksum(headers, state.config.checksum, checksum);
+      append_authorization(headers, state, "PUT", handle.object_path,
+                           length == 0 ? kEmptyPayloadSha256
+                                       : kUnsignedPayload);
+      HttpPool::Lease client = state.http->acquire_bulk();
+      if (length == 0) {
+        client->begin_upload("PUT", handle.object_path, headers, 0);
+        return client->finish_upload();
+      }
+      return client->put_from_fd(handle.object_path, headers,
+                                 handle.cache_entry->data_fd(), 0, length);
+    }, "PutObject(cache)", &ambiguous);
+    if (ambiguous && response.status == 412) {
+      Response recovered;
+      if (recover_write_commit(state, handle, recovered)) {
+        return recovered;
+      }
+      throw std::system_error(EIO, std::generic_category(),
+                              "cached PutObject outcome unknown");
+    }
+    if (response.status == 412 && handle.create_exclusive) {
+      throw std::system_error(EEXIST, std::generic_category(),
+                              "PutObject destination exists");
+    }
+    require_s3_success(response, "PutObject(cache)");
+    verify_upload_checksum(response, state.config.checksum,
+                           checksum, "PutObject(cache)");
+    return response;
+  } catch (...) {
+    if (ambiguous) {
+      Response recovered;
+      if (recover_write_commit(state, handle, recovered)) {
+        return recovered;
+      }
+      fprintf(stderr, "error: cached PutObject outcome unknown: %s\n",
+              handle.object_path.c_str());
+      throw std::system_error(EIO, std::generic_category(),
+                              "cached PutObject outcome unknown");
+    }
+    throw;
+  }
+}
+
+void commit_cached_write(OpenHandle& handle) {
+  InodeFile& item = *handle.item;
+  handle.cache_entry->commit_write(CacheIdentity{
+      .key = handle.key,
+      .etag = handle.etag,
+      .version_id = handle.version_id,
+      .size = handle.stream_offset,
+      .mtime = item.mtime.load(std::memory_order_relaxed),
+  });
+}
+
+void CachedFileWriter::flush(State& state, OpenHandle& handle) {
+  std::unique_lock guard(handle.mutex);
+  while (handle.write_in_progress) {
+    handle.condition.wait(guard);
+  }
+  while (handle.write_state == WRITE_SEALING) {
+    handle.condition.wait(guard);
+  }
+  if (handle.unlinked.load(std::memory_order_acquire)) {
+    throw std::system_error(ESTALE, std::generic_category(),
+                            "flush unlinked file");
+  }
+  if (handle.write_state == WRITE_SEALED) {
+    return;
+  }
+  if (handle.write_state == WRITE_FAILED) {
+    throw std::system_error(handle.write_error, std::generic_category(),
+                            "cached write handle failed");
+  }
+  handle.write_state = WRITE_SEALING;
+  try {
+    handle.cache_entry->begin_write();
+    if (handle.stream_offset <= state.config.part_size &&
+        !handle.multipart_required) {
+      guard.unlock();
+      const Response response = put_cached_object(state, handle);
+      handle.page_cache_store_failed |=
+          !store_cached_partial_pages(state, handle);
+      update_written_metadata(state, handle, response);
+      commit_cached_write(handle);
+      guard.lock();
+    } else {
+      submit_ready_cached_parts(state, handle, true);
+      while (handle.pending_parts != 0 &&
+             handle.write_state != WRITE_FAILED) {
+        handle.condition.wait(guard);
+      }
+      if (handle.write_state == WRITE_FAILED) {
+        throw std::system_error(handle.write_error,
+                                std::generic_category(),
+                                "cached multipart upload failed");
+      }
+      for (size_t i = 0; i < handle.part_etags.size(); ++i) {
+        if (handle.part_etags[i].empty()) {
+          throw std::system_error(EIO, std::generic_category(),
+                                  "cached multipart part has no ETag");
+        }
+      }
+      guard.unlock();
+      complete_multipart(state, handle);
+      // The writer remains registered until this flush finishes, so no new
+      // opener can observe metadata before partial pages are restored.
+      handle.page_cache_store_failed |=
+          !store_cached_partial_pages(state, handle);
+      if (handle.page_cache_store_failed) {
+        handle.item->set_page_cache_valid(false);
+      }
+      commit_cached_write(handle);
+      guard.lock();
+    }
+    handle.write_state = WRITE_SEALED;
+    handle.condition.notify_all();
+  } catch (const std::system_error& error) {
+    if (!guard.owns_lock()) {
+      guard.lock();
+    }
+    fail_write(handle, error.code().value());
+    throw;
+  } catch (...) {
+    if (!guard.owns_lock()) {
+      guard.lock();
+    }
+    fail_write(handle, EIO);
+    throw;
+  }
+
+  const bool unregister = handle.registered;
+  handle.registered = false;
+  guard.unlock();
+  if (unregister) {
+    unregister_open_handle(state, handle.object_path, handle, false);
+  }
+}
+
+void CachedFileWriter::fsync(State&, OpenHandle& handle, bool) {
+  std::unique_lock guard(handle.mutex);
+  while (handle.write_in_progress) {
+    handle.condition.wait(guard);
+  }
+  if (handle.unlinked.load(std::memory_order_acquire)) {
+    throw std::system_error(ESTALE, std::generic_category(),
+                            "fsync unlinked file");
+  }
+  CacheEntry& entry = *handle.cache_entry;
+  guard.unlock();
+  entry.sync_write();
+  guard.lock();
+  if (handle.write_state == WRITE_FAILED) {
+    throw std::system_error(handle.write_error,
+                            std::generic_category(),
+                            "cached write handle failed");
+  }
+}
+
+void UncachedFileWriter::flush(State& state, OpenHandle& handle) {
+  if (handle.unlinked.load(std::memory_order_acquire)) {
+    throw std::system_error(ESTALE, std::generic_category(),
+                            "flush unlinked file");
+  }
+  seal_write(state, handle);
+  bool unregister = false;
+  {
+    std::lock_guard handle_guard(handle.mutex);
+    unregister = handle.registered;
+    handle.registered = false;
+  }
+  if (unregister) {
+    unregister_open_handle(state, handle.object_path, handle, false);
+  }
+}
+
+void UncachedFileWriter::fsync(State&, OpenHandle& handle, bool) {
+  std::unique_lock handle_guard(handle.mutex);
+  while (handle.write_in_progress) {
+    handle.condition.wait(handle_guard);
+  }
+  if (handle.unlinked.load(std::memory_order_acquire)) {
+    throw std::system_error(ESTALE, std::generic_category(),
+                            "fsync unlinked file");
+  }
+  if (handle.write_state == WRITE_FAILED) {
+    throw std::system_error(handle.write_error,
+                            std::generic_category(),
+                            "write handle failed");
+  }
+}
+
+struct CachedRemotePart {
+  std::string etag;
+  uint64_t size = 0;
+  unsigned number = 0;
+};
+
+std::vector<CachedRemotePart> list_cached_parts(
+    State& state, const OpenHandle& handle) {
+  std::vector<CachedRemotePart> parts;
+  unsigned marker = 0;
+  for (;;) {
+    std::string query = "uploadId=" + uri_encode(handle.upload_id, false);
+    query += "&max-parts=1000";
+    if (marker != 0) {
+      query += "&part-number-marker=" + std::to_string(marker);
+    }
+    const std::string path = query_path(handle.object_path, query);
+    const Response response = request_with_retries([&] {
+      const HeaderList headers = authorization_headers(
+          state, "GET", path, {}, kEmptyPayloadSha256);
+      HttpPool::Lease client = state.http->acquire();
+      return client->request_no_body(
+          "GET", path, headers, kMaximumListResponseSize);
+    }, "ListParts(cache recovery)");
+    require_s3_success(response, "ListParts(cache recovery)");
+    S3Xml xml(response_xml(response), "ListParts(cache recovery)");
+    const tinyxml2::XMLElement& root =
+        xml.result_root("ListPartsResult");
+    unsigned last = marker;
+    for (const tinyxml2::XMLElement* child = root.FirstChildElement();
+         child != nullptr; child = child->NextSiblingElement()) {
+      if (!S3Xml::named(*child, "Part")) {
+        continue;
+      }
+      uint64_t number = 0;
+      uint64_t length = 0;
+      const std::string number_text = xml.required_text(
+          *child, "PartNumber");
+      const std::string length_text = xml.required_text(*child, "Size");
+      if (!parse_unsigned(trim_xml_space(number_text), number) ||
+          number == 0 || number > kMaximumMultipartParts ||
+          !parse_unsigned(trim_xml_space(length_text), length)) {
+        throw std::runtime_error(
+            "ListParts(cache recovery) returned an invalid part");
+      }
+      if (number <= last) {
+        throw std::runtime_error(
+            "ListParts(cache recovery) returned unordered parts");
+      }
+      parts.push_back(CachedRemotePart{
+          .etag = xml.required_text(*child, "ETag"),
+          .size = length,
+          .number = unsigned(number),
+      });
+      last = unsigned(number);
+    }
+    const bool truncated = xml.required_bool(root, "IsTruncated");
+    if (!truncated) {
+      return parts;
+    }
+    uint64_t next = 0;
+    const std::string next_text = xml.required_text(
+        root, "NextPartNumberMarker");
+    if (!parse_unsigned(trim_xml_space(next_text), next) ||
+        next <= marker || next > kMaximumMultipartParts) {
+      throw std::runtime_error(
+          "ListParts(cache recovery) returned an invalid marker");
+    }
+    marker = unsigned(next);
+  }
+}
+
+void recover_cached_write(State& state,
+                          const std::shared_ptr<CacheEntry>& entry,
+                          const std::stop_token& stop) {
+  RequestStopScope request_stop(stop);
+  OpenHandle handle;
+  InodeFile item;
+  handle.writable      = true;
+  handle.item          = &item;
+  handle.key           = entry->key();
+  handle.object_path   = object_request_path(state, handle.key);
+  handle.etag          = entry->etag();
+  handle.version_id    = entry->version_id();
+  handle.upload_id     = entry->upload_id();
+  handle.write_id      = entry->write_id();
+  handle.cache_entry   = entry;
+  handle.stream_offset = entry->written_end();
+  handle.size          = handle.stream_offset;
+  item.set_fsize(handle.size);
+  fprintf(stderr, "warning: recovering cached write: path=%s bytes=%" PRIu64
+                  "\n",
+          handle.object_path.c_str(), handle.stream_offset);
+
+  if (handle.stream_offset <= state.config.part_size &&
+      handle.upload_id.empty()) {
+    (void)put_cached_object(state, handle);
+  } else {
+    if (handle.upload_id.empty()) {
+      ensure_multipart(state, handle);
+    }
+    const std::vector<CachedRemotePart> remote =
+        list_cached_parts(state, handle);
+    const size_t count = size_t(
+        (handle.stream_offset - 1) / state.config.part_size + 1);
+    handle.part_etags.resize(count);
+    for (const CachedRemotePart& part : remote) {
+      if (part.number > count) {
+        throw std::runtime_error(
+            "ListParts(cache recovery) returned an excess part");
+      }
+      const uint64_t offset =
+          uint64_t(part.number - 1) * state.config.part_size;
+      const size_t expected = size_t(std::min<uint64_t>(
+          state.config.part_size, handle.stream_offset - offset));
+      if (part.size != expected || part.etag.empty()) {
+        throw std::runtime_error(
+            "ListParts(cache recovery) disagrees with local data");
+      }
+      handle.part_etags[part.number - 1] = part.etag;
+    }
+    if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
+      handle.part_checksums.resize(count);
+    }
+    if (state.config.checksum == CHECKSUM_CRC64NVME ||
+        state.config.checksum == CHECKSUM_CRC64XZ) {
+      handle.part_checksum_values.resize(count);
+      handle.part_sizes.resize(count);
+    }
+    for (size_t i = 0; i < count; ++i) {
+      check_request_stop();
+      const unsigned number = unsigned(i + 1);
+      const uint64_t offset = uint64_t(i) * state.config.part_size;
+      const size_t length = size_t(std::min<uint64_t>(
+          state.config.part_size, handle.stream_offset - offset));
+      ChecksumValue checksum;
+      if (handle.part_etags[i].empty()) {
+        handle.part_etags[i] = upload_cached_part(
+            state, handle, number, offset, length, checksum);
+      } else {
+        checksum = checksum_file_range(
+            state.config.checksum, entry->data_fd(), offset, length);
+      }
+      if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
+        handle.part_checksums[i] = std::move(checksum.base64);
+      }
+      if (state.config.checksum == CHECKSUM_CRC64NVME ||
+          state.config.checksum == CHECKSUM_CRC64XZ) {
+        handle.part_checksum_values[i] = checksum.integer;
+        handle.part_sizes[i] = length;
+      }
+    }
+    check_request_stop();
+    complete_multipart(state, handle);
+  }
+
+  check_request_stop();
+  const ObjectMetadata metadata = head_object(state, handle.object_path);
+  if (metadata.size != handle.stream_offset) {
+    throw std::runtime_error(
+        "recovered S3 object has the wrong size");
+  }
+  entry->commit_write(CacheIdentity{
+      .key = handle.key,
+      .etag = metadata.etag,
+      .version_id = metadata.version_id,
+      .size = metadata.size,
+      .mtime = metadata.mtime,
+  });
+}
+
+void finish_pending_delete(State& state, std::string_view path) noexcept {
+  State::PendingDelete operation;
+  {
+    std::lock_guard guard(state.open_files_mutex);
+    const auto pending = state.pending_deletes.find(path);
+    if (pending == state.pending_deletes.end() ||
+        pending->second.deleting) {
+      return;
+    }
+    if (!pending->second.rollback && state.open_files.contains(path)) {
+      return;
+    }
+    pending->second.deleting = true;
+    operation = pending->second;
+  }
+
+  try {
+    bool restored = false;
+    OpenHandleIdentityLocks reader_locks;
+    if (operation.rollback) {
+      reader_locks = lock_open_handle_identities(
+          state, path, "pending rename restore");
+      std::optional<ObjectMetadata> hidden;
+      try {
+        hidden = head_object(state, path);
+      } catch (const std::system_error& error) {
+        if (error.code().value() != ENOENT) {
+          throw;
+        }
+      }
+      if (hidden) {
+        const std::string destination = object_request_path(
+            state, operation.restore_key);
+        std::optional<ObjectMetadata> visible;
+        try {
+          visible = head_object(state, destination);
+        } catch (const std::system_error& error) {
+          if (error.code().value() != ENOENT) {
+            throw;
+          }
+        }
+        if (!visible) {
+          for (OpenHandle* handle : reader_locks.handles) {
+            handle->object_path.reserve(destination.size());
+            handle->key.reserve(operation.restore_key.size());
+          }
+          if (!try_native_rename_object(
+                  state, operation.key, hidden->etag, destination, true)) {
+            throw std::system_error(
+                EOPNOTSUPP, std::generic_category(),
+                "restore interrupted RenameObject destination");
+          }
+          restored = true;
+        } else if (!operation.replacement_etag.empty() &&
+                   visible->etag == operation.replacement_etag) {
+          delete_object(state, operation.key, hidden->etag);
+        } else {
+          throw std::system_error(
+              EBUSY, std::generic_category(),
+              "cannot identify interrupted RenameObject destination");
+        }
+      }
+    } else {
+      delete_object(state, operation.key, {});
+    }
+    std::lock_guard guard(state.open_files_mutex);
+    if (restored) {
+      auto opened = state.open_files.find(path);
+      if (opened == state.open_files.end()) {
+        if (!reader_locks.handles.empty()) {
+          throw std::logic_error(
+              "pending rename reader registry disappeared");
+        }
+      } else {
+        if (opened->second.handles != reader_locks.handles) {
+          throw std::logic_error(
+              "pending rename reader registry changed");
+        }
+        const std::string destination = object_request_path(
+            state, operation.restore_key);
+        for (OpenHandle* handle : opened->second.handles) {
+          if (handle == nullptr) {
+            continue;
+          }
+          handle->object_path.assign(destination);
+          handle->key.assign(operation.restore_key);
+        }
+        auto node = state.open_files.extract(opened);
+        node.key().assign(destination);
+        state.open_files.insert(std::move(node));
+      }
+    }
+    state.local_cache->finish_pending_delete(operation.key);
+    const auto pending = state.pending_deletes.find(path);
+    if (pending != state.pending_deletes.end() &&
+        pending->second.key == operation.key) {
+      state.pending_deletes.erase(pending);
+    }
+    fprintf(stderr,
+            "warning: %s interrupted S3 rename state: path=%.*s\n",
+            restored ? "restored" : "removed",
+            int(path.size()), path.data());
+  } catch (const std::exception& error) {
+    std::lock_guard guard(state.open_files_mutex);
+    const auto pending = state.pending_deletes.find(path);
+    if (pending != state.pending_deletes.end() &&
+        pending->second.key == operation.key) {
+      pending->second.deleting = false;
+    }
+    fprintf(stderr,
+            "error: pending S3 delete retained for recovery: path=%.*s: "
+            "%s\n",
+            int(path.size()), path.data(), error.what());
+  } catch (...) {
+    std::lock_guard guard(state.open_files_mutex);
+    const auto pending = state.pending_deletes.find(path);
+    if (pending != state.pending_deletes.end() &&
+        pending->second.key == operation.key) {
+      pending->second.deleting = false;
+    }
+    fprintf(stderr,
+            "error: pending S3 delete retained for recovery: path=%.*s\n",
+            int(path.size()), path.data());
+  }
+}
+
+void cache_recovery_loop(std::stop_token stop, State* state) noexcept {
+  std::vector<std::string> pending_paths;
+  {
+    std::lock_guard guard(state->open_files_mutex);
+    pending_paths.reserve(state->pending_deletes.size());
+    for (const auto& [path, pending] : state->pending_deletes) {
+      (void)pending;
+      pending_paths.push_back(path);
+    }
+  }
+  for (const std::string& path : pending_paths) {
+    if (stop.stop_requested()) {
+      return;
+    }
+    finish_pending_delete(*state, path);
+  }
+  std::vector<std::shared_ptr<CacheEntry>> recovery_entries;
+  {
+    std::lock_guard guard(state->open_files_mutex);
+    recovery_entries = state->recovery_entries;
+  }
+  for (const std::shared_ptr<CacheEntry>& entry : recovery_entries) {
+    if (stop.stop_requested()) {
+      return;
+    }
+    std::string path = state->config.bucket_path;
+    path.push_back('/');
+    path += uri_encode(entry->key(), true);
+    try {
+      recover_cached_write(*state, entry, stop);
+      {
+        std::lock_guard guard(state->open_files_mutex);
+        state->recovery_paths.erase(path);
+        std::erase(state->recovery_entries, entry);
+      }
+      state->open_files_condition.notify_all();
+      fprintf(stderr, "warning: cached write recovery completed: path=%s\n",
+              path.c_str());
+    } catch (const std::exception& error) {
+      if (stop.stop_requested()) {
+        return;
+      }
+      fprintf(stderr,
+              "error: cached write recovery isolated: path=%s: %s\n",
+              path.c_str(), error.what());
+    } catch (...) {
+      if (stop.stop_requested()) {
+        return;
+      }
+      fprintf(stderr,
+              "error: cached write recovery isolated: path=%s\n",
+              path.c_str());
+    }
+  }
+}
+
+void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
+                      fuse_bufvec* input, off_t offset,
+                      fuse_file_info* file) {
+  try {
+    State& state = state_from(request);
+    OpenHandle& handle = handle_required(file);
+    if (!handle.writer) {
+      throw std::system_error(EBADF, std::generic_category(),
+                              "missing file writer");
+    }
+    handle.writer->write(state, handle, request, inode, input, offset);
+  } catch (...) {
+    reply_callback_error(request);
+  }
+}
+
 void ngs3fs_flush(fuse_req_t request, fuse_ino_t,
                   fuse_file_info* file) {
   try {
     OpenHandle& handle = handle_required(file);
-    if (!handle.writable) {
-      fuse_reply_err(request, 0);
-      return;
-    }
-    State& state = state_from(request);
-    seal_write(state, handle);
-    bool unregister = false;
-    {
-      std::lock_guard handle_guard(handle.mutex);
-      unregister = handle.registered;
-      handle.registered = false;
-    }
-    if (unregister) {
-      unregister_open_handle(state, handle.object_path, true, handle.item);
+    if (handle.writer) {
+      handle.writer->flush(state_from(request), handle);
     }
     fuse_reply_err(request, 0);
   } catch (...) {
@@ -5749,26 +7934,148 @@ void ngs3fs_flush(fuse_req_t request, fuse_ino_t,
   }
 }
 
-void ngs3fs_fsync(fuse_req_t request, fuse_ino_t, int,
+void ngs3fs_fsync(fuse_req_t request, fuse_ino_t, int data_only,
                   fuse_file_info* file) {
   try {
     OpenHandle& handle = handle_required(file);
-    if (!handle.writable) {
-      fuse_reply_err(request, 0);
-      return;
-    }
-    std::unique_lock handle_guard(handle.mutex);
-    while (handle.write_in_progress) {
-      handle.condition.wait(handle_guard);
-    }
-    if (handle.write_state == WRITE_FAILED) {
-      throw std::system_error(handle.write_error,
-                              std::generic_category(),
-                              "write handle failed");
+    if (handle.writer) {
+      handle.writer->fsync(state_from(request), handle, data_only != 0);
     }
     fuse_reply_err(request, 0);
   } catch (...) {
     reply_callback_error(request);
+  }
+}
+
+void discard_pending_inode(State& state, OpenHandle& handle) noexcept {
+  InodeFile* item = handle.item;
+  if (item == nullptr || item->detached() || !item->pending()) {
+    return;
+  }
+  InodeBase* parent = item->parent();
+  if (parent == nullptr || !parent->directory() || parent->detached()) {
+    return;
+  }
+  try {
+    std::lock_guard guard(parent->dir_children().mutation_mutex);
+    if (!item->detached() && item->pending()) {
+      remove_item(state, *item);
+    }
+  } catch (...) {
+  }
+}
+
+void UncachedFileWriter::release(State& state,
+                                 OpenHandle& handle) noexcept {
+  bool release_budget = false;
+  bool discard_pending = false;
+  bool registered      = false;
+  try {
+    std::unique_lock handle_guard(handle.mutex);
+    while (handle.write_in_progress ||
+           handle.write_state == WRITE_SEALING) {
+      handle.condition.wait(handle_guard);
+    }
+    if (handle.write_state == WRITE_OPEN) {
+      fail_write(handle, EIO);
+    }
+    while (handle.pending_parts != 0) {
+      handle.condition.wait(handle_guard);
+    }
+    release_budget = handle.current_reservation;
+    handle.current_reservation = false;
+    handle.current_part.reset();
+    abort_multipart(state, handle);
+    discard_pending = handle.write_state != WRITE_SEALED;
+  } catch (...) {
+  }
+  {
+    std::lock_guard guard(handle.mutex);
+    registered        = handle.registered;
+    handle.registered = false;
+  }
+  if (discard_pending) {
+    discard_pending_inode(state, handle);
+  }
+  if (registered) {
+    unregister_open_handle(state, handle.object_path, handle);
+  } else {
+    release_open_inode(state, handle);
+  }
+  if (release_budget) {
+    release_part_budget(state);
+  }
+}
+
+void CachedFileWriter::release(State& state,
+                               OpenHandle& handle) noexcept {
+  try {
+    std::unique_lock guard(handle.mutex);
+    while (handle.write_in_progress ||
+           handle.write_state == WRITE_SEALING) {
+      handle.condition.wait(guard);
+    }
+    while (handle.pending_parts != 0) {
+      handle.condition.wait(guard);
+    }
+    if (handle.unlinked.load(std::memory_order_acquire)) {
+      const bool registered = handle.registered;
+      handle.registered = false;
+      guard.unlock();
+      abort_multipart(state, handle);
+      if (handle.cache_entry) {
+        handle.cache_entry->discard_write();
+      }
+      if (registered) {
+        unregister_open_handle(state, handle.object_path, handle);
+      } else {
+        release_open_inode(state, handle);
+      }
+      return;
+    }
+    const bool dirty = handle.cache_entry && handle.cache_entry->dirty();
+    if (dirty && handle.write_state != WRITE_SEALED) {
+      fprintf(stderr,
+              "warning: cached write preserved for recovery: path=%s "
+              "bytes=%" PRIu64 "\n",
+              handle.object_path.c_str(), handle.stream_offset);
+      const bool registered = handle.registered;
+      handle.registered = false;
+      guard.unlock();
+      {
+        std::lock_guard open_guard(state.open_files_mutex);
+        state.recovery_paths.insert(handle.object_path);
+      }
+      if (registered) {
+        unregister_open_handle(state, handle.object_path, handle);
+      } else {
+        release_open_inode(state, handle);
+      }
+      return;
+    }
+    const bool registered = handle.registered;
+    handle.registered = false;
+    guard.unlock();
+    if (registered) {
+      unregister_open_handle(state, handle.object_path, handle);
+    } else {
+      release_open_inode(state, handle);
+    }
+    if (handle.write_state != WRITE_SEALED) {
+      discard_pending_inode(state, handle);
+    }
+  } catch (...) {
+    bool registered = false;
+    {
+      std::lock_guard guard(handle.mutex);
+      registered        = handle.registered;
+      handle.registered = false;
+    }
+    if (registered) {
+      unregister_open_handle(state, handle.object_path, handle);
+    } else {
+      release_open_inode(state, handle);
+    }
   }
 }
 
@@ -5783,51 +8090,29 @@ void ngs3fs_release(fuse_req_t request, fuse_ino_t,
     return;
   }
   file->fh = 0;
-
-  bool registered;
-  bool release_budget = false;
-  bool discard_pending = false;
-  if (handle->writable) {
-    std::unique_lock handle_guard(handle->mutex);
-    while (handle->write_in_progress ||
-           handle->write_state == WRITE_SEALING) {
-      handle->condition.wait(handle_guard);
+  constexpr uint64_t closing    = 1ULL << 63;
+  constexpr uint64_t active_mask = closing - 1;
+  uint64_t requests =
+      handle->request_state.fetch_or(closing, std::memory_order_acq_rel);
+  while ((requests & active_mask) != 0) {
+    handle->request_state.wait(requests, std::memory_order_acquire);
+    requests = handle->request_state.load(std::memory_order_acquire);
+  }
+  if (handle->writer) {
+    const std::string path = handle->object_path;
+    handle->writer->release(state, *handle);
+    finish_pending_delete(state, path);
+  } else if (handle->registered) {
+    std::string path;
+    {
+      std::shared_lock identity_guard(handle->identity_mutex);
+      path = handle->object_path;
     }
-    if (handle->write_state == WRITE_OPEN) {
-      fail_write(*handle, EIO);
-    }
-    while (handle->pending_parts != 0) {
-      handle->condition.wait(handle_guard);
-    }
-    release_budget = handle->current_reservation;
-    handle->current_reservation = false;
-    handle->current_part.reset();
-    abort_multipart(state, *handle);
-    discard_pending = handle->write_state != WRITE_SEALED;
-    registered = handle->registered;
     handle->registered = false;
+    unregister_open_handle(state, path, *handle);
+    finish_pending_delete(state, path);
   } else {
-    registered = handle->registered;
-    handle->registered = false;
-  }
-  if (discard_pending) {
-    InodeFile* item = handle->item;
-    if (item != nullptr && !item->detached() && item->pending()) {
-      InodeBase* parent = item->parent();
-      if (parent != nullptr && parent->directory() && !parent->detached()) {
-        std::lock_guard guard(parent->dir_children().mutation_mutex);
-        if (!item->detached() && item->pending()) {
-          remove_item(state, *item);
-        }
-      }
-    }
-  }
-  if (registered) {
-    unregister_open_handle(state, handle->object_path, handle->writable,
-                           handle->item);
-  }
-  if (release_budget) {
-    release_part_budget(state);
+    release_open_inode(state, *handle);
   }
   fuse_reply_err(request, 0);
 }
@@ -5994,9 +8279,6 @@ void ngs3fs_releasedir(fuse_req_t request, fuse_ino_t inode,
       throw std::system_error(
           EBADF, std::generic_category(), "releasedir inode");
     }
-    release_inode_count(item->open_count);
-    state.cache_condition.notify_all();
-    sweep_retired_items(state);
     InodeBase* expected = inode == FUSE_ROOT_ID
                               ? static_cast<InodeBase*>(state.root_item.get())
                               : reinterpret_cast<InodeBase*>(uintptr_t(inode));
@@ -6004,6 +8286,9 @@ void ngs3fs_releasedir(fuse_req_t request, fuse_ino_t inode,
       throw std::system_error(
           EBADF, std::generic_category(), "releasedir inode");
     }
+    release_inode_count(item->open_count);
+    state.cache_condition.notify_all();
+    sweep_retired_items(state);
     fuse_reply_err(request, 0);
   } catch (...) {
     reply_callback_error(request);
@@ -6033,54 +8318,161 @@ void delete_object(State& state, std::string_view key,
   }
 }
 
+std::string pending_delete_key(State& state) {
+  std::string key = state.config.prefix;
+  key.append(kInternalDeleteDirectory);
+  key.push_back('/');
+  key += rename_client_token();
+  return key;
+}
+
+bool hide_open_readers(State& state, std::string_view key,
+                       std::string_view path,
+                       std::string_view restore_key = {},
+                       std::string_view replacement_etag = {},
+                       std::string* hidden_key_result = nullptr,
+                       std::string* hidden_path_result = nullptr) {
+  {
+    std::lock_guard guard(state.open_files_mutex);
+    const auto opened = state.open_files.find(path);
+    if (opened == state.open_files.end() || opened->second.readers == 0) {
+      return false;
+    }
+  }
+
+  const ObjectMetadata metadata = head_object(state, path);
+  if (!native_rename_supported(state, path)) {
+    return false;
+  }
+  std::string hidden_key  = pending_delete_key(state);
+  if (hidden_key.size() > 1024) {
+    return false;
+  }
+  std::string hidden_path = object_request_path(state, hidden_key);
+  state.local_cache->create_pending_delete(
+      hidden_key, restore_key, replacement_etag);
+
+  bool readers_gone = false;
+  OpenHandleIdentityLocks reader_locks;
+  try {
+    reader_locks = lock_open_handle_identities(
+        state, path, "native unlink");
+    readers_gone = reader_locks.handles.empty();
+    for (OpenHandle* handle : reader_locks.handles) {
+      handle->object_path.reserve(hidden_path.size());
+      handle->key.reserve(hidden_key.size());
+    }
+    if (!readers_gone) {
+      std::lock_guard guard(state.open_files_mutex);
+      const auto opened = state.open_files.find(path);
+      if (opened == state.open_files.end() ||
+          opened->second.handles != reader_locks.handles) {
+        throw std::logic_error(
+            "reader registry changed during native unlink");
+      }
+      const bool inserted = state.pending_deletes.try_emplace(
+          hidden_path, State::PendingDelete{
+              .key = hidden_key,
+              .restore_key = std::string(restore_key),
+              .replacement_etag = std::string(replacement_etag),
+              .rollback = !restore_key.empty(),
+              .deleting = true,
+          }).second;
+      if (!inserted) {
+        throw std::logic_error("pending-delete key collision");
+      }
+    }
+    if (readers_gone) {
+      state.local_cache->finish_pending_delete(hidden_key);
+      return false;
+    }
+  } catch (...) {
+    state.local_cache->finish_pending_delete(hidden_key);
+    throw;
+  }
+
+  bool renamed = false;
+  try {
+    renamed = try_native_rename_object(
+        state, key, metadata.etag, hidden_path, true);
+  } catch (...) {
+    const std::exception_ptr failure = std::current_exception();
+    bool known_absent = false;
+    try {
+      const ObjectMetadata hidden = head_object(state, hidden_path);
+      renamed = hidden.size == metadata.size &&
+          (metadata.etag.empty() || hidden.etag == metadata.etag);
+    } catch (const std::system_error& error) {
+      known_absent = error.code().value() == ENOENT;
+    } catch (...) {
+    }
+    if (!renamed) {
+      reader_locks.identities.clear();
+      if (known_absent) {
+        state.local_cache->finish_pending_delete(hidden_key);
+        std::lock_guard guard(state.open_files_mutex);
+        state.pending_deletes.erase(hidden_path);
+      } else {
+        {
+          std::lock_guard guard(state.open_files_mutex);
+          const auto pending = state.pending_deletes.find(hidden_path);
+          if (pending != state.pending_deletes.end()) {
+            pending->second.deleting = false;
+          }
+        }
+        finish_pending_delete(state, hidden_path);
+      }
+      std::rethrow_exception(failure);
+    }
+  }
+  if (!renamed) {
+    state.local_cache->finish_pending_delete(hidden_key);
+    std::lock_guard guard(state.open_files_mutex);
+    state.pending_deletes.erase(hidden_path);
+    return false;
+  }
+
+  {
+    std::lock_guard guard(state.open_files_mutex);
+    const auto opened = state.open_files.find(path);
+    if (opened == state.open_files.end() ||
+        opened->second.handles != reader_locks.handles) {
+      throw std::logic_error("reader registry changed during native rename");
+    }
+    for (OpenHandle* handle : opened->second.handles) {
+      handle->object_path.assign(hidden_path);
+      handle->key.assign(hidden_key);
+    }
+    auto node = state.open_files.extract(opened);
+    node.key().assign(hidden_path);
+    state.open_files.insert(std::move(node));
+    if (restore_key.empty()) {
+      const auto pending = state.pending_deletes.find(hidden_path);
+      if (pending != state.pending_deletes.end()) {
+        pending->second.deleting = false;
+      }
+    }
+  }
+
+  if (!state.local_cache->remove(key, true)) {
+    fprintf(stderr,
+            "warning: native unlink preserved remote readers but could not "
+            "detach their local cache generation: path=%.*s\n",
+            int(path.size()), path.data());
+  }
+  if (hidden_key_result != nullptr) {
+    *hidden_key_result = std::move(hidden_key);
+  }
+  if (hidden_path_result != nullptr) {
+    *hidden_path_result = hidden_path;
+  }
+  return true;
+}
+
 void remove_item(State& state, InodeBase& item) {
   if (detach_cached_item(state, item)) {
     sweep_retired_items(state);
   }
-}
-
-bool move_cached_item(InodeBase& item, InodeBase& new_parent,
-                      std::string_view new_name) {
-  InodeBase& old_parent     = *item.parent();
-  Directory& old_directory = old_parent.dir_children();
-  Directory& new_directory = new_parent.dir_children();
-  size_t destination_slot;
-  if (&old_directory == &new_directory) {
-    std::unique_lock guard(old_directory.mutex);
-    if (item.detached() || new_parent.detached()) {
-      return false;
-    }
-    const auto inserted = new_directory.insert_i(
-        terark::fstring(
-            new_name.data(), ptrdiff_t(new_name.size())), &item);
-    if (!inserted.second) {
-      throw std::logic_error(
-          "rename destination cache entry already exists");
-    }
-    destination_slot = inserted.first;
-    old_directory.erase_i(item.dentry_slot);
-    item.dentry_slot = uint32_t(destination_slot);
-    item.set_parent(&new_parent);
-    item.set_detached(false);
-  } else {
-    std::scoped_lock guard(old_directory.mutex, new_directory.mutex);
-    if (item.detached() || new_parent.detached()) {
-      return false;
-    }
-    const auto inserted = new_directory.insert_i(
-        terark::fstring(
-            new_name.data(), ptrdiff_t(new_name.size())), &item);
-    if (!inserted.second) {
-      throw std::logic_error(
-          "rename destination cache entry already exists");
-    }
-    destination_slot = inserted.first;
-    old_directory.erase_i(item.dentry_slot);
-    item.dentry_slot = uint32_t(destination_slot);
-    item.set_parent(&new_parent);
-    item.set_detached(false);
-  }
-  return true;
 }
 
 void ngs3fs_unlink(fuse_req_t request, fuse_ino_t parent,
@@ -6109,8 +8501,118 @@ void ngs3fs_unlink(fuse_req_t request, fuse_ino_t parent,
     const std::string key = item_key(state, *item);
     const std::string path = object_request_path(state, key);
     PathMutationGuard mutation(
-        state, path, false, {}, false, "unlink");
-    delete_object(state, key, {});
+        state, path, false, {}, false, "unlink",
+        true, true);
+    const bool hidden = state.local_cache &&
+        hide_open_readers(state, key, path);
+    bool preserve_readers = false;
+    OpenHandle* writer = nullptr;
+    std::unique_ptr<OpenRequestGuard> writer_pin;
+    if (!hidden) {
+      std::lock_guard open_guard(state.open_files_mutex);
+      const auto opened = state.open_files.find(path);
+      if (opened != state.open_files.end()) {
+        if (state.local_cache && opened->second.readers != 0) {
+          preserve_readers = std::all_of(
+              opened->second.handles.begin(), opened->second.handles.end(),
+              [](const OpenHandle* handle) {
+                return handle != nullptr && !handle->writable &&
+                    handle->cache_entry && handle->cache_entry->fully_clean();
+              });
+        }
+        if (opened->second.writer) {
+          const auto found = std::find_if(
+              opened->second.handles.begin(), opened->second.handles.end(),
+              [](const OpenHandle* handle) {
+                return handle != nullptr && handle->writable;
+              });
+          if (found == opened->second.handles.end()) {
+            throw std::logic_error("writer registry has no handle");
+          }
+          writer = *found;
+          writer_pin = std::make_unique<OpenRequestGuard>(*writer);
+        }
+      }
+    }
+    std::shared_ptr<CacheEntry> discarded_write;
+    bool writer_marker = false;
+    if (writer != nullptr && state.local_cache && writer->cache_entry &&
+        writer->cache_entry->dirty()) {
+      state.local_cache->create_pending_delete(key);
+      try {
+        std::lock_guard open_guard(state.open_files_mutex);
+        const auto inserted = state.pending_deletes.try_emplace(
+            path, State::PendingDelete{
+                .key = key,
+                .restore_key = {},
+                .replacement_etag = {},
+                .rollback = false,
+                .deleting = true,
+            }).second;
+        if (!inserted) {
+          throw std::logic_error("pending writer unlink collision");
+        }
+        writer_marker = true;
+      } catch (...) {
+        state.local_cache->finish_pending_delete(key);
+        throw;
+      }
+    }
+    try {
+      if (writer != nullptr) {
+        std::unique_lock writer_guard(writer->mutex);
+        while (writer->write_in_progress ||
+               writer->write_state == WRITE_SEALING) {
+          writer->condition.wait(writer_guard);
+        }
+        delete_object(state, key, {});
+        writer->unlinked.store(true, std::memory_order_release);
+        writer->stale.store(true, std::memory_order_release);
+        if (writer->write_state != WRITE_SEALED) {
+          fail_write(*writer, ESTALE);
+        }
+        discarded_write = writer->cache_entry;
+      } else if (!hidden) {
+        delete_object(state, key, {});
+      }
+    } catch (...) {
+      if (writer_marker) {
+        state.local_cache->finish_pending_delete(key);
+        std::lock_guard open_guard(state.open_files_mutex);
+        state.pending_deletes.erase(path);
+      }
+      throw;
+    }
+    if (discarded_write) {
+      discarded_write->discard_write();
+    }
+    if (writer_marker) {
+      std::lock_guard open_guard(state.open_files_mutex);
+      const auto pending = state.pending_deletes.find(path);
+      if (pending != state.pending_deletes.end()) {
+        pending->second.deleting = false;
+      }
+    }
+    const bool preserved = hidden || (state.local_cache &&
+        state.local_cache->remove(key, preserve_readers));
+    if (!preserved) {
+      std::lock_guard open_guard(state.open_files_mutex);
+      const auto opened = state.open_files.find(path);
+      if (opened != state.open_files.end()) {
+        for (OpenHandle* handle : opened->second.handles) {
+          if (handle != nullptr) {
+            if (handle->writable) {
+              if (handle != writer) {
+                throw std::logic_error(
+                    "multiple writers registered for one object");
+              }
+            } else {
+              handle->stale.store(true, std::memory_order_release);
+            }
+          }
+        }
+      }
+    }
     if (!item->detached()) {
       remove_item(state, *item);
     }
@@ -6324,7 +8826,8 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
         object_request_path(state, destination_key);
     PathMutationGuard mutation(
         state, source_path, source_directory,
-        destination_path, source_directory, "rename");
+        destination_path, source_directory, "rename",
+        state.local_cache != nullptr && !source_directory);
     if (source_directory) {
       if (destination_inode != 0 && !destination_directory) {
         throw std::system_error(ENOTDIR, std::generic_category(), "rename");
@@ -6332,6 +8835,15 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
       if (destination_key.starts_with(source_key)) {
         throw std::system_error(EINVAL, std::generic_category(),
                                 "move directory into itself");
+      }
+      refresh_directory_locked(state, source_inode, true);
+      {
+        std::shared_lock guard(source->dir_children().mutex);
+        if (!source->dir_children().empty()) {
+          throw std::system_error(
+              EXDEV, std::generic_category(),
+              "non-empty S3 directory rename is not atomic");
+        }
       }
       if (destination_inode != 0) {
         refresh_directory_locked(state, destination_inode, true);
@@ -6342,11 +8854,11 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
                                     "rename destination directory");
           }
         }
-        const std::string destination_key_snapshot =
-            item_key(state, *destination);
-        delete_object(state, destination_key_snapshot, {});
       }
-      rename_remote_directory(state, source_key, destination_key);
+      const ObjectMetadata metadata = head_object(state, source_path);
+      rename_remote_object(
+          state, source_key, metadata.size, metadata.etag,
+          metadata.version_id, destination_path, false);
       if (destination && !destination->detached()) {
         remove_item(state, *destination);
       }
@@ -6370,11 +8882,70 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
     if (destination_inode != 0 && destination_directory) {
       throw std::system_error(EISDIR, std::generic_category(), "rename");
     }
+    OpenHandleIdentityLocks source_locks;
+    if (state.local_cache) {
+      source_locks = lock_open_handle_identities(
+          state, source_path, "rename source");
+      for (OpenHandle* handle : source_locks.handles) {
+        handle->object_path.reserve(destination_path.size());
+        handle->key.reserve(destination_key.size());
+      }
+    }
     const ObjectMetadata metadata = head_object(state, source_path);
-    rename_remote_object(
-        state, source_key, metadata.size, metadata.etag,
-        metadata.version_id, destination_path,
-        (flags & RENAME_NOREPLACE) != 0);
+    std::string hidden_key;
+    std::string hidden_path;
+    const bool destination_hidden = destination && state.local_cache &&
+        hide_open_readers(
+            state, destination_key, destination_path,
+            destination_key, metadata.etag, &hidden_key, &hidden_path);
+    try {
+      rename_remote_object(
+          state, source_key, metadata.size, metadata.etag,
+          metadata.version_id, destination_path,
+          (flags & RENAME_NOREPLACE) != 0);
+    } catch (...) {
+      if (destination_hidden) {
+        {
+          std::lock_guard guard(state.open_files_mutex);
+          const auto pending = state.pending_deletes.find(hidden_path);
+          if (pending != state.pending_deletes.end()) {
+            pending->second.deleting = false;
+          }
+        }
+        finish_pending_delete(state, hidden_path);
+      }
+      throw;
+    }
+    if (destination_hidden) {
+      try {
+        state.local_cache->commit_pending_delete(hidden_key);
+      } catch (const std::exception& error) {
+        fprintf(stderr,
+                "warning: remote rename committed before pending-delete "
+                "metadata: path=%s: %s\n",
+                hidden_path.c_str(), error.what());
+      }
+      {
+        std::lock_guard guard(state.open_files_mutex);
+        const auto pending = state.pending_deletes.find(hidden_path);
+        if (pending != state.pending_deletes.end()) {
+          pending->second.rollback = false;
+          pending->second.deleting = false;
+        }
+      }
+      finish_pending_delete(state, hidden_path);
+    }
+    const bool destination_preserved = destination_hidden ||
+        (destination && preserve_renamed_destination(
+            state, destination_path, destination_key));
+    if (state.local_cache) {
+      state.local_cache->rename(source_key, destination_key);
+    }
+    finish_open_file_rename(
+        state, source_path, destination_path, destination_key,
+        destination_preserved, source_locks.handles);
+    source_locks.identities.clear();
+    source_locks.pins.clear();
     if (destination && !destination->detached()) {
       remove_item(state, *destination);
     }
@@ -6441,8 +9012,17 @@ void print_help() {
          "crc32, crc32c, crc64nvme, sha1, sha256, md5, xxhash64, "
          "xxhash3, xxhash128, sha512, crc64xz (default auto)\n"
       << "      --verify-read-checksum\n"
-         "                             verify usable full-response checksums "
-         "(default off)\n"
+         "                             background best-effort verification; "
+         "the first read may finish first (default off)\n"
+      << "  -L, --cache-dir PATH      persistent sparse local cache (default off)\n"
+      << "      --cache-size BYTES    maximum physical cache allocation; "
+         "0 is unlimited (default 0)\n"
+      << "      --cache-reserve SIZE|PERCENT\n"
+         "                             preserve cache-filesystem free space "
+         "(default 5%)\n"
+      << "      --max-cache-fetch-size BYTES\n"
+         "                             maximum adaptive cache fill "
+         "(default 8 MiB, minimum 1 MiB)\n"
       << "      --io-size BYTES       statfs optimal I/O size; accepts "
          "KiB/MiB (default 256 KiB)\n"
       << "      --connect-timeout MS  TCP connect timeout (default 5000)\n"
@@ -6575,15 +9155,21 @@ int run(int argc, char** argv) {
         << "warning: splice(2) preflight failed: " << splice_error
         << "; FD-backed FUSE writes will use the copied fallback\n";
   }
-  std::cerr
-      << "warning: fsync is intentionally non-durable; only the first flush "
-         "publishes and completes an S3 write\n";
-
   int result = 1;
   try {
     State state(std::move(config));
     state.splice_available = splice_available;
     configure_checksum(state);
+    initialize_local_cache(state);
+    if (state.local_cache) {
+      fprintf(stderr,
+              "warning: fsync persists only the local cache; the first flush "
+              "publishes and completes the S3 write\n");
+    } else {
+      fprintf(stderr,
+              "warning: fsync is intentionally non-durable; only the first "
+              "flush publishes and completes an S3 write\n");
+    }
     fuse_lowlevel_ops ops{};
     ops.init         = ngs3fs_init;
     ops.forget       = ngs3fs_forget;

@@ -40,6 +40,9 @@ random_read_operations=${NGS3FS_RANDOM_READ_OPERATIONS:-128}
 random_read_file_size=${NGS3FS_RANDOM_READ_FILE_SIZE:-4194304}
 random_read_maximum=${NGS3FS_RANDOM_READ_MAXIMUM:-262144}
 random_read_seed=${NGS3FS_RANDOM_READ_SEED:-0x4e47533346535244}
+# Set NGS3FS_CACHE_DIR to exercise the persistent cache; unset keeps the
+# original uncached test path. It only applies when NGS3FS_TEST_CLIENT=ngs3fs.
+cache_dir=${NGS3FS_CACHE_DIR:-}
 backend=$run_dir/backend
 bucket=ngs3fs-xfstests
 prefix=data
@@ -54,7 +57,7 @@ client_log=$run_dir/$client.log
 case $client in
   ngs3fs)
     client_binary=$ngs3fs
-    test_device=ngs3fs
+    test_device="ngs3fs-xfstests-$port-$$"
     ;;
   goofys)
     client_binary=$goofys
@@ -65,6 +68,9 @@ case $client in
     exit 2
     ;;
 esac
+if [[ $client != ngs3fs && -n "$cache_dir" ]]; then
+  echo "NGS3FS_CACHE_DIR ignored for test client: $client" >&2
+fi
 
 cleanup() {
   status=$?
@@ -144,9 +150,16 @@ if ! curl --silent --output /dev/null "$endpoint/"; then
 fi
 
 if [[ $client == ngs3fs ]]; then
+  ngs3fs_mount_args=(-f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port"
+    -b "$bucket" -k "$prefix" -m 0644 -D 0755
+    -o "fsname=$test_device")
+  if [[ -n "$cache_dir" ]]; then
+    mkdir -p "$cache_dir"
+    ngs3fs_mount_args+=(--cache-dir "$cache_dir")
+    echo "ngs3fs local cache: $cache_dir"
+  fi
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
-    "$ngs3fs" -f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port" \
-      -b "$bucket" -k "$prefix" -m 0644 -D 0755 "$mount_dir" \
+    "$ngs3fs" "${ngs3fs_mount_args[@]}" "$mount_dir" \
       >"$client_log" 2>&1 &
 else
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
@@ -230,13 +243,15 @@ fi
 
 # This is an explicit contract allowlist, not an expected-failure list.
 # generic/001 covers sequential writes, reads with content comparison, create,
-# unlink, rename, and directories. generic/245 checks that rename cannot replace
-# a non-empty directory. Tests requiring scratch devices, random/overwriting
+# unlink, file rename, and directories. generic/245 relies on an atomic
+# non-empty directory rename and is excluded because ngs3fs deliberately
+# returns EXDEV for that operation. Tests requiring scratch devices,
+# random/overwriting
 # writes, O_RDWR, truncate, writable mmap, hard/symbolic links, xattrs, locks,
 # special files, direct I/O, or persistence across fsync/remount stay disabled.
 # The xfstests runner intentionally unmounts TEST_DIR after the final case, so
 # run it after fsstress and require the client to finish successfully.
-echo "xfstests correctness: generic/001 generic/245"
+echo "xfstests correctness: generic/001"
 (
   cd "$xfstests_dir"
   setsid env \
@@ -245,7 +260,7 @@ echo "xfstests correctness: generic/001 generic/245"
     TEST_DIR="$mount_dir" \
     FSTYP=fuse \
     RESULT_BASE="$run_dir/results" \
-      ./check generic/001 generic/245
+      ./check generic/001
 )
 
 set +e

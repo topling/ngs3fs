@@ -5,6 +5,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -52,8 +53,8 @@ struct ServerState {
   std::vector<std::byte> body;
   size_t offset = 0;
   bool response_submitted = false;
-  bool connection_credit_received = false;
   std::string content_length;
+  std::string content_range;
 };
 
 ssize_t read_body(nghttp2_session*, int32_t, uint8_t* buffer,
@@ -73,11 +74,6 @@ ssize_t read_body(nghttp2_session*, int32_t, uint8_t* buffer,
 int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
                   void* user_data) {
   auto& state = *static_cast<ServerState*>(user_data);
-  if (frame->hd.type == NGHTTP2_WINDOW_UPDATE &&
-      frame->hd.stream_id == 0) {
-    state.connection_credit_received = true;
-    return 0;
-  }
   if (frame->hd.type != NGHTTP2_HEADERS ||
       frame->headers.cat != NGHTTP2_HCAT_REQUEST ||
       (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) == 0) {
@@ -87,6 +83,7 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   std::array response_headers{
       header(":status", "206"),
       header("content-length", state.content_length),
+      header("content-range", state.content_range),
       header("etag", "\"mock-etag\""),
   };
   nghttp2_data_provider provider{
@@ -131,6 +128,9 @@ void run_server(int listener, std::vector<std::byte> body) {
   ServerState state;
   state.body = std::move(body);
   state.content_length = std::to_string(state.body.size());
+  state.content_range =
+      "bytes 0-" + std::to_string(state.body.size() - 1) + '/' +
+      std::to_string(state.body.size());
 
   nghttp2_session* raw_session = nullptr;
   assert(nghttp2_session_server_new(&raw_session, callbacks.get(), &state) ==
@@ -151,10 +151,10 @@ void run_server(int listener, std::vector<std::byte> body) {
     flush_server(session.get(), socket.get());
   }
 
-  // Keep the peer alive until the client returns receive-window credit after
-  // draining its pipe. A real S3 connection remains persistent as well.
-  state.connection_credit_received = false;
-  while (!state.connection_credit_received) {
+  // Model a persistent S3 connection. Closing after an arbitrary WINDOW_UPDATE
+  // can discard body bytes still queued in the client and turn the close into
+  // a TCP reset because the server also has unread client-side window credit.
+  for (;;) {
     const ssize_t count =
         ::read(socket.get(), incoming.data(), incoming.size());
     if (count == 0) {
@@ -167,6 +167,20 @@ void run_server(int listener, std::vector<std::byte> body) {
     flush_server(session.get(), socket.get());
   }
 }
+
+class TestFileSink final : public RangeFileSink {
+ public:
+  TestFileSink(int fd, uint64_t offset) noexcept
+      : RangeFileSink(fd, offset) {}
+
+  void progress(const Response&, bool complete) override {
+    ++calls;
+    completed |= complete;
+  }
+
+  size_t calls = 0;
+  bool completed = false;
+};
 
 int main() {
   UniqueFd listener(
@@ -183,7 +197,7 @@ int main() {
   assert(::getsockname(listener.get(), reinterpret_cast<sockaddr*>(&address),
                        &address_size) == 0);
 
-  std::vector<std::byte> expected(128U * 1024U);
+  std::vector<std::byte> expected(8U * 1024U * 1024U);
   for (size_t i = 0; i < expected.size(); ++i) {
     expected[i] = static_cast<std::byte>((i * 17U) & 0xffU);
   }
@@ -191,9 +205,11 @@ int main() {
   std::jthread server(run_server, listener.get(), expected);
   auto client = HttpClient::connect(
       "127.0.0.1", ntohs(address.sin_port), "mock-s3");
-  auto pipe = Pipe::create();
-  const auto response = client->get_range(
-      "/bucket/key", 0, expected.size(), pipe, {}, true, true);
+  UniqueFd file(::memfd_create("h2-range-file", MFD_CLOEXEC));
+  assert(file);
+  TestFileSink sink(file.get(), 0);
+  const auto response = client->get_range_to_fd(
+      "/bucket/key", 0, expected.size(), sink, {}, true, true);
   assert(response.status == 206);
   assert(response.body_bytes == expected.size());
   assert(response.externally_spliced_bytes == expected.size());
@@ -201,10 +217,11 @@ int main() {
   assert(response.wire_start_ns != 0);
   assert(response.wire_last_data_ns >= response.wire_start_ns);
   assert(response.headers.at("etag") == "\"mock-etag\"");
+  assert(sink.calls > 1);
+  assert(sink.completed);
 
   std::vector<std::byte> actual(expected.size());
-  read_all(pipe.read_fd(), actual);
+  read_all(file.get(), actual);
   assert(actual == expected);
-  client->consume(response);
   return 0;
 }

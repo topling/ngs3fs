@@ -33,6 +33,10 @@
 #include <utility>
 #include <vector>
 
+void transfer_pipe_to_file(Pipe& source, RangeFileSink& destination,
+                           size_t length, bool& splice_supported,
+                           Response& response);
+
 struct SslContextDeleter {
   void operator()(SSL_CTX* context) const noexcept {
     SSL_CTX_free(context);
@@ -562,6 +566,12 @@ class Http2Client final : public HttpClient {
                           bool capture_headers,
                           bool measure_transport) override;
 
+  RangeResponse get_range_to_fd(std::string_view path, uint64_t offset,
+                                size_t length, RangeFileSink& destination,
+                                std::span<const Header> headers,
+                                bool capture_headers,
+                                bool measure_transport) override;
+
   RangeResponse put_from_fd(std::string_view path,
                             std::span<const Header> headers,
                             int source_fd, uint64_t source_offset,
@@ -629,11 +639,13 @@ class Http2Client final : public HttpClient {
   ActiveRequest* active = nullptr;
   std::unique_ptr<ActiveRequest> upload_request;
   Pipe upload_response;
+  Pipe file_staging;
   size_t upload_length = kUnknownBodyLength;
   size_t upload_sent = 0;
   uint32_t maximum_frame_size = 16U * 1024U;
   int callback_errno = 0;
   bool reconnect_required = false;
+  bool file_splice_supported = true;
   bool tls = false;
   uint64_t tls_upload_request_id = 0;
 
@@ -1030,7 +1042,6 @@ RangeResponse Http2Client::get_range(std::string_view path, uint64_t offset,
       }
       if (received.header.type == NGHTTP2_DATA) {
         request.response.body_bytes += received.spliced_payload;
-        request.response.externally_spliced_bytes += received.spliced_payload;
         if (measure_transport) {
           request.response.wire_last_data_ns = http2_monotonic_ns();
         }
@@ -1044,6 +1055,124 @@ RangeResponse Http2Client::get_range(std::string_view path, uint64_t offset,
   }
   active = nullptr;
 
+  if (request.close_error != NGHTTP2_NO_ERROR) {
+    throw std::runtime_error("HTTP/2 stream closed with error " +
+                             std::to_string(request.close_error));
+  }
+  return std::move(request.response);
+}
+
+RangeResponse Http2Client::get_range_to_fd(
+    std::string_view path, uint64_t offset, size_t length,
+    RangeFileSink& destination, std::span<const Header> extra_headers,
+    bool capture_headers, bool measure_transport) {
+  ensure_ready();
+  if (active != nullptr) {
+    throw std::logic_error("this synchronous connection already has a request");
+  }
+  if (length == 0 || destination.fd() < 0) {
+    throw std::invalid_argument("invalid file-backed range destination");
+  }
+  const uint64_t inclusive_end = offset + uint64_t(length) - 1;
+  if (inclusive_end < offset) {
+    throw std::overflow_error("range end overflow");
+  }
+
+  const Header* supplied_range = nullptr;
+  for (const Header& value : extra_headers) {
+    if (value.name == "range") {
+      if (supplied_range != nullptr) {
+        throw std::invalid_argument("duplicate GET range header");
+      }
+      supplied_range = &value;
+    }
+  }
+  const ssostr<32> range = supplied_range == nullptr
+      ? range_header_value(offset, inclusive_end) : ssostr<32>{};
+  const std::string_view range_value = supplied_range == nullptr
+      ? sso_view(range) : sso_view(supplied_range->value);
+
+  std::vector<nghttp2_nv>& headers = request_headers;
+  headers.clear();
+  headers.reserve(6 + extra_headers.size());
+  headers.push_back(make_header(":method", "GET"));
+  headers.push_back(make_header(":scheme", tls ? "https" : "http"));
+  headers.push_back(make_header(":authority", authority));
+  headers.push_back(make_header(":path", path));
+  headers.push_back(make_header("range", range_value));
+  headers.push_back(make_header("accept-encoding", "identity"));
+  for (const Header& value : extra_headers) {
+    if (value.name == "range") {
+      continue;
+    }
+    if (sso_view(value.name).starts_with(':') ||
+        value.name == "accept-encoding") {
+      throw std::invalid_argument("GET header conflicts with generated header");
+    }
+    headers.push_back(make_header(sso_view(value.name), sso_view(value.value)));
+  }
+
+  TlsRequestTimer tls_timer(tunnel);
+  if (file_staging.capacity() < maximum_frame_size) {
+    file_staging = Pipe::create(maximum_frame_size);
+  }
+  ActiveRequest request;
+  request.destination       = &file_staging;
+  request.max_body_bytes    = length;
+  request.capture_headers   = capture_headers;
+  request.measure_transport = measure_transport;
+  if (capture_headers) {
+    request.response.headers.reserve(16);
+  }
+  const int stream_id = nghttp2_submit_request(
+      session.get(), nullptr, headers.data(), headers.size(), nullptr,
+      nullptr);
+  if (stream_id < 0) {
+    throw_nghttp2(stream_id, "nghttp2_submit_request");
+  }
+  request.stream_id          = stream_id;
+  request.response.stream_id = stream_id;
+  active                     = &request;
+
+  try {
+    flush();
+    while (!request.closed) {
+      const size_t before = request.response.body_bytes;
+      const size_t shadow_before = request.shadow_callback_bytes;
+      const ReceiveResult received = ingress.receive_one(
+          session.get(), socket.get(), file_staging.write_fd(),
+          length - request.response.body_bytes, request.stream_id);
+      if (received.spliced_payload !=
+          request.shadow_callback_bytes - shadow_before) {
+        throw std::runtime_error("nghttp2 rejected externally spliced DATA");
+      }
+      if (received.header.type == NGHTTP2_DATA) {
+        request.response.body_bytes += received.spliced_payload;
+        if (measure_transport) {
+          request.response.wire_last_data_ns = http2_monotonic_ns();
+        }
+      }
+      const size_t appended = request.response.body_bytes - before;
+      if (appended != 0) {
+        transfer_pipe_to_file(file_staging, destination, appended,
+                              file_splice_supported, request.response);
+        const int consumed = nghttp2_session_consume(
+            session.get(), request.stream_id, appended);
+        if (consumed != 0) {
+          throw_nghttp2(consumed, "nghttp2_session_consume(file range)");
+        }
+        destination.progress(request.response, false);
+      }
+      flush();
+    }
+    destination.progress(request.response, true);
+  } catch (...) {
+    active = nullptr;
+    reconnect_required = true;
+    file_staging = {};
+    throw;
+  }
+  active = nullptr;
   if (request.close_error != NGHTTP2_NO_ERROR) {
     throw std::runtime_error("HTTP/2 stream closed with error " +
                              std::to_string(request.close_error));
@@ -1635,6 +1764,88 @@ bool contains_cr_or_lf(std::string_view value) {
          value.find('\n') != std::string_view::npos;
 }
 
+void write_range_file(RangeFileSink& destination,
+                      std::span<const std::byte> bytes) {
+  size_t written = 0;
+  while (written != bytes.size()) {
+    const ssize_t result = ::pwrite(
+        destination.fd(), bytes.data() + written, bytes.size() - written,
+        off_t(destination.offset()));
+    if (result > 0) {
+      written += size_t(result);
+      destination.advance(size_t(result));
+      continue;
+    }
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    if (result == 0) {
+      throw std::system_error(EIO, std::generic_category(),
+                              "pwrite(cache range)");
+    }
+    http1_throw_errno("pwrite(cache range)");
+  }
+}
+
+bool unsupported_file_splice(int error) noexcept {
+  return error == EINVAL || error == EOPNOTSUPP || error == EXDEV ||
+         error == EPERM || error == ENOSYS;
+}
+
+void transfer_pipe_to_file(Pipe& source, RangeFileSink& destination,
+                           size_t length, bool& splice_supported,
+                           Response& response) {
+  std::array<std::byte, 64U * 1024U> bytes;
+  size_t transferred = 0;
+  while (transferred != length) {
+    if (splice_supported) {
+      off_t offset = off_t(destination.offset());
+      ssize_t result;
+      do {
+        result = ::splice(
+            source.read_fd(), nullptr, destination.fd(), &offset,
+            length - transferred, SPLICE_F_MOVE | SPLICE_F_MORE);
+      } while (result < 0 && errno == EINTR);
+      if (result > 0) {
+        const size_t moved = size_t(result);
+        destination.advance(moved);
+        transferred += moved;
+        response.externally_spliced_bytes += moved;
+        continue;
+      }
+      if (result == 0) {
+        throw std::system_error(
+            std::make_error_code(std::errc::connection_reset),
+            "splice reached EOF before the cache range");
+      }
+      if (!unsupported_file_splice(errno)) {
+        http1_throw_errno("splice(cache file)");
+      }
+      splice_supported = false;
+      fprintf(stderr,
+              "warning: cache filesystem does not support pipe-to-file "
+              "splice; copying downloaded data\n");
+    }
+
+    const size_t wanted = std::min(bytes.size(), length - transferred);
+    ssize_t result;
+    do {
+      result = ::read(source.read_fd(), bytes.data(), wanted);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0) {
+      throw std::system_error(
+          std::make_error_code(std::errc::connection_reset),
+          "cache staging pipe reached EOF");
+    }
+    if (result < 0) {
+      http1_throw_errno("read(cache staging pipe)");
+    }
+    write_range_file(destination, std::span(bytes).first(size_t(result)));
+    transferred += size_t(result);
+    response.fallback_copied_bytes += size_t(result);
+  }
+}
+
 bool valid_header_name(const ssostr<32>& name) {
   if (name.empty()) {
     return false;
@@ -1730,12 +1941,15 @@ void build_request_head(
 class ResponseParser {
  public:
   ResponseParser(Response& response, Pipe* destination,
+                 RangeFileSink* file_destination,
                  size_t max_body_bytes, bool head_response,
                  bool capture_headers)
       : response_(response),
         destination_(destination),
+        file_destination_(file_destination),
         max_body_bytes_(max_body_bytes),
-        captured_body_(destination == nullptr ? &response.body : nullptr),
+        captured_body_(destination == nullptr && file_destination == nullptr
+                           ? &response.body : nullptr),
         head_response_(head_response) {
     static const llhttp_settings_t capture_settings = [] {
       llhttp_settings_t settings;
@@ -1882,6 +2096,8 @@ class ResponseParser {
         value.captured_body_->resize(old_size + length);
         memcpy(value.captured_body_->data() + old_size,
                bytes.data(), bytes.size());
+      } else if (value.file_destination_ != nullptr) {
+        write_range_file(*value.file_destination_, bytes);
       } else {
         write_all(value.destination_->write_fd(), bytes);
       }
@@ -1944,6 +2160,7 @@ class ResponseParser {
 
   Response& response_;
   Pipe* destination_;
+  RangeFileSink* file_destination_;
   size_t max_body_bytes_;
   std::vector<std::byte>* captured_body_;
   llhttp_t parser_{};
@@ -1981,6 +2198,12 @@ class Http1Client final : public HttpClient {
                      bool capture_headers,
                      bool measure_transport) override;
 
+  Response get_range_to_fd(std::string_view path, uint64_t offset,
+                           size_t length, RangeFileSink& destination,
+                           std::span<const Header> headers,
+                           bool capture_headers,
+                           bool measure_transport) override;
+
   Response put_from_fd(std::string_view path,
                        std::span<const Header> headers, int source_fd,
                        uint64_t source_offset, size_t length) override;
@@ -2012,12 +2235,14 @@ class Http1Client final : public HttpClient {
   std::string host;
   std::string request_head;
   std::string upload_method;
+  Pipe file_staging;
   uint16_t port = 0;
   int io_timeout_ms          = kRequestIoTimeoutMs;
   int connect_timeout_ms     = kConnectTimeoutMs;
   size_t receive_buffer_size = 0;
   bool request_active        = false;
   bool upload_chunked        = false;
+  bool file_splice_supported = true;
   uint64_t tls_upload_request_id = 0;
   size_t upload_sent = 0;
   size_t upload_length = kUnknownBodyLength;
@@ -2048,6 +2273,7 @@ class Http1Client final : public HttpClient {
   }
 
   Response receive_response(std::string_view method, Pipe* destination,
+                            RangeFileSink* file_destination,
                             size_t max_body_bytes, uint64_t wire_start_ns,
                             bool capture_headers, bool measure_transport) {
     std::array<std::byte, kHttp1ReadSize> buf;
@@ -2058,7 +2284,8 @@ class Http1Client final : public HttpClient {
       Response response;
       response.wire_start_ns = wire_start_ns;
       ResponseParser parser(
-          response, destination, max_body_bytes, method == "HEAD",
+          response, destination, file_destination, max_body_bytes,
+          method == "HEAD",
           capture_headers);
 
       size_t header_bytes = 0;
@@ -2098,6 +2325,9 @@ class Http1Client final : public HttpClient {
         if (measure_transport && response.body_bytes != before) {
           response.wire_last_data_ns = http1_monotonic_ns();
         }
+        if (file_destination != nullptr && response.body_bytes != before) {
+          file_destination->progress(response, false);
+        }
         if (n == 0 && !parser.headers_complete()) {
           throw std::runtime_error("llhttp made no response progress");
         }
@@ -2125,7 +2355,9 @@ class Http1Client final : public HttpClient {
           }
           if (buffered != 0) {
             const std::span bytes = std::span(buf).subspan(begin, buffered);
-            if (destination == nullptr) {
+            if (file_destination != nullptr) {
+              write_range_file(*file_destination, bytes);
+            } else if (destination == nullptr) {
               response.body.insert(response.body.end(),
                                    bytes.begin(), bytes.end());
             } else {
@@ -2133,12 +2365,56 @@ class Http1Client final : public HttpClient {
             }
             response.body_bytes += buffered;
             response.fallback_copied_bytes += buffered;
+            if (file_destination != nullptr) {
+              file_destination->progress(response, false);
+            }
             remaining -= buffered;
             begin = 0;
             end   = 0;
           }
           if (remaining != 0) {
-            if (destination == nullptr) {
+            if (file_destination != nullptr) {
+              const size_t capacity = std::min<size_t>(
+                  remaining, kPreferredIoSize);
+              if (file_staging.capacity() < capacity) {
+                file_staging = Pipe::create(capacity);
+                const int flags = ::fcntl(
+                    file_staging.write_fd(), F_GETFL);
+                if (flags < 0 || ::fcntl(
+                        file_staging.write_fd(), F_SETFL,
+                        flags & ~O_NONBLOCK) != 0) {
+                  http1_throw_errno("fcntl(file staging pipe)");
+                }
+              }
+              while (remaining != 0) {
+                const size_t count = std::min(
+                    remaining, file_staging.capacity());
+                ssize_t moved;
+                do {
+                  ++response.transport_splice_calls;
+                  moved = ::splice(
+                      socket.get(), nullptr, file_staging.write_fd(), nullptr,
+                      count, SPLICE_F_MOVE | SPLICE_F_MORE);
+                } while (moved < 0 && errno == EINTR);
+                if (moved == 0) {
+                  throw std::system_error(
+                      std::make_error_code(std::errc::connection_reset),
+                      "splice reached EOF during HTTP/1.1 response");
+                }
+                if (moved < 0) {
+                  http1_throw_errno("splice(HTTP/1.1 file body)");
+                }
+                transfer_pipe_to_file(
+                    file_staging, *file_destination, size_t(moved),
+                    file_splice_supported, response);
+                response.body_bytes += size_t(moved);
+                remaining -= size_t(moved);
+                if (measure_transport) {
+                  response.wire_last_data_ns = http1_monotonic_ns();
+                }
+                file_destination->progress(response, false);
+              }
+            } else if (destination == nullptr) {
               const size_t old_size = response.body.size();
               response.body.resize(old_size + remaining);
               size_t received = 0;
@@ -2204,6 +2480,10 @@ class Http1Client final : public HttpClient {
             if (measure_transport && response.body_bytes != before) {
               response.wire_last_data_ns = http1_monotonic_ns();
             }
+            if (file_destination != nullptr &&
+                response.body_bytes != before) {
+              file_destination->progress(response, false);
+            }
           }
           response_complete = parser.message_complete();
         }
@@ -2215,6 +2495,9 @@ class Http1Client final : public HttpClient {
       if (!parser.should_keep_alive()) {
         socket.reset();
       }
+      if (file_destination != nullptr) {
+        file_destination->progress(response, true);
+      }
       return response;
     }
   }
@@ -2224,6 +2507,7 @@ class Http1Client final : public HttpClient {
                          std::optional<size_t> content_length,
                          int source_fd, uint64_t source_offset,
                          Pipe* response_pipe,
+                         RangeFileSink* response_file,
                          size_t max_response_body,
                          bool capture_headers,
                          bool measure_transport,
@@ -2253,7 +2537,8 @@ class Http1Client final : public HttpClient {
                                   *content_length);
       }
       Response response = receive_response(
-          method, response_pipe, max_response_body, wire_start_ns,
+          method, response_pipe, response_file, max_response_body,
+          wire_start_ns,
           capture_headers, measure_transport);
       response.externally_sent_bytes = sent;
       request_active = false;
@@ -2261,6 +2546,7 @@ class Http1Client final : public HttpClient {
     } catch (...) {
       request_active = false;
       socket.reset();
+      file_staging = {};
       throw;
     }
   }
@@ -2307,7 +2593,46 @@ Response Http1Client::get_range(
           : std::span<const Header>(generated_accept_header);
 
   return perform("GET", path, extra_headers, std::nullopt, -1, 0,
-                 &destination, length, capture_headers,
+                 &destination, nullptr, length, capture_headers,
+                 measure_transport, generated_headers, true);
+}
+
+Response Http1Client::get_range_to_fd(
+    std::string_view path, uint64_t offset, size_t length,
+    RangeFileSink& destination, std::span<const Header> extra_headers,
+    bool capture_headers, bool measure_transport) {
+  if (length == 0 || destination.fd() < 0) {
+    throw std::invalid_argument("invalid file-backed range destination");
+  }
+  const uint64_t inclusive_end = offset + uint64_t(length) - 1;
+  if (inclusive_end < offset) {
+    throw std::overflow_error("range end overflow");
+  }
+  const Header* supplied_range = nullptr;
+  for (const Header& header : extra_headers) {
+    if (ascii_equal(sso_view(header.name), "range")) {
+      if (supplied_range != nullptr) {
+        throw std::invalid_argument("duplicate GET range header");
+      }
+      supplied_range = &header;
+    } else if (ascii_equal(sso_view(header.name), "accept-encoding")) {
+      throw std::invalid_argument("GET header conflicts with generated header");
+    }
+  }
+  const ssostr<32> range = supplied_range == nullptr
+      ? range_header_value(offset, inclusive_end) : ssostr<32>{};
+  const std::array generated_range_headers{
+      Header{"range", range},
+      Header{"accept-encoding", "identity"},
+  };
+  const std::array generated_accept_header{
+      Header{"accept-encoding", "identity"},
+  };
+  const std::span<const Header> generated_headers = supplied_range == nullptr
+      ? std::span<const Header>(generated_range_headers)
+      : std::span<const Header>(generated_accept_header);
+  return perform("GET", path, extra_headers, std::nullopt, -1, 0,
+                 nullptr, &destination, length, capture_headers,
                  measure_transport, generated_headers, true);
 }
 
@@ -2325,7 +2650,7 @@ Response Http1Client::put_from_fd(
 
   Response response = perform(
       "PUT", path, extra_headers, length, source_fd, source_offset,
-      nullptr, kPreferredIoSize, true, false);
+      nullptr, nullptr, kPreferredIoSize, true, false);
   return response;
 }
 
@@ -2455,7 +2780,7 @@ Response Http1Client::finish_upload(size_t max_response_body) {
       send_all(socket.get(), end);
     }
     Response response = receive_response(
-        upload_method, nullptr, max_response_body, 0, true, false);
+        upload_method, nullptr, nullptr, max_response_body, 0, true, false);
     response.externally_sent_bytes = upload_sent;
     request_active = false;
     upload_chunked = false;
@@ -2498,7 +2823,7 @@ Response Http1Client::request_no_body(
   Response response = perform(
       method, path, extra_headers,
       needs_content_length ? std::optional<size_t>(0) : std::nullopt,
-      -1, 0, nullptr, max_response_body, true, false);
+      -1, 0, nullptr, nullptr, max_response_body, true, false);
   return response;
 }
 

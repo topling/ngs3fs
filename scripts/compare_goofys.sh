@@ -23,6 +23,8 @@ random_file_size=${RANDOM_READ_FILE_SIZE:-4194304}
 random_maximum_read=${RANDOM_READ_MAXIMUM:-262144}
 random_seed=${RANDOM_READ_SEED:-0x4e47533346535244}
 random_advice=${RANDOM_READ_ADVICE:-random}
+cache_mode=${CACHE_MODE:-none}
+cache_dir=${NGS3FS_CACHE_DIR:-${CACHE_DIR:-}}
 perf=${PERF_BIN:-perf}
 
 versitygw="$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64/versitygw"
@@ -39,6 +41,29 @@ goofys_mount="$run_dir/mnt-goofys"
 access_key=ngs3fs-bench
 secret_key=ngs3fs-bench-secret
 endpoint="http://127.0.0.1:$port"
+
+case "$cache_mode" in
+  none | cold | warm) ;;
+  *)
+    echo "unsupported cache mode: $cache_mode (expected none, cold, or warm)" >&2
+    exit 2
+    ;;
+esac
+if [[ "$cache_mode" != none ]]; then
+  if [[ -z "$cache_dir" ]]; then
+    cache_dir="$run_dir/ngs3fs-cache"
+  fi
+  cache_dir=$(realpath -m "$cache_dir")
+  run_root="${run_dir%/}/"
+  if [[ "$cache_dir" != "$run_root"* || "$cache_dir" = "${run_dir%/}" ]]; then
+    echo "ngs3fs cache directory must be below run_dir: $cache_dir" >&2
+    exit 2
+  fi
+fi
+ngs3fs_cache_args=()
+if [[ "$cache_mode" != none ]]; then
+  ngs3fs_cache_args=(-L "$cache_dir" --cache-reserve 0)
+fi
 
 server_pid=
 ngs3fs_pid=
@@ -114,12 +139,20 @@ process_cpu_ns() {
 }
 
 start_ngs3fs() {
+  if [[ "$cache_mode" != none ]]; then
+    mkdir -p "$cache_dir"
+    if [[ -n "$(find "$cache_dir" -mindepth 1 -print -quit)" ]]; then
+      echo "cache directory must be empty for a reproducible sample: $cache_dir" >&2
+      return 1
+    fi
+  fi
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
     "$ngs3fs" -f "${metrics_args[@]}" -R "$read_ahead" \
       --socket-buffer-size "$socket_buffer_size" \
       -C "$max_connections" \
       -e 127.0.0.1 -p "$port" \
       -a "127.0.0.1:$port" -b "$bucket" \
+      "${ngs3fs_cache_args[@]}" \
       "$ngs3fs_mount" >"$run_dir/ngs3fs.log" 2>&1 &
   ngs3fs_pid=$!
   wait_for_mount "$ngs3fs_mount" "$ngs3fs_pid" ngs3fs
@@ -160,6 +193,8 @@ run_case() {
   local stride=$5
   local daemon_log=$6
   local stem="$run_dir/$client-$bytes"
+  local warmup_object=$object
+  local warmup_iterations=20
   local first_line
   local last_line
   local perf_pid
@@ -167,7 +202,12 @@ run_case() {
   local end_ns
   local used_ns
 
-  "$bench" "$mount_dir/$object" "$bytes" 20 "$stride" \
+  if [[ "$client" = ngs3fs && "$cache_mode" = cold ]]; then
+    warmup_object="$object-cold-warmup"
+  elif [[ "$client" = ngs3fs && "$cache_mode" = warm ]]; then
+    warmup_iterations=$iterations
+  fi
+  "$bench" "$mount_dir/$warmup_object" "$bytes" "$warmup_iterations" "$stride" \
     >"$stem-warmup.jsonl"
 
   first_line=$(wc -l <"$daemon_log")
@@ -224,6 +264,20 @@ run_random_read_case() {
   local last_line
   local get_requests
   local request_log="$run_dir/$client-random-read-requests.log"
+
+  if [[ "$client" = ngs3fs && "$cache_mode" = warm ]]; then
+    "$random_bench" -R "${random_advice_args[@]}" \
+      -d "$mount_dir/random-read" \
+      -f "$random_files" -t "$random_threads" -n "$random_operations" \
+      -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed" \
+      >"$run_dir/$client-random-read-warmup.txt"
+  elif [[ "$client" = ngs3fs && "$cache_mode" = cold ]]; then
+    "$random_bench" -R "${random_advice_args[@]}" \
+      -d "$mount_dir/random-read-cold-warmup" \
+      -f "$random_files" -t "$random_threads" -n 8 \
+      -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed" \
+      >"$run_dir/$client-random-read-warmup.txt"
+  fi
 
   first_line=$(wc -l <"$run_dir/versity-access.log")
   start_ns=$(process_cpu_ns "$daemon_pid")
@@ -321,10 +375,18 @@ mkdir -p "$backend/$bucket" "$ngs3fs_mount" "$goofys_mount"
 if [[ "$workload" = mmap ]]; then
   dd if=/dev/urandom of="$object_path" bs=1M count="$object_mib" status=none
   dd if="$object_path" of=/dev/null bs=8M status=none
+  if [[ "$cache_mode" = cold ]]; then
+    cp --reflink=auto "$object_path" \
+      "$backend/$bucket/$object-cold-warmup"
+  fi
 else
   "$random_bench" -p -d "$backend/$bucket/random-read" \
     -f "$random_files" -t "$random_threads" -n "$random_operations" \
     -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed"
+  if [[ "$cache_mode" = cold ]]; then
+    cp -a "$backend/$bucket/random-read" \
+      "$backend/$bucket/random-read-cold-warmup"
+  fi
 fi
 
 ROOT_ACCESS_KEY_ID=$access_key ROOT_SECRET_ACCESS_KEY=$secret_key \

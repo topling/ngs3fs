@@ -763,6 +763,67 @@ void delete_inode(InodeBase* item) noexcept {
   }
 }
 
+void detach_parent_slot_if_owned(InodeBase& item,
+                                 InodeBase* parent) noexcept {
+  if (parent == nullptr || parent == &item || !parent->directory()) {
+    item.dentry_slot = UINT32_MAX;
+    return;
+  }
+  Directory& children = parent->dir_children();
+  std::unique_lock guard(children.mutex);
+  const uint32_t slot = item.dentry_slot;
+  if (slot == UINT32_MAX) {
+    return;
+  }
+  if (slot < children.end_i() && !children.is_deleted(slot) &&
+      children.val(slot) == &item) {
+    children.erase_i(slot);
+  }
+  // A replacement may already occupy this hash slot. Never erase it merely
+  // because the forgotten inode retained the old slot number.
+  item.dentry_slot = UINT32_MAX;
+}
+
+bool move_cached_item(InodeBase& item, InodeBase& new_parent,
+                      std::string_view new_name) {
+  InodeBase* old_parent = item.parent();
+  if (old_parent == nullptr || !old_parent->directory() ||
+      !new_parent.directory()) {
+    return false;
+  }
+  Directory& old_directory = old_parent->dir_children();
+  Directory& new_directory = new_parent.dir_children();
+  auto move_locked = [&] {
+    if (item.detached() || new_parent.detached()) {
+      return false;
+    }
+    if (item.dentry_slot == UINT32_MAX ||
+        item.dentry_slot >= old_directory.end_i() ||
+        old_directory.is_deleted(item.dentry_slot) ||
+        old_directory.val(item.dentry_slot) != &item) {
+      throw std::logic_error("rename source dentry changed");
+    }
+    const auto inserted = new_directory.insert_i(
+        terark::fstring(new_name.data(), ptrdiff_t(new_name.size())), &item);
+    if (!inserted.second) {
+      throw std::logic_error(
+          "rename destination cache entry already exists");
+    }
+    old_directory.erase_i(item.dentry_slot);
+    item.dentry_slot = uint32_t(inserted.first);
+    item.set_parent(&new_parent);
+    item.set_detached(false);
+    return true;
+  };
+
+  if (&old_directory == &new_directory) {
+    std::unique_lock guard(old_directory.mutex);
+    return move_locked();
+  }
+  std::scoped_lock guard(old_directory.mutex, new_directory.mutex);
+  return move_locked();
+}
+
 unsigned fixed_decimal(std::string_view s, size_t p, size_t n) {
   unsigned value = 0;
   if (p + n > s.size()) {

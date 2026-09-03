@@ -91,6 +91,25 @@ class ExternalDataIngress {
 
 using RangeResponse = Response;
 
+class RangeFileSink {
+ public:
+  RangeFileSink(int fd, uint64_t offset) noexcept
+      : fd_(fd), offset_(offset) {}
+  virtual ~RangeFileSink() = default;
+
+  RangeFileSink(const RangeFileSink&) = delete;
+  RangeFileSink& operator=(const RangeFileSink&) = delete;
+
+  [[nodiscard]] int fd() const noexcept { return fd_; }
+  [[nodiscard]] uint64_t offset() const noexcept { return offset_; }
+  void advance(size_t bytes) noexcept { offset_ += bytes; }
+  virtual void progress(const Response& response, bool complete) = 0;
+
+ private:
+  int fd_;
+  uint64_t offset_;
+};
+
 class HttpClient {
  public:
   static std::unique_ptr<HttpClient> connect(
@@ -109,6 +128,12 @@ class HttpClient {
   virtual Response get_range(
       std::string_view path, uint64_t offset, size_t length,
       Pipe& destination, std::span<const Header> headers = {},
+      bool capture_headers = true,
+      bool measure_transport = false) = 0;
+
+  virtual Response get_range_to_fd(
+      std::string_view path, uint64_t offset, size_t length,
+      RangeFileSink& destination, std::span<const Header> headers = {},
       bool capture_headers = true,
       bool measure_transport = false) = 0;
 

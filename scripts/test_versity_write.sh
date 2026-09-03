@@ -17,6 +17,9 @@ object=object.bin
 access_key=ngs3fs-write
 secret_key=ngs3fs-write-secret
 endpoint="http://127.0.0.1:$port"
+# Set NGS3FS_CACHE_DIR to exercise the persistent cache; unset keeps the
+# original uncached write test path.
+cache_dir=${NGS3FS_CACHE_DIR:-}
 
 server_pid=
 ngs3fs_pid=
@@ -71,10 +74,15 @@ for ((attempt = 0; attempt != 100; ++attempt)); do
   sleep 0.1
 done
 
+ngs3fs_mount_args=(-f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port"
+  -b "$bucket" -k "$prefix" -D 0755)
+if [[ -n "$cache_dir" ]]; then
+  mkdir -p "$cache_dir"
+  ngs3fs_mount_args+=(--cache-dir "$cache_dir")
+  echo "ngs3fs local cache: $cache_dir"
+fi
 AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
-  "$ngs3fs" -f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port" \
-    -b "$bucket" -k "$prefix" -D 0755 \
-    "$mount_dir" \
+  "$ngs3fs" "${ngs3fs_mount_args[@]}" "$mount_dir" \
     >"$run_dir/ngs3fs.log" 2>&1 &
 ngs3fs_pid=$!
 
@@ -97,8 +105,8 @@ if grep -q "copying memory-backed FUSE_WRITE" "$run_dir/ngs3fs.log"; then
 fi
 
 if [[ ! -f "$backend/$bucket/$prefix/renamed.bin" ||
-      ! -f "$backend/$bucket/$prefix/paged-renamed/page-1000" ||
-      -e "$backend/$bucket/$prefix/paged-dir/page-1000" ||
+      ! -f "$backend/$bucket/$prefix/paged-dir/page-1000" ||
+      -e "$backend/$bucket/$prefix/paged-renamed" ||
       -e "$backend/$bucket/$prefix/parallel-a.bin" ||
       -e "$backend/$bucket/$prefix/parallel-b.bin" ||
       -e "$backend/$bucket/$prefix/subdir" ||

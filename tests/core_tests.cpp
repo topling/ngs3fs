@@ -185,6 +185,71 @@ void test_inode_tagged_parent() {
   assert((file.parent_flags & InodeBase::kFlagMask) == 0b0001);
 }
 
+void test_inode_rename_overwrite_forget() {
+  InodeDir parent;
+  auto* source = new InodeFile(&parent);
+  auto* destination = new InodeFile(&parent);
+  const auto source_inserted = parent.children.insert_i(
+      terark::fstring("source", 6), source);
+  const auto destination_inserted = parent.children.insert_i(
+      terark::fstring("destination", 11), destination);
+  assert(source_inserted.second);
+  assert(destination_inserted.second);
+  source->dentry_slot = uint32_t(source_inserted.first);
+  destination->dentry_slot = uint32_t(destination_inserted.first);
+
+  // Model rename's overwrite path: the destination is detached from its
+  // directory but retains its old slot until its lookup is forgotten.
+  parent.children.erase_i(destination->dentry_slot);
+  destination->set_detached(true);
+  assert(move_cached_item(*source, parent, "destination"));
+  const auto replacement = parent.children.find(
+      terark::fstring("destination", 11));
+  assert(replacement != parent.children.end());
+  assert(replacement->second == source);
+
+  detach_parent_slot_if_owned(*destination, &parent);
+  assert(destination->dentry_slot == UINT32_MAX);
+  assert(parent.children.val(source->dentry_slot) == source);
+  delete_inode(destination);
+}
+
+void test_inode_rename_updates_source_slot() {
+  InodeDir parent;
+  auto* source = new InodeFile(&parent);
+  const auto old_inserted = parent.children.insert_i(
+      terark::fstring("old-name", 8), source);
+  assert(old_inserted.second);
+  source->dentry_slot = uint32_t(old_inserted.first);
+  assert(move_cached_item(*source, parent, "new-name"));
+  assert(parent.children.find(terark::fstring("old-name", 8)) ==
+         parent.children.end());
+  const auto new_position = parent.children.find(
+      terark::fstring("new-name", 8));
+  assert(new_position != parent.children.end());
+  assert(new_position->second == source);
+  assert(parent.children.val(source->dentry_slot) == source);
+}
+
+void test_inode_rename_cross_directory_parent_and_slot() {
+  InodeDir old_parent;
+  InodeDir new_parent;
+  auto* moved = new InodeFile(&old_parent);
+  const auto old_inserted = old_parent.children.insert_i(
+      terark::fstring("old-name", 8), moved);
+  assert(old_inserted.second);
+  moved->dentry_slot = uint32_t(old_inserted.first);
+  assert(move_cached_item(*moved, new_parent, "new-name"));
+  assert(moved->parent() == &new_parent);
+  assert(old_parent.children.find(terark::fstring("old-name", 8)) ==
+         old_parent.children.end());
+  const auto new_position = new_parent.children.find(
+      terark::fstring("new-name", 8));
+  assert(new_position != new_parent.children.end());
+  assert(new_position->second == moved);
+  assert(new_parent.children.val(moved->dentry_slot) == moved);
+}
+
 void test_pipe_splice() {
   std::array<int, 2> sockets{-1, -1};
   assert(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
@@ -495,6 +560,9 @@ int main() {
   test_ssostr_header_names();
   test_inode_dentry_slots();
   test_inode_tagged_parent();
+  test_inode_rename_overwrite_forget();
+  test_inode_rename_updates_source_slot();
+  test_inode_rename_cross_directory_parent_and_slot();
   test_pipe_splice();
   test_s3_control_paths();
   test_data_checksums();

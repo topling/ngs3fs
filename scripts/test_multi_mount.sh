@@ -13,6 +13,11 @@ bucket=ngs3fs-multi-mount
 prefix=data
 first_mount=$run_dir/mnt-a
 second_mount=$run_dir/mnt-b
+# Set NGS3FS_CACHE_DIR to exercise the persistent cache. Each mount receives
+# its own child directory so cache metadata and sparse data never collide.
+cache_root=${NGS3FS_CACHE_DIR:-}
+first_cache_dir=
+second_cache_dir=
 access_key=ngs3fs-multi-mount
 secret_key=ngs3fs-multi-mount-secret
 endpoint=http://127.0.0.1:$port
@@ -56,6 +61,13 @@ done
 
 mkdir -p "$backend/$bucket/$prefix/large" \
          "$first_mount" "$second_mount"
+if [[ -n "$cache_root" ]]; then
+  mkdir -p "$cache_root"
+  first_cache_dir=$cache_root/mnt-a
+  second_cache_dir=$cache_root/mnt-b
+  mkdir -p "$first_cache_dir" "$second_cache_dir"
+  echo "ngs3fs local caches: $first_cache_dir, $second_cache_dir"
+fi
 printf 'old-object\n' >"$backend/$bucket/$prefix/race.bin"
 printf 'visible-to-both\n' >"$backend/$bucket/$prefix/visible.bin"
 large_entries=${NGS3FS_LARGE_DIRECTORY_ENTRIES:-5000}
@@ -83,14 +95,19 @@ done
 mount_client() {
   local mount_dir=$1
   local log=$2
+  local cache_dir=$3
+  local mount_args=(-f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port"
+    -b "$bucket" -k "$prefix" -T 0)
+  if [[ -n "$cache_dir" ]]; then
+    mount_args+=(--cache-dir "$cache_dir")
+  fi
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
-    "$ngs3fs" -f -e 127.0.0.1 -p "$port" -a "127.0.0.1:$port" \
-      -b "$bucket" -k "$prefix" -T 0 "$mount_dir" >"$log" 2>&1 &
+    "$ngs3fs" "${mount_args[@]}" "$mount_dir" >"$log" 2>&1 &
 }
 
-mount_client "$first_mount" "$run_dir/ngs3fs-a.log"
+mount_client "$first_mount" "$run_dir/ngs3fs-a.log" "$first_cache_dir"
 first_pid=$!
-mount_client "$second_mount" "$run_dir/ngs3fs-b.log"
+mount_client "$second_mount" "$run_dir/ngs3fs-b.log" "$second_cache_dir"
 second_pid=$!
 for mount_dir in "$first_mount" "$second_mount"; do
   for ((attempt = 0; attempt != 100; ++attempt)); do
