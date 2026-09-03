@@ -1769,6 +1769,21 @@ int main(int argc, char** argv) {
           retry_a_failure = std::current_exception();
         }
       });
+      bool first_fetch_started = false;
+      for (unsigned attempt = 0; attempt != 200; ++attempt) {
+        {
+          std::lock_guard state_guard(shared.mutex);
+          first_fetch_started =
+              shared.special_objects.at("checksum-retry.bin")
+                      ->get_requests != 0;
+        }
+        if (first_fetch_started) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(first_fetch_started,
+              "first checksum fetch did not reach the server");
       std::jthread retry_b_thread([&] {
         try {
           pread_all(retry_second.get(), retry_b, 128U * 1024U);
@@ -1791,11 +1806,11 @@ int main(int argc, char** argv) {
               "checksum retry did not replace the corrupt cached part");
       {
         std::lock_guard state_guard(shared.mutex);
-        require(shared.special_objects.at("checksum-retry.bin")
-                        ->get_requests == 2,
-                "concurrent readers did not share exactly one checksum retry");
         const SpecialObject& retried =
             *shared.special_objects.at("checksum-retry.bin");
+        require(retried.get_requests == 2,
+                "concurrent readers did not share exactly one checksum retry: " +
+                    std::to_string(retried.get_requests));
         require(retried.attributes_requests == 2,
                 "GetObjectAttributes pagination was not completed once");
         require(retried.get_ranges.size() == 2 &&
@@ -1965,6 +1980,11 @@ int main(int argc, char** argv) {
       fail_errno("close-to-open while duplicated writer remains");
     }
     if (!cache_dir.empty()) {
+#if !defined(__SANITIZE_THREAD__)
+      // mincore observes an evictable kernel cache, not a program invariant.
+      // TSan's instrumentation can delay this check enough for ordinary
+      // reclaim to make it nondeterministic; byte/no-GET validation below
+      // remains active in every build.
       const long page_size = ::sysconf(_SC_PAGESIZE);
       require(page_size > 0, "sysconf(_SC_PAGESIZE) failed");
       const size_t mapped_size =
@@ -1989,6 +2009,7 @@ int main(int argc, char** argv) {
                   [](unsigned char page) { return (page & 1U) != 0; }),
               "partial cached writes were not retained in page cache");
       ::munmap(resident_mapping, small_expected.size());
+#endif
     }
     std::vector<std::byte> visible_bytes(small_expected.size());
     pread_all(visible_after_flush.get(), visible_bytes, 0);
