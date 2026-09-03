@@ -39,6 +39,12 @@ HTTP authority, normally a virtual-hosted bucket endpoint.
 .BI "-r, --region " region
 SigV4 region. Default is us-east-1.
 .TP
+.BI "--expected-bucket-owner " account
+Send and sign the expected S3 bucket-owner account on every request.
+.TP
+.B --requester-pays
+Send and sign the S3 requester-pays acknowledgement on every request.
+.TP
 .B -S, --tls
 Require TLS on a non-443 port.
 .TP

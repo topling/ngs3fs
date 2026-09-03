@@ -98,6 +98,35 @@ void test_s3_xml() {
         "embedded-error");
     xml.result_root("CompleteMultipartUploadResult");
   });
+
+  S3ErrorInfo error;
+  assert(parse_s3_error(
+      "<s3:Error xmlns:s3=\"urn:s3\">"
+      "<s3:Code>SlowDown</s3:Code>"
+      "<s3:Message>retry later</s3:Message>"
+      "<s3:RequestId>request-1</s3:RequestId>"
+      "<s3:HostId>host-1</s3:HostId></s3:Error>",
+      error));
+  assert(error.code == "SlowDown");
+  assert(error.message == "retry later");
+  assert(error.request_id == "request-1");
+  assert(error.host_id == "host-1");
+  assert(!parse_s3_error("<NotError/>", error));
+  assert(!parse_s3_error("<Error><Code>", error));
+
+  assert(s3_content_range_matches(
+      "bytes 4096-8191/16384", 4096, 4096, 16384));
+  assert(!s3_content_range_matches(
+      "bytes 0-4095/16384", 4096, 4096, 16384));
+  assert(!s3_content_range_matches(
+      "bytes 4096-8190/16384", 4096, 4096, 16384));
+  assert(!s3_content_range_matches(
+      "bytes 4096-8191/32768", 4096, 4096, 16384));
+  assert(!s3_content_range_matches(
+      "bytes 4096-8191/16384junk", 4096, 4096, 16384));
+  assert(!s3_content_range_matches(
+      "bytes 0-18446744073709551615/18446744073709551615", 0,
+      0, UINT64_MAX));
 }
 
 void test_ssostr_header_names() {

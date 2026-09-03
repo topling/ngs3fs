@@ -209,14 +209,16 @@ int main() {
   assert(file);
   TestFileSink sink(file.get(), 0);
   const auto response = client->get_range_to_fd(
-      "/bucket/key", 0, expected.size(), sink, {}, true, true);
+      "/bucket/key", 0, expected.size(), sink, {}, false, true);
   assert(response.status == 206);
   assert(response.body_bytes == expected.size());
   assert(response.externally_spliced_bytes == expected.size());
   assert(response.fallback_copied_bytes == 0);
   assert(response.wire_start_ns != 0);
   assert(response.wire_last_data_ns >= response.wire_start_ns);
-  assert(response.headers.at("etag") == "\"mock-etag\"");
+  assert(response.headers.empty());
+  assert(sso_view(response.content_range) ==
+         "bytes 0-8388607/8388608");
   assert(sink.calls > 1);
   assert(sink.completed);
 

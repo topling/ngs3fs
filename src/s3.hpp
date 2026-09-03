@@ -57,6 +57,18 @@ class S3Xml {
   ssostr<64> operation_;
 };
 
+struct S3ErrorInfo {
+  std::string code;
+  std::string message;
+  std::string request_id;
+  std::string host_id;
+};
+
+bool parse_s3_error(std::string_view xml, S3ErrorInfo& error) noexcept;
+bool s3_content_range_matches(std::string_view value,
+                              uint64_t offset, size_t length,
+                              uint64_t object_size) noexcept;
+
 struct InodeBase;
 struct InodeFile;
 struct InodeDir;

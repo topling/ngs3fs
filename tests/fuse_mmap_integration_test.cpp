@@ -148,6 +148,9 @@ struct Request {
   std::string part_number_marker;
   std::string multipart_object_size;
   std::string write_id;
+  std::string expected_bucket_owner;
+  std::string request_payer;
+  std::string authorization;
   RequestRange range;
   std::vector<std::byte> body;
 };
@@ -176,6 +179,7 @@ struct SpecialObject {
   int attributes_requests    = 0;
   size_t checksum_part_size  = 0;
   bool attributes_unsupported = false;
+  bool invalid_content_range = false;
   std::vector<RequestRange> get_ranges;
 };
 
@@ -203,6 +207,9 @@ struct SharedServerState {
   int complete_multipart_requests = 0;
   int checksum_mode_requests = 0;
   int object_attributes_requests = 0;
+  int request_timeout_errors = 0;
+  int complete_embedded_errors = 0;
+  int copy_embedded_errors = 0;
   std::map<unsigned, std::vector<std::byte>> uploaded_parts;
   std::map<unsigned, unsigned> upload_attempts;
   std::map<std::string, std::shared_ptr<SpecialObject>> special_objects;
@@ -219,6 +226,9 @@ struct SharedServerState {
   bool deep_present = true;
   bool drop_complete_response_once = false;
   bool complete_response_dropped = false;
+  bool inject_request_timeout = true;
+  bool inject_complete_slowdown = true;
+  bool inject_copy_slowdown = true;
   std::atomic<bool> stop = false;
   std::exception_ptr failure;
 };
@@ -349,6 +359,18 @@ int on_header(nghttp2_session*, const nghttp2_frame* frame,
     auto& state = *static_cast<ServerState*>(user_data);
     state.requests[frame->hd.stream_id].write_id.assign(
         reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "x-amz-expected-bucket-owner") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].expected_bucket_owner.assign(
+        reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "x-amz-request-payer") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].request_payer.assign(
+        reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "authorization") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].authorization.assign(
+        reinterpret_cast<const char*>(value), value_length);
   } else if (header_name.starts_with("x-amz-checksum-")) {
     auto& state = *static_cast<ServerState*>(user_data);
     state.requests[frame->hd.stream_id].checksum_value.assign(
@@ -382,7 +404,9 @@ ssize_t read_body(nghttp2_session*, int32_t, uint8_t* buffer,
   }
   const size_t count =
       std::min(length, response.end - response.cursor);
-  memcpy(buffer, response.object->data() + response.cursor, count);
+  if (count != 0) {
+    memcpy(buffer, response.object->data() + response.cursor, count);
+  }
   response.cursor += count;
   if (response.cursor == response.end) {
     *flags |= NGHTTP2_DATA_FLAG_EOF;
@@ -401,7 +425,9 @@ int submit_text_response(nghttp2_session* session, ServerState& connection,
                          std::string_view checksum_value = {}) {
   auto response = std::make_unique<ResponseSource>();
   response->body.resize(text.size());
-  memcpy(response->body.data(), text.data(), text.size());
+  if (!text.empty()) {
+    memcpy(response->body.data(), text.data(), text.size());
+  }
   response->object = &response->body;
   response->end = response->body.size();
   response->content_length = std::to_string(response->body.size());
@@ -484,6 +510,15 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   Request& request = connection.requests[frame->hd.stream_id];
   SharedServerState& state = *connection.shared;
   std::lock_guard state_guard(state.mutex);
+  require(request.expected_bucket_owner == "111122223333",
+          "request omitted x-amz-expected-bucket-owner");
+  require(request.request_payer == "requester",
+          "request omitted x-amz-request-payer");
+  require(request.authorization.find("x-amz-expected-bucket-owner") !=
+              std::string::npos &&
+              request.authorization.find("x-amz-request-payer") !=
+              std::string::npos,
+          "mount-wide S3 headers were not included in SigV4 SignedHeaders");
   if (request.method == "POST" && frame->hd.type == NGHTTP2_HEADERS &&
       request.path.ends_with("?uploads=")) {
     require(request.checksum_algorithm == checksum_s3_name(state.checksum),
@@ -546,6 +581,17 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       request.path.find("uploadId=upload-1") != std::string::npos) {
     require(request.content_length == std::to_string(request.body.size()),
             "CompleteMultipartUpload omitted an exact Content-Length");
+    if (state.inject_complete_slowdown) {
+      state.inject_complete_slowdown = false;
+      ++state.complete_embedded_errors;
+      const int submitted = submit_text_response(
+          session, connection, frame->hd.stream_id, "200",
+          "<s3:Error xmlns:s3=\"urn:s3\">"
+          "<s3:Code>SlowDown</s3:Code>"
+          "<s3:Message>retry completion</s3:Message>"
+          "<s3:RequestId>complete-retry</s3:RequestId></s3:Error>");
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     if (state.complete_response_dropped && state.uploaded_parts.empty()) {
       const std::array response_headers{
           header(":status", "404"),
@@ -745,15 +791,24 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
             "twice");
     require(request.copy_source_if_match == state.etag,
             "CopyObject omitted the pinned source ETag");
+    if (state.inject_copy_slowdown) {
+      state.inject_copy_slowdown = false;
+      ++state.copy_embedded_errors;
+      const int submitted = submit_text_response(
+          session, connection, frame->hd.stream_id, "200",
+          "<s3:Error xmlns:s3=\"urn:s3\">"
+          "<s3:Code>SlowDown</s3:Code>"
+          "<s3:Message>retry copy</s3:Message></s3:Error>");
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     state.copy_completed = true;
     state.object_key = "copied.bin";
-    const std::array response_headers{
-        header(":status", "200"),
-        header("content-length", "0"),
-    };
-    const int submitted = nghttp2_submit_response(
-        session, frame->hd.stream_id, response_headers.data(),
-        response_headers.size(), nullptr);
+    const int submitted = submit_text_response(
+        session, connection, frame->hd.stream_id, "200",
+        "<s3:CopyObjectResult xmlns:s3=\"urn:s3\">"
+        "<s3:ETag>&quot;after-put&quot;</s3:ETag>"
+        "<s3:LastModified>1994-11-08T08:49:37.000Z</s3:LastModified>"
+        "</s3:CopyObjectResult>");
     return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   if (request.method == "DELETE" && frame->hd.type == NGHTTP2_HEADERS) {
@@ -1107,6 +1162,17 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   }
 
   const std::string key = request_object_key(request.path);
+  if (key == "mmap.bin" && state.inject_request_timeout) {
+    state.inject_request_timeout = false;
+    ++state.request_timeout_errors;
+    const int submitted = submit_text_response(
+        session, connection, frame->hd.stream_id, "400",
+        "<s3:Error xmlns:s3=\"urn:s3\">"
+        "<s3:Code>RequestTimeout</s3:Code>"
+        "<s3:Message>request timed out</s3:Message>"
+        "<s3:RequestId>retry-request</s3:RequestId></s3:Error>");
+    return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+  }
   const auto special = state.special_objects.find(key);
   if (special == state.special_objects.end() &&
       (key == "overwrite-dest.bin" || key == "overwrite-source.bin" ||
@@ -1154,6 +1220,12 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       "bytes " + std::to_string(range.first) + '-' +
       std::to_string(range.last) + '/' +
       std::to_string(object->size());
+  if (is_special && response->keepalive->invalid_content_range) {
+    response->content_range =
+        "bytes " + std::to_string(range.first + 1) + '-' +
+        std::to_string(range.last + 1) + '/' +
+        std::to_string(object->size());
+  }
   ResponseSource* source = response.get();
   connection.responses[frame->hd.stream_id] = std::move(response);
   ++state.active_gets;
@@ -1338,8 +1410,25 @@ void serve_connection(UniqueFd socket, SharedServerState& shared) noexcept {
       }
       flush_server(session.get(), socket.get());
     }
+  } catch (const std::system_error& error) {
+    if (error.code().value() == ECONNRESET ||
+        error.code().value() == EPIPE) {
+      return;
+    }
+    std::exception_ptr failure = std::current_exception();
+    fprintf(stderr, "mock S3 connection failed: %s\n", error.what());
+    record_server_failure(shared, std::move(failure));
   } catch (...) {
-    record_server_failure(shared, std::current_exception());
+    std::exception_ptr failure = std::current_exception();
+    try {
+      std::rethrow_exception(failure);
+    } catch (const std::exception& error) {
+      fprintf(stderr, "mock S3 connection failed: %s\n", error.what());
+    } catch (...) {
+      fputs("mock S3 connection failed with a non-standard exception\n",
+            stderr);
+    }
+    record_server_failure(shared, std::move(failure));
   }
 }
 
@@ -1453,12 +1542,16 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
     fail_errno("fork");
   }
   if (process == 0) {
+    ::setenv("AWS_ACCESS_KEY_ID", "integration-access-key", 1);
+    ::setenv("AWS_SECRET_ACCESS_KEY", "integration-secret-key", 1);
+    ::unsetenv("AWS_SESSION_TOKEN");
     if (cache_dir.empty()) {
       ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
               port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
               uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
               "0750", "--io-size", "384KiB", "-R", "256KiB", "-I", "1",
               "--checksum", checksum.data(), "--verify-read-checksum",
+              "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "-f", mountpoint.data(),
               static_cast<char*>(nullptr));
     } else {
@@ -1467,6 +1560,7 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
               "0750", "--io-size", "384KiB", "-R", "256KiB", "-I", "1",
               "--checksum", checksum.data(), "--verify-read-checksum",
+              "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "--max-cache-fetch-size", "1MiB",
               "-L", cache_dir.data(),
               "--cache-reserve", "0", "-f", mountpoint.data(),
@@ -1578,6 +1672,9 @@ int main(int argc, char** argv) {
     add_checksum_object("checksum-retry.bin", 1, 128U * 1024U);
     add_checksum_object("checksum-fail.bin", 2);
     add_checksum_object("checksum-unsupported.bin", 0, 0, true);
+    add_checksum_object("invalid-content-range.bin", 0);
+    shared.special_objects.at(
+        "invalid-content-range.bin")->invalid_content_range = true;
     std::jthread server(run_server, listener.socket.get(), std::ref(shared));
 
     mountpoint = make_mountpoint();
@@ -1733,6 +1830,12 @@ int main(int argc, char** argv) {
     require(std::equal(second_read.begin(), second_read.end(),
                        expected.begin() + second_read_offset),
             "second concurrent read returned wrong bytes");
+    {
+      std::lock_guard state_guard(shared.mutex);
+      require(shared.request_timeout_errors == 1 &&
+                  !shared.inject_request_timeout,
+              "400 RequestTimeout was not retried exactly once");
+    }
     second_reader.reset();
 
     void* mapping = ::mmap(nullptr, expected.size(), PROT_READ, MAP_PRIVATE,
@@ -2146,6 +2249,10 @@ int main(int argc, char** argv) {
       require(shared.complete_multipart_requests == 1 &&
                   shared.put_requests == 1,
               "large write did not complete one multipart upload");
+      require(shared.complete_embedded_errors == 1 &&
+                  !shared.inject_complete_slowdown,
+              "HTTP 200 embedded CompleteMultipartUpload error was not "
+              "retried exactly once");
       require(shared.complete_response_dropped,
               "multipart outcome-unknown fault was not injected");
       require(shared.head_requests == heads_before_multipart_commit + 1,
@@ -2625,6 +2732,20 @@ int main(int argc, char** argv) {
       new_destination.reset();
     }
 
+    const std::string invalid_range_path =
+        mountpoint + "/invalid-content-range.bin";
+    UniqueFd invalid_range(
+        ::open(invalid_range_path.c_str(), O_RDONLY | O_CLOEXEC));
+    if (!invalid_range) {
+      fail_errno("open invalid Content-Range object");
+    }
+    std::byte invalid_range_byte{};
+    errno = 0;
+    require(::pread(invalid_range.get(), &invalid_range_byte, 1, 0) == -1 &&
+                errno == EIO,
+            "inconsistent S3 Content-Range did not fail with EIO");
+    invalid_range.reset();
+
     mounted.stop();
     shared.stop.store(true);
     server.request_stop();
@@ -2639,7 +2760,9 @@ int main(int argc, char** argv) {
       const size_t expected_probes = cache_dir.empty() ? 1 : 2;
       require(shared.rename_probe_attempts == expected_probes &&
                   shared.rename_attempts == 2 && shared.copy_completed &&
-                  shared.delete_completed,
+                  shared.delete_completed &&
+                  shared.copy_embedded_errors == 1 &&
+                  !shared.inject_copy_slowdown,
               "rename protocol coverage was incomplete");
       if (!cache_dir.empty()) {
         require(shared.hidden_rename_completed &&

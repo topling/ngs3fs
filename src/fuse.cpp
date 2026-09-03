@@ -65,6 +65,7 @@ struct MountConfig {
   std::string prefix;
   std::string cache_dir;
   std::string region                = "us-east-1";
+  std::string expected_bucket_owner;
   size_t maximum_read_size          = kPreferredIoSize;
   size_t maximum_write_size         = kPreferredIoSize;
   uint32_t io_size                  = kPreferredIoSize;
@@ -96,6 +97,7 @@ struct MountConfig {
   bool verify_read_checksum            = false;
   bool socket_receive_buffer_explicit  = false;
   bool cache_reserve_is_percent        = true;
+  bool requester_pays                  = false;
 };
 
 std::string cache_namespace_id(const MountConfig& config) {
@@ -115,6 +117,8 @@ std::string cache_namespace_id(const MountConfig& config) {
   append(config.bucket_path);
   append(config.prefix);
   append(config.directory_bucket ? "directory" : "general");
+  append(config.expected_bucket_owner);
+  append(config.requester_pays ? "requester" : "");
   return result;
 }
 
@@ -1203,6 +1207,31 @@ inline bool retryable_status(int status) noexcept {
           status != 505);
 }
 
+std::string_view response_xml(const Response& response) noexcept {
+  const char* data = response.body.empty()
+                         ? ""
+                         : reinterpret_cast<const char*>(response.body.data());
+  return std::string_view(data, response.body.size());
+}
+
+bool retryable_s3_code(std::string_view code) noexcept {
+  return code == "RequestTimeout" ||
+      code == "RequestTimeoutException" ||
+      code == "SlowDown" || code == "InternalError" ||
+      code == "ServiceUnavailable" || code == "OperationAborted" ||
+      code == "ConditionalRequestConflict";
+}
+
+bool retryable_response(const Response& response) noexcept {
+  if (retryable_status(response.status)) {
+    return true;
+  }
+  S3ErrorInfo error;
+  return !response.body.empty() &&
+      parse_s3_error(response_xml(response), error) &&
+      retryable_s3_code(error.code);
+}
+
 bool retry_after_delay(const Response& response) noexcept {
   const auto header = response.headers.find("retry-after");
   if (header == response.headers.end()) {
@@ -1210,7 +1239,17 @@ bool retry_after_delay(const Response& response) noexcept {
   }
   uint64_t seconds = 0;
   if (!parse_unsigned(sso_view(header->second), seconds)) {
-    return false;
+    try {
+      const time_t deadline = parse_http_mtime(sso_view(header->second));
+      timespec now{};
+      if (::clock_gettime(CLOCK_REALTIME, &now) != 0 ||
+          deadline <= now.tv_sec) {
+        return false;
+      }
+      seconds = uint64_t(deadline - now.tv_sec);
+    } catch (...) {
+      return false;
+    }
   }
   seconds = std::min<uint64_t>(seconds, 30);
   timespec delay{.tv_sec = time_t(seconds), .tv_nsec = 0};
@@ -1255,14 +1294,14 @@ Response request_with_retries(Request&& request, const char* operation,
     try {
       Response response = request();
       check_request_stop();
-      if (!retryable_status(response.status) || attempt == 3) {
+      if (!retryable_response(response) || attempt == 3) {
         return response;
       }
       if (ambiguous != nullptr) {
         *ambiguous = true;
       }
       fprintf(stderr,
-              "warning: retrying %s after HTTP status %d attempt=%u\n",
+              "warning: retrying %s after S3 response status=%d attempt=%u\n",
               operation, response.status, attempt + 1);
       delayed = retry_after_delay(response);
     } catch (...) {
@@ -1344,6 +1383,8 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   constexpr int cache_size_option                  = 264;
   constexpr int cache_reserve_option               = 265;
   constexpr int maximum_cache_fetch_size_option    = 266;
+  constexpr int expected_bucket_owner_option       = 267;
+  constexpr int requester_pays_option              = 268;
   constexpr option long_options[] = {
       {"endpoint-host", required_argument, nullptr, 'e'},
       {"endpoint-port", required_argument, nullptr, 'p'},
@@ -1373,6 +1414,9 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
        cache_reserve_option},
       {"max-cache-fetch-size", required_argument, nullptr,
        maximum_cache_fetch_size_option},
+      {"expected-bucket-owner", required_argument, nullptr,
+       expected_bucket_owner_option},
+      {"requester-pays", no_argument, nullptr, requester_pays_option},
       {"read-ahead", required_argument, nullptr, 'R'},
       {"dir-cache-timeout", required_argument, nullptr, 'T'},
       {"max-cached-inodes", required_argument, nullptr, 'I'},
@@ -1558,6 +1602,16 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
         config.maximum_cache_fetch_size = size_t(value);
         break;
       }
+      case expected_bucket_owner_option:
+        if (optarg == nullptr || *optarg == '\0') {
+          throw std::invalid_argument(
+              "--expected-bucket-owner must not be empty");
+        }
+        config.expected_bucket_owner = optarg;
+        break;
+      case requester_pays_option:
+        config.requester_pays = true;
+        break;
       case 'R': {
         const uint64_t value = parse_required_size("--read-ahead");
         const long page_size = ::sysconf(_SC_PAGESIZE);
@@ -1950,6 +2004,18 @@ OpenHandle& handle_required(const fuse_file_info* file) {
   return *handle;
 }
 
+template<class Headers>
+void append_mount_request_headers(Headers& headers,
+                                  const MountConfig& config) {
+  if (config.requester_pays) {
+    headers.push_back(Header{"x-amz-request-payer", "requester"});
+  }
+  if (!config.expected_bucket_owner.empty()) {
+    headers.push_back(Header{"x-amz-expected-bucket-owner",
+                             config.expected_bucket_owner});
+  }
+}
+
 void authorization_headers_for_credentials(
     HeaderList& output, const State& state, const Credentials& credentials,
     std::string_view method,
@@ -2009,12 +2075,8 @@ void authorization_headers_for_credentials(
       });
 }
 
-std::string_view response_xml(const Response& response) noexcept {
-  const char* data = response.body.empty()
-                         ? ""
-                         : reinterpret_cast<const char*>(response.body.data());
-  return std::string_view(data, response.body.size());
-}
+[[noreturn]] void throw_s3_response(const Response& response,
+                                    const char* operation);
 
 void ensure_express_session(State& state) {
   if (!state.config.directory_bucket) {
@@ -2036,27 +2098,29 @@ void ensure_express_session(State& state) {
   Credentials credentials;
   uint64_t expiration = 0;
   try {
-    std::vector<Header> headers{
-        Header{"x-amz-create-session-mode", "ReadWrite"},
-    };
-    HeaderList authorization;
-    authorization_headers_for_credentials(
-        authorization, state, state.credentials.get(), "GET", "/?session",
-        headers, kEmptyPayloadSha256);
-    headers.insert(headers.end(),
-                   std::make_move_iterator(authorization.begin()),
-                   std::make_move_iterator(authorization.end()));
-    std::unique_ptr<HttpClient> client = HttpClient::connect(
-        state.config.endpoint_host, state.config.endpoint_port,
-        state.config.authority, state.config.tls,
-        state.config.request_timeout_ms, state.config.connect_timeout_ms,
-        state.config.protocol_probe_timeout_ms,
-        state.config.socket_receive_buffer_size);
-    const Response response = client->request_no_body(
-        "GET", "/?session", headers, kMaximumListResponseSize);
+    const Response response = request_with_retries([&] {
+      std::vector<Header> headers{
+          Header{"x-amz-create-session-mode", "ReadWrite"},
+      };
+      append_mount_request_headers(headers, state.config);
+      HeaderList authorization;
+      authorization_headers_for_credentials(
+          authorization, state, state.credentials.get(), "GET", "/?session",
+          headers, kEmptyPayloadSha256);
+      headers.insert(headers.end(),
+                     std::make_move_iterator(authorization.begin()),
+                     std::make_move_iterator(authorization.end()));
+      std::unique_ptr<HttpClient> client = HttpClient::connect(
+          state.config.endpoint_host, state.config.endpoint_port,
+          state.config.authority, state.config.tls,
+          state.config.request_timeout_ms, state.config.connect_timeout_ms,
+          state.config.protocol_probe_timeout_ms,
+          state.config.socket_receive_buffer_size);
+      return client->request_no_body(
+          "GET", "/?session", headers, kMaximumListResponseSize);
+    }, "CreateSession");
     if (response.status != 200) {
-      throw std::runtime_error("CreateSession failed with status " +
-                               std::to_string(response.status));
+      throw_s3_response(response, "CreateSession");
     }
     S3Xml xml(response_xml(response), "CreateSession");
     const tinyxml2::XMLElement& root =
@@ -2105,9 +2169,20 @@ void authorization_headers(
     std::string_view payload_hash, bool fast_get = false,
     std::string_view datetime = {}) {
   if (!state.config.directory_bucket) {
+    if (!state.config.requester_pays &&
+        state.config.expected_bucket_owner.empty()) {
+      authorization_headers_for_credentials(
+          output, state, state.credentials.get(), method, request_path,
+          signed_headers, payload_hash, fast_get, datetime);
+      return;
+    }
+    std::vector<Header> augmented(signed_headers.begin(),
+                                  signed_headers.end());
+    append_mount_request_headers(augmented, state.config);
     authorization_headers_for_credentials(
         output, state, state.credentials.get(), method, request_path,
-        signed_headers, payload_hash, fast_get, datetime);
+        augmented, payload_hash, fast_get, datetime);
+    append_mount_request_headers(output, state.config);
     return;
   }
 
@@ -2120,11 +2195,13 @@ void authorization_headers(
   const std::string token = credentials.session_token;
   credentials.session_token.clear();
   std::vector<Header> augmented(signed_headers.begin(), signed_headers.end());
+  append_mount_request_headers(augmented, state.config);
   augmented.push_back(Header{"x-amz-s3session-token", token});
   authorization_headers_for_credentials(
       output, state, credentials, method, request_path, augmented,
       payload_hash);
   output.push_back(Header{"x-amz-s3session-token", token});
+  append_mount_request_headers(output, state.config);
 }
 
 HeaderList authorization_headers(
@@ -2142,9 +2219,20 @@ HeaderList base_authorization_headers(
     std::span<const Header> signed_headers,
     std::string_view payload_hash) {
   HeaderList output;
+  if (!state.config.requester_pays &&
+      state.config.expected_bucket_owner.empty()) {
+    authorization_headers_for_credentials(
+        output, state, state.credentials.get(), method, request_path,
+        signed_headers, payload_hash);
+    return output;
+  }
+  std::vector<Header> augmented(signed_headers.begin(),
+                                signed_headers.end());
+  append_mount_request_headers(augmented, state.config);
   authorization_headers_for_credentials(
       output, state, state.credentials.get(), method, request_path,
-      signed_headers, payload_hash);
+      augmented, payload_hash);
+  append_mount_request_headers(output, state.config);
   return output;
 }
 
@@ -2365,11 +2453,92 @@ int errno_for_s3_status(int status) noexcept {
   }
 }
 
-[[noreturn]] void throw_s3_status(int status, const char* operation) {
+int errno_for_s3_error(int status, std::string_view code) noexcept {
+  if (code == "NoSuchBucket" || code == "NoSuchKey" ||
+      code == "NoSuchUpload") {
+    return ENOENT;
+  }
+  if (code == "BucketAlreadyExists" ||
+      code == "BucketAlreadyOwnedByYou") {
+    return EEXIST;
+  }
+  if (code == "AccessDenied" || code == "InvalidAccessKeyId" ||
+      code == "SignatureDoesNotMatch" || code == "ExpiredToken" ||
+      code == "TokenRefreshRequired") {
+    return EACCES;
+  }
+  if (code == "InvalidObjectState" ||
+      code == "ObjectNotInActiveTierError") {
+    return EIO;
+  }
+  if (code == "InvalidRange" || code == "InvalidArgument" ||
+      code == "InvalidRequest" || code == "MalformedXML" ||
+      code == "EntityTooSmall" || code == "InvalidPart" ||
+      code == "InvalidPartOrder") {
+    return EINVAL;
+  }
+  if (code == "EntityTooLarge" || code == "TooManyParts") {
+    return EFBIG;
+  }
+  if (code == "KeyTooLongError") {
+    return ENAMETOOLONG;
+  }
+  if (code == "NotImplemented" || code == "MethodNotAllowed") {
+    return EOPNOTSUPP;
+  }
+  if (code == "PreconditionFailed") {
+    return ESTALE;
+  }
+  if (retryable_s3_code(code)) {
+    return EAGAIN;
+  }
+  if (code == "InsufficientStorage") {
+    return ENOSPC;
+  }
+  return errno_for_s3_status(status);
+}
+
+void append_s3_diagnostic(std::string& destination,
+                          std::string_view label,
+                          std::string_view value) {
+  if (value.empty()) {
+    return;
+  }
+  destination.push_back(' ');
+  destination.append(label);
+  destination.push_back('=');
+  constexpr size_t maximum = 512;
+  const size_t length = std::min(value.size(), maximum);
+  destination.reserve(destination.size() + length);
+  for (size_t i = 0; i < length; ++i) {
+    const unsigned char ch = u_char(value[i]);
+    destination.push_back(ch < 0x20 || ch == 0x7f ? ' ' : char(ch));
+  }
+}
+
+[[noreturn]] void throw_s3_response(const Response& response,
+                                    const char* operation) {
+  S3ErrorInfo error;
+  const bool parsed = !response.body.empty() &&
+      parse_s3_error(response_xml(response), error);
+  std::string message(operation);
+  message += " failed with HTTP status ";
+  message += std::to_string(response.status);
+  if (parsed) {
+    append_s3_diagnostic(message, "code", error.code);
+    append_s3_diagnostic(message, "message", error.message);
+  }
+  const auto request_id = response.headers.find("x-amz-request-id");
+  if (request_id != response.headers.end()) {
+    append_s3_diagnostic(message, "request_id",
+                         sso_view(request_id->second));
+  } else if (parsed) {
+    append_s3_diagnostic(message, "request_id", error.request_id);
+  }
   throw std::system_error(
-      errno_for_s3_status(status), std::generic_category(),
-      std::string(operation) + " failed with HTTP status " +
-          std::to_string(status));
+      parsed ? errno_for_s3_error(response.status, error.code)
+             : errno_for_s3_status(response.status),
+      std::generic_category(), message);
 }
 
 struct ObjectMetadata {
@@ -2480,7 +2649,7 @@ ObjectMetadata head_object(State& state, std::string_view path) {
     throw std::system_error(ENOENT, std::generic_category(), "S3 HEAD");
   }
   if (response.status != 200) {
-    throw_s3_status(response.status, "S3 HEAD");
+    throw_s3_response(response, "S3 HEAD");
   }
   const auto content_length = response.headers.find("content-length");
   if (content_length == response.headers.end()) {
@@ -3153,9 +3322,10 @@ ListedXmlPage parse_list_xml(const Response& response,
   }
   page.truncated = xml.required_bool(root, "IsTruncated");
   page.token = xml.optional_text(root, "NextContinuationToken");
-  if (page.truncated && page.token.empty()) {
+  if (page.truncated == page.token.empty()) {
     throw std::runtime_error(
-        std::string(operation) + " omitted NextContinuationToken");
+        std::string(operation) +
+        " returned inconsistent IsTruncated and NextContinuationToken");
   }
   return page;
 }
@@ -3179,7 +3349,7 @@ ListedPage list_directory_page(State& state, std::string_view prefix,
         "GET", path, headers, kMaximumListResponseSize);
   }, "ListObjectsV2");
   if (response.status != 200) {
-    throw_s3_status(response.status, "ListObjectsV2");
+    throw_s3_response(response, "ListObjectsV2");
   }
   ListedXmlPage listed = parse_list_xml(response, "ListObjectsV2");
   ListedPage page;
@@ -4173,8 +4343,12 @@ void update_written_metadata(State& state, OpenHandle& handle,
 }
 
 void require_s3_success(const Response& response, const char* operation) {
-  if (response.status < 200 || response.status >= 300) {
-    throw_s3_status(response.status, operation);
+  S3ErrorInfo error;
+  const bool embedded_error = response.status >= 200 &&
+      response.status < 300 && !response.body.empty() &&
+      parse_s3_error(response_xml(response), error);
+  if (response.status < 200 || response.status >= 300 || embedded_error) {
+    throw_s3_response(response, operation);
   }
 }
 
@@ -4559,7 +4733,7 @@ void ensure_multipart(State& state, OpenHandle& handle) {
               handle.object_path.c_str());
       throw;
     }
-    if (retryable_status(response.status)) {
+    if (retryable_response(response)) {
       fprintf(stderr,
               "error: not retrying ambiguous CreateMultipartUpload: "
               "status=%d path=%s\n",
@@ -4984,7 +5158,12 @@ void complete_multipart(State& state, OpenHandle& handle) {
     }
     throw;
   }
-  if (ambiguous && response.status == 404) {
+  S3ErrorInfo complete_error;
+  const bool embedded_error = response.status >= 200 &&
+      response.status < 300 && !response.body.empty() &&
+      parse_s3_error(response_xml(response), complete_error);
+  if (ambiguous &&
+      (response.status < 200 || response.status >= 300 || embedded_error)) {
     Response recovered;
     if (recover_write_commit(state, handle, recovered)) {
       update_written_metadata(state, handle, recovered);
@@ -5243,9 +5422,8 @@ void delete_probe_object(State& state, std::string_view path) {
   }, "DeleteObject rename probe");
   if (response.status != 200 && response.status != 204 &&
       response.status != 404) {
-    throw std::runtime_error(
-        "failed to remove RenameObject capability probe with status " +
-        std::to_string(response.status));
+    throw_s3_response(response,
+                      "DeleteObject RenameObject capability probe");
   }
 }
 
@@ -5286,8 +5464,7 @@ bool probe_rename_object(State& state, std::string_view source) {
   if (rename_object_unsupported(response)) {
     return false;
   }
-  throw std::runtime_error("RenameObject capability probe failed with status " +
-                           std::to_string(response.status));
+  throw_s3_response(response, "RenameObject capability probe");
 }
 
 void delete_object(State& state, std::string_view key,
@@ -5412,19 +5589,18 @@ void multipart_copy_object(State& state, uint64_t size,
     if (no_replace) {
       headers.push_back(Header{"if-none-match", "*"});
     }
-    append_authorization(headers, state, "POST", complete_path,
-                         kUnsignedPayload);
-    HttpPool::Lease client = state.http->acquire();
-    client->begin_upload("POST", complete_path, headers, body.size());
-    client->upload_bytes(std::span(
-        reinterpret_cast<const std::byte*>(body.data()), body.size()));
-    Response completed;
-    try {
-      completed = client->finish_upload();
-    } catch (...) {
-      complete_outcome_unknown = true;
-      throw;
-    }
+    Response completed = request_with_retries([&] {
+      std::vector<Header> request_headers = headers;
+      append_authorization(request_headers, state, "POST", complete_path,
+                           kUnsignedPayload);
+      HttpPool::Lease client = state.http->acquire();
+      client->begin_upload(
+          "POST", complete_path, request_headers, body.size());
+      client->upload_bytes(std::span(
+          reinterpret_cast<const std::byte*>(body.data()), body.size()));
+      return client->finish_upload();
+    }, "multipart-copy CompleteMultipartUpload",
+       &complete_outcome_unknown);
     if (completed.status == 412 && no_replace) {
       throw std::system_error(EEXIST, std::generic_category(),
                               "multipart-copy destination exists");
@@ -5507,8 +5683,7 @@ bool try_native_rename_object(State& state, std::string_view key,
                    : "RenameObject source changed");
   }
   if (!rename_object_unsupported(response)) {
-    throw std::runtime_error("RenameObject failed with status " +
-                             std::to_string(response.status));
+    throw_s3_response(response, "RenameObject");
   }
   state.rename_object_support.store(-1, std::memory_order_release);
   return false;
@@ -5579,13 +5754,14 @@ void rename_remote_object(State& state, std::string_view key,
         delete_object(state, key, etag);
         return;
       }
-      throw std::runtime_error(
-          "CopyObject rename fallback failed with status " +
-          std::to_string(copied.status));
+      throw_s3_response(copied, "CopyObject rename fallback");
     }
-    if (!copied.body.empty()) {
-      S3Xml xml(response_xml(copied), "CopyObject rename fallback");
-      xml.result_root("CopyObjectResult");
+    require_s3_success(copied, "CopyObject rename fallback");
+    S3Xml xml(response_xml(copied), "CopyObject rename fallback");
+    const tinyxml2::XMLElement& root =
+        xml.result_root("CopyObjectResult");
+    if (xml.required_text(root, "ETag").empty()) {
+      throw std::runtime_error("CopyObject response omitted ETag");
     }
   }
 
@@ -5613,9 +5789,8 @@ void rename_remote_object(State& state, std::string_view key,
         "CopyObject succeeded but the source changed before DeleteObject");
   }
   if (deleted.status != 200 && deleted.status != 204) {
-    throw std::runtime_error(
-        "CopyObject succeeded but DeleteObject failed with status " +
-        std::to_string(deleted.status));
+    throw_s3_response(
+        deleted, "CopyObject succeeded but DeleteObject");
   }
 }
 
@@ -6128,37 +6303,38 @@ int reply_cached_range(fuse_req_t request, CacheEntry& entry,
   return reply_pinned_cached_range(request, entry, offset, length);
 }
 
-bool cache_content_range_matches(const Response& response,
-                                 const CacheFetchClaim& claim,
-                                 uint64_t object_size) noexcept {
+bool content_range_matches(const Response& response,
+                           uint64_t offset, size_t length,
+                           uint64_t object_size) noexcept {
   if (response.status != 206) {
-    return response.status == 200 && claim.offset == 0 &&
-        uint64_t(claim.length) == object_size;
+    return response.status == 200 && offset == 0 &&
+        uint64_t(length) == object_size;
   }
-  const auto found = response.headers.find("content-range");
-  if (found == response.headers.end()) {
+  if (response.content_range.empty()) {
     return false;
   }
-  std::string_view value = sso_view(found->second);
-  constexpr std::string_view prefix = "bytes ";
-  if (!value.starts_with(prefix)) {
-    return false;
+  return s3_content_range_matches(
+      sso_view(response.content_range), offset, length, object_size);
+}
+
+[[noreturn]] void throw_inconsistent_range_response(
+    const Response& response, uint64_t offset, size_t length,
+    uint64_t object_size, const char* operation) {
+  if (response.status != 200 && response.status != 206) {
+    throw_s3_response(response, operation);
   }
-  value.remove_prefix(prefix.size());
-  const size_t dash  = value.find('-');
-  const size_t slash = value.find('/', dash == std::string_view::npos
-                                         ? 0 : dash + 1);
-  if (dash == std::string_view::npos || slash == std::string_view::npos) {
-    return false;
+  std::string message = std::string(operation) +
+      " returned an inconsistent range status=" +
+      std::to_string(response.status) + " expected_offset=" +
+      std::to_string(offset) + " expected_bytes=" +
+      std::to_string(length) + " expected_total=" +
+      std::to_string(object_size) + " body_bytes=" +
+      std::to_string(response.body_bytes);
+  if (!response.content_range.empty()) {
+    append_s3_diagnostic(message, "content_range",
+                         sso_view(response.content_range));
   }
-  uint64_t first = 0;
-  uint64_t last  = 0;
-  uint64_t total = 0;
-  return parse_unsigned(value.substr(0, dash), first) &&
-      parse_unsigned(value.substr(dash + 1, slash - dash - 1), last) &&
-      parse_unsigned(value.substr(slash + 1), total) &&
-      first == claim.offset && total == object_size &&
-      last >= first && last - first + 1 == claim.length;
+  throw std::runtime_error(message);
 }
 
 class CacheReadSink final : public RangeFileSink {
@@ -6174,7 +6350,8 @@ class CacheReadSink final : public RangeFileSink {
         wanted_length_(wanted_length) {}
 
   void progress(const Response& response, bool complete) override {
-    if (!cache_content_range_matches(response, claim_, entry_.size())) {
+    if (!content_range_matches(response, claim_.offset, claim_.length,
+                               entry_.size())) {
       return;
     }
     if (response.body_bytes > claim_.length) {
@@ -6359,7 +6536,7 @@ std::vector<CacheChecksumPart> get_checksum_manifest(
           kMaximumListResponseSize);
     }, "GetObjectAttributes");
     if (response.status != 200) {
-      throw_s3_status(response.status, "GetObjectAttributes");
+      throw_s3_response(response, "GetObjectAttributes");
     }
     S3Xml xml(response_xml(response), "GetObjectAttributes");
     const tinyxml2::XMLElement& root =
@@ -6486,7 +6663,8 @@ bool service_cached_checksums(State& state, OpenHandle& handle,
           range.headers, true, false);
       const CacheFetchClaim fetched{
           claim.offset, claim.epoch, 0, size_t(claim.size)};
-      valid = cache_content_range_matches(response, fetched, handle.size) &&
+      valid = content_range_matches(response, fetched.offset, fetched.length,
+                                    handle.size) &&
           response.body_bytes == fetched.length &&
           verify_cached_part(entry, claim);
     } catch (...) {
@@ -6503,7 +6681,8 @@ bool service_cached_checksums(State& state, OpenHandle& handle,
 bool cache_response_matches(const Response& response,
                             const CacheFetchClaim& claim,
                             uint64_t object_size) noexcept {
-  return cache_content_range_matches(response, claim, object_size) &&
+  return content_range_matches(response, claim.offset, claim.length,
+                               object_size) &&
       response.body_bytes == claim.length;
 }
 
@@ -6589,17 +6768,51 @@ bool read_cached(State& state, OpenHandle& handle,
         lease = state.http->acquire();
       }
       HttpClient& client = lease.client();
-      const AuthorizedRangeRequest range = make_range_request(
-          state, handle, worker, claim.offset, claim.length);
-      response = client.get_range_to_fd(
-          range.path(), claim.offset, claim.length, sink,
-          range.headers, true,
-          state.config.report_metrics);
-      if (!cache_response_matches(response, claim, handle.size)) {
-        if (response.status != 200 && response.status != 206) {
-          throw_s3_status(response.status, "cached GetObject range");
+      for (unsigned attempt = 0; ; ++attempt) {
+        const AuthorizedRangeRequest range = make_range_request(
+            state, handle, worker, claim.offset, claim.length);
+        response = client.get_range_to_fd(
+            range.path(), claim.offset, claim.length, sink,
+            range.headers, true,
+            state.config.report_metrics);
+        bool retry = retryable_response(response);
+        if (response.status == 403 && !state.config.directory_bucket &&
+            !range.range_signed) {
+          int expected = 0;
+          const bool selected_signed =
+              state.range_signing_mode.compare_exchange_strong(
+                  expected, 2, std::memory_order_relaxed);
+          retry = selected_signed || expected == 2;
+          if (selected_signed) {
+            fprintf(stderr,
+                    "warning: S3 endpoint rejected an unsigned Range "
+                    "header; signing Range for this mount\n");
+          }
+          worker.authorization_valid = false;
+        } else if ((response.status == 401 || response.status == 403) &&
+                   state.config.directory_bucket) {
+          invalidate_express_session(state);
+          retry = true;
         }
-        throw std::runtime_error("cached GetObject returned a short body");
+        if (!retry || attempt == 3) {
+          break;
+        }
+        if (sink.replied()) {
+          throw std::logic_error(
+              "retryable S3 error arrived after cached data was published");
+        }
+        fprintf(stderr,
+                "warning: retrying cached GetObject after S3 response "
+                "status=%d attempt=%u\n",
+                response.status, attempt + 1);
+        if (!retry_after_delay(response)) {
+          retry_delay(attempt);
+        }
+      }
+      if (!cache_response_matches(response, claim, handle.size)) {
+        throw_inconsistent_range_response(
+            response, claim.offset, claim.length, handle.size,
+            "cached GetObject");
       }
 
       const bool checksum_scope_matches =
@@ -6805,7 +7018,7 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
           retry_delay(attempt);
           continue;
         }
-        if (retryable_status(response.status) && attempt != 3) {
+        if (retryable_response(response) && attempt != 3) {
           if (response.requires_consume) {
             client.consume(response);
           }
@@ -6833,17 +7046,12 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
       throw std::system_error(ESTALE, std::generic_category(),
                               "S3 object changed during open");
     }
-    const bool full_object_response =
-        response.status == 200 && unsigned_offset == 0 &&
-        wanted == object_size;
-    if ((response.status != 206 && !full_object_response) ||
+    const bool valid_range = content_range_matches(
+        response, unsigned_offset, wanted, object_size);
+    if (!valid_range ||
         response.body_bytes != wanted) {
-      if (response.status != 200 && response.status != 206) {
-        throw_s3_status(response.status, "GetObject range");
-      }
-      throw std::runtime_error(
-          "unexpected S3 range response bytes=" +
-          std::to_string(response.body_bytes));
+      throw_inconsistent_range_response(
+          response, unsigned_offset, wanted, object_size, "GetObject");
     }
     if (state.config.verify_read_checksum && unsigned_offset == 0 &&
         uint64_t(wanted) == object_size) {
@@ -8543,7 +8751,7 @@ void delete_object(State& state, std::string_view key,
   }
   if (response.status != 200 && response.status != 204 &&
       response.status != 404) {
-    throw_s3_status(response.status, "DeleteObject");
+    throw_s3_response(response, "DeleteObject");
   }
 }
 
@@ -9237,6 +9445,10 @@ void print_help() {
       "  -b, --bucket NAME         S3 bucket (required)\n"
       "  -k, --prefix PREFIX       optional raw object-key prefix\n"
       "  -r, --region REGION       SigV4 region (default us-east-1)\n"
+      "      --expected-bucket-owner ACCOUNT\n"
+      "                             reject requests to a bucket owned by a "
+      "different account\n"
+      "      --requester-pays       acknowledge requester-pays billing\n"
       "  -K, --checksum ALGORITHM  upload checksum: auto, default, none, "
       "crc32, crc32c, crc64nvme, sha1, sha256, md5, xxhash64, "
       "xxhash3, xxhash128, sha512, crc64xz (default auto)\n"
@@ -9370,8 +9582,12 @@ int run(int argc, char** argv) {
     return 2;
   }
   if (config.authority.find_first_of("\r\n") != std::string::npos ||
-      config.region.find_first_of("\r\n") != std::string::npos) {
-    fprintf(stderr, "authority and region must not contain CR or LF\n");
+      config.region.find_first_of("\r\n") != std::string::npos ||
+      config.expected_bucket_owner.find_first_of("\r\n") !=
+          std::string::npos) {
+    fprintf(stderr,
+            "authority, region, and expected bucket owner must not contain "
+            "CR or LF\n");
     fuse_opt_free_args(&arguments);
     free(options.mountpoint);
     return 2;

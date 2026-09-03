@@ -56,6 +56,17 @@ multi-file namespace. It remains experimental rather than production-ready.
   that require COMPOSITE checksums carry every Part checksum into completion
   XML. CRC64NVME uses a FULL_OBJECT checksum combined from the Part CRCs, so
   completion does not scan the object data again.
+- `--expected-bucket-owner ACCOUNT` sends and signs
+  `x-amz-expected-bucket-owner` on every S3 request, preventing a DNS or
+  configuration mistake from silently targeting a bucket owned by another
+  account. `--requester-pays` likewise sends and signs
+  `x-amz-request-payer: requester`. Both are opt-in so non-AWS S3-compatible
+  services keep their existing behavior.
+- S3 XML error codes are preserved in diagnostics and participate in errno
+  mapping and retry decisions. Retryable errors such as `RequestTimeout` and
+  `SlowDown` are recognized even when their HTTP status alone is ambiguous.
+  HTTP 200 `<Error>` responses from copy and multipart completion are treated
+  as failures, as required by S3.
 - Read verification is off by default. `--verify-read-checksum` enables
   background best-effort verification when a complete independently
   verifiable object or multipart unit is available. The first read or mmap

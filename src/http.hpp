@@ -34,6 +34,7 @@ struct Response {
   uint64_t wire_start_ns = 0;
   uint64_t wire_last_data_ns = 0;
   bool requires_consume = false;
+  ssostr<80> content_range;
   terark::gold_hash_map<ssostr<32>, ssostr<32>> headers;
   std::vector<std::byte> body;
 };

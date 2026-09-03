@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <limits>
 #include <mutex>
@@ -738,6 +739,68 @@ bool S3Xml::required_bool(const tinyxml2::XMLElement& parent,
   error += ' ';
   error.append(message);
   throw std::runtime_error(error);
+}
+
+bool parse_s3_error(std::string_view text, S3ErrorInfo& error) noexcept {
+  const std::string_view prefix = text.substr(0, 1024);
+  if (prefix.find("<Error") == std::string_view::npos &&
+      prefix.find(":Error") == std::string_view::npos) {
+    return false;
+  }
+  try {
+    S3Xml xml(text, "S3 error response");
+    if (!xml.root_is("Error")) {
+      return false;
+    }
+    const tinyxml2::XMLElement& root = xml.root("Error");
+    S3ErrorInfo parsed{
+        .code       = xml.optional_text(root, "Code"),
+        .message    = xml.optional_text(root, "Message"),
+        .request_id = xml.optional_text(root, "RequestId"),
+        .host_id    = xml.optional_text(root, "HostId"),
+    };
+    error = std::move(parsed);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool s3_content_range_matches(std::string_view value,
+                              uint64_t offset, size_t length,
+                              uint64_t object_size) noexcept {
+  if (length == 0) {
+    return false;
+  }
+  constexpr std::string_view prefix = "bytes ";
+  if (!value.starts_with(prefix)) {
+    return false;
+  }
+  value.remove_prefix(prefix.size());
+  const size_t dash  = value.find('-');
+  const size_t slash = value.find('/', dash == std::string_view::npos
+                                         ? 0 : dash + 1);
+  if (dash == std::string_view::npos || slash == std::string_view::npos ||
+      value.find('/', slash + 1) != std::string_view::npos) {
+    return false;
+  }
+  const auto parse = [](std::string_view text, uint64_t& result) {
+    if (text.empty()) {
+      return false;
+    }
+    const auto parsed = std::from_chars(
+        text.data(), text.data() + text.size(), result);
+    return parsed.ec == std::errc{} &&
+        parsed.ptr == text.data() + text.size();
+  };
+  uint64_t first = 0;
+  uint64_t last  = 0;
+  uint64_t total = 0;
+  return parse(value.substr(0, dash), first) &&
+      parse(value.substr(dash + 1, slash - dash - 1), last) &&
+      parse(value.substr(slash + 1), total) &&
+      first == offset && total == object_size && last >= first &&
+      last - first == uint64_t(length - 1);
 }
 
 Directory::Directory() {

@@ -500,9 +500,8 @@ int main() {
   const Response missing = delayed_client->get_range(
       "/bucket/delayed-missing", 0, delayed_body.size(), missing_pipe);
   assert(missing.status == 404);
-  std::array<std::byte, 9> missing_body{};
-  read_all(missing_pipe.read_fd(), missing_body);
-  assert(memcmp(missing_body.data(), "not found", missing_body.size()) == 0);
+  assert(std::string(reinterpret_cast<const char*>(missing.body.data()),
+                     missing.body.size()) == "not found");
   const Response closing_head = delayed_client->request_no_body(
       "HEAD", "/bucket/delayed-close");
   assert(closing_head.status == 200);
@@ -551,7 +550,7 @@ int main() {
   assert(file);
   TestFileSink sink(file.get(), 0);
   const Response file_response = file_client->get_range_to_fd(
-      "/bucket/file", 0, file_body.size(), sink, {}, true, true);
+      "/bucket/file", 0, file_body.size(), sink, {}, false, true);
   assert(file_response.status == 206);
   assert(file_response.body_bytes == file_body.size());
   assert(file_response.fallback_copied_bytes > 0);
@@ -561,7 +560,10 @@ int main() {
   assert(file_response.transport_splice_calls > 0);
   assert(file_response.wire_start_ns != 0);
   assert(file_response.wire_last_data_ns >= file_response.wire_start_ns);
-  assert(file_response.headers.at("etag") == "\"h1-file-etag\"");
+  assert(file_response.headers.empty());
+  assert(sso_view(file_response.content_range) ==
+         "bytes 0-" + std::to_string(file_body.size() - 1) + "/" +
+             std::to_string(file_body.size()));
   assert(sink.calls > 1);
   assert(sink.completed);
   std::vector<std::byte> actual_file(file_body.size());
