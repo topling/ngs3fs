@@ -291,6 +291,39 @@ LD_LIBRARY_PATH=$perf_lib "$perf" script -i "$run_dir/perf.data" \
   >"$run_dir/perf.script"
 "$flamegraph_dir/stackcollapse-perf.pl" "$run_dir/perf.script" \
   >"$run_dir/perf.folded"
+if [[ ! -s "$run_dir/perf.folded" ]]; then
+  echo "warning: perf captured no stacks; retrying a longer sampling pass" >&2
+  rm -f "$run_dir/perf.data" "$run_dir/perf.script" \
+    "$run_dir/perf.folded"
+  LD_LIBRARY_PATH=$perf_lib "$perf" record -F "$perf_frequency" \
+    -e "$perf_event" \
+    --call-graph dwarf,16384 -p "$ngs3fs_pid" \
+    -o "$run_dir/perf.data" -- sleep 3600 &
+  perf_pid=$!
+  sleep 0.2
+  if [[ "$workload" = mmap ]]; then
+    "$bench" "$mount_dir/$object" "$bytes" "$((iterations * 4))" 17825792 \
+      >"$run_dir/profile-retry.jsonl"
+  else
+    "$random_bench" -R "${random_advice_args[@]}" \
+      -d "$mount_dir/random-read" \
+      -f "$random_files" -t "$random_threads" \
+      -n "$((random_operations * 4))" \
+      -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed" \
+      >"$run_dir/profile-retry.txt"
+  fi
+  kill -INT "$perf_pid" 2>/dev/null || true
+  wait "$perf_pid" 2>/dev/null || true
+  perf_pid=
+  LD_LIBRARY_PATH=$perf_lib "$perf" script -i "$run_dir/perf.data" \
+    >"$run_dir/perf.script"
+  "$flamegraph_dir/stackcollapse-perf.pl" "$run_dir/perf.script" \
+    >"$run_dir/perf.folded"
+fi
+if [[ ! -s "$run_dir/perf.folded" ]]; then
+  echo "perf captured no stack samples after retry" >&2
+  exit 2
+fi
 "$flamegraph_dir/flamegraph.pl" --width 1600 \
   --title "$title" \
   --subtitle "VersityGW v1.7.0, HTTP/1.1, $perf_frequency Hz $perf_event" \
