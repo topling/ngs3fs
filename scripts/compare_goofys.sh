@@ -25,7 +25,7 @@ random_maximum_read=${RANDOM_READ_MAXIMUM:-262144}
 random_seed=${RANDOM_READ_SEED:-0x4e47533346535244}
 random_advice=${RANDOM_READ_ADVICE:-random}
 cache_mode=${CACHE_MODE:-none}
-cache_dir=${NGS3FS_CACHE_DIR:-${CACHE_DIR:-}}
+cache_dir=${CACHE_DIR:-${NGS3FS_CACHE_DIR:-}}
 perf=${PERF_BIN:-perf}
 drop_after_warmup=${DROP_CACHES_AFTER_WARMUP:-0}
 
@@ -59,7 +59,7 @@ if [[ "$cache_mode" != none ]]; then
   cache_dir=$(realpath -m "$cache_dir")
   run_root="${run_dir%/}/"
   if [[ "$cache_dir" != "$run_root"* || "$cache_dir" = "${run_dir%/}" ]]; then
-    echo "ngs3fs cache directory must be below run_dir: $cache_dir" >&2
+    echo "cache directory must be below run_dir: $cache_dir" >&2
     exit 2
   fi
 fi
@@ -185,9 +185,19 @@ stop_goofys() {
 
 start_mountpoint_s3() {
   mkdir -p "$run_dir/mountpoint-logs"
+  local -a mountpoint_cache_args=()
+  if [[ "$cache_mode" != none ]]; then
+    mkdir -p "$cache_dir"
+    if [[ -n "$(find "$cache_dir" -mindepth 1 -print -quit)" ]]; then
+      echo "cache directory must be empty for a reproducible sample: $cache_dir" >&2
+      return 1
+    fi
+    mountpoint_cache_args=(--cache "$cache_dir" --max-cache-size 1024)
+  fi
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
     "$mountpoint_s3" -f --endpoint-url "$endpoint" --region us-east-1 \
       --force-path-style --log-directory "$run_dir/mountpoint-logs" \
+      "${mountpoint_cache_args[@]}" \
       "$bucket" "$goofys_mount" \
       >"$run_dir/mountpoint-s3.log" 2>&1 &
   goofys_pid=$!

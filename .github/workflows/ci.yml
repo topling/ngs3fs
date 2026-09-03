@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out ngs3fs
         uses: actions/checkout@v7
@@ -293,13 +293,16 @@ jobs:
 
       - name: Compare Mountpoint concurrent random reads
         run: |
-          sudo env \
-            REFERENCE_CLIENT=mountpoint-s3 \
-            MOUNTPOINT_S3_BIN="$GITHUB_WORKSPACE/build/tools/mount-s3" \
-            BENCHMARK_REPETITIONS=3 \
-            CACHE_MODE=none \
-            ./scripts/benchmark_random_read.sh \
-            "$GITHUB_WORKSPACE/build/benchmarks/github-mountpoint-random-read"
+          for mode in none cold warm; do
+            sudo env \
+              REFERENCE_CLIENT=mountpoint-s3 \
+              MOUNTPOINT_S3_BIN="$GITHUB_WORKSPACE/build/tools/mount-s3" \
+              BENCHMARK_REPETITIONS=3 \
+              CACHE_MODE="$mode" \
+              DROP_CACHES_AFTER_WARMUP=1 \
+              ./scripts/benchmark_random_read.sh \
+              "$GITHUB_WORKSPACE/build/benchmarks/github-mountpoint-random-read-$mode"
+          done
 
       - name: A/B test socket receive buffer
         run: |
@@ -369,11 +372,22 @@ jobs:
       - name: Make Mountpoint evidence readable
         if: always()
         run: |
-          log_root=build/benchmarks/github-mountpoint-random-read
-          if [[ -d "$log_root" ]]; then
-            sudo find "$log_root" -path '*/mountpoint-logs/*' -type f \
-              -exec chmod a+r {} +
-          fi
+          for log_root in build/benchmarks/github-mountpoint-random-read-*; do
+            if [[ -d "$log_root" ]]; then
+              sudo find "$log_root" -path '*/mountpoint-logs/*' -type f \
+                -exec chmod a+r {} +
+            fi
+          done
+
+      - name: Summarize random-read CPU comparisons
+        if: always()
+        run: |
+          ./scripts/summarize_random_read.py \
+            build/benchmarks/random-read-report \
+            build/benchmarks/github-random-read-* \
+            build/benchmarks/github-mountpoint-random-read-*
+          cat build/benchmarks/random-read-report/random-read-cpu-comparison.md \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark and flame graphs
         if: always()
@@ -391,15 +405,16 @@ jobs:
             build/benchmarks/github-random-read-*/*/ngs3fs.log
             build/benchmarks/github-random-read-*/*/goofys.log
             build/benchmarks/github-random-read-*/*/versity.log
-            build/benchmarks/github-mountpoint-random-read/system.txt
-            build/benchmarks/github-mountpoint-random-read/samples.csv
-            build/benchmarks/github-mountpoint-random-read/summary.csv
-            build/benchmarks/github-mountpoint-random-read/*/random-read-summary.csv
-            build/benchmarks/github-mountpoint-random-read/*/*-random-read-result.txt
-            build/benchmarks/github-mountpoint-random-read/*/ngs3fs.log
-            build/benchmarks/github-mountpoint-random-read/*/mountpoint-s3.log
-            build/benchmarks/github-mountpoint-random-read/*/mountpoint-logs/*
-            build/benchmarks/github-mountpoint-random-read/*/versity.log
+            build/benchmarks/github-mountpoint-random-read-*/system.txt
+            build/benchmarks/github-mountpoint-random-read-*/samples.csv
+            build/benchmarks/github-mountpoint-random-read-*/summary.csv
+            build/benchmarks/github-mountpoint-random-read-*/*/random-read-summary.csv
+            build/benchmarks/github-mountpoint-random-read-*/*/*-random-read-result.txt
+            build/benchmarks/github-mountpoint-random-read-*/*/ngs3fs.log
+            build/benchmarks/github-mountpoint-random-read-*/*/mountpoint-s3.log
+            build/benchmarks/github-mountpoint-random-read-*/*/mountpoint-logs/*
+            build/benchmarks/github-mountpoint-random-read-*/*/versity.log
+            build/benchmarks/random-read-report/**
             build/benchmarks/github-socket-buffer/system.txt
             build/benchmarks/github-socket-buffer/samples.csv
             build/benchmarks/github-socket-buffer/summary.csv
@@ -437,3 +452,28 @@ jobs:
             build/benchmarks/github-cache-recovery/ngs3fs-recovery.log
             build/benchmarks/github-cache-recovery/versity.log
             build/benchmarks/github-cache-recovery/versity-access.log
+
+      - name: Configure GitHub Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      - name: Upload CPU comparison site
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: build/benchmarks/random-read-report
+
+  deploy-pages:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy CPU comparison site
+        id: deployment
+        uses: actions/deploy-pages@v4

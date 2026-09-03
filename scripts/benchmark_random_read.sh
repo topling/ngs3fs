@@ -61,9 +61,13 @@ for advice in random normal; do
     for client in "${clients[@]}"; do
       ((++sample))
       run_dir="$output_dir/$advice-r$repetition-$client"
-      cache_dir="$run_dir/ngs3fs-cache"
-      sample_cache_mode=$cache_mode
-      if [[ "$cache_mode" != none && "$client" = ngs3fs ]]; then
+      cache_dir="$run_dir/$client-cache"
+      if [[ "$client" = ngs3fs || "$client" = mountpoint-s3 ]]; then
+        sample_cache_mode=$cache_mode
+      else
+        sample_cache_mode=none
+      fi
+      if [[ "$sample_cache_mode" != none ]]; then
         sample_cache_dir=$cache_dir
         mkdir -p "$cache_dir"
       else
@@ -83,7 +87,6 @@ for advice in random normal; do
       RANDOM_READ_ADVICE="$advice" \
       CACHE_MODE="$sample_cache_mode" \
       CACHE_DIR="$cache_dir" \
-      NGS3FS_CACHE_DIR="$cache_dir" \
       PORT="$((base_port + sample))" \
         "$project_dir/scripts/compare_goofys.sh" "$run_dir"
       sample_summary=$(tail -n 1 "$run_dir/random-read-summary.csv")
@@ -134,12 +137,14 @@ printf '%s\n' \
   >"$output_dir/summary.csv"
 for advice in random normal; do
   for client in ngs3fs "$reference_client"; do
-    summary_cache_mode=$cache_mode
+    if [[ "$client" = ngs3fs || "$client" = mountpoint-s3 ]]; then
+      summary_cache_mode=$cache_mode
+    else
+      summary_cache_mode=none
+    fi
     summary_cache_dir=-
-    if [[ "$client" = ngs3fs ]]; then
-      if [[ "$summary_cache_mode" != none ]]; then
-        summary_cache_dir="$output_dir/$advice-r*-ngs3fs/ngs3fs-cache"
-      fi
+    if [[ "$summary_cache_mode" != none ]]; then
+      summary_cache_dir="$output_dir/$advice-r*-$client/$client-cache"
     fi
     wall=$(metric_stats "$advice" "$client" 11)
     cpu=$(metric_stats "$advice" "$client" 12)
