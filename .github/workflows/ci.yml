@@ -366,6 +366,15 @@ jobs:
             ./scripts/benchmark_cache_recovery.sh \
             "$GITHUB_WORKSPACE/build/benchmarks/github-cache-recovery"
 
+      - name: Make Mountpoint evidence readable
+        if: always()
+        run: |
+          log_root=build/benchmarks/github-mountpoint-random-read
+          if [[ -d "$log_root" ]]; then
+            sudo find "$log_root" -path '*/mountpoint-logs/*' -type f \
+              -exec chmod a+r {} +
+          fi
+
       - name: Upload benchmark and flame graphs
         if: always()
         uses: actions/upload-artifact@v7
