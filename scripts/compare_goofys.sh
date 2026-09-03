@@ -461,6 +461,10 @@ wait_for_server
 if [[ "$workload" = random-read &&
       ( "$client" = mountpoint-s3 ||
         ( "$client" = both && "$reference_client" = mountpoint-s3 ) ) ]]; then
+  mountpoint_source_dirs=("$backend/$bucket/random-read")
+  if [[ "$cache_mode" = cold ]]; then
+    mountpoint_source_dirs+=("$backend/$bucket/random-read-cold-warmup")
+  fi
   while IFS= read -r file; do
     key=${file#"$backend/$bucket/"}
     upload_source="$run_dir/mountpoint-upload.bin"
@@ -470,7 +474,7 @@ if [[ "$workload" = random-read &&
       --user "$access_key:$secret_key" \
       --upload-file "$upload_source" "$endpoint/$bucket/$key" \
       --output /dev/null
-  done < <(find "$backend/$bucket/random-read" -type f -print)
+  done < <(find "${mountpoint_source_dirs[@]}" -type f -print)
   rm -f "$run_dir/mountpoint-upload.bin"
 fi
 

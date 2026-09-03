@@ -382,6 +382,8 @@ jobs:
       - name: Summarize random-read CPU comparisons
         if: always()
         run: |
+          sudo install -d -o "$USER" -g "$(id -gn)" \
+            build/benchmarks/random-read-report
           ./scripts/summarize_random_read.py \
             build/benchmarks/random-read-report \
             build/benchmarks/github-random-read-* \
