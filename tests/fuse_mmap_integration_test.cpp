@@ -217,6 +217,8 @@ struct SharedServerState {
   bool hidden_rename_completed = false;
   bool hidden_delete_completed = false;
   bool deep_present = true;
+  bool drop_complete_response_once = false;
+  bool complete_response_dropped = false;
   std::atomic<bool> stop = false;
   std::exception_ptr failure;
 };
@@ -236,6 +238,7 @@ struct ServerState {
   SharedServerState* shared = nullptr;
   std::map<int32_t, Request> requests;
   std::map<int32_t, std::unique_ptr<ResponseSource>> responses;
+  bool close_without_response = false;
 };
 
 bool parse_range(std::string_view value, RequestRange& range) {
@@ -543,6 +546,16 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       request.path.find("uploadId=upload-1") != std::string::npos) {
     require(request.content_length == std::to_string(request.body.size()),
             "CompleteMultipartUpload omitted an exact Content-Length");
+    if (state.complete_response_dropped && state.uploaded_parts.empty()) {
+      const std::array response_headers{
+          header(":status", "404"),
+          header("content-length", "0"),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     require(!state.uploaded_parts.empty(),
             "CompleteMultipartUpload had no uploaded parts");
     const std::string_view xml(
@@ -580,6 +593,12 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     state.last_modified_iso = "1994-11-08T08:49:37.000Z";
     ++state.complete_multipart_requests;
     ++state.put_requests;
+    if (state.drop_complete_response_once) {
+      state.drop_complete_response_once = false;
+      state.complete_response_dropped   = true;
+      connection.close_without_response = true;
+      return 0;
+    }
     std::string result =
         "<s3:CompleteMultipartUploadResult xmlns:s3=\"urn:s3\">"
         "<s3:ETag>&quot;after-put&quot;</s3:ETag>";
@@ -1314,6 +1333,9 @@ void serve_connection(UniqueFd socket, SharedServerState& shared) noexcept {
       const ssize_t consumed = nghttp2_session_mem_recv(
           session.get(), input.data(), static_cast<size_t>(count));
       require(consumed == count, "nghttp2 server did not consume input");
+      if (state.close_without_response) {
+        return;
+      }
       flush_server(session.get(), socket.get());
     }
   } catch (...) {
@@ -1813,10 +1835,21 @@ int main(int argc, char** argv) {
       if (first_failed < 0 && errno != EIO) {
         fail_errno("first read of permanently corrupt checksum object");
       }
-      const int advised = ::posix_fadvise(
-          fail_file.get(), 0, 0, POSIX_FADV_DONTNEED);
-      require(advised == 0,
-              "unable to drop the deliberately corrupt test page");
+      bool invalidated = first_failed < 0 && errno == EIO;
+      for (unsigned attempt = 0; !invalidated && attempt != 200; ++attempt) {
+        errno = 0;
+        const ssize_t result = ::pread(
+            fail_file.get(), failed_bytes.data(), 1, 0);
+        if (result < 0 && errno == EIO) {
+          invalidated = true;
+          break;
+        }
+        require(result == 1,
+                "unexpected result while waiting for checksum invalidation");
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      require(invalidated,
+              "checksum failure did not invalidate an already returned page");
       errno = 0;
       require(::pread(fail_file.get(), failed_bytes.data(), 1,
                       256U * 1024U) < 0 && errno == EIO,
@@ -2000,8 +2033,10 @@ int main(int argc, char** argv) {
       shared.object = external_expected;
       shared.etag = "\"external-put\"";
       shared.version_id = "version-3";
-      shared.last_modified = "Wed, 09 Nov 1994 08:49:37 GMT";
-      shared.last_modified_iso = "1994-11-09T08:49:37.000Z";
+      // Keep the server timestamp and object size unchanged. Generation
+      // validation must use ETag/Version rather than second-resolution mtime.
+      shared.last_modified = "Mon, 07 Nov 1994 08:49:37 GMT";
+      shared.last_modified_iso = "1994-11-07T08:49:37.000Z";
       gets_before_external_open = shared.get_requests;
     }
     UniqueFd external_reader(
@@ -2012,14 +2047,48 @@ int main(int argc, char** argv) {
     std::vector<std::byte> external_bytes(external_expected.size());
     pread_all(external_reader.get(), external_bytes, 0);
     require(external_bytes == external_expected,
-            "mtime change reused stale locally written page cache");
-    external_reader.reset();
+            "same-mtime generation change reused stale page cache");
     {
       std::lock_guard state_guard(shared.mutex);
       require(shared.get_requests > gets_before_external_open,
-              "external mtime change did not fetch new object data");
+              "external generation change did not fetch new object data");
     }
 
+    std::vector<std::byte> next_generation = external_expected;
+    next_generation.back() ^= std::byte{0x5a};
+    {
+      std::lock_guard state_guard(shared.mutex);
+      shared.object = next_generation;
+      shared.etag = "\"external-put-again\"";
+      shared.version_id = "version-4";
+    }
+    errno = 0;
+    UniqueFd conflicting_reader(
+        ::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
+    require(!conflicting_reader && errno == EBUSY,
+            "new generation opened while an old reader was still active");
+    std::byte stale_byte{};
+    errno = 0;
+    require(::pread(external_reader.get(), &stale_byte, 1, 0) < 0 &&
+                errno == ESTALE,
+            "old generation reader did not become ESTALE");
+    external_reader.reset();
+    UniqueFd next_reader;
+    retry_after_fuse_release("open next object generation", [&] {
+      next_reader.reset(::open(
+          file_path.c_str(), O_RDONLY | O_CLOEXEC));
+      return next_reader ? 0 : -1;
+    });
+    std::vector<std::byte> next_bytes(next_generation.size());
+    pread_all(next_reader.get(), next_bytes, 0);
+    require(next_bytes == next_generation,
+            "next generation reader returned stale data");
+    next_reader.reset();
+
+    {
+      std::lock_guard state_guard(shared.mutex);
+      shared.drop_complete_response_once = true;
+    }
     UniqueFd multipart_writer(
         ::open(file_path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC));
     if (!multipart_writer) {
@@ -2056,6 +2125,8 @@ int main(int argc, char** argv) {
       require(shared.complete_multipart_requests == 1 &&
                   shared.put_requests == 1,
               "large write did not complete one multipart upload");
+      require(shared.complete_response_dropped,
+              "multipart outcome-unknown fault was not injected");
       require(shared.head_requests == heads_before_multipart_commit + 1,
               "completion without Last-Modified did not issue one HEAD");
       require(shared.object == final_expected,

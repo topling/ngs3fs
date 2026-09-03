@@ -19,10 +19,11 @@
 #include <array>
 #include <errno.h>
 #include <ctype.h>
+#include <inttypes.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <charconv>
-#include <iostream>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -224,9 +225,10 @@ class TlsTunnel {
         }
       }
       if (timed_out) {
-        std::cerr << "TLS tunnel timed out after "
-                  << timeout_ns_ / 1'000'000ULL
-                  << " ms without I/O progress\n";
+        fprintf(stderr,
+                "TLS tunnel timed out after %" PRIu64
+                " ms without I/O progress\n",
+                uint64_t(timeout_ns_ / 1'000'000ULL));
         ::shutdown(remote_.get(), SHUT_RDWR);
       } else {
         SSL_shutdown(ssl_.get());
@@ -234,7 +236,7 @@ class TlsTunnel {
       ::shutdown(local_.get(), SHUT_RDWR);
     } catch (const std::exception& error) {
       ::shutdown(local_.get(), SHUT_RDWR);
-      std::cerr << "TLS tunnel stopped: " << error.what() << '\n';
+      fprintf(stderr, "TLS tunnel stopped: %s\n", error.what());
     }
   }
 

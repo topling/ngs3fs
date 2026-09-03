@@ -5,6 +5,7 @@
 #include "s3.hpp"
 
 #include <fuse_lowlevel.h>
+#include <xxhash.h>
 
 #include <fcntl.h>
 #include <getopt.h>
@@ -32,7 +33,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <exception>
-#include <iostream>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -370,9 +370,9 @@ class UploadScheduler {
       try {
         job.run();
       } catch (const std::exception& error) {
-        std::cerr << "unhandled upload job error: " << error.what() << '\n';
+        fprintf(stderr, "unhandled upload job error: %s\n", error.what());
       } catch (...) {
-        std::cerr << "unhandled upload job error\n";
+        fprintf(stderr, "unhandled upload job error\n");
       }
     }
   }
@@ -408,6 +408,7 @@ struct OpenHandle {
   uint64_t size                = 0;
   uint64_t stream_offset       = 0;
   uint64_t cache_last_read_end = 0;
+  uint64_t generation_epoch    = 0;
   size_t cache_read_window     = 0;
   size_t pending_parts         = 0;
   unsigned next_part_number    = 1;
@@ -462,6 +463,11 @@ class OpenRequestGuard {
       handle_.request_state.notify_all();
     }
   }
+
+  OpenRequestGuard(const OpenRequestGuard&) = delete;
+  OpenRequestGuard& operator=(const OpenRequestGuard&) = delete;
+  OpenRequestGuard(OpenRequestGuard&&) = delete;
+  OpenRequestGuard& operator=(OpenRequestGuard&&) = delete;
 
  private:
   static constexpr uint64_t kClosing    = 1ULL << 63;
@@ -634,6 +640,12 @@ struct State {
     bool deleting = false;
   };
 
+  struct PendingInvalidation {
+    fuse_ino_t inode;
+    off_t offset;
+    off_t length;
+  };
+
   MountConfig config;
   CredentialProvider credentials;
   time_t directory_mtime;
@@ -658,6 +670,7 @@ struct State {
   std::atomic<size_t> retired_count{0};
   std::map<std::string, OpenFileState, std::less<>> open_files;
   std::map<std::string, PendingDelete, std::less<>> pending_deletes;
+  std::deque<PendingInvalidation> pending_invalidations;
   std::set<std::string, std::less<>> recovery_paths;
   std::vector<BlockedPath> blocked_paths;
   std::vector<std::shared_ptr<CacheEntry>> recovery_entries;
@@ -688,6 +701,7 @@ struct State {
   uint64_t cache_warning_ns        = 0;
   std::atomic<uint64_t> random_read_warning_ns{0};
   std::atomic<uint64_t> cache_bypass_warning_ns{0};
+  std::atomic<uint64_t> request_error_warning_ns{0};
   std::atomic<bool> page_cache_store_warned{false};
   std::atomic<bool> page_cache_invalidate_warned{false};
   bool splice_available            = true;
@@ -776,6 +790,33 @@ void invalidate_page_cache(State& state, fuse_ino_t inode,
             "warning: unable to invalidate stale page cache: "
             "inode=%" PRIu64 ": %s\n",
             uint64_t(inode), strerror(error));
+  }
+}
+
+void queue_page_invalidation(State& state, fuse_ino_t inode,
+                             off_t offset, off_t length) noexcept {
+  try {
+    std::lock_guard guard(state.cache_mutex);
+    const auto duplicate = std::find_if(
+        state.pending_invalidations.begin(),
+        state.pending_invalidations.end(),
+        [&](const State::PendingInvalidation& pending) {
+          return pending.inode == inode && pending.offset == offset &&
+              pending.length == length;
+        });
+    if (duplicate == state.pending_invalidations.end()) {
+      state.pending_invalidations.push_back(
+          State::PendingInvalidation{inode, offset, length});
+    }
+    state.cache_condition.notify_all();
+  } catch (...) {
+    if (!state.page_cache_invalidate_warned.exchange(
+            true, std::memory_order_relaxed)) {
+      fprintf(stderr,
+              "warning: unable to queue stale page-cache invalidation: "
+              "inode=%" PRIu64 "\n",
+              uint64_t(inode));
+    }
   }
 }
 
@@ -1220,9 +1261,9 @@ Response request_with_retries(Request&& request, const char* operation,
       if (ambiguous != nullptr) {
         *ambiguous = true;
       }
-      std::cerr << "warning: retrying " << operation
-                << " after HTTP status " << response.status
-                << " attempt=" << attempt + 1 << '\n';
+      fprintf(stderr,
+              "warning: retrying %s after HTTP status %d attempt=%u\n",
+              operation, response.status, attempt + 1);
       delayed = retry_after_delay(response);
     } catch (...) {
       check_request_stop();
@@ -1233,9 +1274,9 @@ Response request_with_retries(Request&& request, const char* operation,
       if (attempt == 3) {
         std::rethrow_exception(last_error);
       }
-      std::cerr << "warning: retrying " << operation
-                << " after transport failure attempt="
-                << attempt + 1 << '\n';
+      fprintf(stderr,
+              "warning: retrying %s after transport failure attempt=%u\n",
+              operation, attempt + 1);
     }
     check_request_stop();
     if (!delayed) {
@@ -1757,12 +1798,12 @@ void prepare_file_descriptor_budget(const MountConfig& config,
       return;
     }
   }
-  std::cerr << "warning: RLIMIT_NOFILE=" << limit.rlim_cur
-            << " is below the estimated " << needed
-            << " descriptors needed to use --max-pinned-memory="
-            << config.max_pinned_memory
-            << "; writes may fail before reaching the configured memory "
-               "budget\n";
+  fprintf(stderr,
+          "warning: RLIMIT_NOFILE=%" PRIu64
+          " is below the estimated %" PRIu64
+          " descriptors needed to use --max-pinned-memory=%" PRIu64
+          "; writes may fail before reaching the configured memory budget\n",
+          uint64_t(limit.rlim_cur), needed, config.max_pinned_memory);
 }
 
 State& state_from(fuse_req_t request) {
@@ -1867,14 +1908,26 @@ void reply_callback_error(fuse_req_t request) noexcept {
   if (state.config.stats_interval_seconds != 0) {
     state.request_errors.fetch_add(1, std::memory_order_relaxed);
   }
+  const uint64_t now = fuse_monotonic_ns_noexcept();
+  constexpr uint64_t interval = 1000ULL * 1000ULL * 1000ULL;
+  uint64_t previous =
+      state.request_error_warning_ns.load(std::memory_order_relaxed);
+  bool log = now != 0 &&
+      (previous == 0 || now - previous >= interval) &&
+      state.request_error_warning_ns.compare_exchange_strong(
+          previous, now, std::memory_order_relaxed);
   try {
     throw;
   } catch (const std::system_error& error) {
     const int value = error.code().value();
-    std::cerr << "ngs3fs request failed: " << error.what() << '\n';
+    if (log) {
+      fprintf(stderr, "ngs3fs request failed: %s\n", error.what());
+    }
     fuse_reply_err(request, value > 0 ? value : EIO);
   } catch (const std::exception& error) {
-    std::cerr << "ngs3fs request failed: " << error.what() << '\n';
+    if (log) {
+      fprintf(stderr, "ngs3fs request failed: %s\n", error.what());
+    }
     fuse_reply_err(request, EIO);
   } catch (...) {
     fuse_reply_err(request, EIO);
@@ -2195,23 +2248,24 @@ void configure_checksum(State& state) {
           "HEAD", path, headers, 4096);
       service = checksum_service_from_response(response);
     } catch (const std::exception& error) {
-      std::cerr << "warning: checksum provider probe failed: "
-                << error.what() << '\n';
+      fprintf(stderr, "warning: checksum provider probe failed: %s\n",
+              error.what());
     }
   }
   switch (service) {
     case CHECKSUM_SERVICE_AWS:
       state.config.checksum = CHECKSUM_XXHASH128;
-      std::cerr << "checksum auto selected xxhash128 for Amazon S3\n";
+      fprintf(stderr, "checksum auto selected xxhash128 for Amazon S3\n");
       break;
     case CHECKSUM_SERVICE_OSS:
       state.config.checksum = CHECKSUM_CRC64XZ;
-      std::cerr << "checksum auto selected crc64xz for Alibaba OSS\n";
+      fprintf(stderr, "checksum auto selected crc64xz for Alibaba OSS\n");
       break;
     case CHECKSUM_SERVICE_UNKNOWN:
       state.config.checksum = CHECKSUM_PROTOCOL_DEFAULT;
-      std::cerr << "checksum auto selected protocol default because the "
-                   "endpoint did not advertise a known checksum service\n";
+      fprintf(stderr,
+              "checksum auto selected protocol default because the "
+              "endpoint did not advertise a known checksum service\n");
       break;
   }
   state.config.checksum_service = service;
@@ -2327,6 +2381,94 @@ struct ObjectMetadata {
   std::string write_id;
 };
 
+using ObjectGeneration = uint64_t;
+
+class InodeMetadataGuard {
+ public:
+  explicit InodeMetadataGuard(InodeFile& file) : file_(file) {
+    uint64_t state = file_.generation_epoch.load(std::memory_order_relaxed);
+    for (;;) {
+      if ((state & kRefreshing) != 0) {
+        file_.generation_epoch.wait(state, std::memory_order_relaxed);
+        state = file_.generation_epoch.load(std::memory_order_relaxed);
+        continue;
+      }
+      if (file_.generation_epoch.compare_exchange_weak(
+              state, state | kRefreshing, std::memory_order_acquire,
+              std::memory_order_relaxed)) {
+        break;
+      }
+    }
+  }
+
+  ~InodeMetadataGuard() {
+    file_.generation_epoch.fetch_and(kEpochMask, std::memory_order_release);
+    file_.generation_epoch.notify_all();
+  }
+
+  InodeMetadataGuard(const InodeMetadataGuard&) = delete;
+  InodeMetadataGuard& operator=(const InodeMetadataGuard&) = delete;
+
+ private:
+  static constexpr uint64_t kRefreshing = 1ULL << 63;
+  static constexpr uint64_t kEpochMask  = kRefreshing - 1;
+  InodeFile& file_;
+};
+
+ObjectGeneration object_generation(std::string_view etag,
+                                   std::string_view version_id,
+                                   uint64_t size, time_t mtime) noexcept {
+  if (!version_id.empty()) {
+    return XXH3_64bits_withSeed(
+        version_id.data(), version_id.size(), 0x56455253494f4eULL);
+  }
+  if (!etag.empty()) {
+    return XXH3_64bits_withSeed(etag.data(), etag.size(), 0x45544147ULL);
+  }
+  const std::array<uint64_t, 2> fallback{
+      size, uint64_t(int64_t(mtime))};
+  return XXH3_64bits_withSeed(
+      fallback.data(), sizeof(fallback), 0x4d54494d45ULL);
+}
+
+uint64_t publish_inode_generation(InodeFile& file,
+                                  ObjectGeneration generation) noexcept {
+  constexpr uint64_t refreshing = 1ULL << 63;
+  constexpr uint64_t epoch_mask = refreshing - 1;
+  uint64_t epoch = file.generation_epoch.load(std::memory_order_relaxed) &
+      epoch_mask;
+  const bool known = epoch != 0;
+  const bool changed = known &&
+      file.generation_hash.load(std::memory_order_relaxed) != generation;
+  if (!known || changed) {
+    file.generation_hash.store(generation, std::memory_order_relaxed);
+    epoch = epoch == epoch_mask ? 1 : epoch + 1;
+    file.generation_epoch.store(epoch | refreshing,
+                                std::memory_order_release);
+  }
+  return epoch;
+}
+
+bool stale_old_inode_readers(State& state, InodeFile& file,
+                             OpenHandle& current,
+                             uint64_t generation_epoch) noexcept {
+  bool found = false;
+  std::lock_guard guard(state.open_files_mutex);
+  for (auto& [path, opened] : state.open_files) {
+    (void)path;
+    for (OpenHandle* handle : opened.handles) {
+      if (handle != nullptr && handle != &current &&
+          handle->item == &file && !handle->writable &&
+          handle->generation_epoch != 0 &&
+          handle->generation_epoch != generation_epoch) {
+        handle->stale.store(true, std::memory_order_release);
+        found = true;
+      }
+    }
+  }
+  return found;
+}
+
 ObjectMetadata head_object(State& state, std::string_view path) {
   const Response response = request_with_retries([&] {
     const auto authorization = authorization_headers(
@@ -2394,9 +2536,10 @@ bool recover_write_commit(State& state, const OpenHandle& handle,
     }
     response.headers.insert_or_assign(
         ssostr<32>("last-modified"), std::move(metadata.last_modified));
-    std::cerr << "warning: recovered an ambiguous S3 write commit with "
-                 "HeadObject: "
-              << handle.object_path << '\n';
+    fprintf(stderr,
+            "warning: recovered an ambiguous S3 write commit with "
+            "HeadObject: %s\n",
+            handle.object_path.c_str());
     return true;
   } catch (...) {
     return false;
@@ -2404,16 +2547,44 @@ bool recover_write_commit(State& state, const OpenHandle& handle,
 }
 
 bool refresh_open_metadata(State& state, OpenHandle& handle) {
+  InodeFile& item = *handle.item;
+  InodeMetadataGuard metadata_guard(item);
   ObjectMetadata metadata = head_object(state, handle.object_path);
-  const bool keep_cache = handle.item->page_cache_valid() &&
-      handle.item->fsize.load(std::memory_order_relaxed) == metadata.size &&
-      handle.item->mtime.load(std::memory_order_relaxed) == metadata.mtime;
-  handle.item->fsize.store(metadata.size, std::memory_order_relaxed);
-  handle.item->mtime.store(metadata.mtime, std::memory_order_relaxed);
-  handle.item->set_page_cache_valid(keep_cache);
+  const ObjectGeneration generation = object_generation(
+      metadata.etag, metadata.version_id, metadata.size, metadata.mtime);
+  const uint64_t previous_epoch =
+      item.generation_epoch.load(std::memory_order_acquire) &
+      ((1ULL << 63) - 1);
+  const bool changed = previous_epoch != 0 &&
+      item.generation_hash.load(std::memory_order_relaxed) != generation;
+  const bool keep_cache = item.page_cache_valid() && !changed &&
+      item.fsize.load(std::memory_order_relaxed) == metadata.size;
+  if (changed) {
+    item.set_page_cache_valid(false);
+  }
+  item.fsize.store(metadata.size, std::memory_order_relaxed);
+  item.mtime.store(metadata.mtime, std::memory_order_relaxed);
+  handle.generation_epoch = publish_inode_generation(item, generation);
+  handle.stale.store(false, std::memory_order_release);
+  item.set_page_cache_valid(keep_cache);
   handle.size        = metadata.size;
   handle.etag        = std::move(metadata.etag);
   handle.version_id  = std::move(metadata.version_id);
+  const bool old_readers = stale_old_inode_readers(
+      state, item, handle, handle.generation_epoch);
+  if (changed) {
+    fprintf(stderr, "warning: S3 object generation changed: path=%s\n",
+            handle.object_path.c_str());
+  }
+  if (changed || old_readers) {
+    item.set_page_cache_valid(false);
+    invalidate_page_cache(state, handle.inode);
+  }
+  if (old_readers) {
+    throw std::system_error(
+        EBUSY, std::generic_category(),
+        "old object generation still has open readers");
+  }
   return keep_cache;
 }
 
@@ -2731,8 +2902,8 @@ class ResponseCreditGuard {
       try {
         client_.consume(response_);
       } catch (const std::exception& error) {
-        std::cerr << "failed to discard transport receive credit: "
-                  << error.what() << '\n';
+        fprintf(stderr, "failed to discard transport receive credit: %s\n",
+                error.what());
       }
     }
   }
@@ -3278,11 +3449,10 @@ void cache_inode_tree_deleted(State& state, const InodeBase& item) noexcept {
       std::memory_order_relaxed)) {
   }
   if (old < count) {
-    try {
-      std::cerr << "error: inode cache accounting underflow: used=" << old
-                << " deleting=" << count << '\n';
-    } catch (...) {
-    }
+    fprintf(stderr,
+            "error: inode cache accounting underflow: used=%zu "
+            "deleting=%zu\n",
+            old, count);
   }
   state.cache_condition.notify_all();
 }
@@ -3700,35 +3870,44 @@ void warn_inode_cache_budget(State& state) noexcept {
   }
   state.cache_budget_warned = true;
   state.cache_warning_ns    = now;
-  try {
-    std::cerr << "warning: inode cache remains above soft limit: used="
-              << state.cached_inodes.load(std::memory_order_relaxed)
-              << " limit=" << state.config.max_cached_inodes
-              << "; referenced, open, pending, or fresh entries are retained\n";
-  } catch (...) {
-  }
+  fprintf(stderr,
+          "warning: inode cache remains above soft limit: used=%zu "
+          "limit=%zu; referenced, open, pending, or fresh entries are "
+          "retained\n",
+          state.cached_inodes.load(std::memory_order_relaxed),
+          state.config.max_cached_inodes);
 }
 
 void cache_reclaim_loop(std::stop_token stop, State* state) noexcept {
   while (!stop.stop_requested()) {
     size_t scan_limit = 0;
+    std::deque<State::PendingInvalidation> invalidations;
     {
       std::unique_lock guard(state->cache_mutex);
       state->cache_condition.wait_for(
           guard, std::chrono::milliseconds(250), [&] {
             return stop.stop_requested() ||
+                !state->pending_invalidations.empty() ||
                 state->cached_inodes.load(std::memory_order_acquire) >
                     state->config.max_cached_inodes;
           });
       if (stop.stop_requested()) {
         return;
       }
+      invalidations.swap(state->pending_invalidations);
       if (state->cached_inodes.load(std::memory_order_acquire) <=
           state->config.max_cached_inodes) {
         state->cache_budget_warned = false;
-        continue;
+      } else {
+        scan_limit = state->cache_clock_size * 2 + 1;
       }
-      scan_limit = state->cache_clock_size * 2 + 1;
+    }
+    for (const State::PendingInvalidation& pending : invalidations) {
+      invalidate_page_cache(*state, pending.inode,
+                            pending.offset, pending.length);
+    }
+    if (scan_limit == 0) {
+      continue;
     }
 
     size_t reclaimed = 0;
@@ -3761,11 +3940,8 @@ void cache_reclaim_loop(std::stop_token stop, State* state) noexcept {
       try {
         reclaimed += reclaim_cached_children(*state, *item);
       } catch (const std::exception& error) {
-        try {
-          std::cerr << "warning: inode cache reclamation failed: "
-                    << error.what() << '\n';
-        } catch (...) {
-        }
+        fprintf(stderr, "warning: inode cache reclamation failed: %s\n",
+                error.what());
       } catch (...) {
       }
       if (release_inode_count(item->open_count)) {
@@ -3967,11 +4143,6 @@ void update_written_metadata(State& state, OpenHandle& handle,
     used_head = true;
     mtime     = metadata.mtime;
   }
-  InodeFile& item = *handle.item;
-  item.fsize.store(handle.stream_offset, std::memory_order_relaxed);
-  item.mtime.store(mtime, std::memory_order_relaxed);
-  item.set_page_cache_valid(!handle.page_cache_store_failed);
-  item.set_pending(false);
   const auto etag = response.headers.find("etag");
   if (etag != response.headers.end()) {
     assign_string(handle.etag, etag->second);
@@ -3990,6 +4161,15 @@ void update_written_metadata(State& state, OpenHandle& handle,
   } else {
     handle.version_id.clear();
   }
+  InodeFile& item = *handle.item;
+  InodeMetadataGuard metadata_guard(item);
+  item.fsize.store(handle.stream_offset, std::memory_order_relaxed);
+  item.mtime.store(mtime, std::memory_order_relaxed);
+  item.set_page_cache_valid(!handle.page_cache_store_failed);
+  item.set_pending(false);
+  handle.generation_epoch = publish_inode_generation(
+      item, object_generation(handle.etag, handle.version_id,
+                              handle.stream_offset, mtime));
 }
 
 void require_s3_success(const Response& response, const char* operation) {
@@ -4011,11 +4191,12 @@ void warn_budget_locked(State& state) noexcept {
   constexpr uint64_t interval = 5ULL * 1000ULL * 1000ULL * 1000ULL;
   if (!state.budget_exhausted ||
       now - state.budget_warning_ns >= interval) {
-    std::cerr << "warning: pinned write budget exhausted: used="
-              << state.pinned_bytes
-              << " limit=" << state.config.max_pinned_memory
-              << " part_size=" << state.config.part_size
-              << " waiting_handles=" << state.waiting_writers << '\n';
+    fprintf(stderr,
+            "warning: pinned write budget exhausted: used=%" PRIu64
+            " limit=%" PRIu64 " part_size=%" PRIu64
+            " waiting_handles=%u\n",
+            state.pinned_bytes, state.config.max_pinned_memory,
+            state.config.part_size, state.waiting_writers);
     state.budget_warning_ns = now;
   }
   state.budget_exhausted = true;
@@ -4050,7 +4231,8 @@ void release_part_budget(State& state) noexcept {
   {
     std::lock_guard guard(state.budget_mutex);
     if (state.pinned_bytes < state.config.part_size) {
-      std::cerr << "warning: pinned write budget accounting underflow\n";
+      fprintf(stderr,
+              "warning: pinned write budget accounting underflow\n");
       state.pinned_bytes = 0;
     } else {
       state.pinned_bytes -= state.config.part_size;
@@ -4058,9 +4240,10 @@ void release_part_budget(State& state) noexcept {
     if (state.budget_exhausted &&
         state.pinned_bytes <=
             state.config.max_pinned_memory - state.config.part_size) {
-      std::cerr << "pinned write budget recovered: used="
-                << state.pinned_bytes
-                << " limit=" << state.config.max_pinned_memory << '\n';
+      fprintf(stderr,
+              "pinned write budget recovered: used=%" PRIu64
+              " limit=%" PRIu64 "\n",
+              state.pinned_bytes, state.config.max_pinned_memory);
       state.budget_exhausted = false;
     }
   }
@@ -4281,7 +4464,18 @@ bool store_cached_partial_pages(State& state,
       while (offset < end) {
         const size_t length = size_t(std::min<uint64_t>(
             end - offset, maximum_chunk));
-        fuse_bufvec buffers = FUSE_BUFVEC_INIT(length);
+        fuse_bufvec buffers{
+            .count = 1,
+            .idx   = 0,
+            .off   = 0,
+            .buf   = {{
+                .size  = length,
+                .flags = fuse_buf_flags(0),
+                .mem   = nullptr,
+                .fd    = -1,
+                .pos   = 0,
+            }},
+        };
         buffers.buf[0].flags = fuse_buf_flags(
             FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
         buffers.buf[0].fd  = handle.cache_entry->data_fd();
@@ -4359,15 +4553,17 @@ void ensure_multipart(State& state, OpenHandle& handle) {
       HttpPool::Lease client = state.http->acquire();
       response = client->request_no_body("POST", path, headers);
     } catch (...) {
-      std::cerr << "error: CreateMultipartUpload outcome unknown; an orphan "
-                   "upload may require lifecycle cleanup: "
-                << handle.object_path << '\n';
+      fprintf(stderr,
+              "error: CreateMultipartUpload outcome unknown; an orphan "
+              "upload may require lifecycle cleanup: %s\n",
+              handle.object_path.c_str());
       throw;
     }
     if (retryable_status(response.status)) {
-      std::cerr << "error: not retrying ambiguous CreateMultipartUpload: "
-                << "status=" << response.status
-                << " path=" << handle.object_path << '\n';
+      fprintf(stderr,
+              "error: not retrying ambiguous CreateMultipartUpload: "
+              "status=%d path=%s\n",
+              response.status, handle.object_path.c_str());
     }
     require_s3_success(response, "CreateMultipartUpload");
     if (checksum_is_s3(state.config.checksum)) {
@@ -4608,9 +4804,10 @@ void record_memory_fallback(State& state, size_t bytes) noexcept {
   constexpr uint64_t interval = 5ULL * 1000ULL * 1000ULL * 1000ULL;
   if (state.fallback_warning_ns == 0 ||
       now - state.fallback_warning_ns >= interval) {
-    std::cerr << "warning: copying memory-backed FUSE_WRITE data: bytes="
-              << bytes << " cumulative_bytes="
-              << state.fallback_write_bytes << '\n';
+    fprintf(stderr,
+            "warning: copying memory-backed FUSE_WRITE data: bytes=%zu "
+            "cumulative_bytes=%" PRIu64 "\n",
+            bytes, state.fallback_write_bytes);
     state.fallback_warning_ns = now;
   }
 }
@@ -4721,8 +4918,8 @@ Response put_object(State& state, OpenHandle& handle,
       if (recover_write_commit(state, handle, recovered)) {
         return recovered;
       }
-      std::cerr << "error: PutObject commit outcome unknown: "
-                << handle.object_path << '\n';
+      fprintf(stderr, "error: PutObject commit outcome unknown: %s\n",
+              handle.object_path.c_str());
       throw std::system_error(EIO, std::generic_category(),
                               "PutObject commit outcome unknown");
     }
@@ -4779,8 +4976,9 @@ void complete_multipart(State& state, OpenHandle& handle) {
         handle.part_sizes.clear();
         return;
       }
-      std::cerr << "error: CompleteMultipartUpload commit outcome unknown: "
-                << handle.object_path << '\n';
+      fprintf(stderr,
+              "error: CompleteMultipartUpload commit outcome unknown: %s\n",
+              handle.object_path.c_str());
       throw std::system_error(EIO, std::generic_category(),
                               "multipart commit outcome unknown");
     }
@@ -4797,8 +4995,9 @@ void complete_multipart(State& state, OpenHandle& handle) {
       handle.part_sizes.clear();
       return;
     }
-    std::cerr << "error: CompleteMultipartUpload commit outcome unknown: "
-              << handle.object_path << '\n';
+    fprintf(stderr,
+            "error: CompleteMultipartUpload commit outcome unknown: %s\n",
+            handle.object_path.c_str());
     throw std::system_error(EIO, std::generic_category(),
                             "multipart commit outcome unknown");
   }
@@ -4962,8 +5161,8 @@ void abort_multipart(State& state, OpenHandle& handle) noexcept {
     HttpPool::Lease client = state.http->acquire();
     client->request_no_body("DELETE", path, headers);
   } catch (const std::exception& error) {
-    std::cerr << "failed to abort S3 multipart upload: "
-              << error.what() << '\n';
+    fprintf(stderr, "failed to abort S3 multipart upload: %s\n",
+            error.what());
   }
   handle.upload_id.clear();
 }
@@ -5106,8 +5305,8 @@ void abort_copy_upload(State& state, std::string_view destination,
     HttpPool::Lease client = state.http->acquire();
     client->request_no_body("DELETE", path, headers);
   } catch (const std::exception& error) {
-    std::cerr << "warning: failed to abort multipart copy: "
-              << error.what() << '\n';
+    fprintf(stderr, "warning: failed to abort multipart copy: %s\n",
+            error.what());
   }
 }
 
@@ -5126,9 +5325,10 @@ void multipart_copy_object(State& state, uint64_t size,
     created = create_client->request_no_body(
         "POST", create_path, create_headers);
   } catch (...) {
-    std::cerr << "error: multipart-copy CreateMultipartUpload outcome "
-                 "unknown; lifecycle cleanup may be required: "
-              << destination << '\n';
+    fprintf(stderr,
+            "error: multipart-copy CreateMultipartUpload outcome unknown; "
+            "lifecycle cleanup may be required: %.*s\n",
+            int(destination.size()), destination.data());
     throw;
   }
   require_s3_success(created, "multipart-copy CreateMultipartUpload");
@@ -5235,8 +5435,9 @@ void multipart_copy_object(State& state, uint64_t size,
     completed_xml.result_root("CompleteMultipartUploadResult");
   } catch (...) {
     if (complete_outcome_unknown) {
-      std::cerr << "error: multipart-copy completion outcome unknown: "
-                << destination << '\n';
+      fprintf(stderr,
+              "error: multipart-copy completion outcome unknown: %.*s\n",
+              int(destination.size()), destination.data());
     } else {
       abort_copy_upload(state, destination, upload_id);
     }
@@ -6270,9 +6471,6 @@ bool service_cached_checksums(State& state, OpenHandle& handle,
         continue;
       }
       entry.checksum_mismatch(claim);
-      // TODO: invalidate kernel pages only after the FUSE_READ reply has
-      // completed. notify_inval_inode from this path can wait on that same
-      // request's locked folio and deadlock with an immediate following read.
       HttpPool::Lease acquired;
       if (existing == nullptr || !*existing) {
         acquired = state.http->acquire();
@@ -6433,6 +6631,9 @@ bool read_cached(State& state, OpenHandle& handle,
                     "error: cached S3 checksum retry failed: path=%s "
                     "offset=%" PRIu64 " bytes=%zu\n",
                     handle.object_path.c_str(), claim.offset, claim.length);
+            queue_page_invalidation(
+                state, handle.inode, off_t(claim.offset),
+                off_t(claim.length));
             return true;
           }
           throw std::system_error(EIO, std::generic_category(),
@@ -6449,6 +6650,9 @@ bool read_cached(State& state, OpenHandle& handle,
                   "error: cached S3 part checksum retry failed: path=%s "
                   "offset=%" PRIu64 " bytes=%zu\n",
                   handle.object_path.c_str(), claim.offset, claim.length);
+          queue_page_invalidation(
+              state, handle.inode, off_t(claim.offset),
+              off_t(claim.length));
           return true;
         }
         throw std::system_error(EIO, std::generic_category(),
@@ -6457,6 +6661,11 @@ bool read_cached(State& state, OpenHandle& handle,
     } catch (...) {
       entry.fail_fetch(claim);
       if (sink.replied()) {
+        if (entry.range_bad(claim.offset, claim.length)) {
+          queue_page_invalidation(
+              state, handle.inode, off_t(claim.offset),
+              off_t(claim.length));
+        }
         try {
           throw;
         } catch (const std::exception& error) {
@@ -6498,6 +6707,14 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
     if (handle.stale.load(std::memory_order_acquire)) {
       throw std::system_error(ESTALE, std::generic_category(),
                               "stale open file");
+    }
+    if (!handle.recovery_read && handle.generation_epoch != 0 &&
+        (handle.item->generation_epoch.load(std::memory_order_acquire) &
+         ((1ULL << 63) - 1)) !=
+            handle.generation_epoch) {
+      handle.stale.store(true, std::memory_order_release);
+      throw std::system_error(ESTALE, std::generic_category(),
+                              "stale open file generation");
     }
     if (handle.inode != inode) {
       throw std::system_error(EBADF, std::generic_category(), "read inode");
@@ -6566,8 +6783,9 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
           const bool retry_signed = selected_signed || expected == 2;
           if (retry_signed) {
             if (selected_signed) {
-              std::cerr << "warning: S3 endpoint rejected an unsigned Range "
-                           "header; signing Range for this mount\n";
+              fprintf(stderr,
+                      "warning: S3 endpoint rejected an unsigned Range "
+                      "header; signing Range for this mount\n");
             }
             if (response.requires_consume) {
               client.consume(response);
@@ -6650,35 +6868,34 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
       const uint64_t residual_ns =
           total_ns > transport_span_ns ? total_ns - transport_span_ns : 0;
       std::lock_guard metrics_guard(state.metrics_mutex);
-      std::cerr << "{\"event\":\"read\",\"offset\":"
-                << unsigned_offset << ",\"bytes\":" << wanted
-                << ",\"fetched_bytes\":" << wanted
-                << ",\"cache_hit\":false"
-                << ",\"total_ns\":" << total_ns
-                << ",\"transport_span_ns\":" << transport_span_ns
-                << ",\"residual_ns\":" << residual_ns
-                << ",\"cpu_ns\":" << cpu_complete_ns - cpu_start_ns
-                << ",\"external_bytes\":"
-                << response.externally_spliced_bytes
-                << ",\"fallback_bytes\":"
-                << response.fallback_copied_bytes
-                << ",\"transport_splice_calls\":"
-                << response.transport_splice_calls << "}\n";
+      fprintf(stderr,
+              "{\"event\":\"read\",\"offset\":%" PRIu64
+              ",\"bytes\":%zu,\"fetched_bytes\":%zu"
+              ",\"cache_hit\":false,\"total_ns\":%" PRIu64
+              ",\"transport_span_ns\":%" PRIu64
+              ",\"residual_ns\":%" PRIu64 ",\"cpu_ns\":%" PRIu64
+              ",\"external_bytes\":%zu,\"fallback_bytes\":%zu"
+              ",\"transport_splice_calls\":%zu}\n",
+              unsigned_offset, wanted, wanted, total_ns, transport_span_ns,
+              residual_ns, cpu_complete_ns - cpu_start_ns,
+              response.externally_spliced_bytes,
+              response.fallback_copied_bytes,
+              response.transport_splice_calls);
     }
 
     // Return transport flow-control credit only after libfuse has drained the
     // pipe into /dev/fuse. HTTP/1.1 has no application-managed credit, so its
     // consume operation is intentionally a no-op.
     if (reply_result != 0) {
-      std::cerr << "fuse_reply_data failed: "
-                << strerror(-reply_result) << '\n';
+      fprintf(stderr, "fuse_reply_data failed: %s\n",
+              strerror(-reply_result));
     }
     try {
       credit.consume();
     } catch (const std::exception& error) {
       // The FUSE request was already answered. Do not attempt a second reply.
-      std::cerr << "failed to return transport receive credit: " << error.what()
-                << '\n';
+      fprintf(stderr, "failed to return transport receive credit: %s\n",
+              error.what());
     }
     if (reply_result == 0) {
       if (state.config.stats_interval_seconds != 0) {
@@ -6689,6 +6906,16 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
     }
   } catch (...) {
     reply_callback_error(request);
+    if (use_cache && handle.cache_entry && offset >= 0) {
+      const uint64_t begin = uint64_t(offset);
+      const uint64_t object_size = handle.size;
+      const size_t wanted = begin >= object_size ? 0 : size_t(
+          std::min<uint64_t>(size, object_size - begin));
+      if (wanted != 0 && handle.cache_entry->range_bad(begin, wanted)) {
+        queue_page_invalidation(
+            state, handle.inode, offset, off_t(wanted));
+      }
+    }
   }
 }
 
@@ -6833,9 +7060,11 @@ void UncachedFileWriter::write(State& state, OpenHandle& handle,
     handle.write_in_progress = true;
     if (!handle.part_limit_warned &&
         end > state.config.part_size * 9000ULL) {
-      std::cerr << "warning: sequential write is approaching the configured "
-                   "10,000-part limit: bytes="
-                << end << " maximum=" << maximum_size << '\n';
+      fprintf(stderr,
+              "warning: sequential write is approaching the configured "
+              "10,000-part limit: bytes=%" PRIu64 " maximum=%" PRIu64
+              "\n",
+              end, maximum_size);
       handle.part_limit_warned = true;
     }
 
@@ -9000,67 +9229,67 @@ void ngs3fs_fsyncdir(fuse_req_t request, fuse_ino_t, int,
 }
 
 void print_help() {
-  std::cout
-      << "ngs3fs options:\n"
-      << "  -e, --endpoint-host HOST  S3 endpoint (required)\n"
-      << "  -p, --endpoint-port PORT  endpoint port (default 80)\n"
-      << "  -a, --authority VALUE     HTTP/2 :authority (default HOST:PORT)\n"
-      << "  -b, --bucket NAME         S3 bucket (required)\n"
-      << "  -k, --prefix PREFIX       optional raw object-key prefix\n"
-      << "  -r, --region REGION       SigV4 region (default us-east-1)\n"
-      << "  -K, --checksum ALGORITHM  upload checksum: auto, default, none, "
-         "crc32, crc32c, crc64nvme, sha1, sha256, md5, xxhash64, "
-         "xxhash3, xxhash128, sha512, crc64xz (default auto)\n"
-      << "      --verify-read-checksum\n"
-         "                             background best-effort verification; "
-         "the first read may finish first (default off)\n"
-      << "  -L, --cache-dir PATH      persistent sparse local cache (default off)\n"
-      << "      --cache-size BYTES    maximum physical cache allocation; "
-         "0 is unlimited (default 0)\n"
-      << "      --cache-reserve SIZE|PERCENT\n"
-         "                             preserve cache-filesystem free space "
-         "(default 5%)\n"
-      << "      --max-cache-fetch-size BYTES\n"
-         "                             maximum adaptive cache fill "
-         "(default 8 MiB, minimum 1 MiB)\n"
-      << "      --io-size BYTES       statfs optimal I/O size; accepts "
-         "KiB/MiB (default 256 KiB)\n"
-      << "      --connect-timeout MS  TCP connect timeout (default 5000)\n"
-      << "      --request-timeout MS  no-I/O-progress timeout "
-         "(default 30000)\n"
-      << "      --protocol-probe-timeout MS\n"
-         "                             cleartext HTTP/2 probe timeout "
-         "(default 1000)\n"
-      << "      --socket-buffer-size BYTES\n"
-         "                             TCP receive buffer per connection; "
-         "0 keeps kernel autotuning (default max(2 MiB, max_read))\n"
-      << "      --metadata-timeout MS credential metadata timeout "
-         "(default 1000)\n"
-      << "      --stats-interval SEC emit aggregate JSON stats to stderr; "
-         "0 disables (default 0)\n"
-      << "  -R, --read-ahead BYTES    kernel read-ahead; accepts "
-         "KiB/MiB (default 256 KiB)\n"
-      << "  -T, --dir-cache-timeout MS\n"
-         "                             directory cache TTL "
-         "(default 1000)\n"
-      << "  -I, --max-cached-inodes N soft inode-cache limit "
-         "(default 1000000)\n"
-      << "  -P, --part-size BYTES     multipart part size (default 8 MiB)\n"
-      << "  -c, --max-uploads N       concurrent uploads (default 4)\n"
-      << "  -C, --max-connections N   connection pool size (default 8)\n"
-      << "  -B, --max-pinned-memory BYTES\n"
-         "                             retained write budget (default 256 MiB)\n"
-      << "  credentials            AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, "
-         "AWS_SESSION_TOKEN, shared profiles, credential_process, web "
-         "identity, ECS, or IMDSv2\n"
-      << "  -u, --uid UID             getattr owner (default mount user)\n"
-      << "  -g, --gid GID             getattr group (default mount group)\n"
-      << "  -m, --file-mode OCTAL     object file mode (default 0644)\n"
-      << "  -D, --dir-mode OCTAL      directory mode (default 0755)\n"
-      << "  -M, --metrics             emit per-read latency JSONL\n"
-      << "  -S, --tls                 require TLS; port 443 enables it "
-         "automatically\n"
-      << "usage: ngs3fs [options] [FUSE options] <mountpoint>\n";
+  fputs(
+      "ngs3fs options:\n"
+      "  -e, --endpoint-host HOST  S3 endpoint (required)\n"
+      "  -p, --endpoint-port PORT  endpoint port (default 80)\n"
+      "  -a, --authority VALUE     HTTP/2 :authority (default HOST:PORT)\n"
+      "  -b, --bucket NAME         S3 bucket (required)\n"
+      "  -k, --prefix PREFIX       optional raw object-key prefix\n"
+      "  -r, --region REGION       SigV4 region (default us-east-1)\n"
+      "  -K, --checksum ALGORITHM  upload checksum: auto, default, none, "
+      "crc32, crc32c, crc64nvme, sha1, sha256, md5, xxhash64, "
+      "xxhash3, xxhash128, sha512, crc64xz (default auto)\n"
+      "      --verify-read-checksum\n"
+      "                             background best-effort verification; "
+      "the first read may finish first (default off)\n"
+      "  -L, --cache-dir PATH      persistent sparse local cache (default off)\n"
+      "      --cache-size BYTES    maximum physical cache allocation; "
+      "0 is unlimited (default 0)\n"
+      "      --cache-reserve SIZE|PERCENT\n"
+      "                             preserve cache-filesystem free space "
+      "(default 5%)\n"
+      "      --max-cache-fetch-size BYTES\n"
+      "                             maximum adaptive cache fill "
+      "(default 8 MiB, minimum 1 MiB)\n"
+      "      --io-size BYTES       statfs optimal I/O size; accepts "
+      "KiB/MiB (default 256 KiB)\n"
+      "      --connect-timeout MS  TCP connect timeout (default 5000)\n"
+      "      --request-timeout MS  no-I/O-progress timeout "
+      "(default 30000)\n"
+      "      --protocol-probe-timeout MS\n"
+      "                             cleartext HTTP/2 probe timeout "
+      "(default 1000)\n"
+      "      --socket-buffer-size BYTES\n"
+      "                             TCP receive buffer per connection; "
+      "0 keeps kernel autotuning (default max(2 MiB, max_read))\n"
+      "      --metadata-timeout MS credential metadata timeout "
+      "(default 1000)\n"
+      "      --stats-interval SEC emit aggregate JSON stats to stderr; "
+      "0 disables (default 0)\n"
+      "  -R, --read-ahead BYTES    kernel read-ahead; accepts "
+      "KiB/MiB (default 256 KiB)\n"
+      "  -T, --dir-cache-timeout MS\n"
+      "                             directory cache TTL (default 1000)\n"
+      "  -I, --max-cached-inodes N soft inode-cache limit "
+      "(default 1000000)\n"
+      "  -P, --part-size BYTES     multipart part size (default 8 MiB)\n"
+      "  -c, --max-uploads N       concurrent uploads (default 4)\n"
+      "  -C, --max-connections N   connection pool size (default 8)\n"
+      "  -B, --max-pinned-memory BYTES\n"
+      "                             retained write budget (default 256 MiB)\n"
+      "  credentials            AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, "
+      "AWS_SESSION_TOKEN, shared profiles, credential_process, web "
+      "identity, ECS, or IMDSv2\n"
+      "  -u, --uid UID             getattr owner (default mount user)\n"
+      "  -g, --gid GID             getattr group (default mount group)\n"
+      "  -m, --file-mode OCTAL     object file mode (default 0644)\n"
+      "  -D, --dir-mode OCTAL      directory mode (default 0755)\n"
+      "  -M, --metrics             emit per-read latency JSONL\n"
+      "  -S, --tls                 require TLS; port 443 enables it "
+      "automatically\n"
+      "usage: ngs3fs [options] [FUSE options] <mountpoint>\n",
+      stdout);
 }
 
 int run(int argc, char** argv) {
@@ -9084,10 +9313,10 @@ int run(int argc, char** argv) {
       throw std::runtime_error("write splice pipe has no payload capacity");
     }
     if (config.maximum_write_size < kPreferredIoSize) {
-      std::cerr << "warning: reducing FUSE max_write to "
-                << config.maximum_write_size
-                << " bytes so libfuse can retain requests in its splice "
-                   "receive pipe\n";
+      fprintf(stderr,
+              "warning: reducing FUSE max_write to %zu bytes so libfuse "
+              "can retain requests in its splice receive pipe\n",
+              config.maximum_write_size);
     }
     prepare_file_descriptor_budget(config, pipe_probe.capacity());
     const std::string maximum_read_option =
@@ -9102,7 +9331,7 @@ int run(int argc, char** argv) {
       throw std::runtime_error("unable to enable automatic unmount");
     }
   } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
+    fprintf(stderr, "%s\n", error.what());
     fuse_opt_free_args(&arguments);
     return 2;
   }
@@ -9120,14 +9349,14 @@ int run(int argc, char** argv) {
     return 0;
   }
   if (options.mountpoint == nullptr) {
-    std::cerr << "missing mountpoint\n";
+    fprintf(stderr, "missing mountpoint\n");
     fuse_opt_free_args(&arguments);
     return 2;
   }
   char* canonical_mountpoint = ::realpath(options.mountpoint, nullptr);
   if (canonical_mountpoint == nullptr) {
-    std::cerr << "invalid mountpoint " << options.mountpoint << ": "
-              << strerror(errno) << '\n';
+    fprintf(stderr, "invalid mountpoint %s: %s\n",
+            options.mountpoint, strerror(errno));
     fuse_opt_free_args(&arguments);
     free(options.mountpoint);
     return 2;
@@ -9135,14 +9364,14 @@ int run(int argc, char** argv) {
   free(options.mountpoint);
   options.mountpoint = canonical_mountpoint;
   if (config.endpoint_host.empty() || config.bucket.empty()) {
-    std::cerr << "--endpoint-host and --bucket are required\n";
+    fprintf(stderr, "--endpoint-host and --bucket are required\n");
     fuse_opt_free_args(&arguments);
     free(options.mountpoint);
     return 2;
   }
   if (config.authority.find_first_of("\r\n") != std::string::npos ||
       config.region.find_first_of("\r\n") != std::string::npos) {
-    std::cerr << "authority and region must not contain CR or LF\n";
+    fprintf(stderr, "authority and region must not contain CR or LF\n");
     fuse_opt_free_args(&arguments);
     free(options.mountpoint);
     return 2;
@@ -9151,9 +9380,10 @@ int run(int argc, char** argv) {
   std::string splice_error;
   const bool splice_available = splice_preflight(splice_error);
   if (!splice_available) {
-    std::cerr
-        << "warning: splice(2) preflight failed: " << splice_error
-        << "; FD-backed FUSE writes will use the copied fallback\n";
+    fprintf(stderr,
+            "warning: splice(2) preflight failed: %s; FD-backed FUSE "
+            "writes will use the copied fallback\n",
+            splice_error.c_str());
   }
   int result = 1;
   try {
@@ -9201,7 +9431,7 @@ int run(int argc, char** argv) {
     }
 
     if (fuse_set_signal_handlers(session) != 0) {
-      std::cerr << "warning: failed to install FUSE signal handlers\n";
+      fprintf(stderr, "warning: failed to install FUSE signal handlers\n");
     }
     if (fuse_session_mount(session, options.mountpoint) == 0) {
       const uint32_t requested_read_ahead = state.config.read_ahead_size;
@@ -9209,10 +9439,11 @@ int run(int argc, char** argv) {
       if (!set_kernel_read_ahead(options.mountpoint,
                                  state.config.read_ahead_size,
                                  read_ahead_error)) {
-        std::cerr << "warning: unable to set kernel read-ahead to "
-                  << requested_read_ahead << " bytes: " << read_ahead_error
-                  << "; falling back to kernel value "
-                  << state.config.read_ahead_size << " bytes\n";
+        fprintf(stderr,
+                "warning: unable to set kernel read-ahead to %u bytes: %s; "
+                "falling back to kernel value %u bytes\n",
+                requested_read_ahead, read_ahead_error.c_str(),
+                state.config.read_ahead_size);
       }
       fuse_loop_config loop_config{};
       loop_config.clone_fd         = 1;
@@ -9228,13 +9459,13 @@ int run(int argc, char** argv) {
       }
       fuse_session_unmount(session);
     } else {
-      std::cerr << "failed to mount " << options.mountpoint << ": "
-                << strerror(errno) << '\n';
+      fprintf(stderr, "failed to mount %s: %s\n",
+              options.mountpoint, strerror(errno));
     }
     fuse_remove_signal_handlers(session);
     fuse_session_destroy(session);
   } catch (const std::exception& error) {
-    std::cerr << "ngs3fs startup failed: " << error.what() << '\n';
+    fprintf(stderr, "ngs3fs startup failed: %s\n", error.what());
   }
 
   fuse_opt_free_args(&arguments);

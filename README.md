@@ -64,8 +64,9 @@ multi-file namespace. It remains experimental rather than production-ready.
   checksums are loaded lazily with GetObjectAttributes; a missing, unsupported,
   or unusable manifest skips part verification. A mismatch triggers one exact
   part retry and marks a persistent failure BAD, so later requests reaching
-  ngs3fs fail with `EIO`. Invalidating pages already returned to the kernel is
-  still a TODO because FUSE invalidation can race the locked read folio.
+  ngs3fs fail with `EIO`. After the active FUSE reply completes, a background
+  worker invalidates the affected inode range so later mmap faults also reach
+  the BAD state without racing the request's locked folio.
 - FUSE remains in cached mode; `direct_io` is never enabled.
 - After each upload succeeds, `FUSE_NOTIFY_STORE` consumes the retained
   FD-backed pipe chain into the ordinary kernel page cache, covering partial
@@ -141,10 +142,10 @@ multi-file namespace. It remains experimental rather than production-ready.
   `FUSE_ROOT_ID`, the stable `InodeBase*` value is the inode number; lookup/open
   reference counts defer reclamation until the kernel can no longer use that
   pointer.
-- Read-only open performs HEAD for close-to-open refresh of size, identity,
-  and data. `keep_cache` is disabled. A returned S3 Version ID pins subsequent
-  reads; otherwise `If-Match: ETag` is used and a changed object maps to
-  `ESTALE`.
+- Read-only open performs HEAD for close-to-open refresh of size and object
+  generation. It keeps the inode page cache only when Version ID (preferred),
+  or ETag when no Version ID exists, is unchanged. A changed generation
+  invalidates the inode page cache and makes older open readers `ESTALE`.
 - UID, GID, file mode, and directory mode are mount-wide values supplied by
   `--uid`, `--gid`, `--file-mode`, and `--dir-mode`; none come from S3 metadata.
 - Object size never determines type: zero-byte `Contents` are files.
@@ -286,8 +287,9 @@ A separate two-mount workload races replacement writes through independent
 ngs3fs processes and verifies that the resulting object is complete, then
 lists the same 5,000-entry directory through both caches. The scheduled/manual
 `Provider E2E` workflow runs mmap, multipart upload, concurrent distinct-file
-writes and rename directly against configured Amazon S3 and Alibaba OSS
-accounts; unconfigured providers are reported as skipped rather than passed.
+writes and rename, both with and without the persistent cache, directly
+against configured Amazon S3 and Alibaba OSS accounts. Missing provider
+configuration fails its matrix entries instead of producing a false pass.
 
 Because `fsstress` does not import pre-existing files and its supported create
 operation produces empty files, a separate concurrent random-read stress phase
@@ -474,10 +476,13 @@ random file/offset/length sequence while allowing the kernel's configured
 read-ahead policy.
 
 `scripts/benchmark_random_read.sh` runs both advice modes with isolated,
-alternating ngs3fs/goofys samples and writes an aggregate `samples.csv` plus
-the raw per-sample logs. It drops kernel caches between samples when run with
-enough privilege and removes only the generated backend objects after each
-sample.
+alternating samples and writes an aggregate `samples.csv` plus the raw
+per-sample logs. `REFERENCE_CLIENT=goofys|mountpoint-s3` selects the reference
+implementation. `CACHE_MODE=none|cold|warm` labels and enforces the cache
+state; warm mode warms each client first and then drops the kernel page cache,
+so it measures persistent client-cache value rather than a leftover FUSE page.
+It drops kernel caches between samples when run with enough privilege and
+removes only the generated backend objects after each sample.
 
 The profiler accepts the same workload and advice controls. It produces a
 standard SVG, a searchable/zoomable interactive HTML flame graph, folded
@@ -486,7 +491,19 @@ stacks, and flat/self/inclusive/DSO reports:
 ```sh
 sudo env WORKLOAD=random-read RANDOM_READ_ADVICE=random PERF_EVENT=cpu-clock \
   ./scripts/profile_ngs3fs.sh build/profiles/random-advice
+sudo env WORKLOAD=write CACHE_MODE=warm PERF_EVENT=cpu-clock \
+  ./scripts/profile_ngs3fs.sh build/profiles/cached-write
 ```
+
+The write profile uses a purpose-built single-owner writer rather than shell
+redirection or `dd`: those tools duplicate their output descriptor and close
+the original before writing, which deliberately triggers ngs3fs's
+first-`flush` sealing rule.
+
+`scripts/benchmark_cache_recovery.sh` writes a multipart cached object, waits
+until at least one part has reached S3, kills ngs3fs without closing the
+writer, remounts the same cache, verifies every recovered byte, and records
+restart-to-publication latency and S3 request counts in `summary.csv`.
 
 ## nghttp2 receive invariant
 

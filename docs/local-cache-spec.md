@@ -261,12 +261,10 @@ On mismatch:
 
 The task performing the failed verification owns the retry. Waiting FUSE
 workers never need to run the retry themselves, avoiding worker-pool deadlock.
-Already returned bytes and pinned mapped pages cannot be revoked. Kernel page
-invalidation after an early FUSE reply remains a TODO: issuing
-`notify_inval_inode` from the completing request, or racing it with an
-immediate following read, can deadlock on the request's locked folio. Until
-that ordering is solved, already cached kernel pages may remain readable even
-after the cache-entry part is BAD; all later requests that reach ngs3fs fail
+Already returned bytes cannot be revoked retroactively. After the active FUSE
+reply has completed, checksum failure queues range invalidation to a separate
+worker; this avoids calling `notify_inval_inode` against the request's locked
+folio. Later reads and mmap faults then reach the persistent BAD state and fail
 with `EIO`. A missing or unusable checksum merely skips verification.
 
 ## Cached writes
@@ -399,7 +397,11 @@ second-chance CLOCK:
 - DIRTY, FETCHING, RETRYING, pinned, or pending-operation data is never
   evicted;
 - eviction changes page state before punching the corresponding hole;
-- metadata may remain after every data page is missing.
+- a region containing CLEAN and MISSING pages remains evictable;
+- closed clean entries from earlier process lifetimes are discovered only
+  under capacity pressure, never by a full clean-tree startup scan;
+- metadata and the empty sparse data file are reclaimed after every page is
+  MISSING and no runtime owner remains.
 
 If sufficient clean space cannot be reclaimed, the initiating fetch bypasses
 the cache when safe. A write cannot bypass its authoritative cache and fails
@@ -539,3 +541,9 @@ The implementation is not complete until the following pass:
 10. Runner benchmarks against goofys and Mountpoint for S3, followed by an
     interactive ngs3fs flamegraph. Client-side time excluding network transfer
     remains targeted at no more than 20% of the fastest relevant competitor.
+
+The integration server deliberately commits one multipart object and closes
+the connection before returning the Complete response; ngs3fs must resolve the
+ambiguous outcome by HEAD. The runner recovery benchmark separately waits for
+an observable UploadPart, sends SIGKILL before `flush`, remounts the same cache,
+and records verified restart-to-publication latency and request counts.

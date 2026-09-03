@@ -78,5 +78,6 @@ The `Provider E2E` workflow has AWS and OSS matrix entries. Configure repository
 variables named `NGS3FS_AWS_*` and `NGS3FS_OSS_*` for endpoint, authority,
 bucket, prefix, region and checksum. Configure the corresponding
 `*_ACCESS_KEY_ID`, `*_SECRET_ACCESS_KEY` and optional `*_SESSION_TOKEN` as
-repository secrets. An unconfigured entry reports that it was skipped rather
-than presenting a false provider pass.
+repository secrets. Every provider runs uncached and cached matrix entries.
+An unconfigured entry fails explicitly rather than presenting a false
+provider pass.

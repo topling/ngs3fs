@@ -16,6 +16,7 @@
 #include <atomic>
 #include <errno.h>
 #include <filesystem>
+#include <functional>
 #include <limits.h>
 #include <optional>
 #include <stdio.h>
@@ -244,11 +245,31 @@ void cache_mkdir_if_missing(int parent, const char* name) {
   }
 }
 
+void cache_secure_directory(int fd, const char* operation) {
+  struct stat status{};
+  if (::fstat(fd, &status) != 0) {
+    cache_throw_errno(operation);
+  }
+  if (!S_ISDIR(status.st_mode) || status.st_uid != ::geteuid()) {
+    throw std::runtime_error(
+        "cache directory is not owned by the mounting user");
+  }
+  if ((status.st_mode & 0777) != 0700 && ::fchmod(fd, 0700) != 0) {
+    cache_throw_errno("fchmod(cache directory)");
+  }
+}
+
 UniqueFd cache_open_directory(int parent, const char* name) {
   const int fd = ::openat(parent, name,
                           O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
   if (fd < 0) {
     cache_throw_errno("openat(cache directory)");
+  }
+  try {
+    cache_secure_directory(fd, "fstat(cache directory)");
+  } catch (...) {
+    ::close(fd);
+    throw;
   }
   return UniqueFd(fd);
 }
@@ -567,6 +588,127 @@ uint64_t cache_tree_allocation(int directory) {
   return bytes;
 }
 
+struct CacheCleanRecord {
+  std::string key;
+  std::string etag;
+  std::string version_id;
+  uint64_t size = 0;
+  time_t mtime  = 0;
+};
+
+bool cache_visit_clean_directory(
+    int directory, int data_root, const CacheConfig& config, size_t name_max,
+    const std::function<bool(CacheCleanRecord&&)>& visit) {
+  const int duplicate = ::openat(
+      directory, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (duplicate < 0) {
+    cache_throw_errno("open(cache clean directory scan)");
+  }
+  DIR* stream = ::fdopendir(duplicate);
+  if (stream == nullptr) {
+    ::close(duplicate);
+    cache_throw_errno("fdopendir(cache clean directory)");
+  }
+  bool found = false;
+  try {
+    for (;;) {
+      errno = 0;
+      dirent* item = ::readdir(stream);
+      if (item == nullptr) {
+        if (errno != 0) {
+          cache_throw_errno("readdir(cache clean directory)");
+        }
+        break;
+      }
+      if (strcmp(item->d_name, ".") == 0 ||
+          strcmp(item->d_name, "..") == 0) {
+        continue;
+      }
+      struct stat meta_status{};
+      if (::fstatat(directory, item->d_name, &meta_status,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+        cache_throw_errno("fstatat(cache clean entry)");
+      }
+      if (S_ISDIR(meta_status.st_mode)) {
+        UniqueFd child = cache_open_directory(directory, item->d_name);
+        if (cache_visit_clean_directory(child.get(), data_root, config,
+                                        name_max, visit)) {
+          found = true;
+          break;
+        }
+        continue;
+      }
+      if (!S_ISREG(meta_status.st_mode) ||
+          meta_status.st_size < off_t(sizeof(CacheMetaHeader))) {
+        continue;
+      }
+      UniqueFd fd(::openat(directory, item->d_name,
+                           O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+      if (!fd) {
+        cache_throw_errno("open(cache clean metadata scan)");
+      }
+      CacheMetaHeader header{};
+      ssize_t read_bytes;
+      do {
+        read_bytes = ::pread(fd.get(), &header, sizeof(header), 0);
+      } while (read_bytes < 0 && errno == EINTR);
+      constexpr std::array<char, 8> magic{
+          'N', 'G', 'S', '3', 'C', 'A', 'C', 'H'};
+      if (read_bytes != ssize_t(sizeof(header)) || header.magic != magic ||
+          header.version != kCacheMetaVersion ||
+          header.header_size != kCacheMetaHeaderSize ||
+          header.page_size != config.page_size ||
+          (header.flags & kCacheMetaDirty) != 0 ||
+          header.generation_epoch == 0 ||
+          header.key_length == 0 || header.key_length > header.key.size() ||
+          header.etag_length > header.etag.size() ||
+          header.version_length > header.version_id.size()) {
+        continue;
+      }
+      size_t mapping_size;
+      try {
+        mapping_size = cache_mapping_size(header.object_size,
+                                          config.page_size);
+      } catch (...) {
+        continue;
+      }
+      if (uint64_t(meta_status.st_size) < mapping_size) {
+        continue;
+      }
+      const std::string key(header.key.data(), header.key_length);
+      std::optional<CacheLeaf> data = cache_find_leaf(
+          data_root, key, name_max);
+      if (!data) {
+        continue;
+      }
+      struct stat data_status{};
+      if (::fstatat(data->parent.get(), data->name.c_str(), &data_status,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+          !S_ISREG(data_status.st_mode) ||
+          uint64_t(std::max<off_t>(data_status.st_size, 0)) !=
+              header.object_size) {
+        continue;
+      }
+      if (visit(CacheCleanRecord{
+          .key = key,
+          .etag = std::string(header.etag.data(), header.etag_length),
+          .version_id = std::string(
+              header.version_id.data(), header.version_length),
+          .size = header.object_size,
+          .mtime = time_t(header.mtime),
+      })) {
+        found = true;
+        break;
+      }
+    }
+  } catch (...) {
+    ::closedir(stream);
+    throw;
+  }
+  ::closedir(stream);
+  return found;
+}
+
 CacheEntry::CacheEntry(LocalCache& owner, std::string key, int data_fd,
                        int meta_fd, int dirty_fd, void* mapping,
                        size_t mapping_size, uint64_t size)
@@ -597,7 +739,6 @@ CacheEntry::~CacheEntry() {
     unlinked_bytes += uint64_t(status.st_blocks) * 512;
   }
   if (mapping_ != nullptr && mapping_ != MAP_FAILED) {
-    ::msync(mapping_, mapping_size_, MS_ASYNC);
     ::munmap(mapping_, mapping_size_);
   }
   cache_close_fd(data_fd_);
@@ -801,7 +942,6 @@ void CacheEntry::begin_write() {
   auto& header = *static_cast<CacheMetaHeader*>(mapping_);
   header.flags |= kCacheMetaDirty;
   header.write_phase = 1;
-  ::msync(mapping_, kCacheMetaHeaderSize, MS_ASYNC);
 }
 
 void CacheEntry::ensure_write_capacity(uint64_t end) {
@@ -930,7 +1070,6 @@ void CacheEntry::publish_dirty(uint64_t offset, size_t length,
   std::atomic_ref<uint64_t> published(header.written_end);
   published.store(written_end, std::memory_order_release);
   size_ = written_end;
-  ::msync(mapping_, mapping_size_, MS_ASYNC);
 }
 
 void CacheEntry::set_upload_id(std::string_view upload_id) {
@@ -945,7 +1084,6 @@ void CacheEntry::set_upload_id(std::string_view upload_id) {
   header.upload_id_length = uint32_t(upload_id.size());
   header.upload_part_size = owner_->config().upload_part_size;
   header.write_phase      = upload_id.empty() ? 1 : 2;
-  ::msync(mapping_, kCacheMetaHeaderSize, MS_ASYNC);
 }
 
 std::string CacheEntry::upload_id() const {
@@ -964,7 +1102,6 @@ void CacheEntry::isolate_write() noexcept {
     return;
   }
   header.write_phase = 3;
-  ::msync(mapping_, kCacheMetaHeaderSize, MS_ASYNC);
 }
 
 void CacheEntry::discard_write() noexcept {
@@ -978,7 +1115,6 @@ void CacheEntry::discard_write() noexcept {
     detached_           = true;
     marker_fd           = dirty_fd_;
     dirty_fd_           = -1;
-    ::msync(mapping_, kCacheMetaHeaderSize, MS_ASYNC);
   }
   cache_close_fd(marker_fd);
   owner_->remove_dirty_marker(key_);
@@ -1253,8 +1389,6 @@ void CacheEntry::publish_clean(const CacheFetchClaim& claim,
     fetching_[page] = 0;
   }
   if (first != page_end) {
-    ::msync(static_cast<char*>(mapping_) + bitmap_offset_,
-            mapping_size_ - bitmap_offset_, MS_ASYNC);
     condition_.notify_all();
   }
 }
@@ -1325,8 +1459,6 @@ void CacheEntry::mark_bad(const CacheFetchClaim& claim) noexcept {
       set_page_state(page, CACHE_PAGE_BAD);
       fetching_[page] = 0;
     }
-    ::msync(static_cast<char*>(mapping_) + bitmap_offset_,
-            mapping_size_ - bitmap_offset_, MS_ASYNC);
   }
   condition_.notify_all();
 }
@@ -1343,8 +1475,6 @@ void CacheEntry::begin_retry(const CacheFetchClaim& claim) {
     set_page_state(page, CACHE_PAGE_BAD);
     fetching_[page] = 1;
   }
-  ::msync(static_cast<char*>(mapping_) + bitmap_offset_,
-          mapping_size_ - bitmap_offset_, MS_ASYNC);
   condition_.notify_all();
 }
 
@@ -1584,8 +1714,15 @@ uint64_t CacheEntry::evict_one_region() noexcept {
       const size_t first = size_t(offset / page_size_);
       const size_t last = size_t((end - 1) / page_size_) + 1;
       bool evictable = true;
+      std::vector<size_t> clean_pages;
+      clean_pages.reserve(last - first);
       for (size_t page = first; page < last; ++page) {
-        if (page_state(page) != CACHE_PAGE_CLEAN || fetching_[page]) {
+        const CachePageState state = page_state(page);
+        if (state == CACHE_PAGE_CLEAN) {
+          clean_pages.push_back(page);
+        }
+        if ((state != CACHE_PAGE_CLEAN && state != CACHE_PAGE_MISSING) ||
+            fetching_[page]) {
           evictable = false;
           break;
         }
@@ -1593,7 +1730,7 @@ uint64_t CacheEntry::evict_one_region() noexcept {
       if (region_pins_[region] != 0) {
         evictable = false;
       }
-      if (!evictable) {
+      if (!evictable || clean_pages.empty()) {
         continue;
       }
 
@@ -1601,13 +1738,13 @@ uint64_t CacheEntry::evict_one_region() noexcept {
       if (::fstat(data_fd_, &before) != 0) {
         return 0;
       }
-      for (size_t page = first; page < last; ++page) {
+      for (size_t page : clean_pages) {
         set_page_state(page, CACHE_PAGE_MISSING);
       }
       if (::fallocate(data_fd_,
                       FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                       off_t(offset), off_t(end - offset)) != 0) {
-        for (size_t page = first; page < last; ++page) {
+        for (size_t page : clean_pages) {
           set_page_state(page, CACHE_PAGE_CLEAN);
         }
         return 0;
@@ -1616,8 +1753,6 @@ uint64_t CacheEntry::evict_one_region() noexcept {
       if (::fstat(data_fd_, &after) != 0) {
         return 0;
       }
-      ::msync(static_cast<char*>(mapping_) + bitmap_offset_,
-              mapping_size_ - bitmap_offset_, MS_ASYNC);
       condition_.notify_all();
       const uint64_t old_bytes = uint64_t(before.st_blocks) * 512;
       const uint64_t new_bytes = uint64_t(after.st_blocks) * 512;
@@ -1727,6 +1862,159 @@ void LocalCache::finish_reservation(uint64_t reserved,
   add_allocated(int64_t(std::min<uint64_t>(allocated, INT64_MAX)));
 }
 
+std::recursive_mutex& LocalCache::key_mutex(std::string_view key) noexcept {
+  uint64_t hash = 1469598103934665603ULL;
+  for (char ch : key) {
+    hash ^= u_char(ch);
+    hash *= 1099511628211ULL;
+  }
+  return key_mutexes_[hash % key_mutexes_.size()];
+}
+
+bool LocalCache::reclaim_closed_clean(
+    const std::shared_ptr<CacheEntry>& entry) noexcept {
+  try {
+    std::lock_guard key_guard(key_mutex(entry->key_));
+    std::unique_lock guard(mutex_);
+    auto found = entries_.end();
+    for (auto i = entries_.begin(); i != entries_.end();) {
+      std::shared_ptr<CacheEntry> candidate = i->lock();
+      if (!candidate) {
+        i = entries_.erase(i);
+        continue;
+      }
+      if (candidate.get() == entry.get()) {
+        if (candidate.use_count() != 2) {
+          return false;
+        }
+        found = i;
+        break;
+      }
+      ++i;
+    }
+    if (found == entries_.end()) {
+      return false;
+    }
+    {
+      std::lock_guard entry_guard(entry->mutex_);
+      const auto& header =
+          *static_cast<const CacheMetaHeader*>(entry->mapping_);
+      if (entry->stale_ || entry->detached_ || entry->eviction_disabled_ ||
+          (header.flags & kCacheMetaDirty) != 0 ||
+          !entry->active_claims_.empty() || entry->checksum_ops_ != 0 ||
+          entry->pinned_regions_ != 0) {
+        return false;
+      }
+      for (size_t page = 0; page < entry->page_count_; ++page) {
+        if (entry->page_state(page) != CACHE_PAGE_MISSING ||
+            entry->fetching_[page]) {
+          return false;
+        }
+      }
+      entry->detached_ = true;
+      entry->stale_    = true;
+    }
+    entries_.erase(found);
+    guard.unlock();
+
+    struct statvfs fs{};
+    if (::fstatvfs(root_fd_, &fs) != 0) {
+      cache_throw_errno("fstatvfs(cache cold reclamation)");
+    }
+    const size_t name_max = fs.f_namemax == 0 ? NAME_MAX : fs.f_namemax;
+    std::optional<CacheLeaf> data = cache_find_leaf(
+        data_root_fd_, entry->key_, name_max);
+    std::optional<CacheLeaf> meta = cache_find_leaf(
+        objects_root_fd_, entry->key_, name_max);
+    if (!data || !meta) {
+      return false;
+    }
+    struct stat data_path{};
+    struct stat meta_path{};
+    struct stat data_fd{};
+    struct stat meta_fd{};
+    if (::fstatat(data->parent.get(), data->name.c_str(), &data_path,
+                  AT_SYMLINK_NOFOLLOW) != 0 ||
+        ::fstatat(meta->parent.get(), meta->name.c_str(), &meta_path,
+                  AT_SYMLINK_NOFOLLOW) != 0 ||
+        ::fstat(entry->data_fd_, &data_fd) != 0 ||
+        ::fstat(entry->meta_fd_, &meta_fd) != 0 ||
+        data_path.st_dev != data_fd.st_dev ||
+        data_path.st_ino != data_fd.st_ino ||
+        meta_path.st_dev != meta_fd.st_dev ||
+        meta_path.st_ino != meta_fd.st_ino) {
+      return false;
+    }
+    if (::unlinkat(data->parent.get(), data->name.c_str(), 0) != 0) {
+      cache_throw_errno("unlinkat(cache cold data)");
+    }
+    entry->unlinked_data_ = true;
+    if (::unlinkat(meta->parent.get(), meta->name.c_str(), 0) != 0) {
+      cache_throw_errno("unlinkat(cache cold metadata)");
+    }
+    entry->unlinked_meta_ = true;
+    return true;
+  } catch (const std::exception& error) {
+    if (!cold_scan_warned_.exchange(true, std::memory_order_relaxed)) {
+      fprintf(stderr, "warning: local cache cold reclamation failed: %s\n",
+              error.what());
+    }
+  } catch (...) {
+    if (!cold_scan_warned_.exchange(true, std::memory_order_relaxed)) {
+      fprintf(stderr, "warning: local cache cold reclamation failed\n");
+    }
+  }
+  return false;
+}
+
+bool LocalCache::evict_cold() {
+  try {
+    struct statvfs fs{};
+    if (::fstatvfs(root_fd_, &fs) != 0) {
+      cache_throw_errno("fstatvfs(cache cold eviction)");
+    }
+    const size_t name_max = fs.f_namemax == 0 ? NAME_MAX : fs.f_namemax;
+    return cache_visit_clean_directory(
+        objects_root_fd_, data_root_fd_, config_, name_max,
+        [this](CacheCleanRecord&& record) {
+          try {
+            CacheIdentity identity{
+                .key        = record.key,
+                .etag       = record.etag,
+                .version_id = record.version_id,
+                .size       = record.size,
+                .mtime      = record.mtime,
+            };
+            std::shared_ptr<CacheEntry> entry = open(identity);
+            if (!entry) {
+              return false;
+            }
+            for (unsigned pass = 0; pass != 2; ++pass) {
+              const uint64_t freed = entry->evict_one_region();
+              if (freed != 0) {
+                add_allocated(-int64_t(
+                    std::min<uint64_t>(freed, INT64_MAX)));
+                return true;
+              }
+            }
+            return reclaim_closed_clean(entry);
+          } catch (...) {
+            return false;
+          }
+        });
+  } catch (const std::exception& error) {
+    if (!cold_scan_warned_.exchange(true, std::memory_order_relaxed)) {
+      fprintf(stderr, "warning: local cache cold scan failed: %s\n",
+              error.what());
+    }
+  } catch (...) {
+    if (!cold_scan_warned_.exchange(true, std::memory_order_relaxed)) {
+      fprintf(stderr, "warning: local cache cold scan failed\n");
+    }
+  }
+  return false;
+}
+
 bool LocalCache::evict_one() {
   std::vector<std::shared_ptr<CacheEntry>> entries;
   {
@@ -1742,22 +2030,21 @@ bool LocalCache::evict_one() {
       ++i;
     }
   }
-  if (entries.empty()) {
-    return false;
-  }
-  const size_t begin = clock_entry_.fetch_add(
-      1, std::memory_order_relaxed) % entries.size();
-  for (unsigned pass = 0; pass != 2; ++pass) {
-    for (size_t n = 0; n < entries.size(); ++n) {
-      const uint64_t freed =
-          entries[(begin + n) % entries.size()]->evict_one_region();
-      if (freed != 0) {
-        add_allocated(-int64_t(std::min<uint64_t>(freed, INT64_MAX)));
-        return true;
+  if (!entries.empty()) {
+    const size_t begin = clock_entry_.fetch_add(
+        1, std::memory_order_relaxed) % entries.size();
+    for (unsigned pass = 0; pass != 2; ++pass) {
+      for (size_t n = 0; n < entries.size(); ++n) {
+        const uint64_t freed =
+            entries[(begin + n) % entries.size()]->evict_one_region();
+        if (freed != 0) {
+          add_allocated(-int64_t(std::min<uint64_t>(freed, INT64_MAX)));
+          return true;
+        }
       }
     }
   }
-  return false;
+  return evict_cold();
 }
 
 void LocalCache::punch_range(int fd, uint64_t offset,
@@ -1843,6 +2130,7 @@ LocalCache::LocalCache(CacheConfig config) : config_(std::move(config)) {
     cache_throw_errno("open(cache root)");
   }
   try {
+    cache_secure_directory(root_fd_, "fstat(cache root)");
     lock_fd_ = ::openat(root_fd_, ".ngs3fs.lock",
                         O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (lock_fd_ < 0) {
@@ -1904,9 +2192,10 @@ LocalCache::LocalCache(CacheConfig config) : config_(std::move(config)) {
     pending_root_fd_ = pending.release();
     probe_filesystem();
     std::atomic_ref<uint64_t> allocated(superblock.allocated_bytes);
-    allocated.store(cache_tree_allocation(root_fd_),
-                    std::memory_order_relaxed);
-    ::msync(superblock_mapping_, kCacheRootHeaderSize, MS_ASYNC);
+    if (initialize_superblock) {
+      allocated.store(cache_tree_allocation(root_fd_),
+                      std::memory_order_relaxed);
+    }
   } catch (...) {
     cache_close_fd(data_root_fd_);
     cache_close_fd(objects_root_fd_);
@@ -1929,7 +2218,6 @@ LocalCache::~LocalCache() {
   cache_close_fd(dirty_root_fd_);
   cache_close_fd(pending_root_fd_);
   if (superblock_mapping_ != nullptr) {
-    ::msync(superblock_mapping_, kCacheRootHeaderSize, MS_ASYNC);
     ::munmap(superblock_mapping_, kCacheRootHeaderSize);
     superblock_mapping_ = nullptr;
   }
@@ -2517,6 +2805,7 @@ std::shared_ptr<CacheEntry> LocalCache::create_writer(
       maximum_size == 0) {
     throw std::invalid_argument("invalid cache writer identity");
   }
+  std::lock_guard key_guard(key_mutex(key));
   std::unique_lock guard(mutex_);
   for (auto i = entries_.begin(); i != entries_.end();) {
     std::shared_ptr<CacheEntry> entry = i->lock();
@@ -2525,12 +2814,16 @@ std::shared_ptr<CacheEntry> LocalCache::create_writer(
       continue;
     }
     if (entry->key_ == key) {
-      entry->retire_generation();
       i = entries_.erase(i);
+      guard.unlock();
+      entry->retire_generation();
+      guard.lock();
+      i = entries_.begin();
       continue;
     }
     ++i;
   }
+  guard.unlock();
 
   struct statvfs fs{};
   if (::fstatvfs(root_fd_, &fs) != 0) {
@@ -2539,12 +2832,10 @@ std::shared_ptr<CacheEntry> LocalCache::create_writer(
   const size_t name_max = fs.f_namemax == 0 ? NAME_MAX : fs.f_namemax;
   CacheLeaf data_leaf = cache_leaf(data_root_fd_, key, name_max);
   CacheLeaf meta_leaf = cache_leaf(objects_root_fd_, key, name_max);
-  guard.unlock();
   if (!reserve_capacity(kCacheMetaHeaderSize)) {
     throw std::system_error(ENOSPC, std::generic_category(),
                             "reserve cache writer metadata");
   }
-  guard.lock();
   bool reservation = true;
   int data_fd = ::openat(data_leaf.parent.get(), data_leaf.name.c_str(),
                          O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -2618,7 +2909,10 @@ std::shared_ptr<CacheEntry> LocalCache::create_writer(
     data_fd = -1;
     meta_fd = -1;
     mapping = MAP_FAILED;
-    entries_.push_back(entry);
+    {
+      std::lock_guard registry_guard(mutex_);
+      entries_.push_back(entry);
+    }
     return entry;
   } catch (...) {
     if (reservation) {
@@ -2636,6 +2930,7 @@ std::shared_ptr<CacheEntry> LocalCache::create_writer(
 bool LocalCache::remove(std::string_view key,
                         bool preserve_generation) noexcept {
   try {
+    std::lock_guard key_guard(key_mutex(key));
     std::shared_ptr<CacheEntry> target;
     bool preserved = false;
     std::unique_lock guard(mutex_);
@@ -2664,11 +2959,14 @@ bool LocalCache::remove(std::string_view key,
         std::lock_guard entry_guard(target->mutex_);
         target->detached_ = true;
       }
+      guard.unlock();
       if (preserved) {
         target->disable_eviction();
       } else {
         target->retire_generation();
       }
+    } else {
+      guard.unlock();
     }
 
     struct statvfs fs{};
@@ -2711,7 +3009,6 @@ bool LocalCache::remove(std::string_view key,
                 &CacheEntry::unlinked_data_);
     unlink_file(objects_root_fd_, target ? target->meta_fd_ : -1,
                 &CacheEntry::unlinked_meta_);
-    guard.unlock();
     return preserved;
   } catch (const std::exception& error) {
     fprintf(stderr, "warning: local cache removal failed: key=%.*s: %s\n",
@@ -2731,9 +3028,19 @@ bool LocalCache::rename(std::string_view old_key,
   if (new_key.size() > kCacheKeyCapacity) {
     return false;
   }
+  std::recursive_mutex* first  = &key_mutex(old_key);
+  std::recursive_mutex* second = &key_mutex(new_key);
+  if (std::less<std::recursive_mutex*>{}(second, first)) {
+    std::swap(first, second);
+  }
+  std::unique_lock first_guard(*first);
+  std::optional<std::unique_lock<std::recursive_mutex>> second_guard;
+  if (second != first) {
+    second_guard.emplace(*second);
+  }
   remove(new_key, false);
   try {
-    std::lock_guard guard(mutex_);
+    std::unique_lock guard(mutex_);
     std::shared_ptr<CacheEntry> target;
     for (auto i = entries_.begin(); i != entries_.end();) {
       std::shared_ptr<CacheEntry> entry = i->lock();
@@ -2747,6 +3054,7 @@ bool LocalCache::rename(std::string_view old_key,
       }
       ++i;
     }
+    guard.unlock();
 
     struct statvfs fs{};
     if (::fstatvfs(root_fd_, &fs) != 0) {
@@ -2790,10 +3098,11 @@ bool LocalCache::rename(std::string_view old_key,
       header.key_length = uint32_t(new_key.size());
     };
     if (target) {
+      guard.lock();
       std::lock_guard entry_guard(target->mutex_);
       rewrite(*static_cast<CacheMetaHeader*>(target->mapping_));
       target->key_.assign(new_key);
-      ::msync(target->mapping_, kCacheMetaHeaderSize, MS_ASYNC);
+      guard.unlock();
     } else {
       CacheLeaf destination = cache_leaf(
           objects_root_fd_, new_key, name_max);
@@ -2809,7 +3118,6 @@ bool LocalCache::rename(std::string_view old_key,
       }
       try {
         rewrite(*static_cast<CacheMetaHeader*>(mapping));
-        ::msync(mapping, kCacheMetaHeaderSize, MS_ASYNC);
       } catch (...) {
         ::munmap(mapping, kCacheMetaHeaderSize);
         throw;
@@ -2841,6 +3149,7 @@ std::shared_ptr<CacheEntry> LocalCache::open(
     throw std::system_error(EOVERFLOW, std::generic_category(),
                             "S3 identity is too large for cache metadata");
   }
+  std::lock_guard key_guard(key_mutex(identity.key));
   std::unique_lock guard(mutex_);
   for (auto i = entries_.begin(); i != entries_.end();) {
     std::shared_ptr<CacheEntry> entry = i->lock();
@@ -2860,12 +3169,16 @@ std::shared_ptr<CacheEntry> LocalCache::open(
       if (matches) {
         return entry;
       }
-      entry->retire_generation();
       i = entries_.erase(i);
+      guard.unlock();
+      entry->retire_generation();
+      guard.lock();
+      i = entries_.begin();
       continue;
     }
     ++i;
   }
+  guard.unlock();
 
   struct statvfs fs{};
   if (::fstatvfs(root_fd_, &fs) != 0) {
@@ -2891,39 +3204,9 @@ std::shared_ptr<CacheEntry> LocalCache::open(
     if (meta_fd < 0) {
       cache_throw_errno("open(cache metadata)");
     }
-    guard.unlock();
     if (::flock(meta_fd, LOCK_EX) != 0) {
       cache_throw_errno("flock(cache metadata)");
     }
-    guard.lock();
-    for (auto i = entries_.begin(); i != entries_.end();) {
-      std::shared_ptr<CacheEntry> entry = i->lock();
-      if (!entry) {
-        i = entries_.erase(i);
-        continue;
-      }
-      if (entry->key_ == identity.key) {
-        bool matches = false;
-        {
-          std::lock_guard entry_guard(entry->mutex_);
-          matches = !entry->detached_ && !entry->stale_ &&
-              cache_identity_matches(
-                  *static_cast<CacheMetaHeader*>(entry->mapping_), identity,
-                  config_.page_size);
-        }
-        if (matches) {
-          ::flock(meta_fd, LOCK_UN);
-          cache_close_fd(meta_fd);
-          cache_close_fd(data_fd);
-          return entry;
-        }
-        entry->retire_generation();
-        i = entries_.erase(i);
-        continue;
-      }
-      ++i;
-    }
-    guard.unlock();
 
     struct stat meta_status{};
     if (::fstat(meta_fd, &meta_status) != 0) {
@@ -3034,7 +3317,6 @@ std::shared_ptr<CacheEntry> LocalCache::open(
           next_epoch.fetch_add(1, std::memory_order_relaxed);
       cache_initialize_header(*static_cast<CacheMetaHeader*>(mapping),
                               identity, config_.page_size, epoch);
-      ::msync(mapping, kCacheMetaHeaderSize, MS_ASYNC);
     }
 
     auto entry = std::shared_ptr<CacheEntry>(new CacheEntry(

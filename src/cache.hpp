@@ -5,6 +5,7 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -227,6 +228,10 @@ class LocalCache {
   void cancel_reservation(uint64_t bytes) noexcept;
   void finish_reservation(uint64_t reserved, uint64_t allocated) noexcept;
   bool evict_one();
+  bool evict_cold();
+  bool reclaim_closed_clean(
+      const std::shared_ptr<CacheEntry>& entry) noexcept;
+  std::recursive_mutex& key_mutex(std::string_view key) noexcept;
   void punch_range(int fd, uint64_t offset, uint64_t length) noexcept;
   int create_dirty_marker(std::string_view key, uint64_t epoch);
   void remove_dirty_marker(std::string_view key) noexcept;
@@ -245,9 +250,11 @@ class LocalCache {
   void* superblock_mapping_ = nullptr;
   mutable std::mutex mutex_;
   mutable std::mutex capacity_mutex_;
+  std::array<std::recursive_mutex, 127> key_mutexes_;
   std::vector<std::weak_ptr<CacheEntry>> entries_;
   uint64_t pending_reservations_ = 0;
   std::atomic<size_t> clock_entry_{0};
+  std::atomic<bool> cold_scan_warned_{false};
 };
 
 std::string cache_encode_component(std::string_view component,

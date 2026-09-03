@@ -9,6 +9,7 @@ output_dir=$(realpath -m "$output_dir")
 repetitions=${BENCHMARK_REPETITIONS:-3}
 base_port=${PORT:-17500}
 cache_mode=${CACHE_MODE:-none}
+reference_client=${REFERENCE_CLIENT:-goofys}
 
 case "$cache_mode" in
   none | cold | warm) ;;
@@ -33,8 +34,14 @@ mkdir -p "$output_dir"
   lscpu
   free -h
   printf 'ngs3fs_commit=%s\n' "$(git -C "$project_dir" rev-parse HEAD)"
-  printf 'goofys_binary=%s\n' \
-    "${GOOFYS_BIN:-/home/leipeng/.cache/goofys-reference/bin/goofys}"
+  printf 'reference_client=%s\n' "$reference_client"
+  if [[ "$reference_client" = mountpoint-s3 ]]; then
+    printf 'reference_binary=%s\n' \
+      "${MOUNTPOINT_S3_BIN:-/home/leipeng/osc/mountpoint-s3/target/release/mount-s3}"
+  else
+    printf 'reference_binary=%s\n' \
+      "${GOOFYS_BIN:-/home/leipeng/.cache/goofys-reference/bin/goofys}"
+  fi
   printf 'cache_mode=%s\n' "$cache_mode"
   go version 2>/dev/null || true
 } >"$output_dir/system.txt"
@@ -47,22 +54,21 @@ sample=0
 for advice in random normal; do
   for ((repetition = 1; repetition <= repetitions; ++repetition)); do
     if ((repetition % 2 == 0)); then
-      clients=(goofys ngs3fs)
+      clients=("$reference_client" ngs3fs)
     else
-      clients=(ngs3fs goofys)
+      clients=(ngs3fs "$reference_client")
     fi
     for client in "${clients[@]}"; do
       ((++sample))
       run_dir="$output_dir/$advice-r$repetition-$client"
       cache_dir="$run_dir/ngs3fs-cache"
+      sample_cache_mode=$cache_mode
       if [[ "$cache_mode" != none && "$client" = ngs3fs ]]; then
-        sample_cache_mode=$cache_mode
         sample_cache_dir=$cache_dir
         mkdir -p "$cache_dir"
       else
-        sample_cache_mode=none
         sample_cache_dir=-
-        cache_dir=-
+        cache_dir=
       fi
       # Do not issue a global sync: an unrelated unhealthy FUSE mount can
       # block it indefinitely.  The benchmark backend lives on output_dir's
@@ -76,8 +82,8 @@ for advice in random normal; do
       CLIENT="$client" \
       RANDOM_READ_ADVICE="$advice" \
       CACHE_MODE="$sample_cache_mode" \
-      CACHE_DIR="$sample_cache_dir" \
-      NGS3FS_CACHE_DIR="$sample_cache_dir" \
+      CACHE_DIR="$cache_dir" \
+      NGS3FS_CACHE_DIR="$cache_dir" \
       PORT="$((base_port + sample))" \
         "$project_dir/scripts/compare_goofys.sh" "$run_dir"
       sample_summary=$(tail -n 1 "$run_dir/random-read-summary.csv")
@@ -127,11 +133,10 @@ printf '%s\n' \
   'advice,client,samples,wall_min_ns,wall_median_ns,wall_mean_ns,wall_max_ns,cpu_min_ns,cpu_median_ns,cpu_mean_ns,cpu_max_ns,cpu_per_operation_min_ns,cpu_per_operation_median_ns,cpu_per_operation_mean_ns,cpu_per_operation_max_ns,s3_get_min,s3_get_median,s3_get_mean,s3_get_max,cache_mode,cache_dir' \
   >"$output_dir/summary.csv"
 for advice in random normal; do
-  for client in ngs3fs goofys; do
-    summary_cache_mode=none
+  for client in ngs3fs "$reference_client"; do
+    summary_cache_mode=$cache_mode
     summary_cache_dir=-
     if [[ "$client" = ngs3fs ]]; then
-      summary_cache_mode=$cache_mode
       if [[ "$summary_cache_mode" != none ]]; then
         summary_cache_dir="$output_dir/$advice-r*-ngs3fs/ngs3fs-cache"
       fi

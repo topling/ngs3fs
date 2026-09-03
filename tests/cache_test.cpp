@@ -1,6 +1,7 @@
 #include "cache.hpp"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
@@ -449,6 +450,18 @@ int main() {
   }
 
   {
+    TemporaryDirectory permissions_directory;
+    assert(::chmod(permissions_directory.path.c_str(), 0755) == 0);
+    CacheConfig permissions = config;
+    permissions.root = permissions_directory.path;
+    LocalCache cache(permissions);
+    struct stat status{};
+    assert(::stat(permissions.root.c_str(), &status) == 0);
+    assert((status.st_mode & 0777) == 0700);
+    assert(status.st_uid == ::geteuid());
+  }
+
+  {
     TemporaryDirectory capacity_directory;
     CacheConfig bounded = config;
     bounded.root               = capacity_directory.path;
@@ -486,6 +499,72 @@ int main() {
     full.reserve_is_percent = false;
     LocalCache cache(full);
     assert(!cache.open(test_identity("bypass", "etag", 4096)));
+  }
+
+  {
+    TemporaryDirectory cold_directory;
+    CacheConfig bounded = config;
+    bounded.root               = cold_directory.path;
+    bounded.maximum_bytes      = 1200U * 1024U;
+    bounded.reserve_bytes      = 0;
+    bounded.reserve_percent    = 0;
+    bounded.reserve_is_percent = false;
+    const CacheIdentity first_identity = test_identity(
+        "cold-first", "etag-cold-first", 1024U * 1024U);
+    {
+      LocalCache cache(bounded);
+      std::shared_ptr<CacheEntry> first = cache.open(first_identity);
+      CacheFetchClaim claim = first->claim_fetch(
+          0, 4096, 1024U * 1024U);
+      assert(first->prepare_read(claim.offset, claim.length));
+      write_test_bytes(first->data_fd(), claim.offset, claim.length);
+      first->publish_clean(claim, 0, claim.length, true);
+      first->finish_fetch(claim);
+      assert(first->fully_clean());
+    }
+    {
+      LocalCache cache(bounded);
+      std::shared_ptr<CacheEntry> second = cache.open(test_identity(
+          "cold-second", "etag-cold-second", 1024U * 1024U));
+      CacheFetchClaim claim = second->claim_fetch(
+          0, 4096, 1024U * 1024U);
+      assert(second->prepare_read(claim.offset, claim.length));
+      second->fail_fetch(claim);
+      std::shared_ptr<CacheEntry> first = cache.open(first_identity);
+      assert(first);
+      assert(!first->range_clean(0, 4096));
+    }
+  }
+
+  {
+    TemporaryDirectory mixed_directory;
+    CacheConfig bounded = config;
+    bounded.root               = mixed_directory.path;
+    bounded.maximum_bytes      = 80U * 1024U;
+    bounded.reserve_bytes      = 0;
+    bounded.reserve_percent    = 0;
+    bounded.reserve_is_percent = false;
+    LocalCache cache(bounded);
+    const CacheIdentity mixed_identity = test_identity(
+        "mixed-region", "etag-mixed", 1024U * 1024U);
+    std::shared_ptr<CacheEntry> mixed = cache.open(mixed_identity);
+    CacheFetchClaim first = mixed->claim_fetch(0, 4096, 4096);
+    assert(first.length == 4096);
+    assert(mixed->prepare_read(first.offset, first.length));
+    write_test_bytes(mixed->data_fd(), first.offset, first.length);
+    mixed->publish_clean(first, 0, first.length, true);
+    mixed->finish_fetch(first);
+    assert(mixed->range_clean(0, 4096));
+    mixed.reset();
+
+    std::shared_ptr<CacheEntry> pressure = cache.open(test_identity(
+        "mixed-pressure", "etag-pressure", 64U * 1024U));
+    CacheFetchClaim second = pressure->claim_fetch(0, 4096, 64U * 1024U);
+    assert(pressure->prepare_read(second.offset, second.length));
+    pressure->fail_fetch(second);
+    mixed = cache.open(mixed_identity);
+    assert(mixed);
+    assert(!mixed->range_clean(0, 4096));
   }
   return 0;
 }

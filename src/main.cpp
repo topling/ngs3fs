@@ -1,6 +1,6 @@
 #include "io.hpp"
 
-#include <iostream>
+#include <stdio.h>
 #include <string_view>
 
 int run(int argc, char** argv);
@@ -8,9 +8,8 @@ int run(int argc, char** argv);
 int main(int argc, char** argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--self-test") {
     const auto pipe = Pipe::create();
-    std::cout << "ngs3fs self-test: preferred_io="
-              << kPreferredIoSize
-              << " pipe_capacity=" << pipe.capacity() << '\n';
+    printf("ngs3fs self-test: preferred_io=%zu pipe_capacity=%zu\n",
+           kPreferredIoSize, pipe.capacity());
     return 0;
   }
 

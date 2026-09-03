@@ -12,6 +12,7 @@ bucket=${NGS3FS_BUCKET:?NGS3FS_BUCKET is required}
 prefix=${NGS3FS_PREFIX:-ngs3fs-e2e-${GITHUB_RUN_ID:-$$}-${GITHUB_RUN_ATTEMPT:-0}}
 region=${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}
 checksum=${NGS3FS_CHECKSUM:-auto}
+cache_mode=${NGS3FS_CACHE_MODE:-none}
 run_dir=${1:-$(mktemp -d /tmp/ngs3fs-provider.XXXXXX)}
 mount_dir=$run_dir/mnt
 log=$run_dir/ngs3fs.log
@@ -41,6 +42,19 @@ if [[ ! -x "$ngs3fs" || ! -x "$client" ]]; then
 fi
 mkdir -p "$mount_dir"
 
+cache_args=()
+case "$cache_mode" in
+  none) ;;
+  cached)
+    mkdir -p "$run_dir/cache"
+    cache_args=(-L "$run_dir/cache" --cache-reserve 0)
+    ;;
+  *)
+    echo "invalid NGS3FS_CACHE_MODE: $cache_mode" >&2
+    exit 2
+    ;;
+esac
+
 args=(
   -f
   --endpoint-host "$endpoint_host"
@@ -52,6 +66,7 @@ args=(
   --checksum "$checksum"
   --connect-timeout "${NGS3FS_CONNECT_TIMEOUT_MS:-10000}"
   --request-timeout "${NGS3FS_REQUEST_TIMEOUT_MS:-60000}"
+  "${cache_args[@]}"
 )
 if [[ ${NGS3FS_TLS:-1} == 1 ]]; then
   args+=(--tls)
@@ -75,5 +90,5 @@ if ! mountpoint -q "$mount_dir"; then
 fi
 
 "$client" "$mount_dir"
-printf 'provider E2E passed: endpoint=%s bucket=%s prefix=%s\n' \
-  "$endpoint_host" "$bucket" "$prefix"
+printf 'provider E2E passed: endpoint=%s bucket=%s prefix=%s cache=%s\n' \
+  "$endpoint_host" "$bucket" "$prefix" "$cache_mode"

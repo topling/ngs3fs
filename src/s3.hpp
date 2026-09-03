@@ -187,6 +187,8 @@ struct InodeFile : InodeBase {
 
   std::atomic<time_t> mtime{0};
   std::atomic<uint64_t> fsize{0};
+  std::atomic<uint64_t> generation_hash{0};
+  std::atomic<uint64_t> generation_epoch{0};
 };
 
 struct InodeDir : InodeBase {
@@ -235,7 +237,7 @@ bool move_cached_item(InodeBase& item, InodeBase& new_parent,
 
 static_assert(alignof(InodeBase) == 16);
 static_assert(sizeof(InodeBase) == 32);
-static_assert(sizeof(InodeFile) == 48);
+static_assert(sizeof(InodeFile) == 64);
 
 // S3 request-path helpers and SigV4 signing.
 // Request paths are stored in their on-wire, percent-encoded form. Keeping

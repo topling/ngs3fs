@@ -40,6 +40,9 @@ random_file_size=${RANDOM_READ_FILE_SIZE:-4194304}
 random_maximum_read=${RANDOM_READ_MAXIMUM:-262144}
 random_seed=${RANDOM_READ_SEED:-0x4e47533346535244}
 random_advice=${RANDOM_READ_ADVICE:-random}
+write_bytes=${WRITE_BYTES:-67108864}
+write_block_size=${WRITE_BLOCK_SIZE:-262144}
+write_files=${WRITE_FILES:-2}
 cache_mode=${CACHE_MODE:-none}
 
 versitygw="$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64/versitygw"
@@ -85,6 +88,10 @@ profile_first_line=0
 profile_last_line=0
 profile_get_requests=0
 profile_head_requests=0
+profile_put_requests=0
+profile_upload_part_requests=0
+profile_complete_requests=0
+profile_elapsed_ns=0
 
 cleanup() {
   set +e
@@ -161,6 +168,15 @@ esac
 case "$workload" in
   mmap) required_binaries+=("$bench") ;;
   random-read) required_binaries+=("$random_bench") ;;
+  write)
+    required_binaries+=("$random_bench")
+    if ((write_bytes == 0 || write_block_size == 0 || write_files < 2 ||
+         write_bytes % write_files != 0 ||
+         (write_bytes / write_files) % write_block_size != 0)); then
+      echo "WRITE_BYTES must divide evenly across at least two WRITE_FILES and WRITE_BLOCK_SIZE" >&2
+      exit 2
+    fi
+    ;;
   *)
     echo "unsupported workload: $workload" >&2
     exit 2
@@ -184,7 +200,7 @@ if [[ "$workload" = mmap ]]; then
     cp --reflink=auto "$backend/$bucket/$object" \
       "$backend/$bucket/$object-cold-warmup"
   fi
-else
+elif [[ "$workload" = random-read ]]; then
   "$random_bench" -p -d "$backend/$bucket/random-read" \
     -f "$random_files" -t "$random_threads" -n "$random_operations" \
     -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed"
@@ -224,7 +240,7 @@ if [[ "$workload" = mmap ]]; then
   title="ngs3fs $bytes-byte mmap faults ($cache_mode cache)"
   flame_svg="$run_dir/ngs3fs-$bytes.svg"
   flame_html="$run_dir/ngs3fs-$bytes-interactive.html"
-else
+elif [[ "$workload" = random-read ]]; then
   warmup_dir="$mount_dir/random-read"
   warmup_operations=8
   if [[ "$cache_mode" = warm ]]; then
@@ -241,6 +257,13 @@ else
   title="ngs3fs concurrent multi-file random reads ($random_advice advice, $cache_mode cache)"
   flame_svg="$run_dir/ngs3fs-random-read.svg"
   flame_html="$run_dir/ngs3fs-random-read-interactive.html"
+else
+  "$random_bench" -p -d "$mount_dir/write-warmup" \
+    -f 2 -t 1 -n 1 -s 8388608 -r "$write_block_size" \
+    >"$run_dir/warmup.txt"
+  title="ngs3fs sequential cached write ($cache_mode cache)"
+  flame_svg="$run_dir/ngs3fs-write.svg"
+  flame_html="$run_dir/ngs3fs-write-interactive.html"
 fi
 profile_first_line=$(wc -l <"$run_dir/versity-access.log")
 
@@ -250,13 +273,14 @@ LD_LIBRARY_PATH=$perf_lib "$perf" record -F "$perf_frequency" \
   -o "$run_dir/perf.data" -- sleep 3600 &
 perf_pid=$!
 sleep 0.2
+profile_start_ns=$(date +%s%N)
 if [[ "$workload" = mmap ]]; then
   LD_LIBRARY_PATH=$perf_lib "$perf" stat --no-big-num -x, \
     -e "$perf_stat_events" -p "$ngs3fs_pid" \
     -o "$run_dir/perf-stat.csv" -- \
     "$bench" "$mount_dir/$object" "$bytes" "$iterations" 17825792 \
       >"$run_dir/mmap.jsonl"
-else
+elif [[ "$workload" = random-read ]]; then
   LD_LIBRARY_PATH=$perf_lib "$perf" stat --no-big-num -x, \
     -e "$perf_stat_events" -p "$ngs3fs_pid" \
     -o "$run_dir/perf-stat.csv" -- \
@@ -265,7 +289,16 @@ else
       -f "$random_files" -t "$random_threads" -n "$random_operations" \
       -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed" \
       >"$run_dir/random-read.txt"
+else
+  LD_LIBRARY_PATH=$perf_lib "$perf" stat --no-big-num -x, \
+    -e "$perf_stat_events" -p "$ngs3fs_pid" \
+    -o "$run_dir/perf-stat.csv" -- \
+    "$random_bench" -p -d "$mount_dir/profile-write" \
+      -f "$write_files" -t 1 -n 1 \
+      -s "$((write_bytes / write_files))" -r "$write_block_size" \
+      >"$run_dir/write.txt"
 fi
+profile_elapsed_ns=$(($(date +%s%N) - profile_start_ns))
 profile_last_line=$(wc -l <"$run_dir/versity-access.log")
 if ((profile_last_line > profile_first_line)); then
   profile_get_requests=$(
@@ -276,12 +309,28 @@ if ((profile_last_line > profile_first_line)); then
     sed -n "$((profile_first_line + 1)),${profile_last_line}p" \
       "$run_dir/versity-access.log" | grep -c 's3_HeadObject' || true
   )
+  profile_put_requests=$(
+    sed -n "$((profile_first_line + 1)),${profile_last_line}p" \
+      "$run_dir/versity-access.log" | grep -c 's3_PutObject' || true
+  )
+  profile_upload_part_requests=$(
+    sed -n "$((profile_first_line + 1)),${profile_last_line}p" \
+      "$run_dir/versity-access.log" | grep -c 's3_UploadPart' || true
+  )
+  profile_complete_requests=$(
+    sed -n "$((profile_first_line + 1)),${profile_last_line}p" \
+      "$run_dir/versity-access.log" | grep -c 's3_CompleteMultipartUpload' || true
+  )
 fi
 {
   printf 'cache_mode=%s\n' "$cache_mode"
   printf 'cache_dir=%s\n' "$cache_path"
   printf 's3_get_requests=%s\n' "$profile_get_requests"
   printf 's3_head_requests=%s\n' "$profile_head_requests"
+  printf 's3_put_requests=%s\n' "$profile_put_requests"
+  printf 's3_upload_part_requests=%s\n' "$profile_upload_part_requests"
+  printf 's3_complete_requests=%s\n' "$profile_complete_requests"
+  printf 'elapsed_ns=%s\n' "$profile_elapsed_ns"
 } >"$run_dir/profile-metadata.txt"
 kill -INT "$perf_pid" 2>/dev/null || true
 wait "$perf_pid" 2>/dev/null || true
@@ -304,12 +353,17 @@ if [[ ! -s "$run_dir/perf.folded" ]]; then
   if [[ "$workload" = mmap ]]; then
     "$bench" "$mount_dir/$object" "$bytes" "$((iterations * 4))" 17825792 \
       >"$run_dir/profile-retry.jsonl"
-  else
+  elif [[ "$workload" = random-read ]]; then
     "$random_bench" -R "${random_advice_args[@]}" \
       -d "$mount_dir/random-read" \
       -f "$random_files" -t "$random_threads" \
       -n "$((random_operations * 4))" \
       -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed" \
+      >"$run_dir/profile-retry.txt"
+  else
+    "$random_bench" -p -d "$mount_dir/profile-write-retry" \
+      -f "$write_files" -t 1 -n 1 \
+      -s "$((write_bytes * 4 / write_files))" -r "$write_block_size" \
       >"$run_dir/profile-retry.txt"
   fi
   kill -INT "$perf_pid" 2>/dev/null || true
@@ -368,6 +422,16 @@ if [[ "$workload" = random-read ]]; then
     "$((random_threads * random_operations))" "$pread_operations" \
     "$mmap_operations" "$bytes_read" "$elapsed_ns" \
     "$profile_get_requests" "$profile_head_requests" \
+    "$perf_event" "$perf_frequency" \
+    >>"$run_dir/profile-summary.csv"
+elif [[ "$workload" = write ]]; then
+  printf '%s\n' \
+    'cache_mode,cache_dir,bytes,block_size,elapsed_ns,s3_put_requests,s3_upload_part_requests,s3_complete_requests,perf_event,perf_frequency' \
+    >"$run_dir/profile-summary.csv"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$cache_mode" "$cache_path" "$write_bytes" "$write_block_size" \
+    "$profile_elapsed_ns" "$profile_put_requests" \
+    "$profile_upload_part_requests" "$profile_complete_requests" \
     "$perf_event" "$perf_frequency" \
     >>"$run_dir/profile-summary.csv"
 fi

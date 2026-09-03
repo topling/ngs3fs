@@ -185,6 +185,10 @@ if(NGS3FS_BUILD_TESTS)
   target_compile_options(random_read_stress PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
 
+  add_executable(cache_recovery_fixture tests/cache_recovery_fixture.c)
+  target_compile_options(cache_recovery_fixture PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+
   add_executable(cross_mount_race tests/cross_mount_race.cpp)
   target_compile_options(cross_mount_race PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)

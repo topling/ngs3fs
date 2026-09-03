@@ -9,6 +9,7 @@ run_dir=$(realpath -m "$run_dir")
 port=${PORT:-17071}
 workload=${WORKLOAD:-mmap}
 client=${CLIENT:-both}
+reference_client=${REFERENCE_CLIENT:-goofys}
 iterations=${ITERATIONS:-300}
 object_mib=${OBJECT_MIB:-256}
 order=${ORDER:-forward}
@@ -26,10 +27,12 @@ random_advice=${RANDOM_READ_ADVICE:-random}
 cache_mode=${CACHE_MODE:-none}
 cache_dir=${NGS3FS_CACHE_DIR:-${CACHE_DIR:-}}
 perf=${PERF_BIN:-perf}
+drop_after_warmup=${DROP_CACHES_AFTER_WARMUP:-0}
 
 versitygw="$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64/versitygw"
 ngs3fs=${NGS3FS_BIN:-"$project_dir/build/dev/ngs3fs"}
 goofys=${GOOFYS_BIN:-/home/leipeng/.cache/goofys-reference/bin/goofys}
+mountpoint_s3=${MOUNTPOINT_S3_BIN:-/home/leipeng/osc/mountpoint-s3/target/release/mount-s3}
 bench=${MMAP_BENCH_BIN:-"$project_dir/build/dev/mmap_fault_bench"}
 random_bench=${RANDOM_READ_BENCH_BIN:-"$project_dir/build/dev/random_read_stress"}
 backend="$run_dir/backend"
@@ -180,9 +183,34 @@ stop_goofys() {
   goofys_pid=
 }
 
+start_mountpoint_s3() {
+  mkdir -p "$run_dir/mountpoint-logs"
+  AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
+    "$mountpoint_s3" -f --endpoint-url "$endpoint" --region us-east-1 \
+      --force-path-style --log-directory "$run_dir/mountpoint-logs" \
+      "$bucket" "$goofys_mount" \
+      >"$run_dir/mountpoint-s3.log" 2>&1 &
+  goofys_pid=$!
+  wait_for_mount "$goofys_mount" "$goofys_pid" mountpoint-s3
+}
+
+stop_mountpoint_s3() {
+  stop_goofys
+}
+
 warm_random_backend() {
   find "$backend/$bucket/random-read" -type f \
     -exec dd if={} of=/dev/null bs=1M status=none \;
+}
+
+drop_measurement_caches() {
+  if [[ "$drop_after_warmup" != 1 ]]; then
+    return
+  fi
+  sync -f "$run_dir"
+  if ! echo 3 2>/dev/null >/proc/sys/vm/drop_caches; then
+    echo "warning: unable to drop kernel caches after warmup" >&2
+  fi
 }
 
 run_case() {
@@ -202,13 +230,16 @@ run_case() {
   local end_ns
   local used_ns
 
-  if [[ "$client" = ngs3fs && "$cache_mode" = cold ]]; then
+  if [[ "$cache_mode" = cold ]]; then
     warmup_object="$object-cold-warmup"
-  elif [[ "$client" = ngs3fs && "$cache_mode" = warm ]]; then
+  elif [[ "$cache_mode" = warm ]]; then
     warmup_iterations=$iterations
   fi
   "$bench" "$mount_dir/$warmup_object" "$bytes" "$warmup_iterations" "$stride" \
     >"$stem-warmup.jsonl"
+  if [[ "$cache_mode" = warm ]]; then
+    drop_measurement_caches
+  fi
 
   first_line=$(wc -l <"$daemon_log")
   start_ns=$(process_cpu_ns "$daemon_pid")
@@ -265,13 +296,14 @@ run_random_read_case() {
   local get_requests
   local request_log="$run_dir/$client-random-read-requests.log"
 
-  if [[ "$client" = ngs3fs && "$cache_mode" = warm ]]; then
+  if [[ "$cache_mode" = warm ]]; then
     "$random_bench" -R "${random_advice_args[@]}" \
       -d "$mount_dir/random-read" \
       -f "$random_files" -t "$random_threads" -n "$random_operations" \
       -s "$random_file_size" -r "$random_maximum_read" -S "$random_seed" \
       >"$run_dir/$client-random-read-warmup.txt"
-  elif [[ "$client" = ngs3fs && "$cache_mode" = cold ]]; then
+    drop_measurement_caches
+  elif [[ "$cache_mode" = cold ]]; then
     "$random_bench" -R "${random_advice_args[@]}" \
       -d "$mount_dir/random-read-cold-warmup" \
       -f "$random_files" -t "$random_threads" -n 8 \
@@ -332,20 +364,31 @@ run_random_read_client() {
       "$random_file_size"
     run_random_read_case ngs3fs "$ngs3fs_mount" "$ngs3fs_pid"
     stop_ngs3fs
-  else
+  elif [[ "$client" = goofys ]]; then
     start_goofys
     test "$(stat -c %s "$goofys_mount/random-read/file-0000.bin")" = \
       "$random_file_size"
     run_random_read_case goofys "$goofys_mount" "$goofys_pid"
     stop_goofys
+  else
+    start_mountpoint_s3
+    test "$(stat -c %s "$goofys_mount/random-read/file-0000.bin")" = \
+      "$random_file_size"
+    run_random_read_case mountpoint-s3 "$goofys_mount" "$goofys_pid"
+    stop_mountpoint_s3
   fi
 }
 
 trap cleanup EXIT INT TERM
 
 required_binaries=("$versitygw" "$ngs3fs")
-if [[ "$client" = goofys || "$client" = both ]]; then
+if [[ "$client" = goofys ||
+      ( "$client" = both && "$reference_client" = goofys ) ]]; then
   required_binaries+=("$goofys")
+fi
+if [[ "$client" = mountpoint-s3 ||
+      ( "$client" = both && "$reference_client" = mountpoint-s3 ) ]]; then
+  required_binaries+=("$mountpoint_s3")
 fi
 random_advice_args=()
 case "$random_advice" in
@@ -357,7 +400,13 @@ case "$random_advice" in
     ;;
 esac
 case "$workload" in
-  mmap) required_binaries+=("$bench") ;;
+  mmap)
+    if [[ "$reference_client" != goofys ]]; then
+      echo "the mmap workload currently supports only the goofys reference" >&2
+      exit 2
+    fi
+    required_binaries+=("$bench")
+    ;;
   random-read) required_binaries+=("$random_bench") ;;
   *)
     echo "unsupported workload: $workload" >&2
@@ -396,6 +445,25 @@ ROOT_ACCESS_KEY_ID=$access_key ROOT_SECRET_ACCESS_KEY=$secret_key \
 server_pid=$!
 wait_for_server
 
+# Direct POSIX backend setup leaves an empty ETag in VersityGW's listing.
+# Mountpoint rejects that XML, so create identical objects through S3 when it
+# is the selected reference client.
+if [[ "$workload" = random-read &&
+      ( "$client" = mountpoint-s3 ||
+        ( "$client" = both && "$reference_client" = mountpoint-s3 ) ) ]]; then
+  while IFS= read -r file; do
+    key=${file#"$backend/$bucket/"}
+    upload_source="$run_dir/mountpoint-upload.bin"
+    cp --reflink=auto "$file" "$upload_source"
+    curl --fail --silent --show-error \
+      --aws-sigv4 "aws:amz:us-east-1:s3" \
+      --user "$access_key:$secret_key" \
+      --upload-file "$upload_source" "$endpoint/$bucket/$key" \
+      --output /dev/null
+  done < <(find "$backend/$bucket/random-read" -type f -print)
+  rm -f "$run_dir/mountpoint-upload.bin"
+fi
+
 metrics_args=()
 if [[ "$metrics" != 0 ]]; then
   metrics_args=(-M)
@@ -406,14 +474,14 @@ if [[ "$workload" = random-read ]]; then
     'client,advice,max_connections,files,threads,operations,pread_operations,mmap_operations,bytes,wall_ns,daemon_cpu_ns,daemon_cpu_ns_per_operation,s3_get_requests' \
     >"$run_dir/random-read-summary.csv"
   case "$client" in
-    ngs3fs | goofys) run_random_read_client "$client" ;;
+    ngs3fs | goofys | mountpoint-s3) run_random_read_client "$client" ;;
     both)
       if [[ "$order" = reverse ]]; then
-        run_random_read_client goofys
+        run_random_read_client "$reference_client"
         run_random_read_client ngs3fs
       else
         run_random_read_client ngs3fs
-        run_random_read_client goofys
+        run_random_read_client "$reference_client"
       fi
       ;;
     *)
