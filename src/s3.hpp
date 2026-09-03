@@ -296,6 +296,10 @@ std::string_view checksum_option_name(ChecksumAlgorithm algorithm) noexcept;
 std::string_view checksum_s3_name(ChecksumAlgorithm algorithm) noexcept;
 std::string_view checksum_header_name(ChecksumAlgorithm algorithm) noexcept;
 std::string_view checksum_xml_name(ChecksumAlgorithm algorithm) noexcept;
+bool gcs_checksum_from_header(std::string_view value,
+                              ChecksumAlgorithm preferred,
+                              ChecksumAlgorithm& algorithm,
+                              std::string_view& expected) noexcept;
 bool checksum_is_s3(ChecksumAlgorithm algorithm) noexcept;
 std::string_view checksum_multipart_type(
     ChecksumAlgorithm algorithm) noexcept;

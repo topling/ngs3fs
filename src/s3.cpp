@@ -156,6 +156,51 @@ std::string_view checksum_header_name(ChecksumAlgorithm algorithm) noexcept {
   }
 }
 
+bool gcs_checksum_from_header(std::string_view value,
+                              ChecksumAlgorithm preferred,
+                              ChecksumAlgorithm& algorithm,
+                              std::string_view& expected) noexcept {
+  const auto find = [&](std::string_view name, std::string_view& result) {
+    size_t begin = 0;
+    while (begin < value.size()) {
+      size_t end = value.find(',', begin);
+      if (end == std::string_view::npos) {
+        end = value.size();
+      }
+      while (begin < end && isspace(u_char(value[begin]))) {
+        ++begin;
+      }
+      while (end > begin && isspace(u_char(value[end - 1]))) {
+        --end;
+      }
+      const std::string_view item = value.substr(begin, end - begin);
+      if (item.starts_with(name)) {
+        result = item.substr(name.size());
+        return !result.empty();
+      }
+      begin = value.find(',', begin);
+      if (begin == std::string_view::npos) {
+        break;
+      }
+      ++begin;
+    }
+    return false;
+  };
+  if (preferred != CHECKSUM_MD5 && find("crc32c=", expected)) {
+    algorithm = CHECKSUM_CRC32C;
+    return true;
+  }
+  if (find("md5=", expected)) {
+    algorithm = CHECKSUM_MD5;
+    return true;
+  }
+  if (find("crc32c=", expected)) {
+    algorithm = CHECKSUM_CRC32C;
+    return true;
+  }
+  return false;
+}
+
 std::string_view checksum_xml_name(ChecksumAlgorithm algorithm) noexcept {
   switch (algorithm) {
     case CHECKSUM_CRC32:

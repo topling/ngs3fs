@@ -363,7 +363,8 @@ int on_header(nghttp2_session*, const nghttp2_frame* frame,
     auto& state = *static_cast<ServerState*>(user_data);
     state.requests[frame->hd.stream_id].expected_bucket_owner.assign(
         reinterpret_cast<const char*>(value), value_length);
-  } else if (header_name == "x-amz-request-payer") {
+  } else if (header_name == "x-amz-request-payer" ||
+             header_name == "x-oss-request-payer") {
     auto& state = *static_cast<ServerState*>(user_data);
     state.requests[frame->hd.stream_id].request_payer.assign(
         reinterpret_cast<const char*>(value), value_length);
@@ -496,6 +497,12 @@ std::string response_checksum(ChecksumAlgorithm algorithm,
   return std::string(value.base64.data(), value.base64.size());
 }
 
+std::string_view version_header(ChecksumAlgorithm algorithm) {
+  return algorithm == CHECKSUM_CRC64XZ
+             ? "x-oss-version-id"
+             : "x-amz-version-id";
+}
+
 int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
                   void* user_data) {
   if (frame->hd.type != NGHTTP2_HEADERS &&
@@ -513,11 +520,14 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   require(request.expected_bucket_owner == "111122223333",
           "request omitted x-amz-expected-bucket-owner");
   require(request.request_payer == "requester",
-          "request omitted x-amz-request-payer");
+          "request omitted provider requester-pays header");
+  const std::string_view payer =
+      state.checksum == CHECKSUM_CRC64XZ
+          ? "x-oss-request-payer"
+          : "x-amz-request-payer";
   require(request.authorization.find("x-amz-expected-bucket-owner") !=
               std::string::npos &&
-              request.authorization.find("x-amz-request-payer") !=
-              std::string::npos,
+              request.authorization.find(payer) != std::string::npos,
           "mount-wide S3 headers were not included in SigV4 SignedHeaders");
   if (request.method == "POST" && frame->hd.type == NGHTTP2_HEADERS &&
       request.path.ends_with("?uploads=")) {
@@ -876,7 +886,7 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
           header(":status", "200"),
           header("content-length", content_length),
           header("etag", object.etag),
-          header("x-amz-version-id", object.version_id),
+          header(version_header(state.checksum), object.version_id),
           header("last-modified", object.last_modified),
       };
       const int submitted = nghttp2_submit_response(
@@ -901,12 +911,15 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
         header(":status", "200"),
         header("content-length", content_length),
         header("etag", state.etag),
-        header("x-amz-version-id", state.version_id),
+        header(version_header(state.checksum), state.version_id),
         header("last-modified", state.last_modified),
     };
     if (!state.write_id.empty()) {
       response_headers.push_back(header(
-          "x-amz-meta-ngs3fs-write-id", state.write_id));
+          state.checksum == CHECKSUM_CRC64XZ
+              ? "x-oss-meta-ngs3fs-write-id"
+              : "x-amz-meta-ngs3fs-write-id",
+          state.write_id));
     }
     const int submitted = nghttp2_submit_response(
         session, frame->hd.stream_id, response_headers.data(),
@@ -1088,7 +1101,7 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
           header(":status", "200"),
           header("content-length", "0"),
           header("etag", object->etag),
-          header("x-amz-version-id", object->version_id),
+          header(version_header(state.checksum), object->version_id),
           header("last-modified", object->last_modified),
           header(checksum_header_name(state.checksum), checksum),
       };
@@ -1114,7 +1127,7 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
         header(":status", "200"),
         header("content-length", "0"),
         header("etag", state.etag),
-        header("x-amz-version-id", state.version_id),
+        header(version_header(state.checksum), state.version_id),
         header("last-modified", state.last_modified),
         header(checksum_header_name(state.checksum),
                checksum),
@@ -1146,7 +1159,7 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
         header(":status", "200"),
         header("content-length", "0"),
         header("etag", state.etag),
-        header("x-amz-version-id", state.version_id),
+        header(version_header(state.checksum), state.version_id),
         header("last-modified", state.last_modified),
         header(checksum_header_name(state.checksum),
                checksum),
@@ -1249,7 +1262,7 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       header("content-length", source->content_length),
       header("content-range", source->content_range),
       header("etag", object_etag),
-      header("x-amz-version-id", object_version),
+      header(version_header(state.checksum), object_version),
   };
   if (!request.checksum_mode.empty()) {
     require(request.checksum_mode == "ENABLED" && complete_object,

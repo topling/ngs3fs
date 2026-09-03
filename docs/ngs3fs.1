@@ -109,7 +109,9 @@ crc64xz.
 .TP
 .B --verify-read-checksum
 Enable background best-effort verification of complete independently
-verifiable units. The first read or mmap fault may finish before verification.
+verifiable units. AWS checksum headers, Alibaba OSS CRC64 and Google XML API
+x-goog-hash CRC32C/MD5 are recognized. The first read or mmap fault may finish
+before verification.
 .SH CREDENTIALS
 Credential precedence is AWS environment variables, Web Identity, the selected
 shared profile, credential_process, ECS/EKS container credentials and IMDSv2.

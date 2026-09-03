@@ -54,6 +54,7 @@ enum ChecksumService {
   CHECKSUM_SERVICE_UNKNOWN,
   CHECKSUM_SERVICE_AWS,
   CHECKSUM_SERVICE_OSS,
+  CHECKSUM_SERVICE_GCS,
 };
 
 struct MountConfig {
@@ -99,6 +100,19 @@ struct MountConfig {
   bool cache_reserve_is_percent        = true;
   bool requester_pays                  = false;
 };
+
+ChecksumService checksum_service_from_host(std::string_view host) noexcept;
+
+ChecksumService effective_checksum_service(
+    const MountConfig& config) noexcept {
+  if (config.checksum_service != CHECKSUM_SERVICE_UNKNOWN) {
+    return config.checksum_service;
+  }
+  ChecksumService service = checksum_service_from_host(config.endpoint_host);
+  return service == CHECKSUM_SERVICE_UNKNOWN
+             ? checksum_service_from_host(config.authority)
+             : service;
+}
 
 std::string cache_namespace_id(const MountConfig& config) {
   std::string result;
@@ -1735,8 +1749,13 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   }
 
   if (config.authority.empty() && !config.endpoint_host.empty()) {
-    config.authority = format_authority(
-        config.endpoint_host, config.endpoint_port);
+    std::string host = config.endpoint_host;
+    if (!config.bucket.empty() &&
+        checksum_service_from_host(host) == CHECKSUM_SERVICE_OSS &&
+        !authority_uses_virtual_bucket(host, config.bucket)) {
+      host = config.bucket + '.' + host;
+    }
+    config.authority = format_authority(host, config.endpoint_port);
   }
   if (config.endpoint_port == 443) {
     config.tls = true;
@@ -2008,7 +2027,11 @@ template<class Headers>
 void append_mount_request_headers(Headers& headers,
                                   const MountConfig& config) {
   if (config.requester_pays) {
-    headers.push_back(Header{"x-amz-request-payer", "requester"});
+    headers.push_back(Header{
+        effective_checksum_service(config) == CHECKSUM_SERVICE_OSS
+            ? "x-oss-request-payer"
+            : "x-amz-request-payer",
+        "requester"});
   }
   if (!config.expected_bucket_owner.empty()) {
     headers.push_back(Header{"x-amz-expected-bucket-owner",
@@ -2285,6 +2308,11 @@ ChecksumService checksum_service_from_response(
   if (response.headers.find("x-oss-request-id") != response.headers.end()) {
     return CHECKSUM_SERVICE_OSS;
   }
+  if (response.headers.find("x-goog-request-id") != response.headers.end() ||
+      response.headers.find("x-guploader-uploadid") !=
+          response.headers.end()) {
+    return CHECKSUM_SERVICE_GCS;
+  }
   const auto server = response.headers.find("server");
   if (server != response.headers.end()) {
     const std::string_view value = sso_view(server->second);
@@ -2302,6 +2330,9 @@ ChecksumService checksum_service_from_host(std::string_view host) noexcept {
   if (domain_suffix_ignore_case(host, "aliyuncs.com") ||
       domain_suffix_ignore_case(host, "aliyuncs.com.cn")) {
     return CHECKSUM_SERVICE_OSS;
+  }
+  if (domain_suffix_ignore_case(host, "storage.googleapis.com")) {
+    return CHECKSUM_SERVICE_GCS;
   }
   if (domain_suffix_ignore_case(host, "amazonaws.com") ||
       domain_suffix_ignore_case(host, "amazonaws.com.cn")) {
@@ -2348,6 +2379,12 @@ void configure_checksum(State& state) {
     case CHECKSUM_SERVICE_OSS:
       state.config.checksum = CHECKSUM_CRC64XZ;
       fprintf(stderr, "checksum auto selected crc64xz for Alibaba OSS\n");
+      break;
+    case CHECKSUM_SERVICE_GCS:
+      state.config.checksum = CHECKSUM_PROTOCOL_DEFAULT;
+      fprintf(stderr,
+              "checksum auto selected the Google Cloud Storage protocol "
+              "default\n");
       break;
     case CHECKSUM_SERVICE_UNKNOWN:
       state.config.checksum = CHECKSUM_PROTOCOL_DEFAULT;
@@ -2528,10 +2565,18 @@ void append_s3_diagnostic(std::string& destination,
     append_s3_diagnostic(message, "code", error.code);
     append_s3_diagnostic(message, "message", error.message);
   }
-  const auto request_id = response.headers.find("x-amz-request-id");
+  auto request_id = response.headers.find("x-amz-request-id");
+  if (request_id == response.headers.end()) {
+    request_id = response.headers.find("x-oss-request-id");
+  }
+  if (request_id == response.headers.end()) {
+    request_id = response.headers.find("x-goog-request-id");
+  }
+  if (request_id == response.headers.end()) {
+    request_id = response.headers.find("x-guploader-uploadid");
+  }
   if (request_id != response.headers.end()) {
-    append_s3_diagnostic(message, "request_id",
-                         sso_view(request_id->second));
+    append_s3_diagnostic(message, "request_id", sso_view(request_id->second));
   } else if (parsed) {
     append_s3_diagnostic(message, "request_id", error.request_id);
   }
@@ -2672,11 +2717,17 @@ ObjectMetadata head_object(State& state, std::string_view path) {
       throw std::runtime_error("S3 HEAD returned an unsafe ETag");
     }
   }
-  const auto version = response.headers.find("x-amz-version-id");
+  auto version = response.headers.find("x-amz-version-id");
+  if (version == response.headers.end()) {
+    version = response.headers.find("x-oss-version-id");
+  }
   if (version != response.headers.end() && version->second != "null") {
     assign_string(metadata.version_id, version->second);
   }
-  const auto write_id = response.headers.find("x-amz-meta-ngs3fs-write-id");
+  auto write_id = response.headers.find("x-amz-meta-ngs3fs-write-id");
+  if (write_id == response.headers.end()) {
+    write_id = response.headers.find("x-oss-meta-ngs3fs-write-id");
+  }
   if (write_id != response.headers.end()) {
     assign_string(metadata.write_id, write_id->second);
   }
@@ -3145,7 +3196,8 @@ AuthorizedRangeRequest make_range_request(State& state,
   const bool verify_checksum = state.config.verify_read_checksum &&
       offset == 0 && uint64_t(length) == handle.size;
   const bool request_checksum = verify_checksum &&
-      state.config.checksum_service != CHECKSUM_SERVICE_OSS;
+      state.config.checksum_service != CHECKSUM_SERVICE_OSS &&
+      state.config.checksum_service != CHECKSUM_SERVICE_GCS;
   request.verify_checksum = verify_checksum;
   const int signing_mode =
       state.range_signing_mode.load(std::memory_order_relaxed);
@@ -4219,6 +4271,12 @@ bool read_checksum_from_response(const Response& response,
                                  ChecksumAlgorithm preferred,
                                  ChecksumAlgorithm& algorithm,
                                  std::string_view& expected) {
+  const auto goog = response.headers.find("x-goog-hash");
+  if (goog != response.headers.end() &&
+      gcs_checksum_from_header(sso_view(goog->second), preferred,
+                               algorithm, expected)) {
+    return true;
+  }
   const auto type = response.headers.find("x-amz-checksum-type");
   if (type != response.headers.end() && type->second == "COMPOSITE") {
     return false;
@@ -4295,7 +4353,10 @@ void verify_read_checksum(const Response& response, Pipe& pipe,
       throw std::runtime_error("GetObject returned a mismatched OSS CRC64");
     }
   } else if (expected != sso_view(actual.base64)) {
-    throw std::runtime_error("GetObject returned a mismatched S3 checksum");
+    throw std::runtime_error(
+        response.headers.find("x-goog-hash") != response.headers.end()
+            ? "GetObject returned a mismatched Google Cloud Storage checksum"
+            : "GetObject returned a mismatched S3 checksum");
   }
 }
 
@@ -4323,7 +4384,10 @@ void update_written_metadata(State& state, OpenHandle& handle,
   } else {
     handle.etag.clear();
   }
-  const auto version = response.headers.find("x-amz-version-id");
+  auto version = response.headers.find("x-amz-version-id");
+  if (version == response.headers.end()) {
+    version = response.headers.find("x-oss-version-id");
+  }
   if (version != response.headers.end() && version->second != "null") {
     assign_string(handle.version_id, version->second);
   } else if (used_head) {

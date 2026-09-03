@@ -48,7 +48,9 @@ multi-file namespace. It remains experimental rather than production-ready.
   path still has one kernel copy into the page cache.
 - `-K/--checksum` defaults to `auto`. Amazon S3 endpoints select XXHASH128;
   Alibaba OSS endpoints select their native CRC64/XZ response check; unknown
-  S3-compatible endpoints leave checksum selection to the protocol service.
+  S3-compatible endpoints and Google Cloud Storage leave upload checksum
+  selection to the protocol service. Google XML API `x-goog-hash` CRC32C and
+  MD5 values are recognized by optional read verification.
   Explicit `crc32`, `crc32c`, `crc64nvme`, `sha1`, `sha256`, `md5`,
   `xxhash64`, `xxhash3`, `xxhash128`, and `sha512` use S3's algorithm-specific
   checksum headers. `crc64xz` selects the OSS response checksum, while
@@ -60,8 +62,13 @@ multi-file namespace. It remains experimental rather than production-ready.
   `x-amz-expected-bucket-owner` on every S3 request, preventing a DNS or
   configuration mistake from silently targeting a bucket owned by another
   account. `--requester-pays` likewise sends and signs
-  `x-amz-request-payer: requester`. Both are opt-in so non-AWS S3-compatible
-  services keep their existing behavior.
+  `x-amz-request-payer: requester`; detected Alibaba OSS endpoints use the
+  native `x-oss-request-payer` spelling. Both are opt-in so other
+  S3-compatible services keep their existing behavior.
+- When `--authority` is omitted for a recognized Alibaba OSS endpoint,
+  ngs3fs generates `<bucket>.<endpoint>` automatically because OSS rejects
+  path-style requests. An explicit authority is preserved for custom domains
+  and proxies.
 - S3 XML error codes are preserved in diagnostics and participate in errno
   mapping and retry decisions. Retryable errors such as `RequestTimeout` and
   `SlowDown` are recognized even when their HTTP status alone is ambiguous.
@@ -386,7 +393,8 @@ leaves receive-window sizing to normal kernel TCP autotuning. Linux may cap an
 explicit value at `net.core.rmem_max`, in which case ngs3fs prints one warning
 and recreates the socket without locking its receive-buffer size.
 `--verify-read-checksum` is intentionally independent of the upload checksum
-selection and is disabled unless explicitly requested.
+selection and is disabled unless explicitly requested. It accepts AWS checksum
+headers, Alibaba OSS CRC64, and Google XML API `x-goog-hash` CRC32C/MD5.
 `--read-ahead` must be page-aligned; `0` disables it. Values above the
 per-request pipe capacity are split by kernel FUSE read limits when kernel BDI
 tuning is available.

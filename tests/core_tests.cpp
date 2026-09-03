@@ -348,6 +348,20 @@ void test_data_checksums() {
   assert(checksum_s3_name(CHECKSUM_XXHASH128) == "XXHASH128");
   assert(checksum_header_name(CHECKSUM_CRC64XZ) ==
          "x-oss-hash-crc64ecma");
+  ChecksumAlgorithm gcs_algorithm = CHECKSUM_NONE;
+  std::string_view gcs_expected;
+  assert(gcs_checksum_from_header(
+      "crc32c=n03x6A==, md5=Ojk9c3dhfxgoKVVHYwFbHQ==",
+      CHECKSUM_PROTOCOL_DEFAULT, gcs_algorithm, gcs_expected));
+  assert(gcs_algorithm == CHECKSUM_CRC32C && gcs_expected == "n03x6A==");
+  assert(gcs_checksum_from_header(
+      "crc32c=n03x6A==, md5=Ojk9c3dhfxgoKVVHYwFbHQ==",
+      CHECKSUM_MD5, gcs_algorithm, gcs_expected));
+  assert(gcs_algorithm == CHECKSUM_MD5 &&
+         gcs_expected == "Ojk9c3dhfxgoKVVHYwFbHQ==");
+  assert(!gcs_checksum_from_header(
+      "etag=not-a-checksum", CHECKSUM_PROTOCOL_DEFAULT,
+      gcs_algorithm, gcs_expected));
   assert(checksum_xml_name(CHECKSUM_SHA512) == "ChecksumSHA512");
   assert(checksum_multipart_type(CHECKSUM_CRC64NVME) == "FULL_OBJECT");
   assert(checksum_multipart_type(CHECKSUM_XXHASH128) == "COMPOSITE");
