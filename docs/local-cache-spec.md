@@ -28,6 +28,23 @@ crash while the operating system remains alive. It does not promise recovery
 from power loss, operating-system crash, cache-device loss, manual cache-tree
 modification, or silent storage corruption.
 
+## Page-cache policy
+
+The FUSE inode pagecache is the primary hot-data cache. Sparse local data files
+use ordinary buffered I/O so cache hits, fills, checksums, recovery and uploads
+share a simple portable path. Every data-file open description is marked once
+with `POSIX_FADV_NOREUSE`; on Linux 6.3 and newer this makes accesses through
+that description ineligible for page-cache reference promotion. Local pages
+may coexist transiently with FUSE pages, but reclaim should prefer the local
+copy instead of polluting the active working set. The call is exactly
+`posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE)`: it is issued once immediately
+after each data-file open, and length zero covers the whole file.
+
+`POSIX_FADV_NOREUSE` is advisory rather than an immediate eviction request.
+ngs3fs does not use `POSIX_FADV_DONTNEED`, direct I/O, page retrieval, or FUSE
+passthrough to enforce a strict single-copy invariant. The advice is best effort:
+ngs3fs neither detects kernel support nor makes mount correctness depend on it.
+
 ## Mount options
 
 - `-L, --cache-dir PATH` enables the persistent local cache. Omitting it keeps
@@ -143,13 +160,18 @@ Each runtime page consumes two persistent bits:
 | Bits | State | Meaning |
 | --- | --- | --- |
 | `00` | MISSING | No usable local data |
-| `01` | CLEAN | Matches the recorded remote generation |
-| `10` | DIRTY | Locally authoritative replacement data |
-| `11` | BAD/RESERVED | Invalid data or a format-reserved state |
+| `01` | READ_PENDING | One request owns the S3 download; overlapping readers wait |
+| `10` | CLEAN | Usable local data; the entry-level dirty flag identifies a local replacement generation |
+| `11` | BAD | Data failed checksum validation and its retry |
 
-`FETCHING`, `VERIFYING`, `RETRYING`, reference bits, and pin counts are
-transient in-memory state. An uploaded part remains DIRTY until the final S3
-object commit succeeds. The server's paginated `ListParts` result is the
+`READ_PENDING` is published in the persistent bitmap before the GET begins.
+It is an inter-thread ownership state, not durable work: after a process
+restart, every surviving READ_PENDING page is changed to MISSING and its
+possibly partial extent is punched before it can be served. `VERIFYING`,
+`RETRYING`, reference bits, and pin counts remain transient in-memory state.
+Locally written pages are CLEAN in the bitmap while the entry-level dirty flag
+keeps the whole replacement generation non-evictable and authoritative until
+the final S3 commit succeeds. The server's paginated `ListParts` result is the
 authoritative upload-progress record; duplicating every part ETag in local
 metadata adds another crash-consistency problem without improving recovery.
 
@@ -157,7 +179,7 @@ Publication ordering is:
 
 1. reserve physical space;
 2. write data;
-3. publish CLEAN or DIRTY with release semantics;
+3. publish CLEAN with release semantics;
 4. for a write, publish the new `written_end`;
 5. reply to FUSE.
 
@@ -216,13 +238,14 @@ grow the per-handle window through 2 MiB, 4 MiB, and 8 MiB, capped by
 - is page aligned except at EOF;
 - expands only forward;
 - may cross already CLEAN islands to avoid another S3 request;
-- stops before another FETCHING or BAD/RETRYING range;
+- stops before another READ_PENDING or BAD range;
 - never crosses the object generation or EOF.
 
-Overlapping fetches coalesce. Readers wait on an existing overlapping claim;
-disjoint misses may fetch concurrently. Once every page needed by the FUSE
-request is CLEAN, ngs3fs sends exactly one reply immediately. The same GET may
-continue filling its speculative tail afterward.
+Overlapping fetches coalesce through READ_PENDING. Readers that need a pending
+page wait for its state to become CLEAN, MISSING, or BAD; they never issue a
+duplicate GET for that page. Disjoint misses may fetch concurrently. Once
+every page needed by the FUSE request is CLEAN, ngs3fs sends exactly one reply
+immediately. The same GET may continue filling its speculative tail afterward.
 
 Demand misses have priority over speculative tails. A cache miss expands only
 when a bulk connection is immediately available. Uploads and expanded fills
@@ -292,11 +315,13 @@ write must start exactly at `written_end`; a different offset fails with
 ### Local acceptance and upload
 
 Before replying to a write, ngs3fs creates the dirty marker, reserves one full
-upload unit, writes the supplied range to the sparse data file, publishes DIRTY
-pages and `written_end`, and only then replies. The default reservation is
-therefore 8 MiB even for a very small first write. This deliberate common-path
-simplicity may reject many concurrent tiny writers near capacity; that access
-pattern is not optimized.
+upload unit, writes the supplied range to the sparse data file, publishes the
+dirty generation's data as CLEAN pages plus `written_end`, and only then
+replies. The entry-level dirty flag prevents those pages from being mistaken
+for a committed remote generation. The default reservation is therefore 8 MiB
+even for a very small first write. This deliberate common-path simplicity may
+reject many concurrent tiny writers near capacity; that access pattern is not
+optimized.
 
 Successful local data write plus mmap metadata publication is the write
 success boundary. Remote visibility is not implied. `fdatasync` and `msync`
@@ -329,7 +354,8 @@ The first writable `flush` permanently seals the handle:
   `CompleteMultipartUpload`;
 - on success it records the returned identity and Last-Modified; if the
   response omits Last-Modified, it performs one HEAD;
-- DIRTY pages become CLEAN and remain available to subsequent readers;
+- the entry-level dirty flag is cleared; its CLEAN pages remain available to
+  subsequent readers;
 - repeated flush with no new data succeeds;
 - every later non-empty write fails and emits one stderr diagnostic containing
   the path.
@@ -394,8 +420,8 @@ second-chance CLOCK:
 - a cache access sets a transient reference bit;
 - the first CLOCK pass clears the bit;
 - a later unreferenced pass may evict the region;
-- DIRTY, FETCHING, RETRYING, pinned, or pending-operation data is never
-  evicted;
+- dirty generations, READ_PENDING, BAD, pinned, or pending-operation data is
+  never evicted;
 - eviction changes page state before punching the corresponding hole;
 - a region containing CLEAN and MISSING pages remains evictable;
 - closed clean entries from earlier process lifetimes are discovered only

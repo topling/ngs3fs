@@ -242,6 +242,18 @@ multi-file namespace. It remains experimental rather than production-ready.
 
 ## TODO
 
+- With the persistent local cache enabled, allow a read-only handle to open
+  after a writer for the same key is fully initialized. The reader shares that
+  writer's cache generation, never issues HEAD or GET for it, and may read
+  randomly only within the acquire-loaded `written_end` published by completed
+  writes. Each completed write must also publish the growing inode size;
+  reads beyond the currently published size return EOF rather than waiting.
+  Existing readers must still exclude a later writable open, and the writer
+  remains unique. Implement this by explicitly representing a writer that is
+  registered but not yet ready, auditing the open registry, unlink/rename,
+  flush/failure/recovery, and mmap growth semantics, and adding concurrency
+  tests. This is deliberately mount-local read-your-writes visibility and does
+  not change S3 close-to-open visibility.
 - Linux FUSE can currently merge the folios required by the caller with
   speculative readahead folios into one `FUSE_READ`. A reply cannot complete
   incrementally, so the caller may wait for that whole merged request. When
@@ -407,6 +419,11 @@ S3 to mirror every small FUSE read. `--cache-size` limits physical allocation
 and `--cache-reserve` preserves filesystem free space (5% by default). Clean
 regions use second-chance CLOCK eviction; a read bypasses the cache if clean
 space cannot be reclaimed.
+
+Cache data files remain buffered. Each newly opened data-file description gets
+one whole-file `POSIX_FADV_NOREUSE` hint so supporting kernels prefer reclaiming
+this duplicate local copy; ngs3fs does not probe support or depend on the hint
+for correctness.
 
 With local caching enabled, sequential replacement writes become locally
 authoritative before FUSE acknowledges them. The first byte reserves one full

@@ -84,8 +84,16 @@ int main() {
     const CacheFetchClaim claim = entry->claim_fetch(100, 200, 1024 * 1024);
     assert(claim.offset == 0);
     assert(claim.length == 9000);
+    assert(!entry->claim_fetch(100, 200, 1024 * 1024));
+    auto pending_waiter = std::async(std::launch::async, [&] {
+      entry->wait_for_range(100, 200);
+      return entry->range_clean(100, 200);
+    });
+    assert(pending_waiter.wait_for(std::chrono::milliseconds(20)) ==
+           std::future_status::timeout);
     write_test_bytes(entry->data_fd(), 0, 4096);
     entry->publish_clean(claim, 0, 4096, false);
+    assert(pending_waiter.get());
     assert(entry->range_clean(0, 4096));
     assert(!entry->range_clean(4096, 1));
 
@@ -106,6 +114,22 @@ int main() {
     assert(unaligned_claim.offset == 0);
     assert(unaligned_claim.length == 8192);
     unaligned->fail_fetch(unaligned_claim);
+
+    std::shared_ptr<CacheEntry> partial_pending = cache.open(
+        test_identity("partial-pending", "etag-pending", 8192));
+    const CacheFetchClaim one_page = partial_pending->claim_fetch(
+        0, 4096, 4096);
+    assert(one_page.offset == 0 && one_page.length == 4096);
+    auto overlap_waiter = std::async(std::launch::async, [&] {
+      partial_pending->wait_for_range(0, 8192);
+      return partial_pending->range_clean(0, 4096);
+    });
+    assert(overlap_waiter.wait_for(std::chrono::milliseconds(20)) ==
+           std::future_status::timeout);
+    write_test_bytes(partial_pending->data_fd(), 0, 4096);
+    partial_pending->publish_clean(one_page, 0, 4096, true);
+    partial_pending->finish_fetch(one_page);
+    assert(overlap_waiter.get());
 
     std::shared_ptr<CacheEntry> tail = cache.open(
         test_identity("partial-tail", "etag-tail", 4097));
@@ -237,6 +261,7 @@ int main() {
     write_test_bytes(writer->data_fd(), 0, 4096);
     writer->publish_dirty(0, 4096, 4096);
     assert(writer->dirty());
+    assert(!writer->fully_clean());
     assert(writer->written_end() == 4096);
     writer->set_upload_id("upload-1");
     assert(writer->upload_id() == "upload-1");
@@ -244,7 +269,26 @@ int main() {
     writer->commit_write(test_identity(
         "written/file", "written-etag", 4096));
     assert(!writer->dirty());
+    assert(writer->fully_clean());
     assert(writer->range_clean(0, 4096));
+  }
+
+  const CacheIdentity interrupted_identity = test_identity(
+      "interrupted-read", "etag-interrupted", 8192);
+  {
+    LocalCache cache(config);
+    std::shared_ptr<CacheEntry> entry = cache.open(interrupted_identity);
+    const CacheFetchClaim claim = entry->claim_fetch(0, 4096, 8192);
+    assert(claim.offset == 0 && claim.length == 8192);
+    write_test_bytes(entry->data_fd(), 0, 1024);
+  }
+  {
+    LocalCache cache(config);
+    std::shared_ptr<CacheEntry> entry = cache.open(interrupted_identity);
+    assert(!entry->range_clean(0, 4096));
+    const CacheFetchClaim claim = entry->claim_fetch(0, 4096, 8192);
+    assert(claim.offset == 0 && claim.length == 8192);
+    entry->fail_fetch(claim);
   }
 
   {

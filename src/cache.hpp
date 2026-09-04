@@ -15,10 +15,10 @@
 #include <vector>
 
 enum CachePageState : uint8_t {
-  CACHE_PAGE_MISSING = 0b00,
-  CACHE_PAGE_CLEAN   = 0b01,
-  CACHE_PAGE_DIRTY   = 0b10,
-  CACHE_PAGE_BAD     = 0b11,
+  CACHE_PAGE_MISSING      = 0b00,
+  CACHE_PAGE_READ_PENDING = 0b01,
+  CACHE_PAGE_CLEAN        = 0b10,
+  CACHE_PAGE_BAD          = 0b11,
 };
 
 struct CacheConfig {
@@ -176,7 +176,6 @@ class CacheEntry {
   size_t bitmap_offset_ = 0;
   mutable std::mutex mutex_;
   std::condition_variable condition_;
-  std::vector<uint8_t> fetching_;
   std::vector<uint8_t> referenced_;
   std::vector<uint32_t> region_pins_;
   std::vector<uint64_t> active_claims_;

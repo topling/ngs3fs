@@ -28,7 +28,7 @@
 constexpr char kCacheEscapePrefix[] = ".~ngs3fs~.";
 constexpr char kCacheValueName[]    = ".~ngs3fs~.value";
 constexpr uint32_t kCacheRootVersion = 1;
-constexpr uint32_t kCacheMetaVersion = 3;
+constexpr uint32_t kCacheMetaVersion = 4;
 constexpr uint32_t kCacheByteOrder    = 0x01020304;
 constexpr uint32_t kCachePathVersion  = 1;
 constexpr uint32_t kCacheMetaDirty    = 1;
@@ -537,6 +537,10 @@ void cache_close_fd(int& fd) noexcept {
   }
 }
 
+void advise_cache_data_file(int fd) noexcept {
+  (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE);
+}
+
 uint64_t cache_tree_allocation(int directory) {
   const int duplicate = ::openat(
       directory, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -724,10 +728,29 @@ CacheEntry::CacheEntry(LocalCache& owner, std::string key, int data_fd,
       page_size_(owner.config().page_size),
       page_count_(size == 0 ? 0 : size_t((size - 1) / page_size_ + 1)),
       bitmap_offset_(kCacheMetaHeaderSize),
-      fetching_(page_count_, 0),
       referenced_(size == 0 ? 0 : size_t(
           (size - 1) / std::max<size_t>(1024U * 1024U, page_size_) + 1), 0),
-      region_pins_(referenced_.size(), 0) {}
+      region_pins_(referenced_.size(), 0) {
+  size_t page = 0;
+  while (page < page_count_) {
+    while (page < page_count_ &&
+           page_state(page) != CACHE_PAGE_READ_PENDING) {
+      ++page;
+    }
+    const size_t first = page;
+    while (page < page_count_ &&
+           page_state(page) == CACHE_PAGE_READ_PENDING) {
+      set_page_state(page, CACHE_PAGE_MISSING);
+      ++page;
+    }
+    if (first != page) {
+      const uint64_t offset = uint64_t(first) * page_size_;
+      const uint64_t end = std::min<uint64_t>(
+          size_, uint64_t(page) * page_size_);
+      owner_->punch_range(data_fd_, offset, end - offset);
+    }
+  }
+}
 
 CacheEntry::~CacheEntry() {
   uint64_t unlinked_bytes = 0;
@@ -895,7 +918,7 @@ bool CacheEntry::range_bad(uint64_t offset, size_t length) const {
   const size_t first = size_t(offset / page_size_);
   const size_t last = size_t((offset + length - 1) / page_size_);
   for (size_t page = first; page <= last; ++page) {
-    if (page_state(page) == CACHE_PAGE_BAD && !fetching_[page]) {
+    if (page_state(page) == CACHE_PAGE_BAD) {
       return true;
     }
   }
@@ -904,7 +927,8 @@ bool CacheEntry::range_bad(uint64_t offset, size_t length) const {
 
 bool CacheEntry::fully_clean() const {
   std::lock_guard guard(mutex_);
-  return !stale_ &&
+  const auto& header = *static_cast<const CacheMetaHeader*>(mapping_);
+  return !stale_ && (header.flags & kCacheMetaDirty) == 0 &&
       range_all_state(0, size_t(std::min<uint64_t>(size_, SIZE_MAX)),
                       CACHE_PAGE_CLEAN);
 }
@@ -1050,9 +1074,6 @@ void CacheEntry::publish_dirty(uint64_t offset, size_t length,
     throw std::logic_error("non-sequential cache write publication");
   }
   const size_t pages = size_t((written_end - 1) / page_size_) + 1;
-  if (fetching_.size() < pages) {
-    fetching_.resize(pages, 0);
-  }
   page_count_ = pages;
   const size_t regions = size_t(
       (written_end - 1) /
@@ -1064,7 +1085,7 @@ void CacheEntry::publish_dirty(uint64_t offset, size_t length,
   const size_t first = size_t(offset / page_size_);
   const size_t last  = size_t((written_end - 1) / page_size_);
   for (size_t page = first; page <= last; ++page) {
-    set_page_state(page, CACHE_PAGE_DIRTY);
+    set_page_state(page, CACHE_PAGE_CLEAN);
   }
   header.object_size = written_end;
   std::atomic_ref<uint64_t> published(header.written_end);
@@ -1164,11 +1185,6 @@ void CacheEntry::commit_write(const CacheIdentity& identity) {
     header.flags           &= ~kCacheMetaDirty;
     header.write_phase      = 0;
     header.upload_id_length = 0;
-    for (size_t page = 0; page < page_count_; ++page) {
-      if (page_state(page) == CACHE_PAGE_DIRTY) {
-        set_page_state(page, CACHE_PAGE_CLEAN);
-      }
-    }
     eviction_disabled_ = false;
     if (::msync(mapping_, mapping_size_, MS_SYNC) != 0) {
       cache_throw_errno("msync(cache write commit)");
@@ -1273,20 +1289,22 @@ void CacheEntry::disable_eviction() noexcept {
 
 bool CacheEntry::range_ready_locked(uint64_t offset,
                                     size_t length) const noexcept {
-  if (stale_) {
-    return true;
-  }
-  if (range_all_state(offset, length, CACHE_PAGE_CLEAN)) {
+  if (stale_ || length == 0) {
     return true;
   }
   const size_t first = size_t(offset / page_size_);
   const size_t last = size_t((offset + length - 1) / page_size_);
+  bool pending = false;
   for (size_t page = first; page <= last; ++page) {
-    if (page_state(page) == CACHE_PAGE_BAD && !fetching_[page]) {
+    const CachePageState state = page_state(page);
+    if (state == CACHE_PAGE_BAD) {
       return true;
     }
+    if (state == CACHE_PAGE_READ_PENDING) {
+      pending = true;
+    }
   }
-  return false;
+  return !pending;
 }
 
 CacheFetchClaim CacheEntry::claim_fetch(uint64_t wanted_offset,
@@ -1310,7 +1328,7 @@ CacheFetchClaim CacheEntry::claim_fetch(uint64_t wanted_offset,
       ++missing;
       continue;
     }
-    if (fetching_[missing] || page_state(missing) == CACHE_PAGE_BAD) {
+    if (page_state(missing) != CACHE_PAGE_MISSING) {
       return {};
     }
     break;
@@ -1328,7 +1346,8 @@ CacheFetchClaim CacheEntry::claim_fetch(uint64_t wanted_offset,
       size_, std::max(request_end, expanded_end));
   size_t end_page = size_t((wanted_end - 1) / page_size_) + 1;
   for (size_t page = missing; page < end_page; ++page) {
-    if (fetching_[page] || page_state(page) == CACHE_PAGE_BAD) {
+    const CachePageState state = page_state(page);
+    if (state == CACHE_PAGE_READ_PENDING || state == CACHE_PAGE_BAD) {
       end_page = page;
       break;
     }
@@ -1341,8 +1360,8 @@ CacheFetchClaim CacheEntry::claim_fetch(uint64_t wanted_offset,
   active_claims_.push_back(id);
   ++next_claim_id_;
   for (size_t page = missing; page < end_page; ++page) {
-    if (page_state(page) != CACHE_PAGE_CLEAN) {
-      fetching_[page] = 1;
+    if (page_state(page) == CACHE_PAGE_MISSING) {
+      set_page_state(page, CACHE_PAGE_READ_PENDING);
     }
   }
   return CacheFetchClaim{start, epoch_, id, size_t(end - start)};
@@ -1351,17 +1370,7 @@ CacheFetchClaim CacheEntry::claim_fetch(uint64_t wanted_offset,
 void CacheEntry::wait_for_range(uint64_t offset, size_t length) {
   std::unique_lock guard(mutex_);
   condition_.wait(guard, [&] {
-    if (range_ready_locked(offset, length)) {
-      return true;
-    }
-    const size_t first = size_t(offset / page_size_);
-    const size_t last = size_t((offset + length - 1) / page_size_);
-    for (size_t page = first; page <= last; ++page) {
-      if (page_state(page) != CACHE_PAGE_CLEAN && !fetching_[page]) {
-        return true;
-      }
-    }
-    return false;
+    return range_ready_locked(offset, length);
   });
   if (stale_) {
     throw std::system_error(ESTALE, std::generic_category(),
@@ -1385,8 +1394,9 @@ void CacheEntry::publish_clean(const CacheFetchClaim& claim,
   }
   page_end = std::min(page_end, page_count_);
   for (size_t page = first; page < page_end; ++page) {
-    set_page_state(page, CACHE_PAGE_CLEAN);
-    fetching_[page] = 0;
+    if (page_state(page) == CACHE_PAGE_READ_PENDING) {
+      set_page_state(page, CACHE_PAGE_CLEAN);
+    }
   }
   if (first != page_end) {
     condition_.notify_all();
@@ -1409,8 +1419,24 @@ void CacheEntry::finish_fetch(const CacheFetchClaim& claim) noexcept {
     const size_t first = size_t(claim.offset / page_size_);
     const size_t last = std::min(
         page_count_, size_t((claim.offset + claim.length - 1) / page_size_) + 1);
-    for (size_t page = first; page < last; ++page) {
-      fetching_[page] = 0;
+    size_t page = first;
+    while (page < last) {
+      while (page < last &&
+             page_state(page) != CACHE_PAGE_READ_PENDING) {
+        ++page;
+      }
+      const size_t pending = page;
+      while (page < last &&
+             page_state(page) == CACHE_PAGE_READ_PENDING) {
+        set_page_state(page, CACHE_PAGE_MISSING);
+        ++page;
+      }
+      if (pending != page) {
+        const uint64_t offset = uint64_t(pending) * page_size_;
+        const uint64_t end = std::min<uint64_t>(
+            size_, uint64_t(page) * page_size_);
+        owner_->punch_range(data_fd_, offset, end - offset);
+      }
     }
   }
   end_fetch_locked(claim);
@@ -1423,22 +1449,20 @@ void CacheEntry::fail_fetch(const CacheFetchClaim& claim) noexcept {
     const size_t first = size_t(claim.offset / page_size_);
     const size_t last = std::min(
         page_count_, size_t((claim.offset + claim.length - 1) / page_size_) + 1);
-    for (size_t page = first; page < last; ++page) {
-      fetching_[page] = 0;
-    }
     size_t page = first;
     while (page < last) {
       while (page < last &&
-             page_state(page) != CACHE_PAGE_MISSING) {
+             page_state(page) != CACHE_PAGE_READ_PENDING) {
         ++page;
       }
-      const size_t missing = page;
+      const size_t pending = page;
       while (page < last &&
-             page_state(page) == CACHE_PAGE_MISSING) {
+             page_state(page) == CACHE_PAGE_READ_PENDING) {
+        set_page_state(page, CACHE_PAGE_MISSING);
         ++page;
       }
-      if (missing != page) {
-        const uint64_t offset = uint64_t(missing) * page_size_;
+      if (pending != page) {
+        const uint64_t offset = uint64_t(pending) * page_size_;
         const uint64_t end = std::min<uint64_t>(
             size_, uint64_t(page) * page_size_);
         owner_->punch_range(data_fd_, offset, end - offset);
@@ -1457,7 +1481,6 @@ void CacheEntry::mark_bad(const CacheFetchClaim& claim) noexcept {
         page_count_, size_t((claim.offset + claim.length - 1) / page_size_) + 1);
     for (size_t page = first; page < last; ++page) {
       set_page_state(page, CACHE_PAGE_BAD);
-      fetching_[page] = 0;
     }
   }
   condition_.notify_all();
@@ -1472,8 +1495,7 @@ void CacheEntry::begin_retry(const CacheFetchClaim& claim) {
   const size_t last = std::min(
       page_count_, size_t((claim.offset + claim.length - 1) / page_size_) + 1);
   for (size_t page = first; page < last; ++page) {
-    set_page_state(page, CACHE_PAGE_BAD);
-    fetching_[page] = 1;
+    set_page_state(page, CACHE_PAGE_READ_PENDING);
   }
   condition_.notify_all();
 }
@@ -1721,8 +1743,7 @@ uint64_t CacheEntry::evict_one_region() noexcept {
         if (state == CACHE_PAGE_CLEAN) {
           clean_pages.push_back(page);
         }
-        if ((state != CACHE_PAGE_CLEAN && state != CACHE_PAGE_MISSING) ||
-            fetching_[page]) {
+        if (state != CACHE_PAGE_CLEAN && state != CACHE_PAGE_MISSING) {
           evictable = false;
           break;
         }
@@ -1906,8 +1927,7 @@ bool LocalCache::reclaim_closed_clean(
         return false;
       }
       for (size_t page = 0; page < entry->page_count_; ++page) {
-        if (entry->page_state(page) != CACHE_PAGE_MISSING ||
-            entry->fetching_[page]) {
+        if (entry->page_state(page) != CACHE_PAGE_MISSING) {
           return false;
         }
       }
@@ -2503,6 +2523,7 @@ std::vector<std::shared_ptr<CacheEntry>> LocalCache::recover_dirty(
       if (data_fd < 0 || meta_fd < 0 || dirty_fd < 0) {
         cache_throw_errno("open(cache recovery files)");
       }
+      advise_cache_data_file(data_fd);
       struct stat meta_status{};
       struct stat data_status{};
       if (::fstat(meta_fd, &meta_status) != 0 ||
@@ -2843,6 +2864,7 @@ std::shared_ptr<CacheEntry> LocalCache::create_writer(
     cancel_reservation(kCacheMetaHeaderSize);
     cache_throw_errno("open(cache writer data)");
   }
+  advise_cache_data_file(data_fd);
   int meta_fd = -1;
   void* mapping = MAP_FAILED;
   try {
@@ -3192,6 +3214,7 @@ std::shared_ptr<CacheEntry> LocalCache::open(
   if (data_fd < 0) {
     cache_throw_errno("open(cache data)");
   }
+  advise_cache_data_file(data_fd);
   int meta_fd = -1;
   void* mapping = MAP_FAILED;
   const size_t required_mapping_size =

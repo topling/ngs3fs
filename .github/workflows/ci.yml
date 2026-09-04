@@ -66,6 +66,7 @@ jobs:
             ninja-build \
             psmisc \
             python3 \
+            strace \
             uuid-dev \
             xfslibs-dev \
             xfsprogs \
@@ -79,6 +80,16 @@ jobs:
 
       - name: Bootstrap, build, and test
         run: ./scripts/bootstrap.sh
+
+      - name: Verify local-cache page advice
+        run: |
+          trace=build/cache-noreuse.trace
+          strace -f -e trace=fadvise64 -o "$trace" build/dev/cache_test
+          total=$(grep -c 'fadvise64(' "$trace")
+          advised=$(grep -c \
+            'fadvise64([^,]*, 0, 0, POSIX_FADV_NOREUSE) = 0' "$trace")
+          test "$total" -gt 0
+          test "$total" -eq "$advised"
 
       - name: Build Linux kernel filesystem tests
         run: make -C upstream/xfstests -j2
