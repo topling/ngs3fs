@@ -175,7 +175,8 @@ def write_html(path, comparisons, generated, source_run):
         <th>Advice</th><th>Cache<br>ngs3fs / reference</th><th>Reference</th>
         <th class="number">ngs3fs<br>CPU/op (ms)</th>
         <th class="number">Reference<br>CPU/op (ms)</th>
-        <th class="number">CPU ratio</th><th class="number">ngs3fs CPU saved</th>
+        <th class="number">Reference CPU ÷<br>ngs3fs CPU</th>
+        <th class="number">ngs3fs CPU saved</th>
         <th class="number">Median S3 GET<br>ngs3fs / reference</th><th>Evidence</th>
       </tr></thead>
       <tbody>{''.join(rows)}
