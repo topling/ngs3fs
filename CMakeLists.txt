@@ -66,6 +66,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(Dependencies)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto SSL)
 ngs3fs_find_fuse3()
+ngs3fs_find_liburing()
 
 FetchContent_Declare(ngs3fs_tinyxml2
   URL https://github.com/leethomason/tinyxml2/archive/refs/tags/11.0.0.tar.gz
@@ -143,9 +144,10 @@ endif()
 add_executable(ngs3fs
   src/main.cpp
   src/fuse.cpp
+  src/fuse_reactor.cpp
 )
-target_link_libraries(ngs3fs PRIVATE ngs3fs_core FUSE3::fuse3)
-target_compile_definitions(ngs3fs PRIVATE FUSE_USE_VERSION=35)
+target_link_libraries(ngs3fs PRIVATE ngs3fs_core FUSE3::fuse3 LIBURING::uring)
+target_compile_definitions(ngs3fs PRIVATE FUSE_USE_VERSION=318)
 target_compile_options(ngs3fs PRIVATE
   -Wall -Wextra -Wpedantic -Wconversion)
 
@@ -226,6 +228,24 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME fuse_mmap_integration_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>)
   set_tests_properties(fuse_mmap_integration_test PROPERTIES TIMEOUT 60)
+  add_test(NAME fuse_uring_integration_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 plain uring)
+  set_tests_properties(fuse_uring_integration_test PROPERTIES TIMEOUT 60)
+  add_test(NAME fuse_legacy_integration_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 plain legacy)
+  set_tests_properties(fuse_legacy_integration_test PROPERTIES TIMEOUT 60)
+  add_test(NAME fuse_multi_reactor_integration_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 plain uring 2)
+  set_tests_properties(fuse_multi_reactor_integration_test PROPERTIES
+    TIMEOUT 60)
+  add_test(NAME fuse_multi_reactor_cached_integration_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 cache uring 2)
+  set_tests_properties(fuse_multi_reactor_cached_integration_test PROPERTIES
+    TIMEOUT 60)
   add_test(NAME fuse_crc64nvme_integration_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs> crc64nvme)
   set_tests_properties(fuse_crc64nvme_integration_test PROPERTIES TIMEOUT 60)
@@ -276,6 +296,17 @@ if(NGS3FS_BUILD_TESTS)
     COMMAND ngs3fs --checksum not-a-checksum --help)
   set_tests_properties(checksum_invalid_test PROPERTIES WILL_FAIL TRUE)
 
+  add_test(NAME io_engine_options_test COMMAND ngs3fs --io-engine auto --reactors 1 --help)
+  add_test(NAME io_engine_legacy_option_test COMMAND ngs3fs --io-engine legacy --help)
+  add_test(NAME io_engine_uring_option_test COMMAND ngs3fs --io-engine uring --help)
+  add_test(NAME io_engine_invalid_test COMMAND ngs3fs --io-engine nope --help)
+  set_tests_properties(io_engine_invalid_test PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME reactors_invalid_test COMMAND ngs3fs --reactors nope --help)
+  set_tests_properties(reactors_invalid_test PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME reactors_zero_test COMMAND ngs3fs --reactors 0 --help)
+  set_tests_properties(reactors_zero_test PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME reactors_oversized_test COMMAND ngs3fs --reactors 257 --help)
+  set_tests_properties(reactors_oversized_test PROPERTIES WILL_FAIL TRUE)
   add_test(NAME cache_options_test
     COMMAND ngs3fs -L /tmp/ngs3fs-option-test --cache-size 1GiB
                    --cache-reserve 5% --help)

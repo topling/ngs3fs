@@ -5,6 +5,36 @@ documented sequential replacement-write and close-to-open contract. Treat that
 contract as part of the application deployment, not as a POSIX-compatible
 default.
 
+## I/O engine selection
+
+`--io-engine legacy` is the deployment default while the uring engine remains
+experimental and consumes more CPU in the current local random-read
+benchmark. `--io-engine auto` is experimental. At startup it probes
+the patched classic-fusefd io_uring transport and uses it when initialization
+succeeds. If the probe or reactor initialization fails, it logs a warning and
+starts the legacy libfuse threaded engine. This is the only fallback point:
+after requests are being served, a fatal transport failure fails the mount and
+does not migrate it to another engine.
+
+`--io-engine legacy` forces the existing threaded libfuse path. `--io-engine
+uring` forces the caller-owned FUSE transport reactor group and fails the
+mount if that transport cannot be initialized. `--reactors N` creates N rings
+and N cloned FUSE device fds. `N=1` uses the same group implementation and
+does not acquire a group lock on the request/reply hot path.
+
+The uring engine covers classic `/dev/fuse` receive/reply and cleartext HTTP
+connect, send, receive and splice operations reached from dispatched FUSE
+callbacks, upload workers and uncached-prefetch continuations. Socket
+operations carry linked request timeouts. TLS remains implemented by the
+threaded `TlsTunnel`; local-cache file I/O and unscoped maintenance work also
+remain threaded. Consequently this is not yet a complete all-FD reactor, and
+an HTTP connection is not yet permanently assigned to one reactor. The uring
+build uses a
+pinned libfuse 3.18.2 source
+dependency plus the small ngs3fs asynchronous-reply patch. Bootstrap fetches
+and builds that dependency; verify the pinned version and patch in CI before
+rollout.
+
 ## Required bucket policy and lifecycle
 
 - Grant only the mounted bucket/prefix operations used by the deployment:

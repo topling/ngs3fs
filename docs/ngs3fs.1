@@ -62,6 +62,22 @@ Per-attempt ECS, IMDS and credential endpoint timeout. Default is 1000.
 .TP
 .BI "--stats-interval " seconds
 Emit aggregate JSON health and resource counters to stderr. Zero disables it.
+.TP
+.BI "--io-engine " auto|legacy|uring
+Select the FUSE transport engine. The default is legacy while S3 and cache I/O
+integration remains experimental. Auto tries the caller-owned io_uring
+classic-fusefd transport at startup and falls back to the legacy libfuse
+threaded loop with a warning if initialization is unavailable. The
+legacy and uring engines cannot be switched while a mount is running. The
+uring engine drives cleartext HTTP socket operations reached from scoped FUSE,
+upload and prefetch work. TLS and local-cache file I/O remain threaded.
+.TP
+.BI "--reactors " count
+Number of io_uring FUSE transport reactors, from 1 through 256. Each reactor
+uses a separate ring and cloned FUSE device fd. The default is one. This
+option has no effect when the legacy engine is selected. S3 socket and cache
+file operations without a reactor scope remain threaded in the current
+implementation.
 .SH CACHE AND I/O OPTIONS
 .TP
 .BI "-T, --dir-cache-timeout " milliseconds

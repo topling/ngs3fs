@@ -81,25 +81,34 @@ add_subdirectory(
   "${CMAKE_BINARY_DIR}/_deps/llhttp-v9.4.3"
   EXCLUDE_FROM_ALL)
 
+function(ngs3fs_find_liburing)
+  find_path(LIBURING_INCLUDE_DIR NAMES liburing.h)
+  find_library(LIBURING_LIBRARY NAMES uring liburing)
+  if(NOT LIBURING_INCLUDE_DIR OR NOT LIBURING_LIBRARY)
+    message(FATAL_ERROR "liburing development files are required")
+  endif()
+  if(NOT TARGET LIBURING::uring)
+    add_library(LIBURING::uring UNKNOWN IMPORTED)
+    set_target_properties(LIBURING::uring PROPERTIES
+      IMPORTED_LOCATION "${LIBURING_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${LIBURING_INCLUDE_DIR}")
+  endif()
+endfunction()
+
 function(ngs3fs_find_fuse3)
-  find_path(FUSE3_INCLUDE_DIR
-    NAMES fuse_lowlevel.h
-    HINTS
-      "${NGS3FS_DEPS_DIR}/sysroot/usr/include/fuse3"
-      "/usr/include/fuse3")
-  find_library(FUSE3_LIBRARY
-    NAMES fuse3 libfuse3.so.3 fuse3.so.3
-    HINTS
-      "${NGS3FS_DEPS_DIR}/sysroot/usr/lib/x86_64-linux-gnu"
-      "/lib/x86_64-linux-gnu"
-      "/usr/lib/x86_64-linux-gnu")
-  if(NOT FUSE3_INCLUDE_DIR OR NOT FUSE3_LIBRARY)
-    message(FATAL_ERROR "libfuse3 is required; run scripts/bootstrap.sh")
+  set(NGS3FS_FUSE3_INCLUDE_DIR
+    "${NGS3FS_DEPS_DIR}/fuse-3.18.2/include/fuse3")
+  set(NGS3FS_FUSE3_LIBRARY
+    "${NGS3FS_DEPS_DIR}/fuse-3.18.2/lib/libfuse3.a")
+  if(NOT EXISTS "${NGS3FS_FUSE3_INCLUDE_DIR}/fuse_lowlevel.h" OR
+     NOT EXISTS "${NGS3FS_FUSE3_LIBRARY}")
+    message(FATAL_ERROR
+      "patched libfuse 3.18.2 is missing; run scripts/bootstrap.sh")
   endif()
   if(NOT TARGET FUSE3::fuse3)
-    add_library(FUSE3::fuse3 UNKNOWN IMPORTED)
+    add_library(FUSE3::fuse3 STATIC IMPORTED)
     set_target_properties(FUSE3::fuse3 PROPERTIES
-      IMPORTED_LOCATION "${FUSE3_LIBRARY}"
-      INTERFACE_INCLUDE_DIRECTORIES "${FUSE3_INCLUDE_DIR}")
+      IMPORTED_LOCATION "${NGS3FS_FUSE3_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${NGS3FS_FUSE3_INCLUDE_DIR}")
   endif()
 endfunction()

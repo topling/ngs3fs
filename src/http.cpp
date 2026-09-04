@@ -369,6 +369,32 @@ void require_nghttp2(nghttp2_ssize result, size_t expected,
                            ": incomplete frame consumption");
 }
 
+struct Http2HeaderRead {
+  nghttp2_session* session;
+  const std::byte* data;
+  size_t data_length;
+  size_t receive_length;
+  std::exception_ptr error;
+
+  static int process(void* context, size_t received) noexcept {
+    auto& self = *static_cast<Http2HeaderRead*>(context);
+    try {
+      if (received != self.receive_length) {
+        throw std::runtime_error("incomplete HTTP/2 frame header");
+      }
+      require_nghttp2(
+          nghttp2_session_mem_recv2(
+              self.session,
+              reinterpret_cast<const uint8_t*>(self.data), self.data_length),
+          self.data_length, "nghttp2_session_mem_recv(frame header)");
+      return 1;
+    } catch (...) {
+      self.error = std::current_exception();
+      return -EIO;
+    }
+  }
+};
+
 ExternalDataIngress::ExternalDataIngress(size_t shadow_span_bytes)
     : shadow_span_bytes_(shadow_span_bytes) {
   static_assert(kDefaultShadowSpanSize == kPreferredIoSize);
@@ -445,12 +471,32 @@ ReceiveResult ExternalDataIngress::receive_one(
 
   std::array<std::byte, kFrameHeaderSize> wire_header{};
   std::copy(frame_prefix.begin(), frame_prefix.end(), wire_header.begin());
-  read_all(socket_fd, std::span(wire_header).subspan(frame_prefix.size()));
-  require_nghttp2(
-      nghttp2_session_mem_recv2(
-          session, reinterpret_cast<const uint8_t*>(wire_header.data()),
-          wire_header.size()),
-      wire_header.size(), "nghttp2_session_mem_recv(frame header)");
+  const std::span missing =
+      std::span(wire_header).subspan(frame_prefix.size());
+  Http2HeaderRead read{
+      .session = session,
+      .data           = wire_header.data(),
+      .data_length    = wire_header.size(),
+      .receive_length = missing.size(),
+      .error          = {},
+  };
+  const ssize_t received = missing.empty()
+      ? (Http2HeaderRead::process(&read, 0) > 0 ? 0 : -1)
+      : io_receive_exact_then(
+            socket_fd, missing.data(), missing.size(), 0,
+            Http2HeaderRead::process, &read);
+  if (received < 0) {
+    if (read.error != nullptr) {
+      std::rethrow_exception(read.error);
+    }
+    throw std::system_error(errno, std::generic_category(),
+                            "recv(HTTP/2 frame header)");
+  }
+  if (size_t(received) != missing.size()) {
+    throw std::system_error(
+        std::make_error_code(std::errc::connection_reset),
+        "HTTP/2 peer closed during frame header");
+  }
   if (!header_ready_) {
     throw std::runtime_error("nghttp2 did not report the frame header");
   }
@@ -474,7 +520,7 @@ ReceiveResult ExternalDataIngress::receive_one(
 
   payload_.resize(result.header.length);
   if (!payload_.empty()) {
-    read_all(socket_fd, payload_);
+    receive_all(socket_fd, payload_);
     require_nghttp2(
         nghttp2_session_mem_recv2(
             session, reinterpret_cast<const uint8_t*>(payload_.data()),
@@ -1804,8 +1850,9 @@ bool Http2Client::probe_server() {
   std::array<std::byte, prefix.size()> received_prefix{};
   try {
     const ssize_t received =
-        ::recv(socket.get(), received_prefix.data(),
-               received_prefix.size(), MSG_WAITALL);
+        io_receive(socket.get(), received_prefix.data(),
+                   received_prefix.size(), MSG_WAITALL,
+                   probe_timeout_ms);
     if (received == 0) {
       set_socket_receive_timeout(socket.get(), io_timeout_ms);
       return false;
@@ -1953,7 +2000,7 @@ void transfer_pipe_to_file(Pipe& source, RangeFileSink& destination,
       off_t offset = off_t(destination.offset());
       ssize_t result;
       do {
-        result = ::splice(
+        result = io_splice(
             source.read_fd(), nullptr, destination.fd(), &offset,
             length - transferred, SPLICE_F_MOVE | SPLICE_F_MORE);
       } while (result < 0 && errno == EINTR);
@@ -2350,6 +2397,57 @@ class ResponseParser {
   bool capture_content_range_ = false;
 };
 
+struct Http1HeaderRead {
+  ResponseParser& parser;
+  Response& response;
+  std::span<std::byte> buffer;
+  size_t& begin;
+  size_t& end;
+  size_t& header_bytes;
+  RangeFileSink* file_destination;
+  bool measure_transport;
+  std::exception_ptr error;
+
+  static int process(void* context, size_t length) noexcept {
+    auto& self = *static_cast<Http1HeaderRead*>(context);
+    try {
+      self.begin = 0;
+      self.end   = length;
+      const size_t before = self.response.body_bytes;
+      const size_t consumed = self.parser.execute(
+          self.buffer.first(length));
+      self.begin += consumed;
+      self.header_bytes += consumed;
+      if (self.begin == self.end) {
+        self.begin = 0;
+        self.end   = 0;
+      }
+      if (self.response.body_bytes != before) {
+        if (self.measure_transport) {
+          self.response.wire_last_data_ns = http1_monotonic_ns();
+        }
+        if (self.file_destination != nullptr) {
+          self.file_destination->progress(self.response, false);
+        }
+      }
+      if (self.parser.headers_complete()) {
+        return 1;
+      }
+      if (consumed == 0) {
+        throw std::runtime_error("llhttp made no response progress");
+      }
+      if (self.header_bytes >= kMaxResponseHeaderBytes) {
+        throw std::runtime_error(
+            "HTTP/1.1 response headers exceed 64 KiB");
+      }
+      return 0;
+    } catch (...) {
+      self.error = std::current_exception();
+      return -EIO;
+    }
+  }
+};
+
 class Http1RangeDownload;
 
 class Http1Client final : public HttpClient {
@@ -2477,26 +2575,32 @@ class Http1Client final : public HttpClient {
       size_t header_bytes = 0;
       while (!parser.headers_complete()) {
         if (begin == end) {
-          if (header_bytes == kMaxResponseHeaderBytes) {
-            throw std::runtime_error(
-                "HTTP/1.1 response headers exceed 64 KiB");
-          }
-          const size_t room = kMaxResponseHeaderBytes - header_bytes;
-          ssize_t n;
-          do {
-            n = ::recv(socket.get(), buf.data(),
-                       std::min(buf.size(), room), 0);
-          } while (n < 0 && errno == EINTR);
-          if (n == 0) {
+          Http1HeaderRead header{
+              .parser       = parser,
+              .response     = response,
+              .buffer       = buf,
+              .begin        = begin,
+              .end          = end,
+              .header_bytes = header_bytes,
+              .file_destination = file_destination,
+              .measure_transport = measure_transport,
+              .error        = {},
+          };
+          const ssize_t received = io_receive_until(
+              socket.get(), buf.data(), buf.size(), 0,
+              Http1HeaderRead::process, &header);
+          if (received == 0) {
             throw std::system_error(
                 std::make_error_code(std::errc::connection_reset),
                 "HTTP/1.1 peer closed before response headers");
           }
-          if (n < 0) {
+          if (received < 0) {
+            if (header.error != nullptr) {
+              std::rethrow_exception(header.error);
+            }
             http1_throw_errno("recv(HTTP/1.1 header)");
           }
-          begin = 0;
-          end   = size_t(n);
+          continue;
         }
 
         const size_t before = response.body_bytes;
@@ -2586,7 +2690,7 @@ class Http1Client final : public HttpClient {
                 ssize_t moved;
                 do {
                   ++response.transport_splice_calls;
-                  moved = ::splice(
+                  moved = io_splice(
                       socket.get(), nullptr, file_staging.write_fd(), nullptr,
                       count, SPLICE_F_MOVE | SPLICE_F_MORE);
                 } while (moved < 0 && errno == EINTR);
@@ -2615,7 +2719,7 @@ class Http1Client final : public HttpClient {
               while (received != remaining) {
                 ssize_t n;
                 do {
-                  n = ::recv(socket.get(),
+                  n = io_receive(socket.get(),
                              response.body.data() + old_size + received,
                              remaining - received, 0);
                 } while (n < 0 && errno == EINTR);
@@ -2649,7 +2753,7 @@ class Http1Client final : public HttpClient {
             if (begin == end) {
               ssize_t n;
               do {
-                n = ::recv(socket.get(), buf.data(), buf.size(), 0);
+                n = io_receive(socket.get(), buf.data(), buf.size(), 0);
               } while (n < 0 && errno == EINTR);
               if (n < 0) {
                 http1_throw_errno("recv(HTTP/1.1 body)");
@@ -2875,55 +2979,20 @@ class Http1RangeDownload final : public RangeDownload {
     if (headers_ready_) {
       return;
     }
-    for (;;) {
-      while (!parser_->headers_complete()) {
-        if (begin_ == end_) {
-          if (header_bytes_ == kMaxResponseHeaderBytes) {
-            throw std::runtime_error(
-                "HTTP/1.1 response headers exceed 64 KiB");
-          }
-          const size_t room = kMaxResponseHeaderBytes - header_bytes_;
-          ssize_t n;
-          do {
-            n = ::recv(client_.socket.get(), buffer_.data(),
-                       std::min(buffer_.size(), room), 0);
-          } while (n < 0 && errno == EINTR);
-          if (n == 0) {
-            throw std::system_error(
-                std::make_error_code(std::errc::connection_reset),
-                "HTTP/1.1 peer closed before response headers");
-          }
-          if (n < 0) {
-            http1_throw_errno("recv(HTTP/1.1 header)");
-          }
-          begin_ = 0;
-          end_   = size_t(n);
-        }
-        const size_t n = parser_->execute(
-            std::span(buffer_).subspan(begin_, end_ - begin_));
-        begin_ += n;
-        header_bytes_ += n;
-        if (begin_ == end_) {
-          begin_ = 0;
-          end_   = 0;
-        }
-        if (n == 0 && !parser_->headers_complete()) {
-          throw std::runtime_error("llhttp made no response progress");
-        }
+    header_error_ = nullptr;
+    const ssize_t received = io_receive_until(
+        client_.socket.get(), buffer_.data(), buffer_.size(), 0,
+        process_header_read, this);
+    if (received == 0) {
+      throw std::system_error(
+          std::make_error_code(std::errc::connection_reset),
+          "HTTP/1.1 peer closed before response headers");
+    }
+    if (received < 0) {
+      if (header_error_ != nullptr) {
+        std::rethrow_exception(header_error_);
       }
-
-      if (response_.status < 100 || response_.status >= 200 ||
-          response_.status == 101) {
-        break;
-      }
-      if (!parser_->message_complete()) {
-        throw std::runtime_error("incomplete informational response");
-      }
-      const uint64_t wire_start_ns = response_.wire_start_ns;
-      response_ = {};
-      response_.wire_start_ns = wire_start_ns;
-      header_bytes_ = 0;
-      reset_parser();
+      http1_throw_errno("recv(HTTP/1.1 header)");
     }
 
     headers_ready_ = true;
@@ -2963,6 +3032,59 @@ class Http1RangeDownload final : public RangeDownload {
     }
   }
 
+  static int process_header_read(void* context, size_t length) noexcept {
+    auto& self = *static_cast<Http1RangeDownload*>(context);
+    try {
+      return self.process_header_bytes(length) ? 1 : 0;
+    } catch (...) {
+      self.header_error_ = std::current_exception();
+      return -EIO;
+    }
+  }
+
+  bool process_header_bytes(size_t length) {
+    begin_ = 0;
+    end_   = length;
+    for (;;) {
+      while (!parser_->headers_complete()) {
+        const size_t n = parser_->execute(
+            std::span(buffer_).subspan(begin_, end_ - begin_));
+        begin_ += n;
+        header_bytes_ += n;
+        if (begin_ == end_) {
+          begin_ = 0;
+          end_   = 0;
+        }
+        if (n == 0 && !parser_->headers_complete()) {
+          throw std::runtime_error("llhttp made no response progress");
+        }
+        if (!parser_->headers_complete() && begin_ == end_) {
+          if (header_bytes_ >= kMaxResponseHeaderBytes) {
+            throw std::runtime_error(
+                "HTTP/1.1 response headers exceed 64 KiB");
+          }
+          return false;
+        }
+      }
+
+      if (response_.status < 100 || response_.status >= 200 ||
+          response_.status == 101) {
+        return true;
+      }
+      if (!parser_->message_complete()) {
+        throw std::runtime_error("incomplete informational response");
+      }
+      const uint64_t wire_start_ns = response_.wire_start_ns;
+      response_ = {};
+      response_.wire_start_ns = wire_start_ns;
+      header_bytes_ = 0;
+      reset_parser();
+      if (begin_ == end_) {
+        return false;
+      }
+    }
+  }
+
   void receive_body_once() {
     if (response_.status < 300 && fixed_remaining_) {
       receive_fixed_once();
@@ -2971,7 +3093,8 @@ class Http1RangeDownload final : public RangeDownload {
     if (begin_ == end_) {
       ssize_t n;
       do {
-        n = ::recv(client_.socket.get(), buffer_.data(), buffer_.size(), 0);
+        n = io_receive(client_.socket.get(), buffer_.data(),
+                       buffer_.size(), 0);
       } while (n < 0 && errno == EINTR);
       if (n < 0) {
         http1_throw_errno("recv(HTTP/1.1 body)");
@@ -3026,9 +3149,9 @@ class Http1RangeDownload final : public RangeDownload {
     ssize_t moved;
     do {
       ++response_.transport_splice_calls;
-      moved = ::splice(client_.socket.get(), nullptr,
-                       client_.file_staging.write_fd(), nullptr,
-                       requested, SPLICE_F_MOVE | SPLICE_F_MORE);
+      moved = io_splice(client_.socket.get(), nullptr,
+                        client_.file_staging.write_fd(), nullptr,
+                        requested, SPLICE_F_MOVE | SPLICE_F_MORE);
     } while (moved < 0 && errno == EINTR);
     if (moved == 0) {
       throw std::system_error(
@@ -3065,6 +3188,7 @@ class Http1RangeDownload final : public RangeDownload {
   Response response_;
   std::optional<TlsRequestTimer> timer_;
   std::optional<ResponseParser> parser_;
+  std::exception_ptr header_error_;
   std::array<std::byte, kHttp1ReadSize> buffer_;
   std::optional<size_t> fixed_remaining_;
   size_t begin_ = 0;

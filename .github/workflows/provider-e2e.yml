@@ -68,7 +68,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            build-essential cmake curl fuse3 libfuse3-dev libssl-dev ninja-build
+            build-essential cmake curl fuse3 libfuse3-dev liburing-dev \
+            libssl-dev meson ninja-build
 
       - name: Enable FUSE
         run: |

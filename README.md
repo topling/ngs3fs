@@ -86,6 +86,24 @@ multi-file namespace. It remains experimental rather than production-ready.
   worker invalidates the affected inode range so later mmap faults also reach
   the BAD state without racing the request's locked folio.
 - FUSE remains in cached mode; `direct_io` is never enabled.
+- The FUSE transport can be selected with `--io-engine auto|legacy|uring`.
+  `legacy` remains the default while the uring engine is experimental and its
+  CPU cost remains higher on the local random-read benchmark.
+  `legacy` uses the existing libfuse threaded loop; `uring` uses the
+  caller-owned io_uring reactor for the classic `/dev/fuse` transport while
+  libfuse continues to own request decoding, dispatch and reply semantics.
+  Cleartext HTTP connect, send, receive and splice operations issued by FUSE
+  callbacks, upload workers and uncached-prefetch continuation workers are
+  submitted to the callback's reactor with linked request timeouts.
+  `--reactors` selects the reactor count. Each reactor owns one ring and one
+  cloned FUSE device fd; the one-reactor case uses the same group code without
+  a shared hot-path lock. A fallback is possible only during startup; a
+  running mount never changes engines.
+- TLS remains at the existing threaded `TlsTunnel` boundary. Thus an uring
+  mount uses a threaded remote TLS socket. Local-cache `pread`/`pwrite`, cache
+  maintenance and background work without a reactor scope also remain on the
+  threaded path; the uring engine does not yet claim a complete all-FD event
+  loop.
 - After each upload succeeds, `FUSE_NOTIFY_STORE` consumes the retained
   FD-backed pipe chain into the ordinary kernel page cache, covering partial
   pages that FUSE write-through mode otherwise discards. Later read opens keep

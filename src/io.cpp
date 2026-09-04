@@ -22,6 +22,209 @@
 #include <string>
 #include <system_error>
 
+thread_local IoExecutor* current_io_executor = nullptr;
+thread_local int current_io_timeout_ms       = 0;
+
+IoExecutorScope::IoExecutorScope(IoExecutor* executor,
+                                 int timeout_ms) noexcept
+    : previous_executor_(current_io_executor),
+      previous_timeout_ms_(current_io_timeout_ms) {
+  current_io_executor   = executor;
+  current_io_timeout_ms = timeout_ms;
+}
+
+IoExecutorScope::~IoExecutorScope() {
+  current_io_executor   = previous_executor_;
+  current_io_timeout_ms = previous_timeout_ms_;
+}
+
+int effective_io_timeout(int timeout_ms) noexcept {
+  return timeout_ms > 0 ? timeout_ms : current_io_timeout_ms;
+}
+
+ssize_t io_receive(int fd, void* data, size_t length, int flags,
+                   int timeout_ms) noexcept {
+  if (current_io_executor != nullptr) {
+    return current_io_executor->receive(
+        fd, data, length, flags, effective_io_timeout(timeout_ms));
+  }
+  return ::recv(fd, data, length, flags);
+}
+
+ssize_t io_receive_exact(int fd, void* data, size_t length, int flags,
+                         int timeout_ms) noexcept {
+  if (current_io_executor != nullptr) {
+    return current_io_executor->receive_exact(
+        fd, data, length, flags, effective_io_timeout(timeout_ms));
+  }
+  size_t offset = 0;
+  while (offset != length) {
+    const ssize_t result = ::recv(
+        fd, static_cast<u_char*>(data) + offset, length - offset, flags);
+    if (result > 0) {
+      offset += size_t(result);
+      continue;
+    }
+    if (result == 0) {
+      break;
+    }
+    if (errno != EINTR) {
+      return -1;
+    }
+  }
+  return ssize_t(offset);
+}
+
+ssize_t io_receive_exact_then(
+    int fd, void* data, size_t length, int flags,
+    IoExecutor::ReceiveProcessor processor, void* context,
+    int timeout_ms) noexcept {
+  if (processor == nullptr) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (current_io_executor != nullptr) {
+    return current_io_executor->receive_exact_then(
+        fd, data, length, flags, effective_io_timeout(timeout_ms),
+        processor, context);
+  }
+  const ssize_t received = io_receive_exact(
+      fd, data, length, flags, timeout_ms);
+  if (received != ssize_t(length)) {
+    return received;
+  }
+  const int processed = processor(context, length);
+  if (processed > 0) {
+    return received;
+  }
+  errno = processed < 0 ? -processed : EIO;
+  return -1;
+}
+
+ssize_t io_receive_until(int fd, void* data, size_t length, int flags,
+                         IoExecutor::ReceiveProcessor processor,
+                         void* context, int timeout_ms) noexcept {
+  if (processor == nullptr || length == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (current_io_executor != nullptr) {
+    return current_io_executor->receive_until(
+        fd, data, length, flags, effective_io_timeout(timeout_ms),
+        processor, context);
+  }
+  size_t total = 0;
+  for (;;) {
+    const ssize_t result = ::recv(fd, data, length, flags);
+    if (result > 0) {
+      total += size_t(result);
+      const int processed = processor(context, size_t(result));
+      if (processed > 0) {
+        return ssize_t(total);
+      }
+      if (processed < 0) {
+        errno = -processed;
+        return -1;
+      }
+      continue;
+    }
+    if (result == 0) {
+      return ssize_t(total);
+    }
+    if (errno != EINTR) {
+      return -1;
+    }
+  }
+}
+
+ssize_t io_send(int fd, const void* data, size_t length, int flags,
+                int timeout_ms) noexcept {
+  if (current_io_executor != nullptr) {
+    return current_io_executor->send(
+        fd, data, length, flags, effective_io_timeout(timeout_ms));
+  }
+  return ::send(fd, data, length, flags);
+}
+
+ssize_t io_send_exact(int fd, const void* data, size_t length, int flags,
+                      int timeout_ms) noexcept {
+  if (current_io_executor != nullptr) {
+    return current_io_executor->send_exact(
+        fd, data, length, flags, effective_io_timeout(timeout_ms));
+  }
+  size_t offset = 0;
+  while (offset != length) {
+    const ssize_t result = ::send(
+        fd, static_cast<const u_char*>(data) + offset,
+        length - offset, flags);
+    if (result > 0) {
+      offset += size_t(result);
+      continue;
+    }
+    if (result == 0) {
+      errno = EIO;
+      return -1;
+    }
+    if (errno != EINTR) {
+      return -1;
+    }
+  }
+  return ssize_t(offset);
+}
+
+ssize_t io_splice(int input_fd, off_t* input_offset,
+                  int output_fd, off_t* output_offset,
+                  size_t length, unsigned flags,
+                  int timeout_ms) noexcept {
+  if (current_io_executor != nullptr) {
+    return current_io_executor->splice(
+        input_fd, input_offset, output_fd, output_offset,
+        length, flags, effective_io_timeout(timeout_ms));
+  }
+  return ::splice(input_fd, input_offset, output_fd, output_offset,
+                  length, flags);
+}
+
+ssize_t io_splice_exact(int input_fd, off_t* input_offset,
+                        int output_fd, off_t* output_offset,
+                        size_t length, unsigned flags,
+                        int timeout_ms, size_t* calls) noexcept {
+  if (current_io_executor != nullptr) {
+    return current_io_executor->splice_exact(
+        input_fd, input_offset, output_fd, output_offset,
+        length, flags, effective_io_timeout(timeout_ms), calls);
+  }
+  size_t transferred = 0;
+  while (transferred != length) {
+    if (calls != nullptr) {
+      ++*calls;
+    }
+    const ssize_t result = ::splice(
+        input_fd, input_offset, output_fd, output_offset,
+        length - transferred, flags);
+    if (result > 0) {
+      transferred += size_t(result);
+      continue;
+    }
+    if (result == 0) {
+      break;
+    }
+    if (errno != EINTR) {
+      return -1;
+    }
+  }
+  return ssize_t(transferred);
+}
+
+int io_connect(int fd, const sockaddr* address,
+               socklen_t address_length, int timeout_ms) noexcept {
+  if (current_io_executor != nullptr) {
+    return current_io_executor->connect(
+        fd, address, address_length, timeout_ms);
+  }
+  return ::connect(fd, address, address_length);
+}
+
 // Pipe and descriptor data movement.
 [[noreturn]] void pipe_throw_errno(const char* operation) {
   throw std::system_error(errno, std::generic_category(), operation);
@@ -66,29 +269,17 @@ Pipe Pipe::create(size_t preferred_capacity) {
 
 size_t splice_exact(int source_fd, int destination_fd,
                     size_t length, unsigned int flags, size_t* calls) {
-  size_t transferred = 0;
-  while (transferred < length) {
-    const size_t remaining = length - transferred;
-    if (calls != nullptr) {
-      ++*calls;
-    }
-    const ssize_t result = ::splice(source_fd, nullptr, destination_fd, nullptr,
-                                    remaining, flags);
-    if (result > 0) {
-      transferred += static_cast<size_t>(result);
-      continue;
-    }
-    if (result == 0) {
-      throw std::system_error(
-          std::make_error_code(std::errc::connection_reset),
-          "splice reached EOF before the requested length");
-    }
-    if (errno == EINTR) {
-      continue;
-    }
+  const ssize_t result = io_splice_exact(
+      source_fd, nullptr, destination_fd, nullptr, length, flags, 0, calls);
+  if (result < 0) {
     pipe_throw_errno("splice");
   }
-  return transferred;
+  if (size_t(result) != length) {
+    throw std::system_error(
+        std::make_error_code(std::errc::connection_reset),
+        "splice reached EOF before the requested length");
+  }
+  return length;
 }
 
 size_t splice_from_fd_exact(int source_fd, uint64_t& source_offset,
@@ -97,7 +288,7 @@ size_t splice_from_fd_exact(int source_fd, uint64_t& source_offset,
   size_t transferred = 0;
   while (transferred < length) {
     off_t offset = off_t(source_offset);
-    const ssize_t result = ::splice(
+    const ssize_t result = io_splice(
         source_fd, &offset, destination_fd, nullptr,
         length - transferred, flags);
     if (result > 0) {
@@ -124,8 +315,8 @@ size_t splice_some(int source_fd, uint64_t* source_offset,
   for (;;) {
     off_t offset = source_offset == nullptr ? 0 : off_t(*source_offset);
     off_t* position = source_offset == nullptr ? nullptr : &offset;
-    const ssize_t result = ::splice(source_fd, position, destination_fd,
-                                    nullptr, length, flags);
+    const ssize_t result = io_splice(source_fd, position, destination_fd,
+                                     nullptr, length, flags);
     if (result > 0) {
       if (source_offset != nullptr) {
         *source_offset = uint64_t(offset);
@@ -178,8 +369,8 @@ size_t splice_to_fd_exact(int source_fd, int destination_fd,
   while (transferred < length) {
     off_t offset = static_cast<off_t>(destination_offset);
     const ssize_t result =
-        ::splice(source_fd, nullptr, destination_fd, &offset,
-                 length - transferred, flags);
+        io_splice(source_fd, nullptr, destination_fd, &offset,
+                  length - transferred, flags);
     if (result > 0) {
       transferred += static_cast<size_t>(result);
       destination_offset = static_cast<uint64_t>(offset);
@@ -240,19 +431,28 @@ void write_all(int fd, std::span<const std::byte> bytes) {
 }
 
 void send_all(int socket_fd, std::span<const std::byte> bytes) {
-  size_t offset = 0;
-  while (offset < bytes.size()) {
-    const ssize_t result =
-        ::send(socket_fd, bytes.data() + offset, bytes.size() - offset,
-               MSG_NOSIGNAL);
-    if (result > 0) {
-      offset += static_cast<size_t>(result);
-      continue;
-    }
-    if (result < 0 && errno == EINTR) {
-      continue;
-    }
+  const ssize_t result = io_send_exact(
+      socket_fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+  if (result < 0) {
     pipe_throw_errno("send");
+  }
+  if (size_t(result) != bytes.size()) {
+    throw std::system_error(
+        std::make_error_code(std::errc::io_error),
+        "send reached EOF before the requested length");
+  }
+}
+
+void receive_all(int socket_fd, std::span<std::byte> bytes) {
+  const ssize_t result = io_receive_exact(
+      socket_fd, bytes.data(), bytes.size());
+  if (result < 0) {
+    pipe_throw_errno("recv");
+  }
+  if (size_t(result) != bytes.size()) {
+    throw std::system_error(
+        std::make_error_code(std::errc::connection_reset),
+        "recv reached EOF before the requested length");
   }
 }
 
@@ -438,7 +638,8 @@ UniqueFd connect_tcp(std::string_view host, uint16_t port,
       }
     }
 
-    if (::connect(socket.get(), address->ai_addr, address->ai_addrlen) != 0) {
+    if (io_connect(socket.get(), address->ai_addr, address->ai_addrlen,
+                   connect_timeout_ms) != 0) {
       if (errno != EINPROGRESS) {
         last_error = errno;
         continue;

@@ -1,0 +1,323 @@
+diff --git a/include/fuse_lowlevel.h b/include/fuse_lowlevel.h
+index 6be0295b..2b9dad47 100644
+--- a/include/fuse_lowlevel.h
++++ b/include/fuse_lowlevel.h
+@@ -23,6 +23,7 @@
+ #endif
+ 
+ #include "fuse_common.h"
++#include <errno.h>
+ 
+ #include <stddef.h>
+ #include <utime.h>
+@@ -141,8 +142,25 @@ struct fuse_custom_io {
+ 				     off_t *offout, size_t len,
+ 			           unsigned int flags, void *userdata);
+ 	int (*clone_fd)(int master_fd);
++	ssize_t (*writev_async)(int fd, const struct iovec *iov, int count,
++				 fuse_req_t req, void *userdata);
++	ssize_t (*splice_send_async)(int fdin, int fdout, size_t len,
++				      unsigned int flags, fuse_req_t req,
++				      void *userdata);
++	void *async_userdata;
++	void (*async_wakeup)(void *userdata);
++	void (*clear_receive)(void *userdata);
+ };
+ 
++/** Result returned by an async custom-I/O hook after taking reply ownership. */
++#define FUSE_CUSTOM_IO_DEFERRED (-EINPROGRESS)
++
++/** Complete and release a deferred reply exactly once. */
++int fuse_reply_async_complete(fuse_req_t req, int result);
++
++/** Return the current receive-buffer requirement for a session. */
++size_t fuse_session_bufsize(struct fuse_session *se);
++
+ /**
+  * Flags for fuse_lowlevel_notify_entry()
+  * 0 = invalidate entry
+@@ -2337,6 +2355,17 @@ void fuse_session_destroy(struct fuse_session *se);
+  */
+ int fuse_session_fd(struct fuse_session *se);
+ 
++/**
++ * Clone the session's FUSE device file descriptor.
++ *
++ * The caller owns the returned descriptor and must close it. This is the
++ * public equivalent of the clone-fd path used by the multithreaded loop.
++ *
++ * @param se the mounted session
++ * @return a cloned file descriptor, or -1 with errno set
++ */
++int fuse_session_clone_fd(struct fuse_session *se);
++
+ /**
+  * Process a raw request supplied in a generic buffer
+  *
+diff --git a/lib/fuse_i.h b/lib/fuse_i.h
+index d35e1e51..bf40943c 100644
+--- a/lib/fuse_i.h
++++ b/lib/fuse_i.h
+@@ -43,6 +43,7 @@ struct fuse_req {
+ 		unsigned int is_uring : 1;
+ 		unsigned int is_copy_file_range_64 : 1;
+ 	} flags;
++	_Atomic int async_reply_pending;
+ 	union {
+ 		struct {
+ 			uint64_t unique;
+diff --git a/lib/fuse_loop_mt.c b/lib/fuse_loop_mt.c
+index ec4bb0b2..5cff29ab 100644
+--- a/lib/fuse_loop_mt.c
++++ b/lib/fuse_loop_mt.c
+@@ -256,7 +256,7 @@ int fuse_start_thread(pthread_t *thread_id, void *(*func)(void *), void *arg)
+ 	return 0;
+ }
+ 
+-static int fuse_clone_chan_fd_default(struct fuse_session *se)
++int fuse_session_clone_fd(struct fuse_session *se)
+ {
+ 	int res;
+ 	int clonefd;
+@@ -305,7 +305,7 @@ static struct fuse_chan *fuse_clone_chan(struct fuse_mt *mt)
+ 		else
+ 			return NULL;
+ 	} else {
+-		clonefd = fuse_clone_chan_fd_default(se);
++		clonefd = fuse_session_clone_fd(se);
+ 	}
+ 	if (clonefd < 0)
+ 		return NULL;
+@@ -532,4 +532,3 @@ void fuse_loop_cfg_set_clone_fd(struct fuse_loop_config *config,
+ {
+ 	config->clone_fd = value;
+ }
+-
+diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
+index d420b257..4c13b11c 100644
+--- a/lib/fuse_lowlevel.c
++++ b/lib/fuse_lowlevel.c
+@@ -228,12 +228,21 @@ static struct fuse_req *fuse_ll_alloc_req(struct fuse_session *se)
+  * Send data to fuse-kernel using an fd of the fuse device.
+  */
+ static int fuse_write_msg_dev(struct fuse_session *se, struct fuse_chan *ch,
+-			     struct iovec *iov, int count)
++			     struct iovec *iov, int count, fuse_req_t req)
+ {
+ 	ssize_t res;
+ 	int err;
+ 
+-	if (se->io != NULL)
++	if (se->io != NULL && se->io->writev_async != NULL) {
++		if (req != NULL)
++			atomic_store_explicit(&req->async_reply_pending, 1,
++					      memory_order_release);
++		res = se->io->writev_async(ch ? ch->fd : se->fd, iov, count,
++					   req, se->io->async_userdata);
++		if (res != FUSE_CUSTOM_IO_DEFERRED && req != NULL)
++			atomic_store_explicit(&req->async_reply_pending, 0,
++					      memory_order_relaxed);
++	} else if (se->io != NULL)
+ 
+ 		/* se->io->writev is never NULL if se->io is not NULL as
+ 		 * specified by fuse_session_custom_io()
+@@ -243,6 +252,9 @@ static int fuse_write_msg_dev(struct fuse_session *se, struct fuse_chan *ch,
+ 	else
+ 		res = writev(ch ? ch->fd : se->fd, iov, count);
+ 
++	if (res == FUSE_CUSTOM_IO_DEFERRED)
++		return FUSE_CUSTOM_IO_DEFERRED;
++
+ 	if (res == -1) {
+ 		/* ENOENT means the operation was interrupted */
+ 		err = errno;
+@@ -284,7 +296,7 @@ static int fuse_send_msg(struct fuse_session *se, struct fuse_chan *ch,
+ 	if (is_uring)
+ 		err = fuse_send_msg_uring(req, iov, count);
+ 	else
+-		err = fuse_write_msg_dev(se, ch, iov, count);
++		err = fuse_write_msg_dev(se, ch, iov, count, req);
+ 
+ 	trace_request_reply(out->unique, out->len, out->error, err);
+ 	return err;
+@@ -320,10 +332,33 @@ static int send_reply_iov(fuse_req_t req, int error, struct iovec *iov,
+ 	int res;
+ 
+ 	res = fuse_send_reply_iov_nofree(req, error, iov, count);
++	if (res == FUSE_CUSTOM_IO_DEFERRED)
++		return 0;
+ 	fuse_free_req(req);
+ 	return res;
+ }
+ 
++int fuse_reply_async_complete(fuse_req_t req, int result)
++{
++	if (req == NULL)
++		return -EINVAL;
++
++	if (!atomic_exchange_explicit(&req->async_reply_pending, 0,
++				      memory_order_acq_rel))
++		return -EALREADY;
++
++	if (result < 0 && result != -ENOENT && !fuse_session_exited(req->se)) {
++		fuse_session_exit(req->se);
++	}
++	fuse_free_req(req);
++	return 0;
++}
++
++size_t fuse_session_bufsize(struct fuse_session *se)
++{
++	return se == NULL ? 0 : se->bufsize;
++}
++
+ static int send_reply(fuse_req_t req, int error, const void *arg,
+ 		      size_t argsize)
+ {
+@@ -746,6 +781,16 @@ static void fuse_ll_clear_pipe(struct fuse_session *se)
+ 	}
+ }
+ 
++static void fuse_ll_clear_input(struct fuse_session *se,
++				const struct fuse_buf *buf)
++{
++	if ((buf->flags & FUSE_BUF_IS_FD) && se->io != NULL &&
++	    se->io->clear_receive != NULL)
++		se->io->clear_receive(se->io->async_userdata);
++	else
++		fuse_ll_clear_pipe(se);
++}
++
+ #if defined(HAVE_SPLICE) && defined(HAVE_VMSPLICE)
+ static int read_back(int fd, char *buf, size_t len)
+ {
+@@ -865,7 +910,18 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
+ 	}
+ 
+ 
+-	res = vmsplice(llp->pipe[1], iov, iov_count, SPLICE_F_NONBLOCK);
++	/* vmsplice keeps references to the caller's pages.  An asynchronous
++	 * splice outlives these stack-backed reply headers, so copy only the
++	 * small control iovecs into the pipe in that mode.  File payload pages
++	 * still enter through splice below. */
++	if (se->io != NULL && se->io->splice_send_async != NULL) {
++		do {
++			res = writev(llp->pipe[1], iov, iov_count);
++		} while (res == -1 && errno == EINTR);
++	} else {
++		res = vmsplice(llp->pipe[1], iov, iov_count,
++			       SPLICE_F_NONBLOCK);
++	}
+ 	if (res == -1)
+ 		goto fallback;
+ 
+@@ -974,7 +1030,29 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
+ 	    (se->conn.want_ext & FUSE_CAP_SPLICE_MOVE))
+ 		splice_flags |= SPLICE_F_MOVE;
+ 
+-	if (se->io != NULL && se->io->splice_send != NULL) {
++	if (se->io != NULL && se->io->splice_send_async != NULL) {
++		int read_fd = llp->pipe[0];
++
++		close(llp->pipe[1]);
++		llp->pipe[1] = -1;
++		if (req != NULL)
++			atomic_store_explicit(&req->async_reply_pending, 1,
++					      memory_order_release);
++		res = se->io->splice_send_async(read_fd,
++						      ch ? ch->fd : se->fd,
++						      out->len, splice_flags,
++						      req,
++						      se->io->async_userdata);
++		if (res == FUSE_CUSTOM_IO_DEFERRED) {
++			llp->pipe[0] = -1;
++			pthread_setspecific(se->pipe_key, NULL);
++			free(llp);
++			return res;
++		}
++		if (req != NULL)
++			atomic_store_explicit(&req->async_reply_pending, 0,
++					      memory_order_relaxed);
++	} else if (se->io != NULL && se->io->splice_send != NULL) {
+ 		res = se->io->splice_send(llp->pipe[0], NULL,
+ 						  ch ? ch->fd : se->fd, NULL, out->len,
+ 					  	  splice_flags, se->userdata);
+@@ -1033,6 +1111,8 @@ int fuse_reply_data(fuse_req_t req, struct fuse_bufvec *bufv,
+ 
+ 	res = fuse_send_data_iov(req->se, req->ch, iov, 1, bufv, flags, req);
+ 	if (res <= 0) {
++		if (res == FUSE_CUSTOM_IO_DEFERRED)
++			return 0;
+ 		fuse_free_req(req);
+ 		return res;
+ 	} else {
+@@ -1822,7 +1902,7 @@ static void do_write_buf(fuse_req_t req, const fuse_ino_t nodeid,
+ out:
+ 	/* Need to reset the pipe if ->write_buf() didn't consume all data */
+ 	if ((ibuf->flags & FUSE_BUF_IS_FD) && bufv.idx < bufv.count)
+-		fuse_ll_clear_pipe(se);
++		fuse_ll_clear_input(se, ibuf);
+ }
+ 
+ static void _do_flush(fuse_req_t req, const fuse_ino_t nodeid,
+@@ -2754,7 +2834,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
+ 	if (se->conn.proto_minor >= 14) {
+ #ifdef HAVE_SPLICE
+ #ifdef HAVE_VMSPLICE
+-		if ((se->io == NULL) || (se->io->splice_send != NULL)) {
++		if ((se->io == NULL) || (se->io->splice_send != NULL) ||
++		    (se->io->splice_send_async != NULL)) {
+ 			se->conn.capable_ext |= FUSE_CAP_SPLICE_WRITE |
+ 						FUSE_CAP_SPLICE_MOVE;
+ 		}
+@@ -3071,7 +3152,8 @@ static int send_notify_iov(struct fuse_session *se, int notify_code,
+ 	iov[0].iov_base = &out;
+ 	iov[0].iov_len = sizeof(struct fuse_out_header);
+ 
+-	return fuse_send_msg(se, NULL, iov, count, req);
++	int res = fuse_send_msg(se, NULL, iov, count, req);
++	return res == FUSE_CUSTOM_IO_DEFERRED ? 0 : res;
+ }
+ 
+ int fuse_lowlevel_notify_poll(struct fuse_pollhandle *ph)
+@@ -3248,6 +3330,8 @@ int fuse_lowlevel_notify_store(struct fuse_session *se, fuse_ino_t ino,
+ 	iov[1].iov_len = sizeof(outarg);
+ 
+ 	res = fuse_send_data_iov(se, NULL, iov, 2, bufv, flags, req);
++	if (res == FUSE_CUSTOM_IO_DEFERRED)
++		return 0;
+ 	if (res > 0)
+ 		res = -res;
+ 
+@@ -3721,7 +3805,7 @@ reply_err:
+ 	fuse_reply_err(req, err);
+ clear_pipe:
+ 	if (buf->flags & FUSE_BUF_IS_FD)
+-		fuse_ll_clear_pipe(se);
++		fuse_ll_clear_input(se, buf);
+ 	goto out_free;
+ }
+ 
+@@ -4472,6 +4556,8 @@ void fuse_session_exit(struct fuse_session *se)
+ {
+ 	atomic_store_explicit(&se->mt_exited, 1, memory_order_relaxed);
+ 	sem_post(&se->mt_finish);
++	if (se->io != NULL && se->io->async_wakeup != NULL)
++		se->io->async_wakeup(se->io->async_userdata);
+ }
+ 
+ __attribute__((no_sanitize_thread))
+diff --git a/lib/fuse_versionscript b/lib/fuse_versionscript
+index b58360fe..7feef1b2 100644
+--- a/lib/fuse_versionscript
++++ b/lib/fuse_versionscript
+@@ -220,6 +220,9 @@ FUSE_3.18 {
+ 
+ 		fuse_reply_statx;
+ 		fuse_fs_statx;
++		fuse_reply_async_complete;
++		fuse_session_bufsize;
++		fuse_session_clone_fd;
+ } FUSE_3.17;
+ 
+ # Local Variables:

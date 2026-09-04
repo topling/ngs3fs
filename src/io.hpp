@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -49,6 +50,82 @@ class UniqueFd {
 
 inline constexpr size_t kPreferredIoSize = 256U * 1024U;
 
+class IoExecutor {
+ public:
+  using ReceiveProcessor = int (*)(void*, size_t) noexcept;
+
+  virtual ~IoExecutor() = default;
+
+  virtual ssize_t receive(int fd, void* data, size_t length,
+                          int flags, int timeout_ms) noexcept = 0;
+  virtual ssize_t receive_exact(int fd, void* data, size_t length,
+                                int flags, int timeout_ms) noexcept = 0;
+  virtual ssize_t receive_exact_then(
+      int fd, void* data, size_t length, int flags, int timeout_ms,
+      ReceiveProcessor processor, void* context) noexcept = 0;
+  virtual ssize_t receive_until(int fd, void* data, size_t length,
+                                int flags, int timeout_ms,
+                                ReceiveProcessor processor,
+                                void* context) noexcept = 0;
+  virtual ssize_t send(int fd, const void* data, size_t length,
+                       int flags, int timeout_ms) noexcept = 0;
+  virtual ssize_t send_exact(int fd, const void* data, size_t length,
+                             int flags, int timeout_ms) noexcept = 0;
+  virtual ssize_t splice(int input_fd, off_t* input_offset,
+                         int output_fd, off_t* output_offset,
+                         size_t length, unsigned flags,
+                         int timeout_ms) noexcept = 0;
+  virtual ssize_t splice_exact(int input_fd, off_t* input_offset,
+                               int output_fd, off_t* output_offset,
+                               size_t length, unsigned flags,
+                               int timeout_ms,
+                               size_t* calls) noexcept = 0;
+  virtual int connect(int fd, const sockaddr* address,
+                      socklen_t address_length,
+                      int timeout_ms) noexcept = 0;
+};
+
+class IoExecutorScope {
+ public:
+  IoExecutorScope(IoExecutor* executor, int timeout_ms) noexcept;
+  ~IoExecutorScope();
+
+  IoExecutorScope(const IoExecutorScope&) = delete;
+  IoExecutorScope& operator=(const IoExecutorScope&) = delete;
+
+ private:
+  IoExecutor* previous_executor_ = nullptr;
+  int previous_timeout_ms_       = 0;
+};
+
+ssize_t io_receive(int fd, void* data, size_t length, int flags = 0,
+                   int timeout_ms = 0) noexcept;
+ssize_t io_receive_exact(int fd, void* data, size_t length, int flags = 0,
+                         int timeout_ms = 0) noexcept;
+ssize_t io_receive_exact_then(
+    int fd, void* data, size_t length, int flags,
+    IoExecutor::ReceiveProcessor processor, void* context,
+    int timeout_ms = 0) noexcept;
+ssize_t io_receive_until(int fd, void* data, size_t length, int flags,
+                         IoExecutor::ReceiveProcessor processor,
+                         void* context,
+                         int timeout_ms = 0) noexcept;
+ssize_t io_send(int fd, const void* data, size_t length, int flags,
+                int timeout_ms = 0) noexcept;
+ssize_t io_send_exact(int fd, const void* data, size_t length, int flags,
+                      int timeout_ms = 0) noexcept;
+ssize_t io_splice(int input_fd, off_t* input_offset,
+                  int output_fd, off_t* output_offset,
+                  size_t length, unsigned flags,
+                  int timeout_ms = 0) noexcept;
+ssize_t io_splice_exact(int input_fd, off_t* input_offset,
+                        int output_fd, off_t* output_offset,
+                        size_t length, unsigned flags,
+                        int timeout_ms = 0,
+                        size_t* calls = nullptr) noexcept;
+int io_connect(int fd, const sockaddr* address,
+               socklen_t address_length, int timeout_ms) noexcept;
+
 class Pipe {
  public:
   static Pipe create(size_t preferred_capacity = kPreferredIoSize);
@@ -91,6 +168,7 @@ size_t sendfile_exact(int socket_fd, int source_fd,
 
 void write_all(int fd, std::span<const std::byte> bytes);
 void send_all(int socket_fd, std::span<const std::byte> bytes);
+void receive_all(int socket_fd, std::span<std::byte> bytes);
 void read_all(int fd, std::span<std::byte> bytes);
 
 inline constexpr int kConnectTimeoutMs = 5'000;

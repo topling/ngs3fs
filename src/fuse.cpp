@@ -1,5 +1,6 @@
 #include "cache.hpp"
 #include "credentials.hpp"
+#include "fuse_reactor.hpp"
 #include "http.hpp"
 #include "io.hpp"
 #include "s3.hpp"
@@ -51,6 +52,7 @@
 constexpr size_t kMaximumListResponseSize      = 8U * 1024U * 1024U;
 constexpr unsigned kDirectoryListLimit         = 1000;
 constexpr uint32_t kKernelReadAheadSize        = 256U * 1024U;
+constexpr unsigned kFuseReactorQueueDepth      = 256;
 constexpr char kMaxPrefetchWindowEnvironment[] =
     "UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE";
 
@@ -59,6 +61,12 @@ enum ChecksumService {
   CHECKSUM_SERVICE_AWS,
   CHECKSUM_SERVICE_OSS,
   CHECKSUM_SERVICE_GCS,
+};
+
+enum IoEngine {
+  IO_ENGINE_AUTO,
+  IO_ENGINE_LEGACY,
+  IO_ENGINE_URING,
 };
 
 struct MountConfig {
@@ -90,6 +98,8 @@ struct MountConfig {
   int metadata_timeout_ms           = 1000;
   ChecksumAlgorithm checksum        = CHECKSUM_AUTO;
   ChecksumService checksum_service  = CHECKSUM_SERVICE_UNKNOWN;
+  IoEngine io_engine                = IO_ENGINE_LEGACY;
+  unsigned reactor_count            = 1;
   uid_t uid                         = ::getuid();
   gid_t gid                         = ::getgid();
   mode_t file_mode                  = 0644;
@@ -325,11 +335,13 @@ class UploadScheduler {
  private:
   struct Job {
     const void* owner;
+    FuseReactor* reactor;
     std::function<void()> run;
   };
 
  public:
-  explicit UploadScheduler(unsigned concurrency) {
+  UploadScheduler(unsigned concurrency, int io_timeout_ms)
+      : io_timeout_ms_(io_timeout_ms) {
     threads_.reserve(concurrency);
     for (unsigned i = 0; i < concurrency; ++i) {
       threads_.emplace_back([this] { worker(); });
@@ -357,7 +369,7 @@ class UploadScheduler {
   void submit(const void* owner, std::function<void()> run) {
     {
       std::lock_guard guard(mutex_);
-      jobs_.push_back(Job{owner, std::move(run)});
+      jobs_.push_back(Job{owner, current_fuse_reactor(), std::move(run)});
     }
     condition_.notify_one();
   }
@@ -388,6 +400,10 @@ class UploadScheduler {
         last_owner_ = job.owner;
       }
       try {
+        std::optional<FuseReactorReplyScope> scope;
+        if (job.reactor != nullptr) {
+          scope.emplace(job.reactor, io_timeout_ms_);
+        }
         job.run();
       } catch (const std::exception& error) {
         fprintf(stderr, "unhandled upload job error: %s\n", error.what());
@@ -401,6 +417,7 @@ class UploadScheduler {
   std::deque<Job> jobs_;
   std::mutex mutex_;
   std::condition_variable condition_;
+  int io_timeout_ms_ = kRequestIoTimeoutMs;
   const void* last_owner_ = nullptr;
   bool stopping_ = false;
 };
@@ -593,7 +610,8 @@ struct State {
         directory_mtime(wall_time_seconds()),
         root_item(std::make_unique<InodeDir>()),
         http(std::make_unique<HttpPool>(config)),
-        uploads(std::make_unique<UploadScheduler>(config.max_uploads)),
+        uploads(std::make_unique<UploadScheduler>(
+            config.max_uploads, config.request_timeout_ms)),
         cache_reclaimer([this](std::stop_token stop) {
           cache_reclaim_loop(stop, this);
         }) {
@@ -605,7 +623,7 @@ struct State {
     }
   }
 
-  ~State() {
+  void stop_background_tasks() noexcept {
     cache_recovery.request_stop();
     if (cache_recovery.joinable()) {
       cache_recovery.join();
@@ -627,6 +645,10 @@ struct State {
       cache_reclaimer.join();
     }
     uploads.reset();
+  }
+
+  ~State() {
+    stop_background_tasks();
     for (const auto& [inode, retired] : retired_items) {
       (void)inode;
       detach_parent_slot_if_owned(*retired.item, retired.parent);
@@ -1420,6 +1442,8 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   constexpr int cache_reserve_option               = 265;
   constexpr int expected_bucket_owner_option       = 267;
   constexpr int requester_pays_option              = 268;
+  constexpr int io_engine_option                   = 269;
+  constexpr int reactors_option                    = 270;
   constexpr option long_options[] = {
       {"endpoint-host", required_argument, nullptr, 'e'},
       {"endpoint-port", required_argument, nullptr, 'p'},
@@ -1449,6 +1473,8 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       {"expected-bucket-owner", required_argument, nullptr,
        expected_bucket_owner_option},
       {"requester-pays", no_argument, nullptr, requester_pays_option},
+      {"io-engine", required_argument, nullptr, io_engine_option},
+      {"reactors", required_argument, nullptr, reactors_option},
       {"dir-cache-timeout", required_argument, nullptr, 'T'},
       {"max-cached-inodes", required_argument, nullptr, 'I'},
       {"part-size", required_argument, nullptr, 'P'},
@@ -1625,6 +1651,31 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       case requester_pays_option:
         config.requester_pays = true;
         break;
+      case io_engine_option: {
+        const std::string_view value = optarg == nullptr
+                                           ? std::string_view()
+                                           : std::string_view(optarg);
+        if (value == "auto") {
+          config.io_engine = IO_ENGINE_AUTO;
+        } else if (value == "legacy") {
+          config.io_engine = IO_ENGINE_LEGACY;
+        } else if (value == "uring") {
+          config.io_engine = IO_ENGINE_URING;
+        } else {
+          throw std::invalid_argument(
+              "invalid --io-engine; expected auto, legacy, or uring");
+        }
+        break;
+      }
+      case reactors_option: {
+        const uint64_t value = parse_required_unsigned("--reactors");
+        if (value == 0 || value > 256) {
+          throw std::invalid_argument(
+              "--reactors must be between 1 and 256");
+        }
+        config.reactor_count = unsigned(value);
+        break;
+      }
       case 'T': {
         const uint64_t milliseconds =
             parse_required_unsigned("--dir-cache-timeout");
@@ -4691,11 +4742,12 @@ bool store_cached_partial_pages(State& state,
             .idx   = 0,
             .off   = 0,
             .buf   = {{
-                .size  = length,
-                .flags = fuse_buf_flags(0),
-                .mem   = nullptr,
-                .fd    = -1,
-                .pos   = 0,
+                .size     = length,
+                .flags    = fuse_buf_flags(0),
+                .mem      = nullptr,
+                .fd       = -1,
+                .pos      = 0,
+                .mem_size = 0,
             }},
         };
         buffers.buf[0].flags = fuse_buf_flags(
@@ -5844,6 +5896,7 @@ void rename_remote_object(State& state, std::string_view key,
 
 void ngs3fs_init(void* userdata, fuse_conn_info* connection) {
   auto& state = *static_cast<State*>(userdata);
+  connection->no_interrupt = 1;
   unsigned int desired = FUSE_CAP_ASYNC_READ | FUSE_CAP_ATOMIC_O_TRUNC;
   if ((connection->capable & FUSE_CAP_EXPLICIT_INVAL_DATA) != 0) {
     desired |= FUSE_CAP_EXPLICIT_INVAL_DATA;
@@ -6508,10 +6561,8 @@ class UncachedFileReader final : public FileReader {
   std::deque<std::shared_ptr<UncachedPrefetch>> retained_;
   std::thread thread_;
   std::mutex mutex_;
-  uint64_t next_offset_ = 0;
   size_t retained_bytes_ = 0;
   size_t next_window_ = 1024U * 1024U;
-  bool sequence_started_ = false;
 };
 
 enum CacheChecksumResult {
@@ -7276,11 +7327,6 @@ bool UncachedFileReader::try_prefetch(
     return offset >= value.offset && wanted <= value.length &&
         offset - value.offset <= value.length - wanted;
   };
-  const auto advance = [&] {
-    sequence_started_ = true;
-    next_offset_ = offset + wanted;
-  };
-  const bool adjacent = !sequence_started_ || offset == next_offset_;
   std::shared_ptr<UncachedPrefetch> selected;
   std::unique_ptr<RangeDownload> started_download;
   HttpPool::Lease started_lease;
@@ -7301,7 +7347,7 @@ bool UncachedFileReader::try_prefetch(
       {
         std::unique_lock guard(prefetch_->mutex);
         const uint64_t end = prefetch_->offset + prefetch_->length;
-        if (adjacent && offset == end) {
+        if (offset == end) {
           prefetch_->condition.wait(guard, [&] {
             return prefetch_->produced == prefetch_->length ||
                 prefetch_->complete || prefetch_->error != nullptr;
@@ -7314,7 +7360,6 @@ bool UncachedFileReader::try_prefetch(
     }
 
     if (!start) {
-      advance();
       return false;
     }
 
@@ -7348,7 +7393,6 @@ bool UncachedFileReader::try_prefetch(
     const size_t length = size_t(std::min<uint64_t>(
         remaining, std::max(wanted, next_window_)));
     if (length <= wanted) {
-      advance();
       return false;
     }
 
@@ -7361,7 +7405,6 @@ bool UncachedFileReader::try_prefetch(
 
     started_lease = state.http->try_acquire_bulk();
     if (!started_lease) {
-      advance();
       return false;
     }
 
@@ -7390,13 +7433,11 @@ bool UncachedFileReader::try_prefetch(
                                  selected->offset, selected->length,
                                  object_size)) {
         prefetch_.reset();
-        advance();
         return false;
       }
       selected->sink.start_publishing(started_download->response());
     } catch (...) {
       prefetch_.reset();
-      advance();
       return false;
     }
   }
@@ -7414,7 +7455,6 @@ bool UncachedFileReader::try_prefetch(
           selected->complete || selected->error != nullptr;
     });
     if (selected->produced < relative + wanted) {
-      advance();
       return false;
     }
     response.status = selected->response.status;
@@ -7423,19 +7463,24 @@ bool UncachedFileReader::try_prefetch(
   }
   if (!content_range_matches(response, selected->offset,
                              selected->length, object_size)) {
-    advance();
     return false;
   }
 
   if (started_download) {
     const bool collect_stats = state.config.stats_interval_seconds != 0;
+    FuseReactor* reactor = current_fuse_reactor();
+    const int io_timeout_ms = state.config.request_timeout_ms;
     auto complete =
-        [selected, object_size, collect_stats,
+        [selected, object_size, collect_stats, reactor, io_timeout_ms,
          remote_reads = &state.remote_reads,
          remote_read_bytes = &state.remote_read_bytes](
             HttpPool::Lease lease,
             std::unique_ptr<RangeDownload> download) mutable {
           (void)lease;
+          std::optional<FuseReactorReplyScope> scope;
+          if (reactor != nullptr) {
+            scope.emplace(reactor, io_timeout_ms);
+          }
           try {
             Response finished = download->finish();
             const bool valid = content_range_matches(
@@ -7485,7 +7530,6 @@ bool UncachedFileReader::try_prefetch(
     fprintf(stderr, "fuse_reply_data(read-ahead) failed: %s\n",
             strerror(-result));
   }
-  advance();
   return true;
 }
 
@@ -7544,11 +7588,11 @@ void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
   try {
     State& state = state_from(request);
     OpenHandle& handle = handle_required(file);
-    OpenRequestGuard active(handle);
     if (!handle.reader) {
       throw std::system_error(EBADF, std::generic_category(),
                               "missing file reader");
     }
+    OpenRequestGuard active(handle);
     handle.reader->read(state, handle, request, inode, size, offset);
   } catch (...) {
     reply_callback_error(request);
@@ -9810,6 +9854,9 @@ void print_help() {
       "                             reject requests to a bucket owned by a "
       "different account\n"
       "      --requester-pays       acknowledge requester-pays billing\n"
+      "      --io-engine MODE       FUSE loop: auto, legacy, or uring "
+      "(default legacy)\n"
+      "      --reactors N           io_uring reactor count (default 1)\n"
       "  -K, --checksum ALGORITHM  upload checksum: auto, default, none, "
       "crc32, crc32c, crc64nvme, sha1, sha256, md5, xxhash64, "
       "xxhash3, xxhash128, sha512, crc64xz (default auto)\n"
@@ -10003,8 +10050,11 @@ int run(int argc, char** argv) {
     if (session == nullptr) {
       throw std::runtime_error("failed to create FUSE session");
     }
+    std::unique_ptr<FuseReactorGroup> reactors;
 
-    if (fuse_set_signal_handlers(session) != 0) {
+    bool signal_handlers_installed =
+        fuse_set_signal_handlers(session) == 0;
+    if (!signal_handlers_installed) {
       fprintf(stderr, "warning: failed to install FUSE signal handlers\n");
     }
     if (fuse_session_mount(session, options.mountpoint) == 0) {
@@ -10020,25 +10070,75 @@ int run(int argc, char** argv) {
                 requested_read_ahead, read_ahead_error.c_str(),
                 effective_read_ahead);
       }
-      fuse_loop_config loop_config{};
-      loop_config.clone_fd         = 1;
-      loop_config.max_idle_threads = 10;
+      fuse_loop_config* loop_config = fuse_loop_cfg_create();
+      if (loop_config != nullptr) {
+        fuse_loop_cfg_set_clone_fd(loop_config, 1);
+        fuse_loop_cfg_set_idle_threads(loop_config, 10);
+      }
       {
         std::lock_guard guard(state.session_mutex);
         state.session = session;
       }
-      result = fuse_session_loop_mt(session, &loop_config);
+      bool run_legacy = state.config.io_engine == IO_ENGINE_LEGACY;
+      if (!run_legacy) {
+        reactors = std::make_unique<FuseReactorGroup>();
+        std::string reactor_error;
+        if (reactors->initialize(session, state.config.reactor_count,
+                                 kFuseReactorQueueDepth,
+                                 state.config.max_connections,
+                                 state.config.request_timeout_ms,
+                                 reactor_error)) {
+          result = reactors->run();
+          reactors->report_stats();
+          if (result != 0) {
+            fprintf(stderr, "io_uring engine failed: %s\n",
+                    strerror(-result));
+          }
+        } else if (state.config.io_engine == IO_ENGINE_URING) {
+          fprintf(stderr, "unable to start io_uring engine: %s\n",
+                  reactor_error.c_str());
+          result = -EIO;
+        } else {
+          fprintf(stderr,
+                  "warning: unable to start io_uring engine: %s; using "
+                  "the legacy engine\n",
+                  reactor_error.c_str());
+          run_legacy = true;
+        }
+      }
+      if (run_legacy) {
+        if (loop_config == nullptr) {
+          fprintf(stderr, "unable to allocate legacy FUSE loop config\n");
+          result = -ENOMEM;
+        } else {
+          result = fuse_session_loop_mt(session, loop_config);
+        }
+      }
+      if (loop_config != nullptr) {
+        fuse_loop_cfg_destroy(loop_config);
+      }
       {
         std::lock_guard guard(state.session_mutex);
         state.session = nullptr;
+      }
+      if (signal_handlers_installed) {
+        fuse_remove_signal_handlers(session);
+        signal_handlers_installed = false;
+      }
+      state.stop_background_tasks();
+      if (reactors) {
+        reactors->shutdown();
       }
       fuse_session_unmount(session);
     } else {
       fprintf(stderr, "failed to mount %s: %s\n",
               options.mountpoint, strerror(errno));
     }
-    fuse_remove_signal_handlers(session);
+    if (signal_handlers_installed) {
+      fuse_remove_signal_handlers(session);
+    }
     fuse_session_destroy(session);
+    reactors.reset();
   } catch (const std::exception& error) {
     fprintf(stderr, "ngs3fs startup failed: %s\n", error.what());
   }

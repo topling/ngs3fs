@@ -1546,7 +1546,10 @@ std::string make_mountpoint() {
 
 pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
                    uint16_t port, std::string_view checksum,
-                   std::string_view cache_dir, bool verify_reads = true) {
+                   std::string_view cache_dir,
+                   std::string_view engine = "auto",
+                   std::string_view reactors = "1",
+                   bool verify_reads = true) {
   const std::string port_text = std::to_string(port);
   const std::string uid_text  = std::to_string(::getuid());
   const std::string gid_text  = std::to_string(::getgid());
@@ -1565,7 +1568,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
               "0750", "-I", "1", "--checksum", checksum.data(),
               "--expected-bucket-owner", "111122223333", "--requester-pays",
-              "--stats-interval", "86400", "-f", mountpoint.data(),
+              "--stats-interval", "86400", "--io-engine", engine.data(),
+              "--reactors", reactors.data(), "-f", mountpoint.data(),
               static_cast<char*>(nullptr));
     } else if (cache_dir.empty()) {
       ::unsetenv("UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE");
@@ -1575,7 +1579,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               "0750", "-I", "1",
               "--checksum", checksum.data(), "--verify-read-checksum",
               "--expected-bucket-owner", "111122223333", "--requester-pays",
-              "--stats-interval", "86400", "-f", mountpoint.data(),
+              "--stats-interval", "86400", "--io-engine", engine.data(),
+              "--reactors", reactors.data(), "-f", mountpoint.data(),
               static_cast<char*>(nullptr));
     } else {
       ::unsetenv("UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE");
@@ -1586,7 +1591,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               "--checksum", checksum.data(), "--verify-read-checksum",
               "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "-L", cache_dir.data(),
-              "--cache-reserve", "0", "-f", mountpoint.data(),
+              "--cache-reserve", "0", "--io-engine", engine.data(),
+              "--reactors", reactors.data(), "-f", mountpoint.data(),
               static_cast<char*>(nullptr));
     }
     _exit(127);
@@ -1610,9 +1616,10 @@ void wait_until_mounted(std::string_view file_path, pid_t process) {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 2 || argc > 4) {
+  if (argc < 2 || argc > 6) {
     std::cerr << "usage: fuse_mmap_integration_test NGS3FS "
-                 "[CHECKSUM [cache]]\n";
+                 "[CHECKSUM [plain|cache|prefetch "
+                 "[auto|legacy|uring [REACTORS]]]]\n";
     return 2;
   }
   if (::access("/dev/fuse", R_OK | W_OK) != 0) {
@@ -1632,7 +1639,15 @@ int main(int argc, char** argv) {
       throw std::invalid_argument(
           "integration checksum must be xxhash128, crc64nvme, or crc64xz");
     }
-    const bool prefetch_mode = argc == 4 &&
+    const std::string_view engine = argc >= 5 ? argv[4] : "auto";
+    if (engine != "auto" && engine != "legacy" && engine != "uring") {
+      throw std::invalid_argument("unknown integration-test io engine");
+    }
+    const std::string_view reactors = argc == 6 ? argv[5] : "1";
+    if (reactors != "1" && reactors != "2") {
+      throw std::invalid_argument("integration-test reactors must be 1 or 2");
+    }
+    const bool prefetch_mode = argc >= 4 &&
         std::string_view(argv[3]) == "prefetch";
     std::vector<std::byte> expected(512U * 1024U + 37U);
     for (size_t i = 0; i < expected.size(); ++i) {
@@ -1713,18 +1728,19 @@ int main(int argc, char** argv) {
     std::jthread server(run_server, listener.socket.get(), std::ref(shared));
 
     mountpoint = make_mountpoint();
-    if (argc == 4) {
-      if (std::string_view(argv[3]) != "cache" && !prefetch_mode) {
+    if (argc >= 4) {
+      if (std::string_view(argv[3]) != "plain" &&
+          std::string_view(argv[3]) != "cache" && !prefetch_mode) {
         throw std::invalid_argument("unknown integration-test mode");
       }
-      if (!prefetch_mode) {
+      if (std::string_view(argv[3]) == "cache") {
         cache_dir = make_mountpoint();
       }
     }
     const std::string checksum_option(checksum_option_name(checksum));
     const pid_t process = start_daemon(
         argv[1], mountpoint, listener.port, checksum_option, cache_dir,
-        !prefetch_mode);
+        engine, reactors, !prefetch_mode);
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
@@ -2533,7 +2549,8 @@ int main(int argc, char** argv) {
       recovery_writer.reset();
 
       const pid_t restarted = start_daemon(
-          argv[1], mountpoint, listener.port, checksum_option, cache_dir);
+          argv[1], mountpoint, listener.port, checksum_option, cache_dir,
+          engine, reactors);
       mounted.restart(restarted);
       wait_until_mounted(copied_path, restarted);
       UniqueFd recovered;
@@ -2741,7 +2758,8 @@ int main(int argc, char** argv) {
       }
       mounted.crash();
       const pid_t restarted = start_daemon(
-          argv[1], mountpoint, listener.port, checksum_option, cache_dir);
+          argv[1], mountpoint, listener.port, checksum_option, cache_dir,
+          engine, reactors);
       mounted.restart(restarted);
       wait_until_mounted(copied_path, restarted);
       {

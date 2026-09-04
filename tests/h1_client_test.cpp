@@ -612,5 +612,39 @@ int main() {
                                timeout_start;
   assert(timed_out);
   assert(timeout_elapsed < std::chrono::milliseconds(800));
+  stalled_server.join();
+
+  std::jthread oversized_header_server([&] {
+    UniqueFd probe = accept_one(listener.get());
+    std::array<std::byte, 24> client_magic{};
+    read_all(probe.get(), client_magic);
+    send_text(probe.get(),
+              "HTTP/1.1 505 HTTP Version Not Supported\r\n"
+              "content-length: 0\r\nconnection: close\r\n\r\n");
+    finish_probe_response(probe.get());
+    probe.reset();
+
+    UniqueFd socket = accept_one(listener.get());
+    const std::string head = read_request_head(
+        socket.get(), "oversized-header HEAD");
+    assert(head.starts_with(
+        "HEAD /bucket/oversized-header HTTP/1.1\r\n"));
+    std::string response = "HTTP/1.1 200 OK\r\nx-padding: ";
+    response.append(64U * 1024U - response.size(), 'a');
+    send_text(socket.get(), response);
+  });
+
+  auto oversized_header_client = HttpClient::connect(
+      "127.0.0.1", port, "mock-s3", false, kRequestIoTimeoutMs,
+      kConnectTimeoutMs, kProtocolProbeTimeoutMs, false);
+  bool oversized_header_rejected = false;
+  try {
+    oversized_header_client->request_no_body(
+        "HEAD", "/bucket/oversized-header");
+  } catch (const std::runtime_error&) {
+    oversized_header_rejected = true;
+  }
+  assert(oversized_header_rejected);
+  oversized_header_server.join();
   return 0;
 }

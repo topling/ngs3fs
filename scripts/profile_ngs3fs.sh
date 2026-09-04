@@ -10,9 +10,18 @@ port=${PORT:-17072}
 workload=${WORKLOAD:-mmap}
 iterations=${ITERATIONS:-3000}
 max_connections=${MAX_CONNECTIONS:-8}
+io_engine=${NGS3FS_IO_ENGINE:-}
+reactors=${NGS3FS_REACTORS:-}
 bytes=${BYTES:-1048576}
 perf_event=${PERF_EVENT:-cycles:u}
 perf_frequency=${PERF_FREQUENCY:-4000}
+io_args=()
+if [[ -n "$io_engine" ]]; then
+  io_args+=(--io-engine "$io_engine")
+fi
+if [[ -n "$reactors" ]]; then
+  io_args+=(--reactors "$reactors")
+fi
 perf_stat_events=${PERF_STAT_EVENTS:-}
 if [[ -z "$perf_stat_events" ]]; then
   perf_stat_events=task-clock
@@ -219,6 +228,7 @@ wait_for_server
 AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
   "$ngs3fs" -f -e 127.0.0.1 -p "$port" \
     -C "$max_connections" \
+    "${io_args[@]}" \
     -a "127.0.0.1:$port" \
     -b "$bucket" "${cache_arg[@]}" "$mount_dir" \
     >"$run_dir/ngs3fs.log" 2>&1 &

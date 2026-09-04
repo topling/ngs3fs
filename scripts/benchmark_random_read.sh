@@ -45,6 +45,8 @@ mkdir -p "$output_dir"
   printf 'cache_mode=%s\n' "$cache_mode"
   printf 'ngs3fs_max_prefetch_window_size=%s\n' \
     "${UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE:-134217728}"
+  printf 'ngs3fs_io_engine=%s\n' "${NGS3FS_IO_ENGINE:-default}"
+  printf 'ngs3fs_reactors=%s\n' "${NGS3FS_REACTORS:-default}"
   go version 2>/dev/null || true
 } >"$output_dir/system.txt"
 

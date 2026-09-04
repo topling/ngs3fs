@@ -63,6 +63,7 @@ jobs:
             libtool-bin \
             liburing-dev \
             libssl-dev \
+            meson \
             ninja-build \
             psmisc \
             python3 \
@@ -186,7 +187,9 @@ jobs:
             curl \
             fuse3 \
             libfuse3-dev \
+            liburing-dev \
             libssl-dev \
+            meson \
             ninja-build
 
       - name: Enable FUSE
@@ -245,9 +248,11 @@ jobs:
             curl \
             fuse3 \
             libfuse3-dev \
+            liburing-dev \
             libssl-dev \
             linux-tools-common \
             linux-tools-generic \
+            meson \
             ninja-build \
             python3
 
@@ -301,6 +306,15 @@ jobs:
               ./scripts/benchmark_random_read.sh \
               "$GITHUB_WORKSPACE/build/benchmarks/github-random-read-$mode"
           done
+
+      - name: A/B test io engines and reactor counts
+        run: |
+          sudo env \
+            BENCHMARK_REPETITIONS=3 \
+            RANDOM_READ_ADVICE=random \
+            ./scripts/benchmark_io_engine.sh \
+            "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine"
+          cat build/benchmarks/github-io-engine/summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Compare Mountpoint concurrent random reads
         run: |
@@ -418,6 +432,13 @@ jobs:
             build/benchmarks/github-random-read-*/*/ngs3fs.log
             build/benchmarks/github-random-read-*/*/goofys.log
             build/benchmarks/github-random-read-*/*/versity.log
+            build/benchmarks/github-io-engine/system.txt
+            build/benchmarks/github-io-engine/samples.csv
+            build/benchmarks/github-io-engine/summary.csv
+            build/benchmarks/github-io-engine/summary.md
+            build/benchmarks/github-io-engine/*/random-read-summary.csv
+            build/benchmarks/github-io-engine/*/ngs3fs.log
+            build/benchmarks/github-io-engine/*/versity.log
             build/benchmarks/github-mountpoint-random-read-*/system.txt
             build/benchmarks/github-mountpoint-random-read-*/samples.csv
             build/benchmarks/github-mountpoint-random-read-*/summary.csv

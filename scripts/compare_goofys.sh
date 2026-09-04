@@ -16,6 +16,8 @@ order=${ORDER:-forward}
 metrics=${METRICS:-0}
 socket_buffer_size=${SOCKET_BUFFER_SIZE:-2MiB}
 max_connections=${MAX_CONNECTIONS:-8}
+io_engine=${NGS3FS_IO_ENGINE:-}
+reactors=${NGS3FS_REACTORS:-}
 random_files=${RANDOM_READ_FILES:-32}
 random_threads=${RANDOM_READ_THREADS:-16}
 random_operations=${RANDOM_READ_OPERATIONS:-128}
@@ -63,8 +65,15 @@ if [[ "$cache_mode" != none ]]; then
   fi
 fi
 ngs3fs_cache_args=()
+ngs3fs_io_args=()
 if [[ "$cache_mode" != none ]]; then
   ngs3fs_cache_args=(-L "$cache_dir" --cache-reserve 0)
+fi
+if [[ -n "$io_engine" ]]; then
+  ngs3fs_io_args+=(--io-engine "$io_engine")
+fi
+if [[ -n "$reactors" ]]; then
+  ngs3fs_io_args+=(--reactors "$reactors")
 fi
 
 server_pid=
@@ -152,6 +161,7 @@ start_ngs3fs() {
     "$ngs3fs" -f "${metrics_args[@]}" \
       --socket-buffer-size "$socket_buffer_size" \
       -C "$max_connections" \
+      "${ngs3fs_io_args[@]}" \
       -e 127.0.0.1 -p "$port" \
       -a "127.0.0.1:$port" -b "$bucket" \
       "${ngs3fs_cache_args[@]}" \
