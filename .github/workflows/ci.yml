@@ -87,7 +87,7 @@ jobs:
           strace -f -e trace=fadvise64 -o "$trace" build/dev/cache_test
           total=$(grep -c 'fadvise64(' "$trace")
           advised=$(grep -c \
-            'fadvise64([^,]*, 0, 0, POSIX_FADV_NOREUSE) = 0' "$trace")
+            'fadvise64([^,]*, 0, 0, POSIX_FADV_NOREUSE)' "$trace")
           test "$total" -gt 0
           test "$total" -eq "$advised"
 

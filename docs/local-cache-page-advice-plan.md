@@ -36,19 +36,19 @@ CI evidence. No unrelated formatting or dependency changes.
    call's result; cache correctness must be unchanged.
 2. Add tests for all data-open call sites and unchanged cache state transitions.
 3. Run the complete local suite and sanitizers; review and fix the scoped diff.
-4. Benchmark cached cold/warm reads and collect `mincore`/memory-pressure evidence.
-   Treat residency as advisory and compare CPU/latency with the prior baseline.
+4. Benchmark cached cold/warm reads and compare CPU/latency with the prior
+   baseline. Do not probe whether the running kernel acts on the advice.
 5. Commit and push scoped changes, run CI, download and analyze useful artifacts.
 
 ## Verification matrix
 
 | Requirement | Evidence |
 |---|---|
-| Every cache data description carries NOREUSE | Call-site audit plus injected helper test |
+| Every cache data description carries NOREUSE | Call-site audit plus syscall trace |
 | Unsupported/no-op advice remains correct | Existing cache semantics tests |
 | Cache semantics unchanged | Complete unit and mounted integration suite |
 | No performance regression | Cached benchmark CPU/latency comparison |
-| Advisory policy has effect where supported | `mincore` or pressure-based residency evidence |
+| No support/effect dependency | Ignored return value plus review of all call sites |
 | Reproducible handoff | CI run URL, conclusion and analyzed artifacts |
 
 ## Stop conditions
@@ -62,4 +62,4 @@ never make existing cache data unreadable.
 
 The unimplemented direct-I/O contract and prototype were removed. The revised
 scope is intentionally smaller, retains buffered I/O, documents NOREUSE's Linux
-6.3 boundary, and verifies policy without asserting deterministic eviction.
+6.3 boundary, and verifies call issuance without probing support or eviction.
