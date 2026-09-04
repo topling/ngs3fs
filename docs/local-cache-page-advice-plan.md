@@ -1,6 +1,6 @@
 # Local-cache page-advice execution contract
 
-Status: approved; execution in progress.
+Status: approved execution contract.
 
 ## Goal and non-goals
 
