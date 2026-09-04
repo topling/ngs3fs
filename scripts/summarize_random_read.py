@@ -102,6 +102,7 @@ def write_markdown(path, comparisons, generated, source_run):
         "",
         f"Generated at {generated} from the median of runner samples.",
         "CPU is aggregate daemon CPU time divided by completed read operations.",
+        "The S3 endpoint is loopback VersityGW, so network first-byte latency is negligible.",
         "",
         "| Advice | Cache (ngs3fs / reference) | ngs3fs --io-size | Reference | CPU/op (ngs3fs / reference) | Reference / ngs3fs | CPU saved | S3 GET (ngs3fs / reference) |",
         "|---|---|---:|---|---:|---:|---:|---:|",
@@ -191,6 +192,8 @@ def write_html(path, comparisons, generated, source_run):
   <div class="notes">
     <p><strong>CPU/op</strong> is aggregate daemon CPU time divided by completed
     <code>pread</code> and mmap-fault operations. Values are medians, not wall time.</p>
+    <p>The S3 endpoint is loopback VersityGW, so network first-byte latency is
+    negligible. The io-size comparison must not be extrapolated to remote S3 latency.</p>
     <p><strong>cold</strong> and <strong>warm</strong> mean disk data caching is enabled
     independently for both ngs3fs and Mountpoint. The cache column makes asymmetric
     comparisons explicit. Each Evidence link opens its raw summary CSV.</p>
