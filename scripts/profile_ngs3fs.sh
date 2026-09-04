@@ -9,7 +9,6 @@ run_dir=$(realpath -m "$run_dir")
 port=${PORT:-17072}
 workload=${WORKLOAD:-mmap}
 iterations=${ITERATIONS:-3000}
-read_ahead=${READ_AHEAD:-256KiB}
 max_connections=${MAX_CONNECTIONS:-8}
 bytes=${BYTES:-1048576}
 perf_event=${PERF_EVENT:-cycles:u}
@@ -218,7 +217,7 @@ server_pid=$!
 wait_for_server
 
 AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
-  "$ngs3fs" -f -R "$read_ahead" -e 127.0.0.1 -p "$port" \
+  "$ngs3fs" -f -e 127.0.0.1 -p "$port" \
     -C "$max_connections" \
     -a "127.0.0.1:$port" \
     -b "$bucket" "${cache_arg[@]}" "$mount_dir" \

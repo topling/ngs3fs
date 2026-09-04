@@ -93,15 +93,12 @@ multi-file namespace. It remains experimental rather than production-ready.
   introduced; the clean pages are never pinned and remain normally
   reclaimable.
 - The preferred application transfer size reported through `statfs.f_bsize`
-  defaults to 256 KiB and is independently configurable with
-  `--io-size`. The allocation-unit field `statfs.f_frsize` remains 4 KiB.
-- Read-ahead defaults to 256 KiB and is controlled by
-  `-R/--read-ahead`; raw bytes and KiB/MiB/GiB suffixes are accepted. Before
-  FUSE INIT, ngs3fs raises the mount's BDI `read_ahead_kb` when permitted and
-  lets the kernel page cache schedule and deduplicate read-ahead. Linux makes
-  that sysfs write root-only. If raising it is denied, ngs3fs prints a warning
-  and falls back to the BDI's current kernel value. There is no userspace
-  read-ahead.
+  is fixed at 256 KiB. The allocation-unit field `statfs.f_frsize` remains
+  4 KiB.
+- The FUSE and BDI kernel read-ahead hints are internally fixed at 256 KiB.
+  Linux makes the sysfs write root-only; if raising it is denied, ngs3fs
+  prints a warning and accepts the BDI's current value. These are kernel
+  policy inputs, not a user-visible read-ahead guarantee.
 - Likely random reads produce a stderr warning with Unix time, object path,
   offset, and request size, plus a recommendation to disable
   `POSIX_FADV_RANDOM`/`MADV_RANDOM`. Detection excludes small objects and EOF
@@ -387,7 +384,7 @@ mkdir -p mount
   --protocol-probe-timeout 1000 --metadata-timeout 1000 \
   --socket-buffer-size 2MiB \
   --stats-interval 60 \
-  --io-size 256KiB -R 256KiB -T 1000 -I 1000000 \
+  -T 1000 -I 1000000 \
   -P 8MiB -c 4 -C 8 -B 256MiB \
   -u 1000 -g 1000 -m 0644 -D 0755 \
   -f mount
@@ -396,9 +393,6 @@ mkdir -p mount
 `--prefix` is a raw S3 key prefix; leading slashes are removed and a trailing
 slash is added internally. Omit it to mount the bucket root. Path-style versus
 virtual-hosted requests are inferred from `--authority` and `--bucket`.
-`--io-size` controls only the preferred transfer-size hint returned by
-`statfs(2)` and must be nonzero; it does not change FUSE request sizing or
-kernel read-ahead.
 `--socket-buffer-size` requests the per-connection TCP receive-buffer capacity
 before connect. Its default is the greater of 2 MiB and FUSE `max_read`; `0`
 leaves receive-window sizing to normal kernel TCP autotuning. Linux may cap an
@@ -407,18 +401,28 @@ and recreates the socket without locking its receive-buffer size.
 `--verify-read-checksum` is intentionally independent of the upload checksum
 selection and is disabled unless explicitly requested. It accepts AWS checksum
 headers, Alibaba OSS CRC64, and Google XML API `x-goog-hash` CRC32C/MD5.
-`--read-ahead` must be page-aligned; `0` disables it. Values above the
-per-request pipe capacity are split by kernel FUSE read limits when kernel BDI
-tuning is available.
-
+Without a local cache, a miss starts an asynchronous 1 MiB Range read into a
+bounded anonymous fd. The foreground returns as soon as its requested bytes
+arrive while the remainder continues in the background. Sequential reads
+double later windows up to 128 MiB. Non-adjacent reads that hit either an
+in-progress or completed window reuse it and do not count as random; misses
+use an independent exact Range request without discarding prefetched bytes.
+The current and retained historical windows share the configured bound; only
+making room for a new window evicts the oldest completed region. After three
+such misses, that handle stops opening new prefetch windows. This path is
+disabled by `--verify-read-checksum`, which retains exact complete-unit
+verification semantics.
 `-L/--cache-dir` enables the persistent sparse local cache. Each S3 key maps to
 a sparse data file plus mmap-backed metadata with a two-bit state per host
 page. Clean hits are returned from the cache FD; misses fetch adaptively from
-1 MiB through `--max-cache-fetch-size` (8 MiB by default), rather than forcing
-S3 to mirror every small FUSE read. `--cache-size` limits physical allocation
-and `--cache-reserve` preserves filesystem free space (5% by default). Clean
-regions use second-chance CLOCK eviction; a read bypasses the cache if clean
-space cannot be reclaimed.
+1 MiB through a 128 MiB maximum prefetch window, rather than forcing S3 to
+mirror every small FUSE read. For both uncached read-ahead and local-cache
+fetch expansion, the unstable environment variable
+`UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE` overrides that maximum with a
+page-aligned integer byte count of at least 1 MiB. `--cache-size` limits
+physical allocation and `--cache-reserve` preserves filesystem free space
+(5% by default). Clean regions use second-chance CLOCK eviction; a read
+bypasses the cache if clean space cannot be reclaimed.
 
 Cache data files remain buffered. Each newly opened data-file description gets
 one whole-file `POSIX_FADV_NOREUSE` hint so supporting kernels prefer reclaiming
@@ -483,9 +487,8 @@ the competitor. The benchmark treats failed `posix_fadvise`/`madvise` cache
 eviction as an error rather than silently reporting a warm-page sample.
 `scripts/compare_goofys.sh` runs both clients against the same VersityGW
 instance and sums every task's `/proc/PID/task/TID/schedstat` runtime, avoiding
-the leader-only and 10 ms quantization errors of `/proc/PID/stat`. Run it with
-enough privilege to raise the mount BDI read-ahead when evaluating the default
-256 KiB setting; the unprivileged fallback is reported explicitly.
+the leader-only and 10 ms quantization errors of `/proc/PID/stat`. The
+unprivileged kernel BDI read-ahead fallback is reported explicitly.
 
 The same script can reuse the concurrent multi-file random-read stress as a
 comparison workload. It prepares identical deterministic objects directly in

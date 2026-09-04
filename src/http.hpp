@@ -111,6 +111,21 @@ class RangeFileSink {
   uint64_t offset_;
 };
 
+class RangeDownload {
+ public:
+  virtual ~RangeDownload() = default;
+
+  RangeDownload(const RangeDownload&) = delete;
+  RangeDownload& operator=(const RangeDownload&) = delete;
+
+  [[nodiscard]] virtual const Response& response() const noexcept = 0;
+  virtual size_t receive_at_least(size_t minimum_body_bytes) = 0;
+  virtual Response finish() = 0;
+
+ protected:
+  RangeDownload() = default;
+};
+
 class HttpClient {
  public:
   static std::unique_ptr<HttpClient> connect(
@@ -133,6 +148,12 @@ class HttpClient {
       bool measure_transport = false) = 0;
 
   virtual Response get_range_to_fd(
+      std::string_view path, uint64_t offset, size_t length,
+      RangeFileSink& destination, std::span<const Header> headers = {},
+      bool capture_headers = true,
+      bool measure_transport = false) = 0;
+
+  virtual std::unique_ptr<RangeDownload> begin_range_to_fd(
       std::string_view path, uint64_t offset, size_t length,
       RangeFileSink& destination, std::span<const Header> headers = {},
       bool capture_headers = true,

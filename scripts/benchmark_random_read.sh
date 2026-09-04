@@ -10,7 +10,6 @@ repetitions=${BENCHMARK_REPETITIONS:-3}
 base_port=${PORT:-17500}
 cache_mode=${CACHE_MODE:-none}
 reference_client=${REFERENCE_CLIENT:-goofys}
-io_size=${IO_SIZE:-256KiB}
 
 case "$cache_mode" in
   none | cold | warm) ;;
@@ -44,12 +43,13 @@ mkdir -p "$output_dir"
       "${GOOFYS_BIN:-/home/leipeng/.cache/goofys-reference/bin/goofys}"
   fi
   printf 'cache_mode=%s\n' "$cache_mode"
-  printf 'ngs3fs_io_size=%s\n' "$io_size"
+  printf 'ngs3fs_max_prefetch_window_size=%s\n' \
+    "${UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE:-134217728}"
   go version 2>/dev/null || true
 } >"$output_dir/system.txt"
 
 printf '%s\n' \
-  'repetition,client,advice,max_connections,files,threads,operations,pread_operations,mmap_operations,bytes,wall_ns,daemon_cpu_ns,daemon_cpu_ns_per_operation,s3_get_requests,cache_mode,cache_dir,io_size' \
+  'repetition,client,advice,max_connections,files,threads,operations,pread_operations,mmap_operations,bytes,wall_ns,daemon_cpu_ns,daemon_cpu_ns_per_operation,s3_get_requests,cache_mode,cache_dir' \
   >"$output_dir/samples.csv"
 
 sample=0
@@ -68,10 +68,6 @@ for advice in random normal; do
         sample_cache_mode=$cache_mode
       else
         sample_cache_mode=none
-      fi
-      sample_io_size=-
-      if [[ "$client" = ngs3fs ]]; then
-        sample_io_size=$io_size
       fi
       if [[ "$sample_cache_mode" != none ]]; then
         sample_cache_dir=$cache_dir
@@ -93,12 +89,11 @@ for advice in random normal; do
       RANDOM_READ_ADVICE="$advice" \
       CACHE_MODE="$sample_cache_mode" \
       CACHE_DIR="$cache_dir" \
-      IO_SIZE="$io_size" \
       PORT="$((base_port + sample))" \
         "$project_dir/scripts/compare_goofys.sh" "$run_dir"
       sample_summary=$(tail -n 1 "$run_dir/random-read-summary.csv")
-      printf '%s,%s,%s,%s,%s\n' "$repetition" "$sample_summary" \
-        "$sample_cache_mode" "$sample_cache_dir" "$sample_io_size" \
+      printf '%s,%s,%s,%s\n' "$repetition" "$sample_summary" \
+        "$sample_cache_mode" "$sample_cache_dir" \
         >>"$output_dir/samples.csv"
       find "$run_dir/backend" -type f -delete
       find "$run_dir/backend" -depth -type d -empty -delete
@@ -140,7 +135,7 @@ metric_stats() {
 }
 
 printf '%s\n' \
-  'advice,client,samples,wall_min_ns,wall_median_ns,wall_mean_ns,wall_max_ns,cpu_min_ns,cpu_median_ns,cpu_mean_ns,cpu_max_ns,cpu_per_operation_min_ns,cpu_per_operation_median_ns,cpu_per_operation_mean_ns,cpu_per_operation_max_ns,s3_get_min,s3_get_median,s3_get_mean,s3_get_max,cache_mode,cache_dir,io_size' \
+  'advice,client,samples,wall_min_ns,wall_median_ns,wall_mean_ns,wall_max_ns,cpu_min_ns,cpu_median_ns,cpu_mean_ns,cpu_max_ns,cpu_per_operation_min_ns,cpu_per_operation_median_ns,cpu_per_operation_mean_ns,cpu_per_operation_max_ns,s3_get_min,s3_get_median,s3_get_mean,s3_get_max,cache_mode,cache_dir' \
   >"$output_dir/summary.csv"
 for advice in random normal; do
   for client in ngs3fs "$reference_client"; do
@@ -153,10 +148,6 @@ for advice in random normal; do
     if [[ "$summary_cache_mode" != none ]]; then
       summary_cache_dir="$output_dir/$advice-r*-$client/$client-cache"
     fi
-    summary_io_size=-
-    if [[ "$client" = ngs3fs ]]; then
-      summary_io_size=$io_size
-    fi
     wall=$(metric_stats "$advice" "$client" 11)
     cpu=$(metric_stats "$advice" "$client" 12)
     cpu_per_operation=$(metric_stats "$advice" "$client" 13)
@@ -164,7 +155,7 @@ for advice in random normal; do
     printf '%s,%s,%s,%s,%s,%s,%s\n' \
       "$advice" "$client" "$repetitions" "$wall" "$cpu" \
       "$cpu_per_operation" \
-      "$requests,$summary_cache_mode,$summary_cache_dir,$summary_io_size" \
+      "$requests,$summary_cache_mode,$summary_cache_dir" \
       >>"$output_dir/summary.csv"
   done
 done

@@ -1546,7 +1546,7 @@ std::string make_mountpoint() {
 
 pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
                    uint16_t port, std::string_view checksum,
-                   std::string_view cache_dir) {
+                   std::string_view cache_dir, bool verify_reads = true) {
   const std::string port_text = std::to_string(port);
   const std::string uid_text  = std::to_string(::getuid());
   const std::string gid_text  = std::to_string(::getgid());
@@ -1558,24 +1558,34 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
     ::setenv("AWS_ACCESS_KEY_ID", "integration-access-key", 1);
     ::setenv("AWS_SECRET_ACCESS_KEY", "integration-secret-key", 1);
     ::unsetenv("AWS_SESSION_TOKEN");
-    if (cache_dir.empty()) {
+    if (!verify_reads) {
+      ::unsetenv("UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE");
       ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
               port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
               uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
-              "0750", "--io-size", "384KiB", "-R", "256KiB", "-I", "1",
+              "0750", "-I", "1", "--checksum", checksum.data(),
+              "--expected-bucket-owner", "111122223333", "--requester-pays",
+              "--stats-interval", "86400", "-f", mountpoint.data(),
+              static_cast<char*>(nullptr));
+    } else if (cache_dir.empty()) {
+      ::unsetenv("UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE");
+      ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
+              port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
+              uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
+              "0750", "-I", "1",
               "--checksum", checksum.data(), "--verify-read-checksum",
               "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "-f", mountpoint.data(),
               static_cast<char*>(nullptr));
     } else {
+      ::unsetenv("UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE");
       ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
               port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
               uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
-              "0750", "--io-size", "384KiB", "-R", "256KiB", "-I", "1",
+              "0750", "-I", "1",
               "--checksum", checksum.data(), "--verify-read-checksum",
               "--expected-bucket-owner", "111122223333", "--requester-pays",
-              "--stats-interval", "86400", "--max-cache-fetch-size", "1MiB",
-              "-L", cache_dir.data(),
+              "--stats-interval", "86400", "-L", cache_dir.data(),
               "--cache-reserve", "0", "-f", mountpoint.data(),
               static_cast<char*>(nullptr));
     }
@@ -1622,6 +1632,8 @@ int main(int argc, char** argv) {
       throw std::invalid_argument(
           "integration checksum must be xxhash128, crc64nvme, or crc64xz");
     }
+    const bool prefetch_mode = argc == 4 &&
+        std::string_view(argv[3]) == "prefetch";
     std::vector<std::byte> expected(512U * 1024U + 37U);
     for (size_t i = 0; i < expected.size(); ++i) {
       expected[i] = static_cast<std::byte>((i * 29U + 7U) & 0xffU);
@@ -1662,6 +1674,16 @@ int main(int argc, char** argv) {
                          "\"overwrite-destination\"");
     add_overwrite_object("overwrite-source.bin", overwrite_source,
                          "\"overwrite-source\"");
+    std::vector<std::byte> read_ahead(4U * 1024U * 1024U + 37U);
+    for (size_t i = 0; i < read_ahead.size(); ++i) {
+      read_ahead[i] = static_cast<std::byte>((i * 53U + 31U) & 0xffU);
+    }
+    add_overwrite_object("read-ahead.bin", read_ahead,
+                         "\"read-ahead\"");
+    add_overwrite_object("read-ahead-sequential.bin", read_ahead,
+                         "\"read-ahead-sequential\"");
+    add_overwrite_object("read-ahead-random.bin", read_ahead,
+                         "\"read-ahead-random\"");
     std::vector<std::byte> checksum_test(256U * 1024U + 37U);
     for (size_t i = 0; i < checksum_test.size(); ++i) {
       checksum_test[i] = static_cast<std::byte>((i * 13U + 41U) & 0xffU);
@@ -1692,25 +1714,171 @@ int main(int argc, char** argv) {
 
     mountpoint = make_mountpoint();
     if (argc == 4) {
-      if (std::string_view(argv[3]) != "cache") {
+      if (std::string_view(argv[3]) != "cache" && !prefetch_mode) {
         throw std::invalid_argument("unknown integration-test mode");
       }
-      cache_dir = make_mountpoint();
+      if (!prefetch_mode) {
+        cache_dir = make_mountpoint();
+      }
     }
     const std::string checksum_option(checksum_option_name(checksum));
     const pid_t process = start_daemon(
-        argv[1], mountpoint, listener.port, checksum_option, cache_dir);
+        argv[1], mountpoint, listener.port, checksum_option, cache_dir,
+        !prefetch_mode);
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
+
+    if (prefetch_mode) {
+      const auto wait_for_gets = [&] {
+        for (unsigned attempt = 0; attempt != 1000; ++attempt) {
+          {
+            std::lock_guard state_guard(shared.mutex);
+            if (shared.active_gets == 0) {
+              return;
+            }
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        throw std::runtime_error("timed out waiting for read-ahead GET");
+      };
+      const std::string path = mountpoint + "/read-ahead.bin";
+      UniqueFd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!fd) {
+        fail_errno("open read-ahead object");
+      }
+      std::array<std::byte, 64U * 1024U> bytes{};
+      pread_all(fd.get(), bytes, 0);
+      require(std::equal(bytes.begin(), bytes.end(), read_ahead.begin()),
+              "initial read-ahead bytes differ");
+      constexpr uint64_t initial_window_tail =
+          1024U * 1024U - bytes.size();
+      pread_all(fd.get(), bytes, initial_window_tail);
+      require(std::equal(bytes.begin(), bytes.end(),
+                         read_ahead.begin() + initial_window_tail),
+              "out-of-order read-ahead hit differs");
+      wait_for_gets();
+      pread_all(fd.get(), bytes, 2U * 1024U * 1024U);
+      require(std::equal(bytes.begin(), bytes.end(),
+                         read_ahead.begin() + 2U * 1024U * 1024U),
+              "read-ahead miss differs");
+      uint64_t continued_offset;
+      {
+        std::lock_guard state_guard(shared.mutex);
+        const auto& ranges = shared.special_objects.at(
+            "read-ahead.bin")->get_ranges;
+        require(ranges.size() == 2,
+                "read-ahead miss did not use one independent GET");
+        require(ranges[1].first == 2U * 1024U * 1024U &&
+                    ranges[1].last == 3U * 1024U * 1024U - 1,
+                "random jump did not restart a 1 MiB window");
+        continued_offset = ranges[1].last + 1;
+      }
+      wait_for_gets();
+      pread_all(fd.get(), bytes, continued_offset);
+      require(std::equal(bytes.begin(), bytes.end(),
+                         read_ahead.begin() + continued_offset),
+              "continued read-ahead bytes differ");
+      pread_all(fd.get(), bytes, 256U * 1024U);
+      require(std::equal(bytes.begin(), bytes.end(),
+                         read_ahead.begin() + 256U * 1024U),
+              "retained read-ahead bytes differ");
+      fd.reset();
+      const std::string sequential_path =
+          mountpoint + "/read-ahead-sequential.bin";
+      UniqueFd sequential_fd(
+          ::open(sequential_path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!sequential_fd) {
+        fail_errno("open sequential read-ahead object");
+      }
+      std::vector<std::byte> sequential_bytes(1280U * 1024U);
+      pread_all(sequential_fd.get(), sequential_bytes, 0);
+      require(std::equal(sequential_bytes.begin(), sequential_bytes.end(),
+                         read_ahead.begin()),
+              "sequential read-ahead bytes differ");
+      sequential_fd.reset();
+      {
+        std::lock_guard state_guard(shared.mutex);
+        const auto& ranges = shared.special_objects.at(
+            "read-ahead.bin")->get_ranges;
+        require(ranges.size() == 3,
+                "read-ahead did not preserve and restart its windows");
+        require(ranges[0].first == 0 &&
+                    ranges[0].last == 1024U * 1024U - 1,
+                "initial read-ahead range is not 1 MiB");
+        require(ranges[1].first == 2U * 1024U * 1024U,
+                "out-of-range read was not fetched independently");
+        require(ranges[2].first == continued_offset &&
+                    ranges[2].last == read_ahead.size() - 1,
+                "continued run did not grow and clip its window");
+        const auto& sequential_ranges = shared.special_objects.at(
+            "read-ahead-sequential.bin")->get_ranges;
+        require(sequential_ranges.size() == 2,
+                "sequential read-ahead did not cross exactly two windows");
+        require(sequential_ranges[0].first == 0 &&
+                    sequential_ranges[0].last == 1024U * 1024U - 1,
+                "sequential read-ahead initial window is not 1 MiB");
+        require(sequential_ranges[1].first == 1024U * 1024U &&
+                    sequential_ranges[1].last == 3U * 1024U * 1024U - 1,
+                "sequential read-ahead second window is not 2 MiB");
+      }
+      const std::string random_path =
+          mountpoint + "/read-ahead-random.bin";
+      UniqueFd random_fd(::open(random_path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!random_fd) {
+        fail_errno("open random-extent read-ahead object");
+      }
+      constexpr std::array<uint64_t, 4> random_offsets{
+          0,
+          2U * 1024U * 1024U,
+          1U * 1024U * 1024U,
+          3U * 1024U * 1024U,
+      };
+      for (const uint64_t random_offset : random_offsets) {
+        pread_all(random_fd.get(), bytes, random_offset);
+        require(std::equal(bytes.begin(), bytes.end(),
+                           read_ahead.begin() + random_offset),
+                "random-extent read-ahead bytes differ");
+        const uint64_t window_tail =
+            random_offset + 1024U * 1024U - bytes.size();
+        pread_all(random_fd.get(), bytes, window_tail);
+        require(std::equal(bytes.begin(), bytes.end(),
+                           read_ahead.begin() + window_tail),
+                "random-extent tail bytes differ");
+        wait_for_gets();
+      }
+      random_fd.reset();
+      {
+        std::lock_guard state_guard(shared.mutex);
+        const auto& ranges = shared.special_objects.at(
+            "read-ahead-random.bin")->get_ranges;
+        require(ranges.size() == random_offsets.size(),
+                "random extents did not each use one GET");
+        for (size_t i = 0; i != ranges.size(); ++i) {
+          require(ranges[i].first == random_offsets[i] &&
+                      ranges[i].last == random_offsets[i] +
+                          1024U * 1024U - 1,
+                  "random extent did not restart a 1 MiB window");
+        }
+      }
+      mounted.stop();
+      shared.stop.store(true);
+      server.request_stop();
+      server.join();
+      if (::rmdir(mountpoint.c_str()) != 0) {
+        fail_errno("rmdir read-ahead mountpoint");
+      }
+      std::cout << "FUSE uncached read-ahead integration passed\n";
+      return 0;
+    }
 
     {
       struct statvfs status{};
       if (::statvfs(mountpoint.c_str(), &status) != 0) {
         fail_errno("statvfs mountpoint");
       }
-      require(status.f_bsize == 384U * 1024U,
-              "configured statfs optimal I/O size was not applied");
+      require(status.f_bsize == 256U * 1024U,
+              "fixed statfs optimal I/O size was not applied");
       require(status.f_frsize == 4096,
               "statfs fragment size must remain 4 KiB");
     }

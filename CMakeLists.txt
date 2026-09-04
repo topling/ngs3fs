@@ -235,17 +235,29 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME fuse_cached_mmap_integration_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs> xxhash128 cache)
   set_tests_properties(fuse_cached_mmap_integration_test PROPERTIES TIMEOUT 90)
+  add_test(NAME fuse_uncached_read_ahead_integration_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 prefetch)
+  set_tests_properties(fuse_uncached_read_ahead_integration_test
+    PROPERTIES TIMEOUT 60)
 
-  add_test(NAME read_ahead_option_test
-    COMMAND ngs3fs -R 1MiB --help)
-  add_test(NAME read_ahead_alignment_test
-    COMMAND ngs3fs --read-ahead 257KiB --help)
-  set_tests_properties(read_ahead_alignment_test PROPERTIES WILL_FAIL TRUE)
-  add_test(NAME io_size_option_test
+  add_test(NAME prefetch_window_environment_test
+    COMMAND ngs3fs --help)
+  set_tests_properties(prefetch_window_environment_test PROPERTIES
+    ENVIRONMENT "UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE=67108864")
+  add_test(NAME invalid_prefetch_window_environment_test
+    COMMAND ngs3fs --help)
+  set_tests_properties(invalid_prefetch_window_environment_test PROPERTIES
+    ENVIRONMENT "UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE=1048577")
+  add_test(NAME removed_read_ahead_option_test
+    COMMAND ngs3fs --read-ahead 1MiB --help)
+  set_tests_properties(removed_read_ahead_option_test PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME removed_io_size_option_test
     COMMAND ngs3fs --io-size 1MiB --help)
-  add_test(NAME io_size_zero_test
-    COMMAND ngs3fs --io-size 0 --help)
-  set_tests_properties(io_size_zero_test PROPERTIES WILL_FAIL TRUE)
+  set_tests_properties(removed_io_size_option_test PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME removed_cache_fetch_option_test
+    COMMAND ngs3fs --max-cache-fetch-size 8MiB --help)
+  set_tests_properties(removed_cache_fetch_option_test PROPERTIES WILL_FAIL TRUE)
   add_test(NAME socket_buffer_size_option_test
     COMMAND ngs3fs --socket-buffer-size 4MiB --help)
   add_test(NAME socket_buffer_size_auto_test
@@ -266,15 +278,9 @@ if(NGS3FS_BUILD_TESTS)
 
   add_test(NAME cache_options_test
     COMMAND ngs3fs -L /tmp/ngs3fs-option-test --cache-size 1GiB
-                   --cache-reserve 5% --max-cache-fetch-size 8MiB --help)
+                   --cache-reserve 5% --help)
   add_test(NAME cache_reserve_size_test
     COMMAND ngs3fs -L /tmp/ngs3fs-option-test --cache-reserve 256MiB --help)
-  add_test(NAME cache_fetch_minimum_test
-    COMMAND ngs3fs --max-cache-fetch-size 512KiB --help)
-  set_tests_properties(cache_fetch_minimum_test PROPERTIES WILL_FAIL TRUE)
-  add_test(NAME cache_fetch_alignment_test
-    COMMAND ngs3fs --max-cache-fetch-size 1025KiB --help)
-  set_tests_properties(cache_fetch_alignment_test PROPERTIES WILL_FAIL TRUE)
   add_test(NAME cache_reserve_invalid_test
     COMMAND ngs3fs --cache-reserve 100% --help)
   set_tests_properties(cache_reserve_invalid_test PROPERTIES WILL_FAIL TRUE)

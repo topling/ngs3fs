@@ -14,8 +14,6 @@ iterations=${ITERATIONS:-300}
 object_mib=${OBJECT_MIB:-256}
 order=${ORDER:-forward}
 metrics=${METRICS:-0}
-read_ahead=${READ_AHEAD:-256KiB}
-io_size=${IO_SIZE:-256KiB}
 socket_buffer_size=${SOCKET_BUFFER_SIZE:-2MiB}
 max_connections=${MAX_CONNECTIONS:-8}
 random_files=${RANDOM_READ_FILES:-32}
@@ -151,8 +149,7 @@ start_ngs3fs() {
     fi
   fi
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
-    "$ngs3fs" -f "${metrics_args[@]}" -R "$read_ahead" \
-      --io-size "$io_size" \
+    "$ngs3fs" -f "${metrics_args[@]}" \
       --socket-buffer-size "$socket_buffer_size" \
       -C "$max_connections" \
       -e 127.0.0.1 -p "$port" \

@@ -21,17 +21,19 @@ enum CachePageState : uint8_t {
   CACHE_PAGE_BAD          = 0b11,
 };
 
+constexpr size_t kDefaultMaxPrefetchWindowSize = 128U * 1024U * 1024U;
+
 struct CacheConfig {
   std::string root;
   std::string namespace_id;
-  uint64_t maximum_bytes       = 0;
-  uint64_t reserve_bytes       = 0;
-  unsigned reserve_percent     = 5;
-  size_t maximum_fetch_size    = 8U * 1024U * 1024U;
-  size_t page_size             = 4096;
-  uint64_t upload_part_size    = 8ULL * 1024ULL * 1024ULL;
-  uint32_t checksum_algorithm  = 0;
-  bool reserve_is_percent      = true;
+  uint64_t maximum_bytes          = 0;
+  uint64_t reserve_bytes          = 0;
+  unsigned reserve_percent        = 5;
+  size_t max_prefetch_window_size = kDefaultMaxPrefetchWindowSize;
+  size_t page_size                = 4096;
+  uint64_t upload_part_size       = 8ULL * 1024ULL * 1024ULL;
+  uint32_t checksum_algorithm     = 0;
+  bool reserve_is_percent         = true;
 };
 
 struct CacheIdentity {

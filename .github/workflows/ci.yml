@@ -302,19 +302,6 @@ jobs:
               "$GITHUB_WORKSPACE/build/benchmarks/github-random-read-$mode"
           done
 
-      - name: Compare concurrent random reads with 1MiB io-size
-        run: |
-          for mode in none cold warm; do
-            sudo env \
-              GOOFYS_BIN="$GITHUB_WORKSPACE/build/tools/goofys" \
-              BENCHMARK_REPETITIONS=4 \
-              CACHE_MODE="$mode" \
-              DROP_CACHES_AFTER_WARMUP=1 \
-              IO_SIZE=1MiB \
-              ./scripts/benchmark_random_read.sh \
-              "$GITHUB_WORKSPACE/build/benchmarks/github-random-read-io-size-1MiB-$mode"
-          done
-
       - name: Compare Mountpoint concurrent random reads
         run: |
           for mode in none cold warm; do
@@ -326,20 +313,6 @@ jobs:
               DROP_CACHES_AFTER_WARMUP=1 \
               ./scripts/benchmark_random_read.sh \
               "$GITHUB_WORKSPACE/build/benchmarks/github-mountpoint-random-read-$mode"
-          done
-
-      - name: Compare Mountpoint concurrent random reads with 1MiB io-size
-        run: |
-          for mode in none cold warm; do
-            sudo env \
-              REFERENCE_CLIENT=mountpoint-s3 \
-              MOUNTPOINT_S3_BIN="$GITHUB_WORKSPACE/build/tools/mount-s3" \
-              BENCHMARK_REPETITIONS=3 \
-              CACHE_MODE="$mode" \
-              DROP_CACHES_AFTER_WARMUP=1 \
-              IO_SIZE=1MiB \
-              ./scripts/benchmark_random_read.sh \
-              "$GITHUB_WORKSPACE/build/benchmarks/github-mountpoint-random-read-io-size-1MiB-$mode"
           done
 
       - name: A/B test socket receive buffer

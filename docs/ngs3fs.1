@@ -64,12 +64,6 @@ Per-attempt ECS, IMDS and credential endpoint timeout. Default is 1000.
 Emit aggregate JSON health and resource counters to stderr. Zero disables it.
 .SH CACHE AND I/O OPTIONS
 .TP
-.BI "--io-size " bytes
-Preferred I/O size reported by statfs. Default is 256 KiB.
-.TP
-.BI "-R, --read-ahead " bytes
-Requested kernel BDI read-ahead. Default is 256 KiB.
-.TP
 .BI "-T, --dir-cache-timeout " milliseconds
 Directory cache lifetime. Default is 1000.
 .TP
@@ -85,9 +79,6 @@ Maximum physical cache allocation. Zero means no fixed limit.
 .BI "--cache-reserve " size-or-percent
 Free space preserved on the cache filesystem. Default is 5%.
 .TP
-.BI "--max-cache-fetch-size " bytes
-Maximum adaptive cache fill. Default is 8 MiB; the minimum is 1 MiB and the
-value must be page aligned.
 .SH WRITE OPTIONS
 .TP
 .BI "-P, --part-size " bytes
@@ -112,6 +103,12 @@ Enable background best-effort verification of complete independently
 verifiable units. AWS checksum headers, Alibaba OSS CRC64 and Google XML API
 x-goog-hash CRC32C/MD5 are recognized. The first read or mmap fault may finish
 before verification.
+.SH ENVIRONMENT
+.TP
+.B UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE
+Maximum adaptive prefetch window in bytes for both uncached reads and local
+cache fills. Default is 134217728 (128 MiB). The value must be page aligned and
+at least 1048576. Invalid values produce a warning and retain the default.
 .SH CREDENTIALS
 Credential precedence is AWS environment variables, Web Identity, the selected
 shared profile, credential_process, ECS/EKS container credentials and IMDSv2.

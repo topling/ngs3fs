@@ -53,7 +53,6 @@ def read_comparisons(input_dirs, data_dir):
                 "suite": input_dir.name,
                 "advice": advice,
                 "ngs3fs_cache": ngs3fs["cache_mode"],
-                "ngs3fs_io_size": ngs3fs.get("io_size", "unspecified"),
                 "reference": reference["client"],
                 "reference_cache": reference["cache_mode"],
                 "samples": number(ngs3fs, "samples"),
@@ -73,8 +72,7 @@ def read_comparisons(input_dirs, data_dir):
         if system.is_file():
             shutil.copyfile(system, data_dir / f"{input_dir.name}-system.txt")
     comparisons.sort(key=lambda row: (
-        row["reference"], row["ngs3fs_io_size"],
-        row["ngs3fs_cache"], row["advice"]))
+        row["reference"], row["ngs3fs_cache"], row["advice"]))
     return comparisons
 
 
@@ -104,14 +102,13 @@ def write_markdown(path, comparisons, generated, source_run):
         "CPU is aggregate daemon CPU time divided by completed read operations.",
         "The S3 endpoint is loopback VersityGW, so network first-byte latency is negligible.",
         "",
-        "| Advice | Cache (ngs3fs / reference) | ngs3fs --io-size | Reference | CPU/op (ngs3fs / reference) | Reference / ngs3fs | CPU saved | S3 GET (ngs3fs / reference) |",
-        "|---|---|---:|---|---:|---:|---:|---:|",
+        "| Advice | Cache (ngs3fs / reference) | Reference | CPU/op (ngs3fs / reference) | Reference / ngs3fs | CPU saved | S3 GET (ngs3fs / reference) |",
+        "|---|---|---|---:|---:|---:|---:|",
     ]
     for row in comparisons:
         lines.append(
             f"| {row['advice']} | {row['ngs3fs_cache']} / "
-            f"{row['reference_cache']} | {row['ngs3fs_io_size']} | "
-            f"{row['reference']} | "
+            f"{row['reference_cache']} | {row['reference']} | "
             f"{milliseconds(row['ngs3fs_cpu_per_operation_ns'])} / "
             f"{milliseconds(row['reference_cpu_per_operation_ns'])} ms | "
             f"{row['reference_cpu_over_ngs3fs']:.2f}x | "
@@ -134,7 +131,6 @@ def write_html(path, comparisons, generated, source_run):
           <tr>
             <td>{html.escape(row['advice'])}</td>
             <td><span class="mode">{html.escape(row['ngs3fs_cache'])}</span> / <span class="mode">{html.escape(row['reference_cache'])}</span></td>
-            <td class="number"><span class="mode">{html.escape(row['ngs3fs_io_size'])}</span></td>
             <td>{html.escape(row['reference'])}</td>
             <td class="number">{milliseconds(row['ngs3fs_cpu_per_operation_ns'])}</td>
             <td class="number">{milliseconds(row['reference_cpu_per_operation_ns'])}</td>
@@ -178,7 +174,7 @@ def write_html(path, comparisons, generated, source_run):
     <table>
       <thead><tr>
         <th>Advice</th><th>Cache<br>ngs3fs / reference</th>
-        <th class="number">ngs3fs<br>--io-size</th><th>Reference</th>
+        <th>Reference</th>
         <th class="number">ngs3fs<br>CPU/op (ms)</th>
         <th class="number">Reference<br>CPU/op (ms)</th>
         <th class="number">Reference CPU ÷<br>ngs3fs CPU</th>
@@ -193,7 +189,7 @@ def write_html(path, comparisons, generated, source_run):
     <p><strong>CPU/op</strong> is aggregate daemon CPU time divided by completed
     <code>pread</code> and mmap-fault operations. Values are medians, not wall time.</p>
     <p>The S3 endpoint is loopback VersityGW, so network first-byte latency is
-    negligible. The io-size comparison must not be extrapolated to remote S3 latency.</p>
+    negligible. Results must not be extrapolated to remote S3 latency.</p>
     <p><strong>cold</strong> and <strong>warm</strong> mean disk data caching is enabled
     independently for both ngs3fs and Mountpoint. The cache column makes asymmetric
     comparisons explicit. Each Evidence link opens its raw summary CSV.</p>

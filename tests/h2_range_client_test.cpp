@@ -208,8 +208,13 @@ int main() {
   UniqueFd file(::memfd_create("h2-range-file", MFD_CLOEXEC));
   assert(file);
   TestFileSink sink(file.get(), 0);
-  const auto response = client->get_range_to_fd(
+  auto download = client->begin_range_to_fd(
       "/bucket/key", 0, expected.size(), sink, {}, false, true);
+  const size_t first_received = download->receive_at_least(64U * 1024U);
+  assert(first_received >= 64U * 1024U);
+  assert(first_received < expected.size());
+  assert(!sink.completed);
+  const auto response = download->finish();
   assert(response.status == 206);
   assert(response.body_bytes == expected.size());
   assert(response.externally_spliced_bytes == expected.size());

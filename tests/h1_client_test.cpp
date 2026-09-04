@@ -549,8 +549,13 @@ int main() {
   UniqueFd file(::memfd_create("h1-range-file", MFD_CLOEXEC));
   assert(file);
   TestFileSink sink(file.get(), 0);
-  const Response file_response = file_client->get_range_to_fd(
+  auto file_download = file_client->begin_range_to_fd(
       "/bucket/file", 0, file_body.size(), sink, {}, false, true);
+  const size_t first_received = file_download->receive_at_least(64U * 1024U);
+  assert(first_received >= 64U * 1024U);
+  assert(first_received < file_body.size());
+  assert(!sink.completed);
+  const Response file_response = file_download->finish();
   assert(file_response.status == 206);
   assert(file_response.body_bytes == file_body.size());
   assert(file_response.fallback_copied_bytes > 0);

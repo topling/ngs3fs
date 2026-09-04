@@ -53,8 +53,11 @@ ngs3fs neither detects kernel support nor makes mount correctness depend on it.
   default, means that no fixed maximum is imposed.
 - `--cache-reserve SIZE|PERCENT` preserves free space on the cache filesystem.
   The default is `5%`.
-- `--max-cache-fetch-size SIZE` caps one adaptive read expansion. The default
-  is 8 MiB, the minimum is 1 MiB, and the value must be page aligned.
+- `UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE` sets the upper bound for the
+  adaptive speculative window for both uncached reads and cache fills. The
+  default is 128 MiB. An override is an integer byte count of at least 1 MiB
+  and must be page aligned; invalid values warn and retain the default. A
+  larger FUSE demand is never truncated to this speculative limit.
 
 The existing multipart upload size is also the cache write-reservation unit.
 It defaults to 8 MiB and is not duplicated as a cache-specific option.
@@ -231,8 +234,8 @@ progress is published.
 ### Fetch selection
 
 The first read and a detected jump request at least 1 MiB. Sequential reads
-grow the per-handle window through 2 MiB, 4 MiB, and 8 MiB, capped by
-`--max-cache-fetch-size`. The actual claim:
+double the per-handle window up to 128 MiB by default, capped by
+`UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE`. The actual claim:
 
 - begins at the first missing page needed by the FUSE request;
 - is page aligned except at EOF;

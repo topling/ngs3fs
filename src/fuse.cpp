@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <linux/fs.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/statvfs.h>
 #include <time.h>
@@ -47,8 +48,11 @@
 #include <utility>
 #include <vector>
 
-constexpr size_t kMaximumListResponseSize = 8U * 1024U * 1024U;
-constexpr unsigned kDirectoryListLimit    = 1000;
+constexpr size_t kMaximumListResponseSize      = 8U * 1024U * 1024U;
+constexpr unsigned kDirectoryListLimit         = 1000;
+constexpr uint32_t kKernelReadAheadSize        = 256U * 1024U;
+constexpr char kMaxPrefetchWindowEnvironment[] =
+    "UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE";
 
 enum ChecksumService {
   CHECKSUM_SERVICE_UNKNOWN,
@@ -69,8 +73,6 @@ struct MountConfig {
   std::string expected_bucket_owner;
   size_t maximum_read_size          = kPreferredIoSize;
   size_t maximum_write_size         = kPreferredIoSize;
-  uint32_t io_size                  = kPreferredIoSize;
-  uint32_t read_ahead_size          = kPreferredIoSize;
   size_t socket_receive_buffer_size = kDefaultSocketReceiveBufferSize;
   uint64_t part_size                = 8ULL * 1024ULL * 1024ULL;
   uint64_t cache_size               = 0;
@@ -79,7 +81,7 @@ struct MountConfig {
   uint64_t directory_cache_ns       = 1000ULL * 1000ULL * 1000ULL;
   size_t max_cached_inodes          = 1'000'000;
   uint32_t stats_interval_seconds   = 0;
-  size_t maximum_cache_fetch_size   = 8U * 1024U * 1024U;
+  size_t max_prefetch_window_size   = kDefaultMaxPrefetchWindowSize;
   unsigned max_uploads              = 4;
   unsigned max_connections          = 8;
   int connect_timeout_ms            = kConnectTimeoutMs;
@@ -1150,7 +1152,7 @@ void warn_random_read(State& state, std::string_view path,
                       size_t size) noexcept {
   const size_t read_ahead = std::min(
       state.config.maximum_read_size,
-      size_t(state.config.read_ahead_size));
+      size_t(kKernelReadAheadSize));
   const size_t threshold = read_ahead / 4;
   if (file_size < threshold || offset == 0 || size > threshold) {
     return;
@@ -1378,6 +1380,27 @@ void load_environment(MountConfig& config) {
   } else if (const char* value = getenv("AWS_DEFAULT_REGION")) {
     config.region = value;
   }
+  if (const char* text = getenv(kMaxPrefetchWindowEnvironment)) {
+    uint64_t value = 0;
+    const long page_size = ::sysconf(_SC_PAGESIZE);
+    constexpr uint64_t minimum = 1024ULL * 1024ULL;
+    if (page_size <= 0 || !parse_unsigned(text, value) || value < minimum ||
+        value > std::numeric_limits<size_t>::max() ||
+        value % uint64_t(page_size) != 0) {
+      fprintf(stderr,
+              "warning: %s must be a page-aligned integer byte count "
+              "of at least 1048576; using default %zu bytes\n",
+              kMaxPrefetchWindowEnvironment,
+              kDefaultMaxPrefetchWindowSize);
+    } else {
+      config.max_prefetch_window_size = size_t(value);
+      fprintf(stderr,
+              "warning: %s overrides the maximum prefetch window to "
+              "%zu bytes\n",
+              kMaxPrefetchWindowEnvironment,
+              config.max_prefetch_window_size);
+    }
+  }
 }
 
 bool parse_arguments(int argc, char** argv, MountConfig& config,
@@ -1386,7 +1409,6 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
     return false;
   }
 
-  constexpr int io_size_option                    = 256;
   constexpr int verify_read_checksum_option       = 257;
   constexpr int connect_timeout_option            = 258;
   constexpr int request_timeout_option            = 259;
@@ -1396,7 +1418,6 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   constexpr int socket_buffer_size_option          = 263;
   constexpr int cache_size_option                  = 264;
   constexpr int cache_reserve_option               = 265;
-  constexpr int maximum_cache_fetch_size_option    = 266;
   constexpr int expected_bucket_owner_option       = 267;
   constexpr int requester_pays_option              = 268;
   constexpr option long_options[] = {
@@ -1409,7 +1430,6 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       {"checksum", required_argument, nullptr, 'K'},
       {"verify-read-checksum", no_argument, nullptr,
        verify_read_checksum_option},
-      {"io-size", required_argument, nullptr, io_size_option},
       {"connect-timeout", required_argument, nullptr,
        connect_timeout_option},
       {"request-timeout", required_argument, nullptr,
@@ -1426,12 +1446,9 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       {"cache-size", required_argument, nullptr, cache_size_option},
       {"cache-reserve", required_argument, nullptr,
        cache_reserve_option},
-      {"max-cache-fetch-size", required_argument, nullptr,
-       maximum_cache_fetch_size_option},
       {"expected-bucket-owner", required_argument, nullptr,
        expected_bucket_owner_option},
       {"requester-pays", no_argument, nullptr, requester_pays_option},
-      {"read-ahead", required_argument, nullptr, 'R'},
       {"dir-cache-timeout", required_argument, nullptr, 'T'},
       {"max-cached-inodes", required_argument, nullptr, 'I'},
       {"part-size", required_argument, nullptr, 'P'},
@@ -1449,7 +1466,7 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       {nullptr, 0, nullptr, 0},
   };
   constexpr std::string_view short_options =
-      "-e:p:a:b:k:r:K:L:R:T:I:P:c:C:B:u:g:m:D:MShVdfso:";
+      "-e:p:a:b:k:r:K:L:T:I:P:c:C:B:u:g:m:D:MShVdfso:";
 
   auto add_fuse_short_option = [&](int value) {
     const char argument[] = {'-', static_cast<char>(value), '\0'};
@@ -1519,15 +1536,6 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       case verify_read_checksum_option:
         config.verify_read_checksum = true;
         break;
-      case io_size_option: {
-        const uint64_t value = parse_required_size("--io-size");
-        if (value == 0 || value > std::numeric_limits<uint32_t>::max()) {
-          throw std::invalid_argument(
-              "--io-size must be nonzero and at most UINT32_MAX");
-        }
-        config.io_size = static_cast<uint32_t>(value);
-        break;
-      }
       case connect_timeout_option:
       case request_timeout_option:
       case protocol_probe_timeout_option:
@@ -1607,15 +1615,6 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
         }
         break;
       }
-      case maximum_cache_fetch_size_option: {
-        const uint64_t value =
-            parse_required_size("--max-cache-fetch-size");
-        if (value > std::numeric_limits<size_t>::max()) {
-          throw std::invalid_argument("--max-cache-fetch-size is too large");
-        }
-        config.maximum_cache_fetch_size = size_t(value);
-        break;
-      }
       case expected_bucket_owner_option:
         if (optarg == nullptr || *optarg == '\0') {
           throw std::invalid_argument(
@@ -1626,18 +1625,6 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       case requester_pays_option:
         config.requester_pays = true;
         break;
-      case 'R': {
-        const uint64_t value = parse_required_size("--read-ahead");
-        const long page_size = ::sysconf(_SC_PAGESIZE);
-        if (page_size <= 0 ||
-            value > std::numeric_limits<uint32_t>::max() ||
-            value % uint64_t(page_size) != 0) {
-          throw std::invalid_argument(
-              "--read-ahead must be page-aligned and at most UINT32_MAX");
-        }
-        config.read_ahead_size = static_cast<uint32_t>(value);
-        break;
-      }
       case 'T': {
         const uint64_t milliseconds =
             parse_required_unsigned("--dir-cache-timeout");
@@ -1796,11 +1783,8 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   if (page_size <= 0) {
     throw std::runtime_error("unable to determine PAGE_SIZE");
   }
-  constexpr size_t minimum_cache_fetch_size = 1024U * 1024U;
-  if (config.maximum_cache_fetch_size < minimum_cache_fetch_size ||
-      config.maximum_cache_fetch_size % size_t(page_size) != 0) {
-    throw std::invalid_argument(
-        "--max-cache-fetch-size must be page-aligned and at least 1 MiB");
+  if (config.max_prefetch_window_size % size_t(page_size) != 0) {
+    throw std::logic_error("prefetch window is not page aligned");
   }
   return true;
 }
@@ -2406,7 +2390,7 @@ void initialize_local_cache(State& state) {
       .maximum_bytes = state.config.cache_size,
       .reserve_bytes = state.config.cache_reserve,
       .reserve_percent = unsigned(state.config.cache_reserve),
-      .maximum_fetch_size = state.config.maximum_cache_fetch_size,
+      .max_prefetch_window_size = state.config.max_prefetch_window_size,
       .page_size = size_t(::sysconf(_SC_PAGESIZE)),
       .upload_part_size = state.config.part_size,
       .checksum_algorithm = uint32_t(state.config.checksum),
@@ -5873,7 +5857,7 @@ void ngs3fs_init(void* userdata, fuse_conn_info* connection) {
   connection->want |= connection->capable & desired;
   state.atomic_o_trunc =
       (connection->want & FUSE_CAP_ATOMIC_O_TRUNC) != 0;
-  connection->max_readahead = state.config.read_ahead_size;
+  connection->max_readahead = kKernelReadAheadSize;
   connection->max_read = static_cast<unsigned int>(std::min<size_t>(
       state.config.maximum_read_size,
       std::numeric_limits<unsigned int>::max()));
@@ -6454,6 +6438,82 @@ class CacheRetrySink final : public RangeFileSink {
   void progress(const Response&, bool) override {}
 };
 
+struct UncachedPrefetch {
+  explicit UncachedPrefetch(UniqueFd storage, uint64_t begin,
+                            size_t count)
+      : fd(std::move(storage)), offset(begin), length(count), sink(*this) {}
+
+  UniqueFd fd;
+  uint64_t offset;
+  size_t length;
+  size_t produced = 0;
+  Response response;
+  std::exception_ptr error;
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool complete = false;
+
+  class Sink final : public RangeFileSink {
+   public:
+    explicit Sink(UncachedPrefetch& prefetch) noexcept
+        : RangeFileSink(prefetch.fd.get(), 0), prefetch_(prefetch) {}
+
+    void progress(const Response& response, bool complete) override {
+      if (!publishing_) {
+        return;
+      }
+      publish(response, complete);
+    }
+
+    void start_publishing(const Response& response) {
+      publishing_ = true;
+      publish(response, false);
+    }
+
+   private:
+    void publish(const Response& response, bool complete) {
+      {
+        std::lock_guard guard(prefetch_.mutex);
+        prefetch_.produced = response.body_bytes;
+        prefetch_.response.status = response.status;
+        prefetch_.response.content_range = response.content_range;
+        prefetch_.response.body_bytes = response.body_bytes;
+        prefetch_.complete = complete;
+      }
+      prefetch_.condition.notify_all();
+    }
+
+    UncachedPrefetch& prefetch_;
+    bool publishing_ = false;
+  };
+
+  Sink sink;
+};
+
+class UncachedFileReader final : public FileReader {
+ public:
+  ~UncachedFileReader() override;
+
+  void read(State& state, OpenHandle& handle, fuse_req_t request,
+            fuse_ino_t inode, size_t size, off_t offset) override;
+
+  bool try_prefetch(State& state, OpenHandle& handle,
+                    fuse_req_t request, uint64_t offset,
+                    size_t wanted, uint64_t object_size);
+
+ private:
+  void join() noexcept;
+
+  std::shared_ptr<UncachedPrefetch> prefetch_;
+  std::deque<std::shared_ptr<UncachedPrefetch>> retained_;
+  std::thread thread_;
+  std::mutex mutex_;
+  uint64_t next_offset_ = 0;
+  size_t retained_bytes_ = 0;
+  size_t next_window_ = 1024U * 1024U;
+  bool sequence_started_ = false;
+};
+
 enum CacheChecksumResult {
   CACHE_CHECKSUM_UNAVAILABLE,
   CACHE_CHECKSUM_VALID,
@@ -6758,9 +6818,10 @@ size_t cache_fetch_expansion(State& state, OpenHandle& handle,
     handle.cache_read_window = initial;
     handle.cache_read_seen = true;
   } else if (offset == handle.cache_last_read_end) {
-    handle.cache_read_window = std::min(
-        state.config.maximum_cache_fetch_size,
-        std::max(initial, handle.cache_read_window * 2));
+    const size_t remaining =
+        state.config.max_prefetch_window_size - handle.cache_read_window;
+    handle.cache_read_window +=
+        std::min(handle.cache_read_window, remaining);
   } else {
     handle.cache_read_window = initial;
   }
@@ -6972,6 +7033,7 @@ bool read_cached(State& state, OpenHandle& handle,
 }
 
 void read_open_file(State& state, OpenHandle& handle, bool use_cache,
+                    UncachedFileReader* uncached,
                     fuse_req_t request, fuse_ino_t inode, size_t size,
                     off_t offset) {
   if (offset < 0) {
@@ -7028,6 +7090,11 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
     }
     if (use_cache && handle.cache_entry != nullptr &&
         read_cached(state, handle, request, unsigned_offset, wanted)) {
+      return;
+    }
+    if (uncached != nullptr && !state.config.verify_read_checksum &&
+        uncached->try_prefetch(
+            state, handle, request, unsigned_offset, wanted, object_size)) {
       return;
     }
 
@@ -7191,19 +7258,250 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
   }
 }
 
-class UncachedFileReader final : public FileReader {
- public:
-  void read(State& state, OpenHandle& handle, fuse_req_t request,
-            fuse_ino_t inode, size_t size, off_t offset) override {
-    read_open_file(state, handle, false, request, inode, size, offset);
+UncachedFileReader::~UncachedFileReader() {
+  join();
+}
+
+void UncachedFileReader::join() noexcept {
+  if (thread_.joinable()) {
+    thread_.join();
   }
-};
+}
+
+bool UncachedFileReader::try_prefetch(
+    State& state, OpenHandle& handle, fuse_req_t request,
+    uint64_t offset, size_t wanted, uint64_t object_size) {
+  std::unique_lock reader_guard(mutex_);
+  const auto contains = [&](const UncachedPrefetch& value) {
+    return offset >= value.offset && wanted <= value.length &&
+        offset - value.offset <= value.length - wanted;
+  };
+  const auto advance = [&] {
+    sequence_started_ = true;
+    next_offset_ = offset + wanted;
+  };
+  const bool adjacent = !sequence_started_ || offset == next_offset_;
+  std::shared_ptr<UncachedPrefetch> selected;
+  std::unique_ptr<RangeDownload> started_download;
+  HttpPool::Lease started_lease;
+  if (prefetch_ && contains(*prefetch_)) {
+    selected = prefetch_;
+  } else {
+    for (auto i = retained_.rbegin(); i != retained_.rend(); ++i) {
+      if (contains(**i)) {
+        selected = *i;
+        break;
+      }
+    }
+  }
+  if (!selected) {
+    bool start = prefetch_ == nullptr;
+    if (prefetch_) {
+      bool ready;
+      {
+        std::unique_lock guard(prefetch_->mutex);
+        const uint64_t end = prefetch_->offset + prefetch_->length;
+        if (adjacent && offset == end) {
+          prefetch_->condition.wait(guard, [&] {
+            return prefetch_->produced == prefetch_->length ||
+                prefetch_->complete || prefetch_->error != nullptr;
+          });
+        }
+        ready = prefetch_->produced == prefetch_->length ||
+            prefetch_->complete || prefetch_->error != nullptr;
+      }
+      start = ready;
+    }
+
+    if (!start) {
+      advance();
+      return false;
+    }
+
+    if (prefetch_) {
+      join();
+      const uint64_t end = prefetch_->offset + prefetch_->length;
+      bool valid;
+      {
+        std::lock_guard guard(prefetch_->mutex);
+        valid = prefetch_->error == nullptr && prefetch_->complete &&
+            prefetch_->produced == prefetch_->length &&
+            content_range_matches(
+                prefetch_->response, prefetch_->offset,
+                prefetch_->length, object_size);
+      }
+      if (valid && offset == end) {
+        const size_t maximum = state.config.max_prefetch_window_size;
+        const size_t growth  = maximum - next_window_;
+        next_window_ += std::min(next_window_, growth);
+      } else if (valid) {
+        retained_bytes_ += prefetch_->length;
+        retained_.push_back(std::move(prefetch_));
+        next_window_ = 1024U * 1024U;
+      } else {
+        next_window_ = 1024U * 1024U;
+      }
+      prefetch_.reset();
+    }
+
+    const uint64_t remaining = object_size - offset;
+    const size_t length = size_t(std::min<uint64_t>(
+        remaining, std::max(wanted, next_window_)));
+    if (length <= wanted) {
+      advance();
+      return false;
+    }
+
+    const size_t maximum = state.config.max_prefetch_window_size;
+    while (!retained_.empty() &&
+           (length >= maximum || retained_bytes_ > maximum - length)) {
+      retained_bytes_ -= retained_.front()->length;
+      retained_.pop_front();
+    }
+
+    started_lease = state.http->try_acquire_bulk();
+    if (!started_lease) {
+      advance();
+      return false;
+    }
+
+    UniqueFd fd(::memfd_create("ngs3fs-read-ahead", MFD_CLOEXEC));
+    if (!fd) {
+      throw std::system_error(errno, std::generic_category(),
+                              "memfd_create(read-ahead)");
+    }
+    if (::ftruncate(fd.get(), off_t(length)) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "ftruncate(read-ahead)");
+    }
+
+    WorkerState& worker = worker_state(state);
+    const AuthorizedRangeRequest range = make_range_request(
+        state, handle, worker, offset, length);
+    selected = std::make_shared<UncachedPrefetch>(
+        std::move(fd), offset, length);
+    prefetch_ = selected;
+    try {
+      started_download = started_lease->begin_range_to_fd(
+          range.path(), selected->offset, selected->length, selected->sink,
+          range.headers, true, false);
+      if (started_download->receive_at_least(wanted) < wanted ||
+          !content_range_matches(started_download->response(),
+                                 selected->offset, selected->length,
+                                 object_size)) {
+        prefetch_.reset();
+        advance();
+        return false;
+      }
+      selected->sink.start_publishing(started_download->response());
+    } catch (...) {
+      prefetch_.reset();
+      advance();
+      return false;
+    }
+  }
+
+  const size_t relative = size_t(offset - selected->offset);
+  Response response;
+  if (started_download) {
+    response.status        = started_download->response().status;
+    response.content_range = started_download->response().content_range;
+    response.body_bytes    = started_download->response().body_bytes;
+  } else {
+    std::unique_lock guard(selected->mutex);
+    selected->condition.wait(guard, [&] {
+      return selected->produced >= relative + wanted ||
+          selected->complete || selected->error != nullptr;
+    });
+    if (selected->produced < relative + wanted) {
+      advance();
+      return false;
+    }
+    response.status = selected->response.status;
+    response.content_range = selected->response.content_range;
+    response.body_bytes = selected->produced;
+  }
+  if (!content_range_matches(response, selected->offset,
+                             selected->length, object_size)) {
+    advance();
+    return false;
+  }
+
+  if (started_download) {
+    const bool collect_stats = state.config.stats_interval_seconds != 0;
+    auto complete =
+        [selected, object_size, collect_stats,
+         remote_reads = &state.remote_reads,
+         remote_read_bytes = &state.remote_read_bytes](
+            HttpPool::Lease lease,
+            std::unique_ptr<RangeDownload> download) mutable {
+          (void)lease;
+          try {
+            Response finished = download->finish();
+            const bool valid = content_range_matches(
+                finished, selected->offset, selected->length,
+                object_size) && finished.body_bytes == selected->length;
+            if (collect_stats && valid) {
+              remote_reads->fetch_add(1, std::memory_order_relaxed);
+              remote_read_bytes->fetch_add(
+                  finished.body_bytes, std::memory_order_relaxed);
+            }
+            {
+              std::lock_guard guard(selected->mutex);
+              selected->response = std::move(finished);
+              selected->produced = selected->response.body_bytes;
+              selected->complete = true;
+            }
+          } catch (...) {
+            std::lock_guard guard(selected->mutex);
+            selected->error = std::current_exception();
+            selected->complete = true;
+          }
+          selected->condition.notify_all();
+        };
+    try {
+      thread_ = std::thread(
+          std::move(complete), std::move(started_lease),
+          std::move(started_download));
+    } catch (...) {
+      {
+        std::lock_guard guard(selected->mutex);
+        selected->error = std::current_exception();
+        selected->complete = true;
+      }
+      selected->condition.notify_all();
+    }
+  }
+  fuse_bufvec buffers{};
+  buffers.count        = 1;
+  buffers.buf[0].size  = wanted;
+  buffers.buf[0].flags = fuse_buf_flags(
+      FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
+  buffers.buf[0].fd    = selected->fd.get();
+  buffers.buf[0].pos   = off_t(relative);
+  const int result = fuse_reply_data(
+      request, &buffers, FUSE_BUF_SPLICE_MOVE);
+  if (result != 0) {
+    fprintf(stderr, "fuse_reply_data(read-ahead) failed: %s\n",
+            strerror(-result));
+  }
+  advance();
+  return true;
+}
+
+void UncachedFileReader::read(
+    State& state, OpenHandle& handle, fuse_req_t request,
+    fuse_ino_t inode, size_t size, off_t offset) {
+  read_open_file(state, handle, false, this,
+                 request, inode, size, offset);
+}
 
 class CachedFileReader final : public FileReader {
  public:
   void read(State& state, OpenHandle& handle, fuse_req_t request,
             fuse_ino_t inode, size_t size, off_t offset) override {
-    read_open_file(state, handle, true, request, inode, size, offset);
+    read_open_file(state, handle, true, nullptr,
+                   request, inode, size, offset);
   }
 };
 
@@ -9480,10 +9778,9 @@ void ngs3fs_link(fuse_req_t request, fuse_ino_t, fuse_ino_t, const char*) {
 }
 
 void ngs3fs_statfs(fuse_req_t request, fuse_ino_t) {
-  auto& state = *static_cast<State*>(fuse_req_userdata(request));
   struct statvfs status{};
   constexpr uint64_t frsize = 4096;
-  status.f_bsize   = state.config.io_size;
+  status.f_bsize   = kPreferredIoSize;
   status.f_frsize  = frsize;
   status.f_blocks  = UINT64_MAX / frsize;
   status.f_bfree   = status.f_blocks;
@@ -9525,11 +9822,6 @@ void print_help() {
       "      --cache-reserve SIZE|PERCENT\n"
       "                             preserve cache-filesystem free space "
       "(default 5%)\n"
-      "      --max-cache-fetch-size BYTES\n"
-      "                             maximum adaptive cache fill "
-      "(default 8 MiB, minimum 1 MiB)\n"
-      "      --io-size BYTES       statfs optimal I/O size; accepts "
-      "KiB/MiB (default 256 KiB)\n"
       "      --connect-timeout MS  TCP connect timeout (default 5000)\n"
       "      --request-timeout MS  no-I/O-progress timeout "
       "(default 30000)\n"
@@ -9543,8 +9835,6 @@ void print_help() {
       "(default 1000)\n"
       "      --stats-interval SEC emit aggregate JSON stats to stderr; "
       "0 disables (default 0)\n"
-      "  -R, --read-ahead BYTES    kernel read-ahead; accepts "
-      "KiB/MiB (default 256 KiB)\n"
       "  -T, --dir-cache-timeout MS\n"
       "                             directory cache TTL (default 1000)\n"
       "  -I, --max-cached-inodes N soft inode-cache limit "
@@ -9554,6 +9844,10 @@ void print_help() {
       "  -C, --max-connections N   connection pool size (default 8)\n"
       "  -B, --max-pinned-memory BYTES\n"
       "                             retained write budget (default 256 MiB)\n"
+      "  environment:\n"
+      "    UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE\n"
+      "                             maximum adaptive read prefetch "
+      "window in bytes (default 134217728)\n"
       "  credentials            AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, "
       "AWS_SESSION_TOKEN, shared profiles, credential_process, web "
       "identity, ECS, or IMDSv2\n"
@@ -9714,16 +10008,17 @@ int run(int argc, char** argv) {
       fprintf(stderr, "warning: failed to install FUSE signal handlers\n");
     }
     if (fuse_session_mount(session, options.mountpoint) == 0) {
-      const uint32_t requested_read_ahead = state.config.read_ahead_size;
+      const uint32_t requested_read_ahead = kKernelReadAheadSize;
+      uint32_t effective_read_ahead = requested_read_ahead;
       std::string read_ahead_error;
       if (!set_kernel_read_ahead(options.mountpoint,
-                                 state.config.read_ahead_size,
+                                 effective_read_ahead,
                                  read_ahead_error)) {
         fprintf(stderr,
                 "warning: unable to set kernel read-ahead to %u bytes: %s; "
                 "falling back to kernel value %u bytes\n",
                 requested_read_ahead, read_ahead_error.c_str(),
-                state.config.read_ahead_size);
+                effective_read_ahead);
       }
       fuse_loop_config loop_config{};
       loop_config.clone_fd         = 1;

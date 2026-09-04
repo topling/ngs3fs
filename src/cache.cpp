@@ -2139,8 +2139,8 @@ bool LocalCache::prepare_range(CacheEntry& entry, uint64_t offset,
 
 LocalCache::LocalCache(CacheConfig config) : config_(std::move(config)) {
   if (config_.root.empty() || config_.page_size == 0 ||
-      config_.maximum_fetch_size < config_.page_size ||
-      config_.maximum_fetch_size % config_.page_size != 0) {
+      config_.max_prefetch_window_size < config_.page_size ||
+      config_.max_prefetch_window_size % config_.page_size != 0) {
     throw std::invalid_argument("invalid local cache configuration");
   }
   std::filesystem::create_directories(config_.root);

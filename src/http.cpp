@@ -551,6 +551,8 @@ uint64_t http2_monotonic_ns() {
          static_cast<uint64_t>(value.tv_nsec);
 }
 
+class Http2RangeDownload;
+
 class Http2Client final : public HttpClient {
  public:
   explicit Http2Client(UniqueFd connected_socket,
@@ -575,6 +577,11 @@ class Http2Client final : public HttpClient {
                                 std::span<const Header> headers,
                                 bool capture_headers,
                                 bool measure_transport) override;
+
+  std::unique_ptr<RangeDownload> begin_range_to_fd(
+      std::string_view path, uint64_t offset, size_t length,
+      RangeFileSink& destination, std::span<const Header> headers,
+      bool capture_headers, bool measure_transport) override;
 
   RangeResponse put_from_fd(std::string_view path,
                             std::span<const Header> headers,
@@ -603,6 +610,8 @@ class Http2Client final : public HttpClient {
   void consume(const RangeResponse& response) override;
 
  private:
+  friend class Http2RangeDownload;
+
   struct UploadSource {
     int fd = -1;
     uint64_t offset = 0;
@@ -900,6 +909,213 @@ class Http2Client final : public HttpClient {
   void ensure_ready();
 };
 
+class Http2RangeDownload final : public RangeDownload {
+ public:
+  Http2RangeDownload(Http2Client& client, std::string_view path,
+                     uint64_t offset, size_t length,
+                     RangeFileSink& destination,
+                     std::span<const Header> extra_headers,
+                     bool capture_headers, bool measure_transport)
+      : client_(client), destination_(destination), length_(length),
+        timer_(client.tunnel) {
+    client_.ensure_ready();
+    if (client_.active != nullptr) {
+      throw std::logic_error(
+          "this synchronous connection already has a request");
+    }
+    if (length == 0 || destination.fd() < 0) {
+      throw std::invalid_argument("invalid file-backed range destination");
+    }
+    const uint64_t inclusive_end = offset + uint64_t(length) - 1;
+    if (inclusive_end < offset) {
+      throw std::overflow_error("range end overflow");
+    }
+
+    const Header* supplied_range = nullptr;
+    for (const Header& value : extra_headers) {
+      if (value.name == "range") {
+        if (supplied_range != nullptr) {
+          throw std::invalid_argument("duplicate GET range header");
+        }
+        supplied_range = &value;
+      }
+    }
+    const ssostr<32> range = supplied_range == nullptr
+        ? range_header_value(offset, inclusive_end) : ssostr<32>{};
+    const std::string_view range_value = supplied_range == nullptr
+        ? sso_view(range) : sso_view(supplied_range->value);
+
+    std::vector<nghttp2_nv>& headers = client_.request_headers;
+    headers.clear();
+    headers.reserve(6 + extra_headers.size());
+    headers.push_back(make_header(":method", "GET"));
+    headers.push_back(make_header(":scheme", client_.tls ? "https" : "http"));
+    headers.push_back(make_header(":authority", client_.authority));
+    headers.push_back(make_header(":path", path));
+    headers.push_back(make_header("range", range_value));
+    headers.push_back(make_header("accept-encoding", "identity"));
+    for (const Header& value : extra_headers) {
+      if (value.name == "range") {
+        continue;
+      }
+      if (sso_view(value.name).starts_with(':') ||
+          value.name == "accept-encoding") {
+        throw std::invalid_argument(
+            "GET header conflicts with generated header");
+      }
+      headers.push_back(
+          make_header(sso_view(value.name), sso_view(value.value)));
+    }
+
+    if (client_.file_staging.capacity() < client_.maximum_frame_size) {
+      client_.file_staging = Pipe::create(client_.maximum_frame_size);
+    }
+    request_.destination       = &client_.file_staging;
+    request_.max_body_bytes    = length;
+    request_.capture_headers   = capture_headers;
+    request_.measure_transport = measure_transport;
+    if (capture_headers) {
+      request_.response.headers.reserve(16);
+    }
+    const int stream_id = nghttp2_submit_request(
+        client_.session.get(), nullptr, headers.data(), headers.size(),
+        nullptr, nullptr);
+    if (stream_id < 0) {
+      throw_nghttp2(stream_id, "nghttp2_submit_request");
+    }
+    request_.stream_id          = stream_id;
+    request_.response.stream_id = stream_id;
+    client_.active              = &request_;
+    try {
+      client_.flush();
+    } catch (...) {
+      abort();
+      throw;
+    }
+  }
+
+  ~Http2RangeDownload() override {
+    if (!done_) {
+      abort();
+    }
+  }
+
+  [[nodiscard]] const Response& response() const noexcept override {
+    return request_.response;
+  }
+
+  size_t receive_at_least(size_t minimum_body_bytes) override {
+    if (minimum_body_bytes > length_) {
+      throw std::invalid_argument("range receive minimum exceeds length");
+    }
+    while (!request_.closed &&
+           request_.response.body_bytes < minimum_body_bytes) {
+      receive_one();
+    }
+    return request_.response.body_bytes;
+  }
+
+  Response finish() override {
+    try {
+      while (!request_.closed) {
+        receive_one();
+      }
+      if (request_.response.status < 300) {
+        destination_.progress(request_.response, true);
+      }
+      client_.active = nullptr;
+      done_ = true;
+      if (request_.close_error != NGHTTP2_NO_ERROR) {
+        throw std::runtime_error("HTTP/2 stream closed with error " +
+                                 std::to_string(request_.close_error));
+      }
+      return std::move(request_.response);
+    } catch (...) {
+      if (!done_) {
+        abort();
+      }
+      throw;
+    }
+  }
+
+ private:
+  void receive_one() {
+    try {
+      const bool error_response = request_.response.status >= 300;
+      Pipe* receive_pipe = &client_.file_staging;
+      size_t body_limit = length_;
+      if (error_response) {
+        if (client_.error_staging.capacity() < client_.maximum_frame_size) {
+          client_.error_staging = Pipe::create(client_.maximum_frame_size);
+        }
+        receive_pipe = &client_.error_staging;
+        body_limit = kMaximumErrorResponseSize;
+      }
+      request_.destination = receive_pipe;
+      request_.max_body_bytes = body_limit;
+      const size_t before = request_.response.body_bytes;
+      const size_t shadow_before = request_.shadow_callback_bytes;
+      const ReceiveResult received = client_.ingress.receive_one(
+          client_.session.get(), client_.socket.get(),
+          receive_pipe->write_fd(),
+          body_limit - request_.response.body_bytes,
+          request_.stream_id);
+      if (received.spliced_payload !=
+          request_.shadow_callback_bytes - shadow_before) {
+        throw std::runtime_error("nghttp2 rejected externally spliced DATA");
+      }
+      if (received.header.type == NGHTTP2_DATA) {
+        request_.response.body_bytes += received.spliced_payload;
+        if (request_.measure_transport) {
+          request_.response.wire_last_data_ns = http2_monotonic_ns();
+        }
+      }
+      const size_t appended = request_.response.body_bytes - before;
+      if (appended != 0) {
+        if (error_response) {
+          const size_t old_size = request_.response.body.size();
+          request_.response.body.resize(old_size + appended);
+          read_all(client_.error_staging.read_fd(),
+                   std::span(request_.response.body)
+                       .subspan(old_size, appended));
+        } else {
+          transfer_pipe_to_file(client_.file_staging, destination_, appended,
+                                client_.file_splice_supported,
+                                request_.response);
+        }
+        const int consumed = nghttp2_session_consume(
+            client_.session.get(), request_.stream_id, appended);
+        if (consumed != 0) {
+          throw_nghttp2(consumed,
+                        "nghttp2_session_consume(file range)");
+        }
+        if (!error_response) {
+          destination_.progress(request_.response, false);
+        }
+      }
+      client_.flush();
+    } catch (...) {
+      abort();
+      throw;
+    }
+  }
+
+  void abort() noexcept {
+    client_.active = nullptr;
+    client_.reconnect_required = true;
+    client_.file_staging = {};
+    client_.error_staging = {};
+    done_ = true;
+  }
+
+  Http2Client& client_;
+  RangeFileSink& destination_;
+  size_t length_;
+  TlsRequestTimer timer_;
+  Http2Client::ActiveRequest request_;
+  bool done_ = false;
+};
+
 Http2Client::Http2Client(UniqueFd connected_socket,
                          std::string request_authority,
                          std::string reconnect_host,
@@ -1101,142 +1317,18 @@ RangeResponse Http2Client::get_range_to_fd(
     std::string_view path, uint64_t offset, size_t length,
     RangeFileSink& destination, std::span<const Header> extra_headers,
     bool capture_headers, bool measure_transport) {
-  ensure_ready();
-  if (active != nullptr) {
-    throw std::logic_error("this synchronous connection already has a request");
-  }
-  if (length == 0 || destination.fd() < 0) {
-    throw std::invalid_argument("invalid file-backed range destination");
-  }
-  const uint64_t inclusive_end = offset + uint64_t(length) - 1;
-  if (inclusive_end < offset) {
-    throw std::overflow_error("range end overflow");
-  }
+  return begin_range_to_fd(
+      path, offset, length, destination, extra_headers,
+      capture_headers, measure_transport)->finish();
+}
 
-  const Header* supplied_range = nullptr;
-  for (const Header& value : extra_headers) {
-    if (value.name == "range") {
-      if (supplied_range != nullptr) {
-        throw std::invalid_argument("duplicate GET range header");
-      }
-      supplied_range = &value;
-    }
-  }
-  const ssostr<32> range = supplied_range == nullptr
-      ? range_header_value(offset, inclusive_end) : ssostr<32>{};
-  const std::string_view range_value = supplied_range == nullptr
-      ? sso_view(range) : sso_view(supplied_range->value);
-
-  std::vector<nghttp2_nv>& headers = request_headers;
-  headers.clear();
-  headers.reserve(6 + extra_headers.size());
-  headers.push_back(make_header(":method", "GET"));
-  headers.push_back(make_header(":scheme", tls ? "https" : "http"));
-  headers.push_back(make_header(":authority", authority));
-  headers.push_back(make_header(":path", path));
-  headers.push_back(make_header("range", range_value));
-  headers.push_back(make_header("accept-encoding", "identity"));
-  for (const Header& value : extra_headers) {
-    if (value.name == "range") {
-      continue;
-    }
-    if (sso_view(value.name).starts_with(':') ||
-        value.name == "accept-encoding") {
-      throw std::invalid_argument("GET header conflicts with generated header");
-    }
-    headers.push_back(make_header(sso_view(value.name), sso_view(value.value)));
-  }
-
-  TlsRequestTimer tls_timer(tunnel);
-  if (file_staging.capacity() < maximum_frame_size) {
-    file_staging = Pipe::create(maximum_frame_size);
-  }
-  ActiveRequest request;
-  request.destination       = &file_staging;
-  request.max_body_bytes    = length;
-  request.capture_headers   = capture_headers;
-  request.measure_transport = measure_transport;
-  if (capture_headers) {
-    request.response.headers.reserve(16);
-  }
-  const int stream_id = nghttp2_submit_request(
-      session.get(), nullptr, headers.data(), headers.size(), nullptr,
-      nullptr);
-  if (stream_id < 0) {
-    throw_nghttp2(stream_id, "nghttp2_submit_request");
-  }
-  request.stream_id          = stream_id;
-  request.response.stream_id = stream_id;
-  active                     = &request;
-
-  try {
-    flush();
-    while (!request.closed) {
-      const bool error_response = request.response.status >= 300;
-      Pipe* receive_pipe = &file_staging;
-      size_t body_limit = length;
-      if (error_response) {
-        if (error_staging.capacity() < maximum_frame_size) {
-          error_staging = Pipe::create(maximum_frame_size);
-        }
-        receive_pipe = &error_staging;
-        body_limit = kMaximumErrorResponseSize;
-      }
-      request.destination = receive_pipe;
-      request.max_body_bytes = body_limit;
-      const size_t before = request.response.body_bytes;
-      const size_t shadow_before = request.shadow_callback_bytes;
-      const ReceiveResult received = ingress.receive_one(
-          session.get(), socket.get(), receive_pipe->write_fd(),
-          body_limit - request.response.body_bytes, request.stream_id);
-      if (received.spliced_payload !=
-          request.shadow_callback_bytes - shadow_before) {
-        throw std::runtime_error("nghttp2 rejected externally spliced DATA");
-      }
-      if (received.header.type == NGHTTP2_DATA) {
-        request.response.body_bytes += received.spliced_payload;
-        if (measure_transport) {
-          request.response.wire_last_data_ns = http2_monotonic_ns();
-        }
-      }
-      const size_t appended = request.response.body_bytes - before;
-      if (appended != 0) {
-        if (error_response) {
-          const size_t old_size = request.response.body.size();
-          request.response.body.resize(old_size + appended);
-          read_all(error_staging.read_fd(), std::span(request.response.body)
-                                                .subspan(old_size, appended));
-        } else {
-          transfer_pipe_to_file(file_staging, destination, appended,
-                                file_splice_supported, request.response);
-        }
-        const int consumed = nghttp2_session_consume(
-            session.get(), request.stream_id, appended);
-        if (consumed != 0) {
-          throw_nghttp2(consumed, "nghttp2_session_consume(file range)");
-        }
-        if (!error_response) {
-          destination.progress(request.response, false);
-        }
-      }
-      flush();
-    }
-    if (request.response.status < 300) {
-      destination.progress(request.response, true);
-    }
-  } catch (...) {
-    active = nullptr;
-    reconnect_required = true;
-    file_staging = {};
-    error_staging = {};
-    throw;
-  }
-  active = nullptr;
-  if (request.close_error != NGHTTP2_NO_ERROR) {
-    throw std::runtime_error("HTTP/2 stream closed with error " +
-                             std::to_string(request.close_error));
-  }
-  return std::move(request.response);
+std::unique_ptr<RangeDownload> Http2Client::begin_range_to_fd(
+    std::string_view path, uint64_t offset, size_t length,
+    RangeFileSink& destination, std::span<const Header> extra_headers,
+    bool capture_headers, bool measure_transport) {
+  return std::make_unique<Http2RangeDownload>(
+      *this, path, offset, length, destination, extra_headers,
+      capture_headers, measure_transport);
 }
 
 RangeResponse Http2Client::put_from_fd(std::string_view path,
@@ -2258,6 +2350,8 @@ class ResponseParser {
   bool capture_content_range_ = false;
 };
 
+class Http1RangeDownload;
+
 class Http1Client final : public HttpClient {
  public:
   Http1Client(UniqueFd connected_socket, std::string request_authority,
@@ -2288,6 +2382,11 @@ class Http1Client final : public HttpClient {
                            bool capture_headers,
                            bool measure_transport) override;
 
+  std::unique_ptr<RangeDownload> begin_range_to_fd(
+      std::string_view path, uint64_t offset, size_t length,
+      RangeFileSink& destination, std::span<const Header> headers,
+      bool capture_headers, bool measure_transport) override;
+
   Response put_from_fd(std::string_view path,
                        std::span<const Header> headers, int source_fd,
                        uint64_t source_offset, size_t length) override;
@@ -2313,6 +2412,8 @@ class Http1Client final : public HttpClient {
   void consume(const Response&) override {}
 
  private:
+  friend class Http1RangeDownload;
+
   std::shared_ptr<TlsTunnel> tunnel;
   UniqueFd socket;
   std::string authority;
@@ -2645,6 +2746,335 @@ class Http1Client final : public HttpClient {
   }
 };
 
+class Http1RangeDownload final : public RangeDownload {
+ public:
+  Http1RangeDownload(Http1Client& client, std::string_view path,
+                     uint64_t offset, size_t length,
+                     RangeFileSink& destination,
+                     std::span<const Header> extra_headers,
+                     bool capture_headers, bool measure_transport)
+      : client_(client), destination_(destination), length_(length),
+        capture_headers_(capture_headers),
+        measure_transport_(measure_transport) {
+    if (length == 0 || destination.fd() < 0) {
+      throw std::invalid_argument("invalid file-backed range destination");
+    }
+    const uint64_t inclusive_end = offset + uint64_t(length) - 1;
+    if (inclusive_end < offset) {
+      throw std::overflow_error("range end overflow");
+    }
+    const Header* supplied_range = nullptr;
+    for (const Header& header : extra_headers) {
+      if (ascii_equal(sso_view(header.name), "range")) {
+        if (supplied_range != nullptr) {
+          throw std::invalid_argument("duplicate GET range header");
+        }
+        supplied_range = &header;
+      } else if (ascii_equal(sso_view(header.name), "accept-encoding")) {
+        throw std::invalid_argument(
+            "GET header conflicts with generated header");
+      }
+    }
+    const ssostr<32> range = supplied_range == nullptr
+        ? range_header_value(offset, inclusive_end) : ssostr<32>{};
+    const std::array generated_range_headers{
+        Header{"range", range},
+        Header{"accept-encoding", "identity"},
+    };
+    const std::array generated_accept_header{
+        Header{"accept-encoding", "identity"},
+    };
+    const std::span<const Header> generated_headers =
+        supplied_range == nullptr
+            ? std::span<const Header>(generated_range_headers)
+            : std::span<const Header>(generated_accept_header);
+
+    if (client_.request_active) {
+      throw std::logic_error("HTTP/1.1 connection already has a request");
+    }
+    client_.request_active = true;
+    try {
+      client_.ensure_connected();
+      timer_.emplace(client_.tunnel);
+      build_request_head(client_.request_head, "GET", path,
+                         client_.authority, generated_headers,
+                         extra_headers, std::nullopt, false, true);
+      response_.wire_start_ns = measure_transport_
+          ? http1_monotonic_ns() : 0;
+      send_all(
+          client_.socket.get(),
+          std::span(
+              reinterpret_cast<const std::byte*>(
+                  client_.request_head.data()),
+              client_.request_head.size()));
+      reset_parser();
+    } catch (...) {
+      abort();
+      throw;
+    }
+  }
+
+  ~Http1RangeDownload() override {
+    if (!done_) {
+      abort();
+    }
+  }
+
+  [[nodiscard]] const Response& response() const noexcept override {
+    return response_;
+  }
+
+  size_t receive_at_least(size_t minimum_body_bytes) override {
+    if (minimum_body_bytes > length_) {
+      throw std::invalid_argument("range receive minimum exceeds length");
+    }
+    try {
+      receive_headers();
+      while (!complete_ && response_.body_bytes < minimum_body_bytes) {
+        receive_body_once();
+      }
+      return response_.body_bytes;
+    } catch (...) {
+      abort();
+      throw;
+    }
+  }
+
+  Response finish() override {
+    try {
+      receive_headers();
+      while (!complete_) {
+        receive_body_once();
+      }
+      if (response_.status < 300) {
+        destination_.progress(response_, true);
+      }
+      if (parser_ && !parser_->should_keep_alive()) {
+        client_.socket.reset();
+      }
+      client_.request_active = false;
+      done_ = true;
+      timer_.reset();
+      return std::move(response_);
+    } catch (...) {
+      if (!done_) {
+        abort();
+      }
+      throw;
+    }
+  }
+
+ private:
+  void reset_parser() {
+    parser_.emplace(
+        response_, nullptr, &destination_, length_, false,
+        capture_headers_, true);
+  }
+
+  void receive_headers() {
+    if (headers_ready_) {
+      return;
+    }
+    for (;;) {
+      while (!parser_->headers_complete()) {
+        if (begin_ == end_) {
+          if (header_bytes_ == kMaxResponseHeaderBytes) {
+            throw std::runtime_error(
+                "HTTP/1.1 response headers exceed 64 KiB");
+          }
+          const size_t room = kMaxResponseHeaderBytes - header_bytes_;
+          ssize_t n;
+          do {
+            n = ::recv(client_.socket.get(), buffer_.data(),
+                       std::min(buffer_.size(), room), 0);
+          } while (n < 0 && errno == EINTR);
+          if (n == 0) {
+            throw std::system_error(
+                std::make_error_code(std::errc::connection_reset),
+                "HTTP/1.1 peer closed before response headers");
+          }
+          if (n < 0) {
+            http1_throw_errno("recv(HTTP/1.1 header)");
+          }
+          begin_ = 0;
+          end_   = size_t(n);
+        }
+        const size_t n = parser_->execute(
+            std::span(buffer_).subspan(begin_, end_ - begin_));
+        begin_ += n;
+        header_bytes_ += n;
+        if (begin_ == end_) {
+          begin_ = 0;
+          end_   = 0;
+        }
+        if (n == 0 && !parser_->headers_complete()) {
+          throw std::runtime_error("llhttp made no response progress");
+        }
+      }
+
+      if (response_.status < 100 || response_.status >= 200 ||
+          response_.status == 101) {
+        break;
+      }
+      if (!parser_->message_complete()) {
+        throw std::runtime_error("incomplete informational response");
+      }
+      const uint64_t wire_start_ns = response_.wire_start_ns;
+      response_ = {};
+      response_.wire_start_ns = wire_start_ns;
+      header_bytes_ = 0;
+      reset_parser();
+    }
+
+    headers_ready_ = true;
+    if (response_.status >= 300) {
+      parser_->resume();
+      return;
+    }
+    fixed_remaining_ = parser_->fixed_body_remaining();
+    if (!fixed_remaining_) {
+      parser_->resume();
+      return;
+    }
+    if (*fixed_remaining_ > length_) {
+      throw std::runtime_error(
+          "HTTP/1.1 response exceeds requested body size");
+    }
+    const size_t buffered = end_ - begin_;
+    if (buffered > *fixed_remaining_) {
+      throw std::runtime_error(
+          "HTTP/1.1 response exceeds requested body size");
+    }
+    if (buffered != 0) {
+      write_range_file(
+          destination_, std::span(buffer_).subspan(begin_, buffered));
+      response_.body_bytes += buffered;
+      response_.fallback_copied_bytes += buffered;
+      *fixed_remaining_ -= buffered;
+      begin_ = 0;
+      end_   = 0;
+      if (measure_transport_) {
+        response_.wire_last_data_ns = http1_monotonic_ns();
+      }
+      destination_.progress(response_, false);
+    }
+    if (*fixed_remaining_ == 0) {
+      complete_ = true;
+    }
+  }
+
+  void receive_body_once() {
+    if (response_.status < 300 && fixed_remaining_) {
+      receive_fixed_once();
+      return;
+    }
+    if (begin_ == end_) {
+      ssize_t n;
+      do {
+        n = ::recv(client_.socket.get(), buffer_.data(), buffer_.size(), 0);
+      } while (n < 0 && errno == EINTR);
+      if (n < 0) {
+        http1_throw_errno("recv(HTTP/1.1 body)");
+      }
+      if (n == 0) {
+        parser_->finish();
+        client_.socket.reset();
+        complete_ = parser_->message_complete();
+        if (!complete_) {
+          throw std::runtime_error("incomplete HTTP/1.1 response");
+        }
+        return;
+      }
+      begin_ = 0;
+      end_   = size_t(n);
+    }
+    const size_t before = response_.body_bytes;
+    const size_t n = parser_->execute(
+        std::span(buffer_).subspan(begin_, end_ - begin_));
+    begin_ += n;
+    if (begin_ == end_) {
+      begin_ = 0;
+      end_   = 0;
+    }
+    if (measure_transport_ && response_.body_bytes != before) {
+      response_.wire_last_data_ns = http1_monotonic_ns();
+    }
+    if (response_.status < 300 && response_.body_bytes != before) {
+      destination_.progress(response_, false);
+    }
+    complete_ = parser_->message_complete();
+  }
+
+  void receive_fixed_once() {
+    if (*fixed_remaining_ == 0) {
+      complete_ = true;
+      return;
+    }
+    const size_t capacity = std::min<size_t>(
+        *fixed_remaining_, kPreferredIoSize);
+    if (client_.file_staging.capacity() < capacity) {
+      client_.file_staging = Pipe::create(capacity);
+      const int flags = ::fcntl(client_.file_staging.write_fd(), F_GETFL);
+      if (flags < 0 || ::fcntl(
+              client_.file_staging.write_fd(), F_SETFL,
+              flags & ~O_NONBLOCK) != 0) {
+        http1_throw_errno("fcntl(file staging pipe)");
+      }
+    }
+    const size_t requested = std::min(
+        *fixed_remaining_, client_.file_staging.capacity());
+    ssize_t moved;
+    do {
+      ++response_.transport_splice_calls;
+      moved = ::splice(client_.socket.get(), nullptr,
+                       client_.file_staging.write_fd(), nullptr,
+                       requested, SPLICE_F_MOVE | SPLICE_F_MORE);
+    } while (moved < 0 && errno == EINTR);
+    if (moved == 0) {
+      throw std::system_error(
+          std::make_error_code(std::errc::connection_reset),
+          "splice reached EOF during HTTP/1.1 response");
+    }
+    if (moved < 0) {
+      http1_throw_errno("splice(HTTP/1.1 file body)");
+    }
+    transfer_pipe_to_file(client_.file_staging, destination_, size_t(moved),
+                          client_.file_splice_supported, response_);
+    response_.body_bytes += size_t(moved);
+    *fixed_remaining_ -= size_t(moved);
+    if (measure_transport_) {
+      response_.wire_last_data_ns = http1_monotonic_ns();
+    }
+    destination_.progress(response_, false);
+    complete_ = *fixed_remaining_ == 0;
+  }
+
+  void abort() noexcept {
+    client_.request_active = false;
+    client_.socket.reset();
+    client_.file_staging = {};
+    timer_.reset();
+    done_ = true;
+  }
+
+  Http1Client& client_;
+  RangeFileSink& destination_;
+  size_t length_;
+  bool capture_headers_;
+  bool measure_transport_;
+  Response response_;
+  std::optional<TlsRequestTimer> timer_;
+  std::optional<ResponseParser> parser_;
+  std::array<std::byte, kHttp1ReadSize> buffer_;
+  std::optional<size_t> fixed_remaining_;
+  size_t begin_ = 0;
+  size_t end_ = 0;
+  size_t header_bytes_ = 0;
+  bool headers_ready_ = false;
+  bool complete_ = false;
+  bool done_ = false;
+};
+
 Response Http1Client::get_range(
     std::string_view path, uint64_t offset, size_t length,
     Pipe& destination, std::span<const Header> extra_headers,
@@ -2694,39 +3124,18 @@ Response Http1Client::get_range_to_fd(
     std::string_view path, uint64_t offset, size_t length,
     RangeFileSink& destination, std::span<const Header> extra_headers,
     bool capture_headers, bool measure_transport) {
-  if (length == 0 || destination.fd() < 0) {
-    throw std::invalid_argument("invalid file-backed range destination");
-  }
-  const uint64_t inclusive_end = offset + uint64_t(length) - 1;
-  if (inclusive_end < offset) {
-    throw std::overflow_error("range end overflow");
-  }
-  const Header* supplied_range = nullptr;
-  for (const Header& header : extra_headers) {
-    if (ascii_equal(sso_view(header.name), "range")) {
-      if (supplied_range != nullptr) {
-        throw std::invalid_argument("duplicate GET range header");
-      }
-      supplied_range = &header;
-    } else if (ascii_equal(sso_view(header.name), "accept-encoding")) {
-      throw std::invalid_argument("GET header conflicts with generated header");
-    }
-  }
-  const ssostr<32> range = supplied_range == nullptr
-      ? range_header_value(offset, inclusive_end) : ssostr<32>{};
-  const std::array generated_range_headers{
-      Header{"range", range},
-      Header{"accept-encoding", "identity"},
-  };
-  const std::array generated_accept_header{
-      Header{"accept-encoding", "identity"},
-  };
-  const std::span<const Header> generated_headers = supplied_range == nullptr
-      ? std::span<const Header>(generated_range_headers)
-      : std::span<const Header>(generated_accept_header);
-  return perform("GET", path, extra_headers, std::nullopt, -1, 0,
-                 nullptr, &destination, length, capture_headers,
-                 measure_transport, generated_headers, true);
+  return begin_range_to_fd(
+      path, offset, length, destination, extra_headers,
+      capture_headers, measure_transport)->finish();
+}
+
+std::unique_ptr<RangeDownload> Http1Client::begin_range_to_fd(
+    std::string_view path, uint64_t offset, size_t length,
+    RangeFileSink& destination, std::span<const Header> extra_headers,
+    bool capture_headers, bool measure_transport) {
+  return std::make_unique<Http1RangeDownload>(
+      *this, path, offset, length, destination, extra_headers,
+      capture_headers, measure_transport);
 }
 
 Response Http1Client::put_from_fd(

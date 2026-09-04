@@ -69,7 +69,7 @@ int main() {
       .maximum_bytes = 0,
       .reserve_bytes = 0,
       .reserve_percent = 5,
-      .maximum_fetch_size = 8U * 1024U * 1024U,
+      .max_prefetch_window_size = 8U * 1024U * 1024U,
       .page_size = 4096,
       .upload_part_size = 8U * 1024U * 1024U,
       .reserve_is_percent = true,
