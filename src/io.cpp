@@ -51,6 +51,24 @@ ssize_t io_receive(int fd, void* data, size_t length, int flags,
   return ::recv(fd, data, length, flags);
 }
 
+ssize_t io_read(int fd, void* data, size_t length,
+                int timeout_ms) noexcept {
+  if (current_io_executor != nullptr) {
+    return current_io_executor->read(
+        fd, data, length, effective_io_timeout(timeout_ms));
+  }
+  return ::read(fd, data, length);
+}
+
+ssize_t io_pread(int fd, void* data, size_t length, off_t offset,
+                 int timeout_ms) noexcept {
+  if (current_io_executor != nullptr) {
+    return current_io_executor->pread(
+        fd, data, length, offset, effective_io_timeout(timeout_ms));
+  }
+  return ::pread(fd, data, length, offset);
+}
+
 ssize_t io_receive_exact(int fd, void* data, size_t length, int flags,
                          int timeout_ms) noexcept {
   if (current_io_executor != nullptr) {
@@ -170,6 +188,15 @@ ssize_t io_send_exact(int fd, const void* data, size_t length, int flags,
     }
   }
   return ssize_t(offset);
+}
+
+ssize_t io_pwrite(int fd, const void* data, size_t length,
+                  off_t offset, int timeout_ms) noexcept {
+  if (current_io_executor != nullptr) {
+    return current_io_executor->pwrite(
+        fd, data, length, offset, effective_io_timeout(timeout_ms));
+  }
+  return ::pwrite(fd, data, length, offset);
 }
 
 ssize_t io_splice(int input_fd, off_t* input_offset,

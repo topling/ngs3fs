@@ -25,9 +25,13 @@ does not acquire a group lock on the request/reply hot path.
 The uring engine covers classic `/dev/fuse` receive/reply and cleartext HTTP
 connect, send, receive and splice operations reached from dispatched FUSE
 callbacks, upload workers and uncached-prefetch continuations. Socket
-operations carry linked request timeouts. TLS remains implemented by the
-threaded `TlsTunnel`; local-cache file I/O and unscoped maintenance work also
-remain threaded. Consequently this is not yet a complete all-FD reactor, and
+operations use monotonic deadlines in the ring wait; only expired operations
+submit `ASYNC_CANCEL`. A read or cache fill is handed to its reactor once and
+then suspends a local fiber on its CQEs. Cache-file writes use `IOSQE_ASYNC` so
+buffered filesystem work runs in io-wq rather than the reactor. TLS remains
+implemented by the threaded `TlsTunnel`; cache maintenance, checksum-state
+waits, and unscoped work remain threaded. Consequently this is not yet a
+complete all-FD reactor, and
 an HTTP connection is not yet permanently assigned to one reactor. The uring
 build uses a
 pinned libfuse 3.18.2 source

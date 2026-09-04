@@ -58,6 +58,10 @@ class IoExecutor {
 
   virtual ssize_t receive(int fd, void* data, size_t length,
                           int flags, int timeout_ms) noexcept = 0;
+  virtual ssize_t read(int fd, void* data, size_t length,
+                       int timeout_ms) noexcept = 0;
+  virtual ssize_t pread(int fd, void* data, size_t length, off_t offset,
+                        int timeout_ms) noexcept = 0;
   virtual ssize_t receive_exact(int fd, void* data, size_t length,
                                 int flags, int timeout_ms) noexcept = 0;
   virtual ssize_t receive_exact_then(
@@ -71,6 +75,8 @@ class IoExecutor {
                        int flags, int timeout_ms) noexcept = 0;
   virtual ssize_t send_exact(int fd, const void* data, size_t length,
                              int flags, int timeout_ms) noexcept = 0;
+  virtual ssize_t pwrite(int fd, const void* data, size_t length,
+                         off_t offset, int timeout_ms) noexcept = 0;
   virtual ssize_t splice(int input_fd, off_t* input_offset,
                          int output_fd, off_t* output_offset,
                          size_t length, unsigned flags,
@@ -100,6 +106,10 @@ class IoExecutorScope {
 
 ssize_t io_receive(int fd, void* data, size_t length, int flags = 0,
                    int timeout_ms = 0) noexcept;
+ssize_t io_read(int fd, void* data, size_t length,
+                int timeout_ms = 0) noexcept;
+ssize_t io_pread(int fd, void* data, size_t length, off_t offset,
+                 int timeout_ms = 0) noexcept;
 ssize_t io_receive_exact(int fd, void* data, size_t length, int flags = 0,
                          int timeout_ms = 0) noexcept;
 ssize_t io_receive_exact_then(
@@ -114,6 +124,8 @@ ssize_t io_send(int fd, const void* data, size_t length, int flags,
                 int timeout_ms = 0) noexcept;
 ssize_t io_send_exact(int fd, const void* data, size_t length, int flags,
                       int timeout_ms = 0) noexcept;
+ssize_t io_pwrite(int fd, const void* data, size_t length,
+                  off_t offset, int timeout_ms = 0) noexcept;
 ssize_t io_splice(int input_fd, off_t* input_offset,
                   int output_fd, off_t* output_offset,
                   size_t length, unsigned flags,

@@ -139,7 +139,33 @@ In one-reactor mode the metadata authority and I/O reactor are the same thread. 
 
 ### I/O ownership
 
-Scoped cleartext socket operations run on the callback reactor or on a reactor captured by background work, and an fd is never concurrently submitted to more than one ring. This is still an intermediate architecture: HTTP connections are leased from a shared pool instead of being permanently owned by one reactor, while TLS remote sockets and some cache/background I/O remain threaded.
+Scoped cleartext socket operations run on the callback reactor or on a reactor
+captured by background work, and an fd is never concurrently submitted to more
+than one ring. A read or cache fill crosses from its FUSE dispatch worker to a
+reactor exactly once. A bounded reactor-local fiber then parses HTTP/1 or
+HTTP/2 and suspends directly on socket, pipe, and cache-file CQEs; it does not
+use the old synchronous per-operation worker/reactor rendezvous. Uncached
+prefetch tails remain reactor tasks rather than threads waiting synchronously
+for reactor I/O.
+
+Cache-file `pwrite` and pipe-to-file splice set `IOSQE_ASYNC`, because buffered
+regular-file writes are otherwise allowed to execute inline during ring
+submission. This deliberately sends local filesystem work to io-wq while
+keeping socket and FUSE transport processing on the reactor. HTTP connections
+are still leased from a shared pool instead of being permanently reactor-owned.
+TLS remote sockets and checksum-state waits remain explicit threaded
+compatibility boundaries.
+
+Cached `FUSE_WRITE` transfers its FD-backed dispatch to a reactor task once.
+The callback marks the original `fuse_bufvec` consumed and returns; dispatch
+recycling is deferred until the task has consumed or drained the pipe. The
+payload therefore crosses neither a userspace buffer nor a synchronous
+worker/reactor rendezvous, while the cache-file write still runs on io-wq.
+
+Successful I/O uses one SQE and one CQE. Each request records an absolute
+monotonic deadline; the event loop waits only until the nearest deadline and
+submits `IORING_OP_ASYNC_CANCEL` solely for an operation that actually expires.
+This replaces linked timeouts, which doubled normal-path completion traffic.
 
 ## FUSE request lifetime
 
@@ -157,7 +183,12 @@ ACTIVE -> CANCELING  -> RETIRED
 ACTIVE -> FAILED     -> RETIRED
 ```
 
-Normal I/O completion, linked timeout, async cancellation, socket failure, and shutdown race through this state machine. Exactly one path may issue the FUSE reply. Every SQE user-data token remains valid until the last possible CQE has been consumed; token generations prevent stale completions from acting on reused storage. FUSE request interrupts are intentionally disabled until ngs3fs can propagate cancellation into the active S3 operation.
+Normal I/O completion, deadline-triggered async cancellation, socket failure,
+and shutdown race through this state machine. Exactly one path may issue the
+FUSE reply. Every SQE user-data token remains valid until the last possible CQE
+has been consumed; token generations prevent stale completions from acting on
+reused storage. FUSE request interrupts are intentionally disabled until
+ngs3fs can propagate cancellation into the active S3 operation.
 
 ## CPU work and checksum semantics
 
@@ -340,17 +371,19 @@ A+Patch.
 The production implementation now covers tasks 1 and 2, the FUSE-transport
 part of task 3, external completion routing, multi-reactor clone-fd sharding,
 startup engine selection, and cleartext HTTP socket submission. FUSE callbacks
-run in a bounded dispatch pool so a callback waiting for its ring-owned socket
-CQE cannot block that reactor from consuming the CQE. Upload and uncached
-prefetch continuation workers capture the originating reactor. Each socket
-operation is submitted with a linked timeout and the worker waits for its
-terminal CQEs.
+run in a bounded dispatch pool. Hot read and cache-fill callbacks submit one
+bounded task to the originating reactor; HTTP/1 and HTTP/2 parsing then runs on
+that reactor's reusable fiber and suspends directly on socket CQEs. Uncached
+prefetch tails are reactor tasks as well. Each successful operation uses one
+SQE/CQE; the event-loop wait uses the nearest monotonic deadline and submits an
+asynchronous cancellation only for a real timeout. Buffered cache-file writes
+are forced onto io-wq.
 
 This remains an intermediate architecture. HTTP connections are leased from
 a shared pool and are not yet permanently assigned to a reactor. Local-cache
-file I/O, TLS remote sockets, cache maintenance, and unscoped background work
-remain threaded. The synchronous HTTP state machine also crosses the
-worker/reactor boundary for each socket operation; local random-read tests
-therefore still show higher CPU and latency than the legacy engine. The
-legacy engine remains the deployment default until ownership is stable and
-the event-driven path is competitive.
+maintenance, TLS remote sockets, checksum-state waits, and unscoped background
+work remain threaded. Metadata callbacks and checksum-enabled cache reads may
+still use the synchronous compatibility submission path. Local random-read
+tests therefore still show higher CPU and latency than the legacy engine. The
+legacy engine remains the deployment default until ownership is stable and the
+event-driven path is competitive.

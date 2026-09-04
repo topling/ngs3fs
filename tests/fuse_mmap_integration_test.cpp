@@ -2280,11 +2280,11 @@ int main(int argc, char** argv) {
       fail_errno("close-to-open while duplicated writer remains");
     }
     if (!cache_dir.empty()) {
-#if !defined(__SANITIZE_THREAD__)
+#if !defined(__SANITIZE_THREAD__) && !defined(__SANITIZE_ADDRESS__)
       // mincore observes an evictable kernel cache, not a program invariant.
-      // TSan's instrumentation can delay this check enough for ordinary
-      // reclaim to make it nondeterministic; byte/no-GET validation below
-      // remains active in every build.
+      // Sanitizer instrumentation can delay this check or add enough memory
+      // pressure for ordinary reclaim to make it nondeterministic;
+      // byte/no-GET validation below remains active in every build.
       const long page_size = ::sysconf(_SC_PAGESIZE);
       require(page_size > 0, "sysconf(_SC_PAGESIZE) failed");
       const size_t mapped_size =

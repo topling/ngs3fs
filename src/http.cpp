@@ -1966,7 +1966,7 @@ void write_range_file(RangeFileSink& destination,
                       std::span<const std::byte> bytes) {
   size_t written = 0;
   while (written != bytes.size()) {
-    const ssize_t result = ::pwrite(
+    const ssize_t result = io_pwrite(
         destination.fd(), bytes.data() + written, bytes.size() - written,
         off_t(destination.offset()));
     if (result > 0) {
@@ -2028,7 +2028,7 @@ void transfer_pipe_to_file(Pipe& source, RangeFileSink& destination,
     const size_t wanted = std::min(bytes.size(), length - transferred);
     ssize_t result;
     do {
-      result = ::read(source.read_fd(), bytes.data(), wanted);
+      result = io_read(source.read_fd(), bytes.data(), wanted);
     } while (result < 0 && errno == EINTR);
     if (result == 0) {
       throw std::system_error(

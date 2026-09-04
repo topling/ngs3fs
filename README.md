@@ -94,16 +94,27 @@ multi-file namespace. It remains experimental rather than production-ready.
   libfuse continues to own request decoding, dispatch and reply semantics.
   Cleartext HTTP connect, send, receive and splice operations issued by FUSE
   callbacks, upload workers and uncached-prefetch continuation workers are
-  submitted to the callback's reactor with linked request timeouts.
+  submitted to the callback's reactor. Read and cache-fill operations use one
+  asynchronous task handoff and then suspend reactor-local fibers directly on
+  io_uring completions; they do not synchronously hand each socket operation
+  back and forth across threads. The reactor wait uses the nearest active I/O
+  deadline, and submits `ASYNC_CANCEL` only when an operation actually times
+  out, avoiding a linked-timeout CQE on every successful operation.
   `--reactors` selects the reactor count. Each reactor owns one ring and one
   cloned FUSE device fd; the one-reactor case uses the same group code without
   a shared hot-path lock. A fallback is possible only during startup; a
   running mount never changes engines.
 - TLS remains at the existing threaded `TlsTunnel` boundary. Thus an uring
-  mount uses a threaded remote TLS socket. Local-cache `pread`/`pwrite`, cache
-  maintenance and background work without a reactor scope also remain on the
-  threaded path; the uring engine does not yet claim a complete all-FD event
-  loop.
+  mount uses a threaded remote TLS socket. On a cleartext cache miss, pipe to
+  cache-file splice and cache-file `pwrite` use `IOSQE_ASYNC`, keeping buffered
+  local-file writes off the reactor thread. Cached FUSE writes transfer their
+  FD-backed dispatch ownership to one reactor task before returning from the
+  callback, so the dispatch worker neither copies the payload nor waits for a
+  worker-to-reactor I/O rendezvous. Cache maintenance, write-side
+  durability work, and work without a reactor scope remain threaded. Read
+  checksum verification currently retains a worker fallback because its
+  shared verification state still has blocking waits; the uring engine does
+  not yet claim a complete all-FD event loop.
 - After each upload succeeds, `FUSE_NOTIFY_STORE` consumes the retained
   FD-backed pipe chain into the ordinary kernel page cache, covering partial
   pages that FUSE write-through mode otherwise discards. Later read opens keep

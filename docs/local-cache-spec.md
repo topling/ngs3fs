@@ -257,6 +257,21 @@ available to an exact demand read or control call. When no bulk connection is
 immediately available, the miss fetches only the page-aligned range needed by
 the FUSE request. Whole pages already published by a failed tail remain valid.
 
+With the uring engine, the dispatch worker performs only the cache-state
+claim and submits one stable cache-fill task. HTTP parsing and socket receive
+then continue on a reactor-local fiber. Writes into the sparse cache data file
+are ring operations forced onto io-wq with `IOSQE_ASYNC`; the reactor itself
+does not execute a buffered filesystem write. CLEAN is published only after
+the corresponding file-write completion, and pending readers are notified
+after that publication.
+
+For a cached FUSE write, the callback copies only the one-element
+`fuse_bufvec` descriptor, marks the original input as transferred, and retains
+the FD-backed dispatch pipe until the reactor task finishes consuming it. The
+dispatch worker then returns immediately. Payload pages remain pipe-backed,
+and pipe-to-cache-file work is submitted to io-wq; no synchronous
+worker-to-reactor I/O handoff or payload copy is introduced.
+
 ### Read checksum behavior
 
 Read verification remains optional and best effort. The help text for

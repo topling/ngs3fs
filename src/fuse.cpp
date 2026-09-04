@@ -247,7 +247,16 @@ class HttpPool {
     size_t slot_ = 0;
   };
 
-  explicit HttpPool(const MountConfig& config) {
+  explicit HttpPool(const MountConfig& config)
+      : release_pipe_(Pipe::create(4096)) {
+    const int release_flags = ::fcntl(
+        release_pipe_.write_fd(), F_GETFL, 0);
+    if (release_flags < 0 ||
+        ::fcntl(release_pipe_.write_fd(), F_SETFL,
+                release_flags | O_NONBLOCK) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "fcntl(HTTP release notification)");
+    }
     slots_.resize(config.max_connections);
     std::vector<std::exception_ptr> errors(config.max_connections);
     std::vector<std::thread> threads;
@@ -316,6 +325,33 @@ class HttpPool {
           return Lease(this, i);
         }
       }
+      FuseReactor* reactor = current_fuse_reactor();
+      if (reactor != nullptr && reactor->in_current_task()) {
+        reactor_waiters_.fetch_add(1, std::memory_order_acquire);
+        for (size_t n = 0; n < usable; ++n) {
+          const size_t i = (begin + n) % usable;
+          bool available = false;
+          if (slots_[i]->busy.compare_exchange_strong(
+                  available, true, std::memory_order_acquire,
+                  std::memory_order_relaxed)) {
+            reactor_waiters_.fetch_sub(1, std::memory_order_release);
+            return Lease(this, i);
+          }
+        }
+        std::byte notification;
+        ssize_t result;
+        do {
+          result = io_read(release_pipe_.read_fd(), &notification,
+                           sizeof(notification));
+        } while (result < 0 && errno == EINTR);
+        reactor_waiters_.fetch_sub(1, std::memory_order_release);
+        if (result != ssize_t(sizeof(notification))) {
+          throw std::system_error(
+              result < 0 ? errno : EIO, std::generic_category(),
+              "wait for HTTP connection");
+        }
+        continue;
+      }
       released_.wait(released, std::memory_order_acquire);
     }
   }
@@ -324,11 +360,24 @@ class HttpPool {
     slots_[i]->busy.store(false, std::memory_order_release);
     released_.fetch_add(1, std::memory_order_release);
     released_.notify_one();
+    if (reactor_waiters_.load(std::memory_order_acquire) != 0) {
+      const std::byte notification{};
+      ssize_t result;
+      do {
+        result = ::write(release_pipe_.write_fd(), &notification,
+                         sizeof(notification));
+      } while (result < 0 && errno == EINTR);
+      // A full pipe is already readable, so dropping this coalesced wakeup
+      // cannot strand a waiter and must never block a reactor thread.
+      (void)result;
+    }
   }
 
   std::vector<std::unique_ptr<Slot>> slots_;
   std::atomic<size_t> next_{0};
   std::atomic<uint64_t> released_{0};
+  Pipe release_pipe_;
+  std::atomic<size_t> reactor_waiters_{0};
 };
 
 class UploadScheduler {
@@ -945,7 +994,21 @@ struct WorkerState {
 WorkerState& worker_state(State& state) {
   // Each FUSE worker reuses its transport pipe and header scratch. HTTP
   // connections are leased from the mount-global pool.
-  thread_local WorkerState worker;
+  FuseReactor* reactor = current_fuse_reactor();
+  WorkerState* selected = nullptr;
+  if (reactor != nullptr && reactor->in_current_task()) {
+    selected = static_cast<WorkerState*>(reactor->task_local_data());
+    if (selected == nullptr) {
+      selected = new WorkerState;
+      reactor->set_task_local_data(selected, [](void* data) noexcept {
+        delete static_cast<WorkerState*>(data);
+      });
+    }
+  } else {
+    thread_local WorkerState worker;
+    selected = &worker;
+  }
+  WorkerState& worker = *selected;
   if (worker.owner != &state) {
     worker.transport_pipe           = Pipe();
     worker.request_headers          = HeaderList();
@@ -6494,9 +6557,11 @@ class CacheRetrySink final : public RangeFileSink {
 struct UncachedPrefetch {
   explicit UncachedPrefetch(UniqueFd storage, uint64_t begin,
                             size_t count)
-      : fd(std::move(storage)), offset(begin), length(count), sink(*this) {}
+      : fd(std::move(storage)), notification(Pipe::create(4096)),
+        offset(begin), length(count), sink(*this) {}
 
   UniqueFd fd;
+  Pipe notification;
   uint64_t offset;
   size_t length;
   size_t produced = 0;
@@ -6505,6 +6570,18 @@ struct UncachedPrefetch {
   std::mutex mutex;
   std::condition_variable condition;
   bool complete = false;
+  size_t waiters = 0;
+
+  void notify_waiters(size_t wake) {
+    condition.notify_all();
+    std::array<std::byte, 64> notifications{};
+    while (wake != 0) {
+      const size_t count = std::min(wake, notifications.size());
+      write_all(notification.write_fd(),
+                std::span(notifications).first(count));
+      wake -= count;
+    }
+  }
 
   class Sink final : public RangeFileSink {
    public:
@@ -6525,15 +6602,18 @@ struct UncachedPrefetch {
 
    private:
     void publish(const Response& response, bool complete) {
+      (void)complete;
+      size_t wake = 0;
       {
         std::lock_guard guard(prefetch_.mutex);
         prefetch_.produced = response.body_bytes;
         prefetch_.response.status = response.status;
         prefetch_.response.content_range = response.content_range;
         prefetch_.response.body_bytes = response.body_bytes;
-        prefetch_.complete = complete;
+        wake = prefetch_.waiters;
+        prefetch_.waiters = 0;
       }
-      prefetch_.condition.notify_all();
+      prefetch_.notify_waiters(wake);
     }
 
     UncachedPrefetch& prefetch_;
@@ -6542,6 +6622,133 @@ struct UncachedPrefetch {
 
   Sink sink;
 };
+
+bool wait_for_prefetch(UncachedPrefetch& prefetch, size_t wanted) {
+  if (current_fuse_reactor() == nullptr) {
+    std::unique_lock guard(prefetch.mutex);
+    prefetch.condition.wait(guard, [&] {
+      return prefetch.produced >= wanted || prefetch.complete ||
+          prefetch.error != nullptr;
+    });
+    return prefetch.produced >= wanted;
+  }
+  for (;;) {
+    {
+      std::lock_guard guard(prefetch.mutex);
+      if (prefetch.produced >= wanted) {
+        return true;
+      }
+      if (prefetch.complete || prefetch.error != nullptr) {
+        return false;
+      }
+      ++prefetch.waiters;
+    }
+    std::byte notification;
+    ssize_t result;
+    do {
+      result = io_read(prefetch.notification.read_fd(),
+                       &notification, sizeof(notification));
+    } while (result < 0 && errno == EINTR);
+    if (result != ssize_t(sizeof(notification))) {
+      throw std::system_error(
+          result < 0 ? errno : EIO, std::generic_category(),
+          "wait for read-ahead progress");
+    }
+  }
+}
+
+bool wait_for_prefetch_complete(UncachedPrefetch& prefetch) {
+  if (current_fuse_reactor() == nullptr) {
+    std::unique_lock guard(prefetch.mutex);
+    prefetch.condition.wait(guard, [&] {
+      return prefetch.complete || prefetch.error != nullptr;
+    });
+    return prefetch.complete && prefetch.error == nullptr;
+  }
+  for (;;) {
+    {
+      std::lock_guard guard(prefetch.mutex);
+      if (prefetch.complete || prefetch.error != nullptr) {
+        return prefetch.complete && prefetch.error == nullptr;
+      }
+      ++prefetch.waiters;
+    }
+    std::byte notification;
+    ssize_t result;
+    do {
+      result = io_read(prefetch.notification.read_fd(),
+                       &notification, sizeof(notification));
+    } while (result < 0 && errno == EINTR);
+    if (result != ssize_t(sizeof(notification))) {
+      throw std::system_error(
+          result < 0 ? errno : EIO, std::generic_category(),
+          "wait for read-ahead completion");
+    }
+  }
+}
+
+struct PrefetchTailTask {
+  std::shared_ptr<UncachedPrefetch> prefetch;
+  uint64_t object_size;
+  bool collect_stats;
+  std::atomic<uint64_t>* remote_reads;
+  std::atomic<uint64_t>* remote_read_bytes;
+  HttpPool::Lease lease;
+  std::unique_ptr<RangeDownload> download;
+  FuseReactor::ReactorTask reactor_task;
+};
+
+void run_prefetch_tail(void* context) noexcept {
+  std::unique_ptr<PrefetchTailTask> task(
+      static_cast<PrefetchTailTask*>(context));
+  (void)task->lease;
+  size_t wake = 0;
+  try {
+    Response finished = task->download->finish();
+    const bool valid = content_range_matches(
+        finished, task->prefetch->offset, task->prefetch->length,
+        task->object_size) &&
+        finished.body_bytes == task->prefetch->length;
+    if (task->collect_stats && valid) {
+      task->remote_reads->fetch_add(1, std::memory_order_relaxed);
+      task->remote_read_bytes->fetch_add(
+          finished.body_bytes, std::memory_order_relaxed);
+    }
+    {
+      std::lock_guard guard(task->prefetch->mutex);
+      task->prefetch->response = std::move(finished);
+      task->prefetch->produced = task->prefetch->response.body_bytes;
+      task->prefetch->complete = true;
+      wake = task->prefetch->waiters;
+      task->prefetch->waiters = 0;
+    }
+  } catch (...) {
+    std::lock_guard guard(task->prefetch->mutex);
+    task->prefetch->error = std::current_exception();
+    task->prefetch->complete = true;
+    wake = task->prefetch->waiters;
+    task->prefetch->waiters = 0;
+  }
+  task->prefetch->notify_waiters(wake);
+}
+
+void cancel_prefetch_tail(void* context) noexcept {
+  std::unique_ptr<PrefetchTailTask> task(
+      static_cast<PrefetchTailTask*>(context));
+  size_t wake;
+  {
+    std::lock_guard guard(task->prefetch->mutex);
+    try {
+      throw std::runtime_error("read-ahead reactor stopped");
+    } catch (...) {
+      task->prefetch->error = std::current_exception();
+    }
+    task->prefetch->complete = true;
+    wake = task->prefetch->waiters;
+    task->prefetch->waiters = 0;
+  }
+  task->prefetch->notify_waiters(wake);
+}
 
 class UncachedFileReader final : public FileReader {
  public:
@@ -6880,25 +7087,45 @@ size_t cache_fetch_expansion(State& state, OpenHandle& handle,
   return std::max(wanted, handle.cache_read_window);
 }
 
+struct AsyncCacheReadTask {
+  State* state;
+  OpenHandle* handle;
+  fuse_req_t request;
+  uint64_t offset;
+  size_t wanted;
+  CacheFetchClaim claim;
+  HttpPool::Lease lease;
+  std::unique_ptr<OpenRequestGuard> active;
+  FuseReactor::ReactorTask reactor_task;
+};
+
+void run_async_cache_read(void* context) noexcept;
+void cancel_async_cache_read(void* context) noexcept;
+
 bool read_cached(State& state, OpenHandle& handle,
-                 fuse_req_t request, uint64_t offset, size_t wanted) {
+                 fuse_req_t request, uint64_t offset, size_t wanted,
+                 std::unique_ptr<OpenRequestGuard>* active = nullptr,
+                 const CacheFetchClaim* assigned_claim = nullptr,
+                 HttpPool::Lease* supplied_lease = nullptr) {
   CacheEntry& entry = *handle.cache_entry;
-  if (state.config.verify_read_checksum && entry.stale()) {
+  const bool preassigned = assigned_claim != nullptr;
+  if (assigned_claim == nullptr &&
+      state.config.verify_read_checksum && entry.stale()) {
     throw std::system_error(ESTALE, std::generic_category(),
                             "stale cached S3 generation");
   }
-  if (state.config.verify_read_checksum) {
+  if (assigned_claim == nullptr && state.config.verify_read_checksum) {
     ensure_checksum_manifest(state, handle);
   }
-  const size_t expansion = cache_fetch_expansion(
-      state, handle, offset, wanted);
+  const size_t expansion = assigned_claim == nullptr
+      ? cache_fetch_expansion(state, handle, offset, wanted) : wanted;
   for (;;) {
-    if (state.config.verify_read_checksum &&
+    if (assigned_claim == nullptr && state.config.verify_read_checksum &&
         !service_cached_checksums(state, handle, offset, wanted)) {
       throw std::system_error(EIO, std::generic_category(),
                               "cached S3 part checksum mismatch");
     }
-    if (entry.pin_clean(offset, wanted)) {
+    if (assigned_claim == nullptr && entry.pin_clean(offset, wanted)) {
       const int result = reply_pinned_cached_range(
           request, entry, offset, wanted);
       if (result != 0) {
@@ -6907,33 +7134,60 @@ bool read_cached(State& state, OpenHandle& handle,
       }
       return true;
     }
-    if (entry.range_bad(offset, wanted)) {
+    if (assigned_claim == nullptr && entry.range_bad(offset, wanted)) {
       throw std::system_error(EIO, std::generic_category(),
                               "cached S3 checksum mismatch");
     }
-    HttpPool::Lease lease;
-    size_t selected_expansion = wanted;
-    if (expansion > wanted) {
-      lease = state.http->try_acquire_bulk();
-      if (lease) {
-        selected_expansion = expansion;
+    HttpPool::Lease lease = supplied_lease != nullptr
+        ? std::move(*supplied_lease) : HttpPool::Lease{};
+    CacheFetchClaim claim;
+    if (assigned_claim != nullptr) {
+      claim = *assigned_claim;
+      assigned_claim = nullptr;
+    } else {
+      size_t selected_expansion = wanted;
+      if (expansion > wanted) {
+        lease = state.http->try_acquire_bulk();
+        if (lease) {
+          selected_expansion = expansion;
+        }
       }
-    }
-    const CacheFetchClaim claim = entry.claim_fetch(
-        offset, wanted, selected_expansion);
-    if (!claim) {
-      entry.wait_for_range(offset, wanted);
-      continue;
+      claim = entry.claim_fetch(offset, wanted, selected_expansion);
+      if (!claim) {
+        entry.wait_for_range(offset, wanted);
+        continue;
+      }
+
+      try {
+        if (!entry.prepare_read(claim.offset, claim.length)) {
+          entry.fail_fetch(claim);
+          return false;
+        }
+      } catch (...) {
+        entry.fail_fetch(claim);
+        throw;
+      }
     }
 
-    try {
-      if (!entry.prepare_read(claim.offset, claim.length)) {
+    if (!preassigned && !state.config.verify_read_checksum &&
+        active != nullptr && *active &&
+        current_fuse_reactor() != nullptr) {
+      auto task = std::make_unique<AsyncCacheReadTask>(
+          AsyncCacheReadTask{&state, &handle, request, offset, wanted,
+                             claim, std::move(lease),
+                             std::move(*active), {}});
+      FuseReactor* reactor = current_fuse_reactor();
+      task->reactor_task = {
+          run_async_cache_read, cancel_async_cache_read, task.get()};
+      AsyncCacheReadTask* submitted = task.release();
+      if (!reactor->submit_task(&submitted->reactor_task)) {
+        task.reset(submitted);
         entry.fail_fetch(claim);
-        return false;
+        throw std::system_error(
+            EAGAIN, std::generic_category(),
+            "submit asynchronous cache fill");
       }
-    } catch (...) {
-      entry.fail_fetch(claim);
-      throw;
+      return true;
     }
 
     CacheReadSink sink(entry, claim, request, offset, wanted);
@@ -7083,10 +7337,30 @@ bool read_cached(State& state, OpenHandle& handle,
   }
 }
 
+void run_async_cache_read(void* context) noexcept {
+  std::unique_ptr<AsyncCacheReadTask> task(
+      static_cast<AsyncCacheReadTask*>(context));
+  try {
+    read_cached(*task->state, *task->handle, task->request,
+                task->offset, task->wanted, nullptr,
+                &task->claim, &task->lease);
+  } catch (...) {
+    reply_callback_error(task->request);
+  }
+}
+
+void cancel_async_cache_read(void* context) noexcept {
+  std::unique_ptr<AsyncCacheReadTask> task(
+      static_cast<AsyncCacheReadTask*>(context));
+  task->handle->cache_entry->fail_fetch(task->claim);
+  fuse_reply_err(task->request, EIO);
+}
+
 void read_open_file(State& state, OpenHandle& handle, bool use_cache,
                     UncachedFileReader* uncached,
                     fuse_req_t request, fuse_ino_t inode, size_t size,
-                    off_t offset) {
+                    off_t offset,
+                    std::unique_ptr<OpenRequestGuard>* active = nullptr) {
   if (offset < 0) {
     fuse_reply_err(request, EINVAL);
     return;
@@ -7140,7 +7414,8 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
       return;
     }
     if (use_cache && handle.cache_entry != nullptr &&
-        read_cached(state, handle, request, unsigned_offset, wanted)) {
+        read_cached(state, handle, request, unsigned_offset, wanted,
+                    active)) {
       return;
     }
     if (uncached != nullptr && !state.config.verify_read_checksum &&
@@ -7343,18 +7618,20 @@ bool UncachedFileReader::try_prefetch(
   if (!selected) {
     bool start = prefetch_ == nullptr;
     if (prefetch_) {
+      const std::shared_ptr<UncachedPrefetch> pending = prefetch_;
+      const uint64_t end = pending->offset + pending->length;
+      if (offset == end) {
+        reader_guard.unlock();
+        wait_for_prefetch_complete(*pending);
+        reader_guard.lock();
+        if (prefetch_ != pending) {
+          return false;
+        }
+      }
       bool ready;
       {
-        std::unique_lock guard(prefetch_->mutex);
-        const uint64_t end = prefetch_->offset + prefetch_->length;
-        if (offset == end) {
-          prefetch_->condition.wait(guard, [&] {
-            return prefetch_->produced == prefetch_->length ||
-                prefetch_->complete || prefetch_->error != nullptr;
-          });
-        }
-        ready = prefetch_->produced == prefetch_->length ||
-            prefetch_->complete || prefetch_->error != nullptr;
+        std::lock_guard guard(prefetch_->mutex);
+        ready = prefetch_->complete || prefetch_->error != nullptr;
       }
       start = ready;
     }
@@ -7424,6 +7701,7 @@ bool UncachedFileReader::try_prefetch(
     selected = std::make_shared<UncachedPrefetch>(
         std::move(fd), offset, length);
     prefetch_ = selected;
+    reader_guard.unlock();
     try {
       started_download = started_lease->begin_range_to_fd(
           range.path(), selected->offset, selected->length, selected->sink,
@@ -7432,14 +7710,42 @@ bool UncachedFileReader::try_prefetch(
           !content_range_matches(started_download->response(),
                                  selected->offset, selected->length,
                                  object_size)) {
-        prefetch_.reset();
+        size_t wake = 0;
+        {
+          std::lock_guard guard(selected->mutex);
+          selected->error = std::make_exception_ptr(
+              std::runtime_error("invalid read-ahead response"));
+          selected->complete = true;
+          wake = selected->waiters;
+          selected->waiters = 0;
+        }
+        selected->notify_waiters(wake);
+        reader_guard.lock();
+        if (prefetch_ == selected) {
+          prefetch_.reset();
+        }
+        reader_guard.unlock();
         return false;
       }
       selected->sink.start_publishing(started_download->response());
     } catch (...) {
-      prefetch_.reset();
+      size_t wake = 0;
+      {
+        std::lock_guard guard(selected->mutex);
+        selected->error = std::current_exception();
+        selected->complete = true;
+        wake = selected->waiters;
+        selected->waiters = 0;
+      }
+      selected->notify_waiters(wake);
+      reader_guard.lock();
+      if (prefetch_ == selected) {
+        prefetch_.reset();
+      }
+      reader_guard.unlock();
       return false;
     }
+    reader_guard.lock();
   }
 
   const size_t relative = size_t(offset - selected->offset);
@@ -7449,14 +7755,11 @@ bool UncachedFileReader::try_prefetch(
     response.content_range = started_download->response().content_range;
     response.body_bytes    = started_download->response().body_bytes;
   } else {
-    std::unique_lock guard(selected->mutex);
-    selected->condition.wait(guard, [&] {
-      return selected->produced >= relative + wanted ||
-          selected->complete || selected->error != nullptr;
-    });
-    if (selected->produced < relative + wanted) {
+    reader_guard.unlock();
+    if (!wait_for_prefetch(*selected, relative + wanted)) {
       return false;
     }
+    std::lock_guard guard(selected->mutex);
     response.status = selected->response.status;
     response.content_range = selected->response.content_range;
     response.body_bytes = selected->produced;
@@ -7467,54 +7770,42 @@ bool UncachedFileReader::try_prefetch(
   }
 
   if (started_download) {
-    const bool collect_stats = state.config.stats_interval_seconds != 0;
+    auto tail = std::make_unique<PrefetchTailTask>(PrefetchTailTask{
+        selected, object_size,
+        state.config.stats_interval_seconds != 0,
+        &state.remote_reads, &state.remote_read_bytes,
+        std::move(started_lease), std::move(started_download), {}});
     FuseReactor* reactor = current_fuse_reactor();
-    const int io_timeout_ms = state.config.request_timeout_ms;
-    auto complete =
-        [selected, object_size, collect_stats, reactor, io_timeout_ms,
-         remote_reads = &state.remote_reads,
-         remote_read_bytes = &state.remote_read_bytes](
-            HttpPool::Lease lease,
-            std::unique_ptr<RangeDownload> download) mutable {
-          (void)lease;
-          std::optional<FuseReactorReplyScope> scope;
-          if (reactor != nullptr) {
-            scope.emplace(reactor, io_timeout_ms);
-          }
-          try {
-            Response finished = download->finish();
-            const bool valid = content_range_matches(
-                finished, selected->offset, selected->length,
-                object_size) && finished.body_bytes == selected->length;
-            if (collect_stats && valid) {
-              remote_reads->fetch_add(1, std::memory_order_relaxed);
-              remote_read_bytes->fetch_add(
-                  finished.body_bytes, std::memory_order_relaxed);
-            }
-            {
-              std::lock_guard guard(selected->mutex);
-              selected->response = std::move(finished);
-              selected->produced = selected->response.body_bytes;
-              selected->complete = true;
-            }
-          } catch (...) {
-            std::lock_guard guard(selected->mutex);
-            selected->error = std::current_exception();
-            selected->complete = true;
-          }
-          selected->condition.notify_all();
-        };
     try {
-      thread_ = std::thread(
-          std::move(complete), std::move(started_lease),
-          std::move(started_download));
+      if (reactor != nullptr) {
+        tail->reactor_task = {
+            run_prefetch_tail, cancel_prefetch_tail, tail.get()};
+        PrefetchTailTask* submitted = tail.release();
+        if (!reactor->submit_task(&submitted->reactor_task)) {
+          tail.reset(submitted);
+          throw std::system_error(
+              EAGAIN, std::generic_category(),
+              "submit read-ahead tail");
+        }
+      } else {
+        PrefetchTailTask* submitted = tail.release();
+        try {
+          thread_ = std::thread(run_prefetch_tail, submitted);
+        } catch (...) {
+          tail.reset(submitted);
+          throw;
+        }
+      }
     } catch (...) {
+      size_t wake = 0;
       {
         std::lock_guard guard(selected->mutex);
         selected->error = std::current_exception();
         selected->complete = true;
+        wake = selected->waiters;
+        selected->waiters = 0;
       }
-      selected->condition.notify_all();
+      selected->notify_waiters(wake);
     }
   }
   fuse_bufvec buffers{};
@@ -7583,6 +7874,44 @@ std::unique_ptr<FileWriter> make_file_writer(State& state,
   return std::make_unique<UncachedFileWriter>();
 }
 
+struct AsyncReadTask {
+  AsyncReadTask(State& state_value, OpenHandle& handle_value,
+                fuse_req_t request_value, fuse_ino_t inode_value,
+                size_t size_value, off_t offset_value)
+      : state(&state_value), handle(&handle_value),
+        request(request_value), inode(inode_value), size(size_value),
+        offset(offset_value), active(handle_value) {}
+
+  State* state;
+  OpenHandle* handle;
+  fuse_req_t request;
+  fuse_ino_t inode;
+  size_t size;
+  off_t offset;
+  OpenRequestGuard active;
+  FuseReactor::ReactorTask reactor_task;
+};
+
+void run_async_read(void* context) noexcept {
+  std::unique_ptr<AsyncReadTask> task(
+      static_cast<AsyncReadTask*>(context));
+  try {
+    read_open_file(
+        *task->state, *task->handle, false,
+        static_cast<UncachedFileReader*>(task->handle->reader.get()),
+        task->request, task->inode, task->size, task->offset,
+        nullptr);
+  } catch (...) {
+    reply_callback_error(task->request);
+  }
+}
+
+void cancel_async_read(void* context) noexcept {
+  std::unique_ptr<AsyncReadTask> task(
+      static_cast<AsyncReadTask*>(context));
+  fuse_reply_err(task->request, EIO);
+}
+
 void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
                  off_t offset, fuse_file_info* file) {
   try {
@@ -7592,7 +7921,26 @@ void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
       throw std::system_error(EBADF, std::generic_category(),
                               "missing file reader");
     }
-    OpenRequestGuard active(handle);
+    FuseReactor* reactor = current_fuse_reactor();
+    if (reactor != nullptr && !state.local_cache) {
+      auto task = std::make_unique<AsyncReadTask>(
+          state, handle, request, inode, size, offset);
+      task->reactor_task = {
+          run_async_read, cancel_async_read, task.get()};
+      AsyncReadTask* submitted = task.release();
+      if (!reactor->submit_task(&submitted->reactor_task)) {
+        task.reset(submitted);
+        throw std::system_error(EAGAIN, std::generic_category(),
+                                "submit asynchronous read");
+      }
+      return;
+    }
+    auto active = std::make_unique<OpenRequestGuard>(handle);
+    if (reactor != nullptr && state.local_cache) {
+      read_open_file(state, handle, true, nullptr,
+                     request, inode, size, offset, &active);
+      return;
+    }
     handle.reader->read(state, handle, request, inode, size, offset);
   } catch (...) {
     reply_callback_error(request);
@@ -7764,7 +8112,7 @@ void pwrite_cache_exact(int fd, uint64_t offset,
                         std::span<const std::byte> bytes) {
   size_t written = 0;
   while (written != bytes.size()) {
-    const ssize_t result = ::pwrite(
+    const ssize_t result = io_pwrite(
         fd, bytes.data() + written, bytes.size() - written,
         off_t(offset + written));
     if (result > 0) {
@@ -7788,8 +8136,8 @@ size_t copy_fd_to_cache(int source_fd, uint64_t& source_offset,
   const size_t wanted = std::min(length, bytes.size());
   for (;;) {
     const ssize_t result = seek
-        ? ::pread(source_fd, bytes.data(), wanted, off_t(source_offset))
-        : ::read(source_fd, bytes.data(), wanted);
+        ? io_pread(source_fd, bytes.data(), wanted, off_t(source_offset))
+        : io_read(source_fd, bytes.data(), wanted);
     if (result > 0) {
       pwrite_cache_exact(cache_fd, cache_offset,
                          std::span(bytes).first(size_t(result)));
@@ -8748,6 +9096,44 @@ void cache_recovery_loop(std::stop_token stop, State* state) noexcept {
   }
 }
 
+struct AsyncCachedWriteTask {
+  AsyncCachedWriteTask(State& state_value, OpenHandle& handle_value,
+                       fuse_req_t request_value, fuse_ino_t inode_value,
+                       const fuse_bufvec& input_value, off_t offset_value)
+      : state(&state_value), handle(&handle_value), request(request_value),
+        inode(inode_value), input(input_value), offset(offset_value),
+        active(handle_value) {}
+
+  State* state;
+  OpenHandle* handle;
+  fuse_req_t request;
+  fuse_ino_t inode;
+  fuse_bufvec input;
+  off_t offset;
+  OpenRequestGuard active;
+  FuseReactor::ReactorTask reactor_task;
+};
+
+void run_async_cached_write(void* context) noexcept {
+  std::unique_ptr<AsyncCachedWriteTask> task(
+      static_cast<AsyncCachedWriteTask*>(context));
+  task->handle->writer->write(
+      *task->state, *task->handle, task->request,
+      task->inode, &task->input, task->offset);
+  if (task->input.idx == task->input.count) {
+    FuseReactor* reactor = current_fuse_reactor();
+    if (reactor != nullptr) {
+      reactor->mark_input_consumed();
+    }
+  }
+}
+
+void cancel_async_cached_write(void* context) noexcept {
+  std::unique_ptr<AsyncCachedWriteTask> task(
+      static_cast<AsyncCachedWriteTask*>(context));
+  fuse_reply_err(task->request, EIO);
+}
+
 void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
                       fuse_bufvec* input, off_t offset,
                       fuse_file_info* file) {
@@ -8757,6 +9143,28 @@ void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
     if (!handle.writer) {
       throw std::system_error(EBADF, std::generic_category(),
                               "missing file writer");
+    }
+    FuseReactor* reactor = current_fuse_reactor();
+    if (reactor != nullptr && state.local_cache) {
+      if (input == nullptr || input->count != 1 || input->idx != 0 ||
+          input->off != 0 ||
+          (input->buf[0].flags & FUSE_BUF_IS_FD) == 0) {
+        throw std::system_error(EIO, std::generic_category(),
+                                "unexpected asynchronous FUSE write buffer");
+      }
+      auto task = std::make_unique<AsyncCachedWriteTask>(
+          state, handle, request, inode, *input, offset);
+      task->reactor_task = {
+          run_async_cached_write, cancel_async_cached_write, task.get()};
+      AsyncCachedWriteTask* submitted = task.release();
+      if (!reactor->submit_input_task(&submitted->reactor_task)) {
+        task.reset(submitted);
+        throw std::system_error(EAGAIN, std::generic_category(),
+                                "submit asynchronous cached write");
+      }
+      input->idx = input->count;
+      input->off = 0;
+      return;
     }
     handle.writer->write(state, handle, request, inode, input, offset);
   } catch (...) {

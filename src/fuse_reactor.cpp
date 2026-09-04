@@ -13,8 +13,35 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
+
+#if defined(__SANITIZE_ADDRESS__)
+extern "C" void __sanitizer_start_switch_fiber(
+    void**, const void*, size_t);
+extern "C" void __sanitizer_finish_switch_fiber(
+    void*, const void**, size_t*);
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+extern "C" void __sanitizer_start_switch_fiber(
+    void**, const void*, size_t);
+extern "C" void __sanitizer_finish_switch_fiber(
+    void*, const void**, size_t*);
+#endif
+#endif
+
+constexpr size_t kReactorFiberStackSize = 1024U * 1024U;
+
+uint64_t reactor_monotonic_ns() noexcept {
+  timespec value{};
+  if (::clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
+    return 0;
+  }
+  return uint64_t(value.tv_sec) * 1'000'000'000 +
+      uint64_t(value.tv_nsec);
+}
 
 thread_local FuseReactor* FuseReactor::current_ = nullptr;
 thread_local FuseReactor* FuseReactor::reply_target_ = nullptr;
@@ -40,6 +67,243 @@ FuseReactor* current_fuse_reactor() noexcept {
       FuseReactor::reply_target_;
 }
 
+void FuseReactor::fiber_entry() noexcept {
+  FuseReactor* reactor = current_;
+  Fiber* fiber = reactor ? reactor->active_fiber_ : nullptr;
+  if (reactor == nullptr || fiber == nullptr || fiber->task == nullptr) {
+    abort();
+  }
+#if defined(__SANITIZE_ADDRESS__)
+  __sanitizer_finish_switch_fiber(
+      reactor->scheduler_sanitizer_fake_stack_, nullptr, nullptr);
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+  __sanitizer_finish_switch_fiber(
+      reactor->scheduler_sanitizer_fake_stack_, nullptr, nullptr);
+#endif
+#endif
+  ReactorTask* task = fiber->task;
+  task->run(task->context);
+  fiber->task = nullptr;
+  fiber->finished = true;
+  reactor->yield_fiber();
+  abort();
+}
+
+bool FuseReactor::start_task(ReactorTask* task) noexcept {
+  Dispatch* input_dispatch = static_cast<Dispatch*>(task->input_owner);
+  Fiber* fiber = nullptr;
+  if (!free_fibers_.empty()) {
+    fiber = free_fibers_.back();
+    free_fibers_.pop_back();
+  } else {
+    fiber = new (std::nothrow) Fiber;
+    if (fiber == nullptr) {
+      release_input_dispatch(input_dispatch);
+      return false;
+    }
+    fiber->stack_mapping_size =
+        fiber_stack_guard_size_ + kReactorFiberStackSize;
+    fiber->stack_mapping = ::mmap(
+        nullptr, fiber->stack_mapping_size, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    if (fiber->stack_mapping == MAP_FAILED) {
+      fiber->stack_mapping = nullptr;
+      delete fiber;
+      release_input_dispatch(input_dispatch);
+      return false;
+    }
+    void* stack = static_cast<u_char*>(fiber->stack_mapping) +
+        fiber_stack_guard_size_;
+    if (::mprotect(stack, kReactorFiberStackSize,
+                   PROT_READ | PROT_WRITE) != 0) {
+      ::munmap(fiber->stack_mapping, fiber->stack_mapping_size);
+      delete fiber;
+      release_input_dispatch(input_dispatch);
+      return false;
+    }
+    fibers_.push_back(fiber);
+  }
+  fiber->task     = task;
+  fiber->input_dispatch = input_dispatch;
+  fiber->input_consumed = false;
+  fiber->queued   = false;
+  fiber->finished = false;
+  if (!initialize_fiber(fiber)) {
+    fiber->task = nullptr;
+    release_fiber(fiber);
+    return false;
+  }
+  queue_fiber(fiber);
+  return true;
+}
+
+bool FuseReactor::initialize_fiber(Fiber* fiber) noexcept {
+  if (::getcontext(&fiber->context) != 0) {
+    return false;
+  }
+  fiber->context.uc_stack.ss_sp =
+      static_cast<u_char*>(fiber->stack_mapping) +
+      fiber_stack_guard_size_;
+  fiber->context.uc_stack.ss_size = kReactorFiberStackSize;
+  fiber->context.uc_stack.ss_flags = 0;
+  fiber->context.uc_link = nullptr;
+  ::makecontext(&fiber->context, FuseReactor::fiber_entry, 0);
+  return true;
+}
+
+void FuseReactor::queue_fiber(Fiber* fiber) noexcept {
+  if (fiber == nullptr || fiber->queued || fiber->finished) {
+    return;
+  }
+  fiber->queued = true;
+  ready_fibers_.push_back(fiber);
+}
+
+void FuseReactor::release_fiber(Fiber* fiber) noexcept {
+  if (fiber == nullptr) {
+    return;
+  }
+  fiber->task     = nullptr;
+  release_input_dispatch(
+      fiber->input_dispatch, !fiber->input_consumed);
+  fiber->input_dispatch = nullptr;
+  fiber->input_consumed = false;
+  fiber->queued   = false;
+  fiber->finished = false;
+  free_fibers_.push_back(fiber);
+}
+
+void FuseReactor::release_input_dispatch(
+    Dispatch* dispatch, bool drain_input) noexcept {
+  if (dispatch == nullptr) {
+    return;
+  }
+  const unsigned previous = dispatch->input_tasks.fetch_sub(
+      1, std::memory_order_acq_rel);
+  if (previous == 0) {
+    abort();
+  }
+  if (previous != 1) {
+    return;
+  }
+  if (drain_input && !drain_receive_pipe(dispatch->pipe[0]) && error_ == 0) {
+    error_ = -EIO;
+  }
+  if (!dispatch->processing_complete) {
+    return;
+  }
+  finish_dispatch(dispatch);
+  if (dispatch_count_ == 0) {
+    abort();
+  }
+  --dispatch_count_;
+  if (!submit_receive() && error_ == 0) {
+    error_ = -EAGAIN;
+  }
+}
+
+void FuseReactor::yield_fiber() noexcept {
+  Fiber* fiber = active_fiber_;
+  if (fiber == nullptr) {
+    abort();
+  }
+#if defined(__SANITIZE_ADDRESS__)
+  __sanitizer_start_switch_fiber(
+      &fiber->sanitizer_fake_stack, nullptr, 0);
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+  __sanitizer_start_switch_fiber(
+      &fiber->sanitizer_fake_stack, nullptr, 0);
+#endif
+#endif
+  if (::swapcontext(&fiber->context, &scheduler_context_) != 0) {
+    abort();
+  }
+#if defined(__SANITIZE_ADDRESS__)
+  __sanitizer_finish_switch_fiber(
+      scheduler_sanitizer_fake_stack_, nullptr, nullptr);
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+  __sanitizer_finish_switch_fiber(
+      scheduler_sanitizer_fake_stack_, nullptr, nullptr);
+#endif
+#endif
+}
+
+void FuseReactor::resume_fiber(Fiber* fiber) noexcept {
+  active_fiber_ = fiber;
+  fiber->queued = false;
+  Dispatch* previous_dispatch = current_dispatch_;
+  current_dispatch_ = nullptr;
+  {
+    FuseReactorReplyScope scope(this, group_->io_timeout_ms_, -1);
+#if defined(__SANITIZE_ADDRESS__)
+    __sanitizer_start_switch_fiber(
+        &scheduler_sanitizer_fake_stack_,
+        fiber->context.uc_stack.ss_sp, fiber->context.uc_stack.ss_size);
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    __sanitizer_start_switch_fiber(
+        &scheduler_sanitizer_fake_stack_,
+        fiber->context.uc_stack.ss_sp, fiber->context.uc_stack.ss_size);
+#endif
+#endif
+    if (::swapcontext(&scheduler_context_, &fiber->context) != 0) {
+      error_ = -errno;
+      fiber->finished = true;
+    }
+#if defined(__SANITIZE_ADDRESS__)
+    __sanitizer_finish_switch_fiber(
+        fiber->sanitizer_fake_stack, nullptr, nullptr);
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    __sanitizer_finish_switch_fiber(
+        fiber->sanitizer_fake_stack, nullptr, nullptr);
+#endif
+#endif
+  }
+  current_dispatch_ = previous_dispatch;
+  active_fiber_ = nullptr;
+  if (!fiber->finished) {
+    return;
+  }
+  release_fiber(fiber);
+  task_count_.fetch_sub(1, std::memory_order_release);
+}
+
+bool FuseReactor::run_ready_fibers() noexcept {
+  while (!ready_fibers_.empty()) {
+    Fiber* fiber = ready_fibers_.back();
+    ready_fibers_.pop_back();
+    resume_fiber(fiber);
+  }
+  return error_ == 0;
+}
+
+void* FuseReactor::task_local_data() const noexcept {
+  return in_current_task() ? active_fiber_->local_data : nullptr;
+}
+
+void FuseReactor::set_task_local_data(
+    void* data, TaskLocalDestructor destructor) noexcept {
+  if (!in_current_task()) {
+    return;
+  }
+  if (active_fiber_->local_data != nullptr &&
+      active_fiber_->local_destructor != nullptr) {
+    active_fiber_->local_destructor(active_fiber_->local_data);
+  }
+  active_fiber_->local_data       = data;
+  active_fiber_->local_destructor = destructor;
+}
+
+void FuseReactor::mark_input_consumed() noexcept {
+  if (in_current_task() && active_fiber_->input_dispatch != nullptr) {
+    active_fiber_->input_consumed = true;
+  }
+}
+
 FuseReactor::~FuseReactor() {
   if (ring_ready_) {
     io_uring_queue_exit(&ring_);
@@ -62,6 +326,54 @@ FuseReactor::~FuseReactor() {
     fail_io_requests(-ENOTCONN);
     ::close(io_pipe_[0]);
   }
+  if (task_pipe_[1] >= 0) {
+    ::close(task_pipe_[1]);
+    task_pipe_[1] = -1;
+  }
+  if (task_pipe_[0] >= 0) {
+    ReactorTask* task = nullptr;
+    while (::read(task_pipe_[0], &task, sizeof(task)) ==
+           ssize_t(sizeof(task))) {
+      Dispatch* dispatch = static_cast<Dispatch*>(task->input_owner);
+      if (task->cancel != nullptr) {
+        task->cancel(task->context);
+      }
+      if (dispatch != nullptr) {
+        const unsigned previous = dispatch->input_tasks.fetch_sub(
+            1, std::memory_order_acq_rel);
+        if (previous == 0) {
+          abort();
+        }
+      }
+      task = nullptr;
+    }
+    ::close(task_pipe_[0]);
+  }
+  for (Fiber* fiber : fibers_) {
+    if (fiber->task != nullptr && fiber->task->cancel != nullptr) {
+      fiber->task->cancel(fiber->task->context);
+      fiber->task = nullptr;
+    }
+    if (fiber->input_dispatch != nullptr) {
+      const unsigned previous = fiber->input_dispatch->input_tasks.fetch_sub(
+          1, std::memory_order_acq_rel);
+      if (previous == 0) {
+        abort();
+      }
+      fiber->input_dispatch = nullptr;
+    }
+    if (fiber->stack_mapping != nullptr) {
+      ::munmap(fiber->stack_mapping, fiber->stack_mapping_size);
+    }
+    if (fiber->local_data != nullptr &&
+        fiber->local_destructor != nullptr) {
+      fiber->local_destructor(fiber->local_data);
+    }
+    delete fiber;
+  }
+  fibers_.clear();
+  free_fibers_.clear();
+  ready_fibers_.clear();
   if (dispatch_pipe_[1] >= 0) {
     ::close(dispatch_pipe_[1]);
     dispatch_pipe_[1] = -1;
@@ -105,6 +417,9 @@ bool FuseReactor::initialize(FuseReactorGroup* group,
   fuse_fd_              = fuse_fd;
   owns_fuse_fd_         = owns_fuse_fd;
   initialization_owner_ = initialization_owner;
+  const long page_result = ::sysconf(_SC_PAGESIZE);
+  fiber_stack_guard_size_ =
+      page_result > 0 ? size_t(page_result) : 4096;
 
   if (::pipe2(external_pipe_, O_CLOEXEC | O_NONBLOCK) != 0) {
     error = "pipe2(FUSE external replies): " +
@@ -119,6 +434,10 @@ bool FuseReactor::initialize(FuseReactorGroup* group,
   if (::pipe2(dispatch_pipe_, O_CLOEXEC | O_NONBLOCK) != 0) {
     error = "pipe2(FUSE dispatch completion): " +
             std::string(strerror(errno));
+    return false;
+  }
+  if (::pipe2(task_pipe_, O_CLOEXEC | O_NONBLOCK) != 0) {
+    error = "pipe2(reactor tasks): " + std::string(strerror(errno));
     return false;
   }
   wake_fd_ = eventfd(0, EFD_CLOEXEC);
@@ -156,7 +475,7 @@ bool FuseReactor::initialize(FuseReactorGroup* group,
       IORING_OP_RECV,
       IORING_OP_SEND,
       IORING_OP_CONNECT,
-      IORING_OP_LINK_TIMEOUT,
+      IORING_OP_ASYNC_CANCEL,
   };
   for (unsigned op : required_ops) {
     if (!io_uring_opcode_supported(probe, int(op))) {
@@ -168,6 +487,7 @@ bool FuseReactor::initialize(FuseReactorGroup* group,
   io_uring_free_probe(probe);
   max_reply_count_ = std::max<size_t>(4, depth / 2);
   max_dispatch_count_ = std::max<size_t>(4, depth / 2);
+  max_task_count_ = depth;
   reply_pool_size_ = depth;
   reply_pool_.reset(new (std::nothrow) Reply[reply_pool_size_]);
   if (!reply_pool_) {
@@ -182,15 +502,26 @@ bool FuseReactor::initialize(FuseReactorGroup* group,
   reply_free_ = reply_pool_.get();
   io_requests_.reserve(depth);
   free_dispatches_.reserve(depth);
+  fibers_.reserve(depth);
+  free_fibers_.reserve(depth);
+  ready_fibers_.reserve(depth);
 
   return true;
 }
 
 int FuseReactor::execute_io(IoRequest& request) noexcept {
   if (current_ == this) {
-    return -EDEADLK;
+    if (active_fiber_ == nullptr || error_ != 0 ||
+        group_->shutting_down_.load(std::memory_order_acquire)) {
+      return -ENOTCONN;
+    }
+    request.fiber = active_fiber_;
+    if (!submit_io_request(&request)) {
+      return -EAGAIN;
+    }
+    yield_fiber();
+    return request.operation_result;
   }
-  request.expected = request.timeout_ms > 0 ? 2 : 1;
   {
     std::shared_lock guard(group_->external_mutex_);
     if (group_->shutting_down_.load(std::memory_order_acquire) ||
@@ -211,10 +542,60 @@ int FuseReactor::execute_io(IoRequest& request) noexcept {
     request.finished.wait(false, std::memory_order_acquire);
     finished = request.finished.load(std::memory_order_acquire);
   }
-  if (request.timeout_result == -ETIME) {
-    return -ETIMEDOUT;
-  }
   return request.operation_result;
+}
+
+bool FuseReactor::submit_task(ReactorTask* task) noexcept {
+  if (task == nullptr || task->run == nullptr) {
+    return false;
+  }
+  size_t count = task_count_.load(std::memory_order_relaxed);
+  do {
+    if (count >= max_task_count_) {
+      return false;
+    }
+  } while (!task_count_.compare_exchange_weak(
+      count, count + 1, std::memory_order_acquire,
+      std::memory_order_relaxed));
+  if (current_ == this) {
+    if (!start_task(task)) {
+      task_count_.fetch_sub(1, std::memory_order_release);
+      return false;
+    }
+    return true;
+  }
+  std::shared_lock guard(group_->external_mutex_);
+  if (group_->shutting_down_.load(std::memory_order_acquire) ||
+      task_pipe_[1] < 0) {
+    task_count_.fetch_sub(1, std::memory_order_release);
+    return false;
+  }
+  ReactorTask* value = task;
+  ssize_t result;
+  do {
+    result = ::write(task_pipe_[1], &value, sizeof(value));
+  } while (result < 0 && errno == EINTR);
+  if (result == ssize_t(sizeof(value))) {
+    return true;
+  }
+  task_count_.fetch_sub(1, std::memory_order_release);
+  return false;
+}
+
+bool FuseReactor::submit_input_task(ReactorTask* task) noexcept {
+  Dispatch* dispatch = current_dispatch_;
+  if (dispatch == nullptr || current_ == this || task == nullptr ||
+      task->input_owner != nullptr) {
+    return false;
+  }
+  dispatch->input_tasks.fetch_add(1, std::memory_order_acq_rel);
+  task->input_owner = dispatch;
+  if (submit_task(task)) {
+    return true;
+  }
+  task->input_owner = nullptr;
+  release_input_dispatch(dispatch);
+  return false;
 }
 
 ssize_t FuseReactor::receive(int fd, void* data, size_t length,
@@ -226,6 +607,43 @@ ssize_t FuseReactor::receive(int fd, void* data, size_t length,
   request.length     = length;
   request.flags      = flags;
   request.timeout_ms = timeout_ms;
+  const int result = execute_io(request);
+  if (result < 0) {
+    errno = -result;
+    return -1;
+  }
+  return result;
+}
+
+ssize_t FuseReactor::read(int fd, void* data, size_t length,
+                          int timeout_ms) noexcept {
+  IoRequest request;
+  request.kind       = IO_READ;
+  request.fd         = fd;
+  request.data       = data;
+  request.length     = length;
+  request.timeout_ms = timeout_ms;
+  const int result = execute_io(request);
+  if (result < 0) {
+    errno = -result;
+    return -1;
+  }
+  return result;
+}
+
+ssize_t FuseReactor::pread(int fd, void* data, size_t length,
+                           off_t offset, int timeout_ms) noexcept {
+  if (length > INT_MAX || offset < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  IoRequest request;
+  request.kind         = IO_PREAD;
+  request.fd           = fd;
+  request.data         = data;
+  request.length       = length;
+  request.timeout_ms   = timeout_ms;
+  request.input_offset = offset;
   const int result = execute_io(request);
   if (result < 0) {
     errno = -result;
@@ -344,6 +762,29 @@ ssize_t FuseReactor::send_exact(int fd, const void* data, size_t length,
   return result;
 }
 
+ssize_t FuseReactor::pwrite(int fd, const void* data, size_t length,
+                            off_t offset, int timeout_ms) noexcept {
+  if (length > INT_MAX || offset < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  IoRequest request;
+  request.kind              = IO_PWRITE;
+  request.fd                = fd;
+  request.data              = const_cast<void*>(data);
+  request.length            = length;
+  request.timeout_ms        = timeout_ms;
+  request.output_offset     = offset;
+  request.has_output_offset = true;
+  request.force_async       = true;
+  const int result = execute_io(request);
+  if (result < 0) {
+    errno = -result;
+    return -1;
+  }
+  return result;
+}
+
 ssize_t FuseReactor::splice(int input_fd, off_t* input_offset,
                             int output_fd, off_t* output_offset,
                             size_t length, unsigned flags,
@@ -357,6 +798,10 @@ ssize_t FuseReactor::splice(int input_fd, off_t* input_offset,
   request.timeout_ms        = timeout_ms;
   request.has_input_offset  = input_offset != nullptr;
   request.has_output_offset = output_offset != nullptr;
+  // Buffered regular-file writes may otherwise execute inline while the
+  // reactor submits the ring.  An explicit destination offset identifies
+  // the pipe-to-cache-file direction; force that work onto io-wq.
+  request.force_async       = output_offset != nullptr;
   request.input_offset      = input_offset ? *input_offset : -1;
   request.output_offset     = output_offset ? *output_offset : -1;
   const int result = execute_io(request);
@@ -391,6 +836,7 @@ ssize_t FuseReactor::splice_exact(
   request.timeout_ms        = timeout_ms;
   request.has_input_offset  = input_offset != nullptr;
   request.has_output_offset = output_offset != nullptr;
+  request.force_async       = output_offset != nullptr;
   request.input_offset      = input_offset ? *input_offset : -1;
   request.output_offset     = output_offset ? *output_offset : -1;
   request.exact             = true;
@@ -452,8 +898,9 @@ ssize_t FuseReactor::async_writev(int fd, const iovec* iov, int count,
   Dispatch* dispatch = current_dispatch_;
   const bool reserved = dispatch != nullptr &&
       dispatch->reply != nullptr && !dispatch->reply_claimed;
+  const bool local = current_ == reactor;
   Reply* reply = reserved ? dispatch->reply :
-      new (std::nothrow) Reply;
+      (local ? reactor->acquire_reply() : new (std::nothrow) Reply);
   if (reply == nullptr) {
     errno = ENOMEM;
     return -1;
@@ -462,7 +909,7 @@ ssize_t FuseReactor::async_writev(int fd, const iovec* iov, int count,
   for (int index = 0; index < count; ++index) {
     if (iov[index].iov_len > SIZE_MAX - length) {
       if (!reserved) {
-        delete reply;
+        reactor->release_reply(reply);
       }
       errno = EOVERFLOW;
       return -1;
@@ -475,7 +922,7 @@ ssize_t FuseReactor::async_writev(int fd, const iovec* iov, int count,
       reply->overflow_data.resize(length);
     } catch (const std::bad_alloc&) {
       if (!reserved) {
-        delete reply;
+        reactor->release_reply(reply);
       }
       errno = ENOMEM;
       return -1;
@@ -493,12 +940,11 @@ ssize_t FuseReactor::async_writev(int fd, const iovec* iov, int count,
     dispatch->reply_claimed = true;
   }
   (void)fd;
-  const bool local = current_ == reactor;
   if ((local && (!group->synchronize_external(reactor) ||
                  !reactor->enqueue_reply(reply))) ||
       (!local && !reactor->submit_external_reply(reply))) {
     if (!reserved) {
-      delete reply;
+      reactor->release_reply(reply);
     }
     errno = EAGAIN;
     return -1;
@@ -521,8 +967,9 @@ ssize_t FuseReactor::async_splice(int input_fd, int output_fd, size_t length,
   Dispatch* dispatch = current_dispatch_;
   const bool reserved = dispatch != nullptr &&
       dispatch->reply != nullptr && !dispatch->reply_claimed;
+  const bool local = current_ == reactor;
   Reply* reply = reserved ? dispatch->reply :
-      new (std::nothrow) Reply;
+      (local ? reactor->acquire_reply() : new (std::nothrow) Reply);
   if (reply == nullptr) {
     errno = ENOMEM;
     return -1;
@@ -535,12 +982,11 @@ ssize_t FuseReactor::async_splice(int input_fd, int output_fd, size_t length,
   if (reserved) {
     dispatch->reply_claimed = true;
   }
-  const bool local = current_ == reactor;
   if ((local && (!group->synchronize_external(reactor) ||
                  !reactor->enqueue_reply(reply))) ||
       (!local && !reactor->submit_external_reply(reply))) {
     if (!reserved) {
-      delete reply;
+      reactor->release_reply(reply);
     }
     errno = EAGAIN;
     return -1;
@@ -624,6 +1070,20 @@ bool FuseReactor::submit_dispatch_receive() noexcept {
   return true;
 }
 
+bool FuseReactor::submit_task_receive() noexcept {
+  if (task_pending_ || io_uring_sq_space_left(&ring_) == 0) {
+    return true;
+  }
+  io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+  if (sqe == nullptr) {
+    return true;
+  }
+  io_uring_prep_poll_add(sqe, task_pipe_[0], POLLIN);
+  io_uring_sqe_set_data(sqe, &task_token_);
+  task_pending_ = true;
+  return true;
+}
+
 bool FuseReactor::submit_wakeup() noexcept {
   if (wake_pending_) {
     return true;
@@ -668,8 +1128,7 @@ bool FuseReactor::submit_io_receive() noexcept {
 }
 
 bool FuseReactor::submit_io_request(IoRequest* request) noexcept {
-  const unsigned needed = request->expected;
-  if (io_uring_sq_space_left(&ring_) < needed) {
+  if (io_uring_sq_space_left(&ring_) == 0) {
     return false;
   }
   io_uring_sqe* operation = io_uring_get_sqe(&ring_);
@@ -685,11 +1144,29 @@ bool FuseReactor::submit_io_request(IoRequest* request) noexcept {
           request->length - (request->exact ? request->transferred : 0),
           request->flags);
       break;
+    case IO_READ:
+      io_uring_prep_read(
+          operation, request->fd, request->data,
+          unsigned(request->length), UINT64_MAX);
+      break;
+    case IO_PREAD:
+      io_uring_prep_read(
+          operation, request->fd, request->data,
+          unsigned(request->length), uint64_t(request->input_offset));
+      break;
     case IO_SEND:
       io_uring_prep_send(
           operation, request->fd,
           static_cast<u_char*>(request->data) + request->transferred,
           request->length - request->transferred, request->flags);
+      break;
+    case IO_PWRITE:
+      io_uring_prep_write(
+          operation, request->fd,
+          static_cast<u_char*>(request->data) + request->transferred,
+          unsigned(request->length - request->transferred),
+          uint64_t(request->output_offset +
+                   off_t(request->transferred)));
       break;
     case IO_SPLICE:
       io_uring_prep_splice(
@@ -710,23 +1187,28 @@ bool FuseReactor::submit_io_request(IoRequest* request) noexcept {
   constexpr uintptr_t kOperationTag = 1;
   io_uring_sqe_set_data64(
       operation, uintptr_t(request) | kOperationTag);
-  if (request->timeout_ms > 0) {
-    operation->flags |= IOSQE_IO_LINK;
-    request->timeout.tv_sec  = request->timeout_ms / 1'000;
-    request->timeout.tv_nsec =
-        (request->timeout_ms % 1'000) * 1'000'000;
-    io_uring_sqe* timeout = io_uring_get_sqe(&ring_);
-    if (timeout == nullptr) {
-      return false;
+  if (request->force_async) {
+    operation->flags |= IOSQE_ASYNC;
+    ++background_file_writes_;
+  }
+  if (request->deadline_ns == 0 && request->timeout_ms > 0) {
+    const uint64_t now = monotonic_now_ns_ != 0
+        ? monotonic_now_ns_ : reactor_monotonic_ns();
+    if (now != 0) {
+      const uint64_t duration =
+          uint64_t(request->timeout_ms) * 1'000'000;
+      request->deadline_ns = now > UINT64_MAX - duration
+          ? UINT64_MAX : now + duration;
     }
-    io_uring_prep_link_timeout(timeout, &request->timeout, 0);
-    constexpr uintptr_t kTimeoutTag = 2;
-    io_uring_sqe_set_data64(
-        timeout, uintptr_t(request) | kTimeoutTag);
   }
   io_requests_.push_back(request);
   ++request->operations;
   ++io_operations_;
+  if (request->fiber != nullptr) {
+    ++task_io_operations_;
+  } else {
+    ++external_io_operations_;
+  }
   return true;
 }
 
@@ -866,6 +1348,8 @@ void FuseReactor::recycle_dispatch(Dispatch* dispatch) noexcept {
     return;
   }
   dispatch->buffer = {};
+  dispatch->input_tasks.store(0, std::memory_order_relaxed);
+  dispatch->processing_complete = false;
   dispatch->reply_claimed = false;
   dispatch->reply_submitted.store(false, std::memory_order_relaxed);
   free_dispatches_.push_back(dispatch);
@@ -921,19 +1405,56 @@ bool FuseReactor::drain_dispatch_pipe() noexcept {
     if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       return true;
     }
+    if (result == 0 &&
+        group_->shutting_down_.load(std::memory_order_acquire)) {
+      return true;
+    }
     if (result <= 0 || size_t(result) % sizeof(Dispatch*) != 0) {
       error_ = result < 0 ? -errno : -EIO;
       return false;
     }
     const size_t count = size_t(result) / sizeof(Dispatch*);
-    for (size_t i = 0; i < count; ++i) {
-      finish_dispatch(dispatches[i]);
-    }
     if (count > dispatch_count_) {
       error_ = -EIO;
       return false;
     }
-    dispatch_count_ -= count;
+    for (size_t i = 0; i < count; ++i) {
+      Dispatch* dispatch = dispatches[i];
+      dispatch->processing_complete = true;
+      if (dispatch->input_tasks.load(std::memory_order_acquire) == 0) {
+        finish_dispatch(dispatch);
+        --dispatch_count_;
+      }
+    }
+  }
+}
+
+bool FuseReactor::drain_task_pipe() noexcept {
+  for (;;) {
+    ReactorTask* task = nullptr;
+    ssize_t result;
+    do {
+      result = ::read(task_pipe_[0], &task, sizeof(task));
+    } while (result < 0 && errno == EINTR);
+    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return true;
+    }
+    if (result == 0 &&
+        group_->shutting_down_.load(std::memory_order_acquire)) {
+      return true;
+    }
+    if (result != ssize_t(sizeof(task)) || task == nullptr) {
+      error_ = result < 0 ? -errno : -EIO;
+      return false;
+    }
+    if (!start_task(task)) {
+      if (task->cancel != nullptr) {
+        task->cancel(task->context);
+      }
+      task_count_.fetch_sub(1, std::memory_order_release);
+      error_ = -ENOMEM;
+      return false;
+    }
   }
 }
 
@@ -987,7 +1508,6 @@ bool FuseReactor::drain_io_pipe() noexcept {
     }
     if (!submit_io_request(request)) {
       request->operation_result = -EAGAIN;
-      request->timeout_result   = -ECANCELED;
       request->finished.store(true, std::memory_order_release);
       request->finished.notify_one();
       return true;
@@ -995,28 +1515,17 @@ bool FuseReactor::drain_io_pipe() noexcept {
   }
 }
 
-void FuseReactor::complete_io(IoRequest* request, bool timeout,
-                              int result) noexcept {
-  if (timeout) {
-    request->timeout_result = result;
-  } else {
-    request->operation_result = result;
-  }
-  if (++request->cqe_completed != request->expected) {
-    return;
-  }
+void FuseReactor::complete_io(IoRequest* request, int result) noexcept {
+  request->operation_result = request->timed_out ? -ETIMEDOUT : result;
   auto found = std::find(io_requests_.begin(), io_requests_.end(), request);
   if (found != io_requests_.end()) {
     *found = io_requests_.back();
     io_requests_.pop_back();
   }
-  if (request->exact && request->operation_result > 0 &&
-      request->timeout_result != -ETIME) {
+  if (request->exact && request->operation_result > 0) {
     request->transferred += size_t(request->operation_result);
     if (request->transferred < request->length) {
       request->operation_result = -ECANCELED;
-      request->timeout_result   = -ECANCELED;
-      request->cqe_completed = 0;
       if (submit_io_request(request)) {
         return;
       }
@@ -1026,8 +1535,7 @@ void FuseReactor::complete_io(IoRequest* request, bool timeout,
     }
   }
   if (request->receive_processor != nullptr &&
-      request->operation_result > 0 &&
-      request->timeout_result != -ETIME) {
+      request->operation_result > 0) {
     const size_t processed_bytes = request->exact
         ? request->transferred : size_t(request->operation_result);
     if (!request->exact) {
@@ -1039,8 +1547,6 @@ void FuseReactor::complete_io(IoRequest* request, bool timeout,
       request->operation_result = -EIO;
     } else if (processed == 0) {
       request->operation_result = -ECANCELED;
-      request->timeout_result   = -ECANCELED;
-      request->cqe_completed = 0;
       if (submit_io_request(request)) {
         return;
       }
@@ -1051,16 +1557,53 @@ void FuseReactor::complete_io(IoRequest* request, bool timeout,
       request->operation_result = int(request->transferred);
     }
   }
-  request->finished.store(true, std::memory_order_release);
-  request->finished.notify_one();
+  if (request->fiber != nullptr) {
+    queue_fiber(request->fiber);
+  } else {
+    request->finished.store(true, std::memory_order_release);
+    request->finished.notify_one();
+  }
+}
+
+bool FuseReactor::cancel_expired_io(uint64_t now) noexcept {
+  constexpr uintptr_t kOperationTag = 1;
+  for (IoRequest* request : io_requests_) {
+    if (request->deadline_ns == 0 || request->deadline_ns > now ||
+        request->cancel_submitted) {
+      continue;
+    }
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    if (sqe == nullptr) {
+      return true;
+    }
+    request->timed_out        = true;
+    request->cancel_submitted = true;
+    io_uring_prep_cancel64(
+        sqe, uintptr_t(request) | kOperationTag, 0);
+    io_uring_sqe_set_data(sqe, &cancel_token_);
+  }
+  return true;
+}
+
+uint64_t FuseReactor::next_io_deadline() const noexcept {
+  uint64_t deadline = UINT64_MAX;
+  for (const IoRequest* request : io_requests_) {
+    if (!request->cancel_submitted && request->deadline_ns != 0) {
+      deadline = std::min(deadline, request->deadline_ns);
+    }
+  }
+  return deadline;
 }
 
 void FuseReactor::fail_io_requests(int result) noexcept {
   for (IoRequest* request : io_requests_) {
     request->operation_result = result;
-    request->timeout_result   = -ECANCELED;
-    request->finished.store(true, std::memory_order_release);
-    request->finished.notify_one();
+    if (request->fiber != nullptr) {
+      queue_fiber(request->fiber);
+    } else {
+      request->finished.store(true, std::memory_order_release);
+      request->finished.notify_one();
+    }
   }
   io_requests_.clear();
 
@@ -1071,7 +1614,6 @@ void FuseReactor::fail_io_requests(int result) noexcept {
   while (::read(io_pipe_[0], &request, sizeof(request)) ==
          ssize_t(sizeof(request))) {
     request->operation_result = result;
-    request->timeout_result   = -ECANCELED;
     request->finished.store(true, std::memory_order_release);
     request->finished.notify_one();
     request = nullptr;
@@ -1086,7 +1628,8 @@ bool FuseReactor::resume_receive() noexcept {
   const bool receive_ready = reply_count_ >= max_reply_count_ ||
       submit_receive();
   if (receive_ready && submit_external_receive() &&
-      submit_io_receive() && submit_dispatch_receive()) {
+      submit_io_receive() && submit_dispatch_receive() &&
+      submit_task_receive()) {
     return true;
   }
   if (error_ == 0) {
@@ -1186,6 +1729,10 @@ void FuseReactor::fail_dispatches() noexcept {
   Dispatch* dispatch = nullptr;
   while (::read(dispatch_pipe_[0], &dispatch, sizeof(dispatch)) ==
          ssize_t(sizeof(dispatch))) {
+    if (dispatch->input_tasks.load(std::memory_order_acquire) != 0) {
+      abort();
+    }
+    drain_receive_pipe(dispatch->pipe[0]);
     finish_dispatch(dispatch);
     if (dispatch_count_ != 0) {
       --dispatch_count_;
@@ -1198,14 +1745,34 @@ void FuseReactor::fail_dispatches() noexcept {
 int FuseReactor::run() noexcept {
   if (!ring_ready_ || !submit_receive() || !submit_wakeup() ||
       !submit_external_receive() || !submit_io_receive() ||
-      !submit_dispatch_receive()) {
+      !submit_dispatch_receive() || !submit_task_receive()) {
     return error_ != 0 ? error_ : -EINVAL;
   }
   current_ = this;
   while (!fuse_session_exited(session_) && error_ == 0) {
-    int result = io_uring_submit_and_wait(&ring_, 1);
+    monotonic_now_ns_ = reactor_monotonic_ns();
+    if (!run_ready_fibers()) {
+      break;
+    }
+    monotonic_now_ns_ = reactor_monotonic_ns();
+    cancel_expired_io(monotonic_now_ns_);
+    const uint64_t deadline = next_io_deadline();
+    int result;
+    if (deadline == UINT64_MAX || monotonic_now_ns_ == 0) {
+      result = io_uring_submit_and_wait(&ring_, 1);
+    } else {
+      const uint64_t remaining = deadline > monotonic_now_ns_
+          ? deadline - monotonic_now_ns_ : 1;
+      __kernel_timespec timeout{
+          .tv_sec = int64_t(remaining / 1'000'000'000),
+          .tv_nsec = int64_t(remaining % 1'000'000'000),
+      };
+      io_uring_cqe* waited = nullptr;
+      result = io_uring_submit_and_wait_timeout(
+          &ring_, &waited, 1, &timeout, nullptr);
+    }
     if (result < 0) {
-      if (result == -EINTR) {
+      if (result == -EINTR || result == -ETIME) {
         continue;
       }
       error_ = result;
@@ -1291,12 +1858,31 @@ int FuseReactor::run() noexcept {
             error_ = -EAGAIN;
           }
         }
+      } else if (data == &task_token_) {
+        task_pending_ = false;
+        if (completion < 0 && completion != -ECANCELED) {
+          error_ = completion;
+        } else if (!fuse_session_exited(session_) &&
+                   (!drain_task_pipe() ||
+                    !submit_task_receive())) {
+          if (error_ == 0) {
+            error_ = -EAGAIN;
+          }
+        }
+      } else if (data == &cancel_token_) {
+        // The original operation CQE owns request completion.  Cancellation
+        // CQEs carry no request pointer so they cannot outlive stack-backed
+        // IoRequest storage.
+        if (completion < 0 && completion != -ENOENT &&
+            completion != -EALREADY && completion != -ECANCELED) {
+          error_ = completion;
+        }
       } else {
         const uintptr_t tagged = uintptr_t(data);
-        if ((tagged & 3) != 0) {
+        if ((tagged & 3) == 1) {
           IoRequest* request = reinterpret_cast<IoRequest*>(
               tagged & ~uintptr_t(3));
-          complete_io(request, (tagged & 3) == 2, completion);
+          complete_io(request, completion);
           if (!drain_io_pipe() || !submit_io_receive()) {
             if (error_ == 0) {
               error_ = -EAGAIN;
@@ -1309,15 +1895,17 @@ int FuseReactor::run() noexcept {
     }
   }
   group_->begin_shutdown();
-  current_ = nullptr;
+  drain_task_pipe();
+  fail_io_requests(error_ != 0 ? error_ : -ENOTCONN);
+  run_ready_fibers();
   if (ring_ready_) {
     io_uring_queue_exit(&ring_);
     ring_ready_ = false;
   }
-  fail_io_requests(error_ != 0 ? error_ : -ENOTCONN);
   fail_replies(error_ != 0 ? error_ : -ENOTCONN);
   fail_external_replies(error_ != 0 ? error_ : -ENOTCONN);
   fail_dispatches();
+  current_ = nullptr;
   return error_;
 }
 
@@ -1515,9 +2103,12 @@ void FuseReactorGroup::begin_shutdown() noexcept {
       ::close(reactor->io_pipe_[1]);
       reactor->io_pipe_[1] = -1;
     }
-    if (reactor->dispatch_pipe_[1] >= 0) {
-      ::close(reactor->dispatch_pipe_[1]);
-      reactor->dispatch_pipe_[1] = -1;
+    // Dispatch workers may still be returning FD-backed input ownership.
+    // Keep this queue writable until they have joined; the reactor destructor
+    // drains it before recycling the retained dispatch pipes.
+    if (reactor->task_pipe_[1] >= 0) {
+      ::close(reactor->task_pipe_[1]);
+      reactor->task_pipe_[1] = -1;
     }
   }
 }
@@ -1607,30 +2198,40 @@ int FuseReactorGroup::run() {
 }
 
 void FuseReactorGroup::report_stats() const noexcept {
-  uint64_t received     = 0;
-  uint64_t completed    = 0;
-  uint64_t external     = 0;
-  uint64_t io_operations = 0;
-  uint64_t drains       = 0;
-  size_t high_water     = 0;
-  unsigned setup_flags = 0;
+  uint64_t received          = 0;
+  uint64_t completed         = 0;
+  uint64_t external          = 0;
+  uint64_t io_operations     = 0;
+  uint64_t task_io           = 0;
+  uint64_t external_io       = 0;
+  uint64_t background_writes = 0;
+  uint64_t drains            = 0;
+  size_t high_water          = 0;
+  unsigned setup_flags       = 0;
   for (const std::unique_ptr<FuseReactor>& reactor : reactors_) {
-    received += reactor->received_requests_;
-    completed += reactor->completed_replies_;
-    external += reactor->external_replies_;
-    io_operations += reactor->io_operations_;
-    drains += reactor->receive_drains_.load(std::memory_order_relaxed);
-    high_water = std::max(high_water, reactor->reply_high_water_);
-    setup_flags |= reactor->setup_flags_;
+    received          += reactor->received_requests_;
+    completed         += reactor->completed_replies_;
+    external          += reactor->external_replies_;
+    io_operations     += reactor->io_operations_;
+    task_io           += reactor->task_io_operations_;
+    external_io       += reactor->external_io_operations_;
+    background_writes += reactor->background_file_writes_;
+    drains            += reactor->receive_drains_.load(
+        std::memory_order_relaxed);
+    high_water         = std::max(high_water, reactor->reply_high_water_);
+    setup_flags       |= reactor->setup_flags_;
   }
   fprintf(stderr,
           "io_uring FUSE transport stats: reactors=%zu requests=%" PRIu64
           " replies=%" PRIu64 " external_replies=%" PRIu64
           " io_operations=%" PRIu64
+          " task_io_operations=%" PRIu64
+          " external_io_operations=%" PRIu64
+          " background_file_writes=%" PRIu64
           " receive_drains=%" PRIu64
           " reply_queue_high_water=%zu setup_flags=0x%x\n",
           reactors_.size(), received, completed, external, io_operations,
-          drains,
+          task_io, external_io, background_writes, drains,
           high_water, setup_flags);
 }
 
