@@ -53,6 +53,7 @@ def read_comparisons(input_dirs, data_dir):
                 "suite": input_dir.name,
                 "advice": advice,
                 "ngs3fs_cache": ngs3fs["cache_mode"],
+                "ngs3fs_io_size": ngs3fs.get("io_size", "unspecified"),
                 "reference": reference["client"],
                 "reference_cache": reference["cache_mode"],
                 "samples": number(ngs3fs, "samples"),
@@ -72,7 +73,8 @@ def read_comparisons(input_dirs, data_dir):
         if system.is_file():
             shutil.copyfile(system, data_dir / f"{input_dir.name}-system.txt")
     comparisons.sort(key=lambda row: (
-        row["reference"], row["ngs3fs_cache"], row["advice"]))
+        row["reference"], row["ngs3fs_io_size"],
+        row["ngs3fs_cache"], row["advice"]))
     return comparisons
 
 
@@ -101,13 +103,14 @@ def write_markdown(path, comparisons, generated, source_run):
         f"Generated at {generated} from the median of runner samples.",
         "CPU is aggregate daemon CPU time divided by completed read operations.",
         "",
-        "| Advice | Cache (ngs3fs / reference) | Reference | CPU/op (ngs3fs / reference) | Reference / ngs3fs | CPU saved | S3 GET (ngs3fs / reference) |",
-        "|---|---|---|---:|---:|---:|---:|",
+        "| Advice | Cache (ngs3fs / reference) | ngs3fs --io-size | Reference | CPU/op (ngs3fs / reference) | Reference / ngs3fs | CPU saved | S3 GET (ngs3fs / reference) |",
+        "|---|---|---:|---|---:|---:|---:|---:|",
     ]
     for row in comparisons:
         lines.append(
             f"| {row['advice']} | {row['ngs3fs_cache']} / "
-            f"{row['reference_cache']} | {row['reference']} | "
+            f"{row['reference_cache']} | {row['ngs3fs_io_size']} | "
+            f"{row['reference']} | "
             f"{milliseconds(row['ngs3fs_cpu_per_operation_ns'])} / "
             f"{milliseconds(row['reference_cpu_per_operation_ns'])} ms | "
             f"{row['reference_cpu_over_ngs3fs']:.2f}x | "
@@ -130,6 +133,7 @@ def write_html(path, comparisons, generated, source_run):
           <tr>
             <td>{html.escape(row['advice'])}</td>
             <td><span class="mode">{html.escape(row['ngs3fs_cache'])}</span> / <span class="mode">{html.escape(row['reference_cache'])}</span></td>
+            <td class="number"><span class="mode">{html.escape(row['ngs3fs_io_size'])}</span></td>
             <td>{html.escape(row['reference'])}</td>
             <td class="number">{milliseconds(row['ngs3fs_cpu_per_operation_ns'])}</td>
             <td class="number">{milliseconds(row['reference_cpu_per_operation_ns'])}</td>
@@ -154,7 +158,7 @@ def write_html(path, comparisons, generated, source_run):
     h1 {{ margin-bottom: .35rem; }}
     .subtitle {{ color: #777; margin: 0 0 1.5rem; }}
     .card {{ border: 1px solid #8885; border-radius: 12px; overflow-x: auto; }}
-    table {{ border-collapse: collapse; width: 100%; min-width: 920px; }}
+    table {{ border-collapse: collapse; width: 100%; min-width: 1020px; }}
     th, td {{ border-bottom: 1px solid #8884; padding: .7rem .65rem; text-align: left; }}
     th {{ background: #8881; font-size: .82rem; }}
     tr:last-child td {{ border-bottom: 0; }}
@@ -172,7 +176,8 @@ def write_html(path, comparisons, generated, source_run):
   <div class="card">
     <table>
       <thead><tr>
-        <th>Advice</th><th>Cache<br>ngs3fs / reference</th><th>Reference</th>
+        <th>Advice</th><th>Cache<br>ngs3fs / reference</th>
+        <th class="number">ngs3fs<br>--io-size</th><th>Reference</th>
         <th class="number">ngs3fs<br>CPU/op (ms)</th>
         <th class="number">Reference<br>CPU/op (ms)</th>
         <th class="number">Reference CPU ÷<br>ngs3fs CPU</th>
