@@ -155,23 +155,32 @@ start_ns=$(date +%s%N)
 start_ngs3fs "$run_dir/ngs3fs-recovery.log"
 deadline=$((SECONDS + timeout_seconds))
 while ((SECONDS < deadline)); do
-  recovered_size=$(stat -c %s "$backend/$bucket/recovery.bin" 2>/dev/null || true)
-  if [[ "$recovered_size" = "$bytes" ]]; then
-    break
-  fi
   kill -0 "$daemon_pid" 2>/dev/null || {
     echo "ngs3fs exited during cache recovery" >&2
     exit 1
   }
+  recovered_size=$(stat -c %s "$backend/$bucket/recovery.bin" 2>/dev/null || true)
+  # CompleteMultipartUpload can succeed before local commit crashes. Require
+  # the recovery marker to retire too, not merely the remote object to exist.
+  if [[ "$recovered_size" = "$bytes" &&
+        ! -e "$cache_dir/meta/dirty/recovery.bin" ]]; then
+    break
+  fi
   sleep 0.02
 done
 recovered_size=$(stat -c %s "$backend/$bucket/recovery.bin" 2>/dev/null || true)
-[[ "$recovered_size" = "$bytes" ]] || {
+[[ "$recovered_size" = "$bytes" &&
+   ! -e "$cache_dir/meta/dirty/recovery.bin" ]] || {
   echo "cache recovery did not publish the expected object" >&2
   exit 1
 }
 elapsed_ns=$(($(date +%s%N) - start_ns))
 cmp -n "$bytes" "$backend/$bucket/recovery.bin" /dev/zero
+cmp -n "$bytes" "$mount_dir/recovery.bin" /dev/zero
+kill -0 "$daemon_pid" 2>/dev/null || {
+  echo "ngs3fs exited after cache recovery" >&2
+  exit 1
+}
 recovery_last_line=$(wc -l <"$run_dir/versity-access.log")
 recovery_requests=0
 if ((recovery_last_line > recovery_first_line)); then

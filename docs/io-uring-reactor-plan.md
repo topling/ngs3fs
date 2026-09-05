@@ -178,6 +178,22 @@ with these gates; re-review implementation ordering before enabling publication.
   suite: 74/74 (73.03 seconds); final TSan suite: 74/74 (135.86 seconds), with
   no reported races. ASan also passed 74/74 (84.72 seconds). The follow-up
   runner CI and performance comparison remain pending.
+- Runner `33970172874` passed all hardening jobs, but its legacy libfuse
+  stress exposed a second directory-refresh race, reproduced locally:
+  mutation callbacks bypassed the per-directory `refreshing` coordinator,
+  allowing two LIST generations to prune each other's children. They now use
+  the same refresh entry point as LOOKUP/READDIR. Legacy mkdir also accepts
+  its own marker already installed by a concurrent LIST after the successful
+  conditional PUT, as the uring path already does. Legacy 8 x 20 stress,
+  including 160 rename/LIST overwrites and 20 syscall rounds, passed in 60 s.
+  Normal/TSan/ASan suites passed 74/74 each (73.39/142.68/86.65 s).
+- The same runner's multipart recovery found that the newly added parent
+  directory lock dereferenced the recovery task's private, parentless inode.
+  Metadata publication now takes that lock only for tree-attached inodes.
+  ASan reproduced the null-parent access before the fix. Normal and ASan
+  64 MiB crash recovery passed afterward; the benchmark now also requires
+  dirty-marker retirement, a mounted content read, and a live daemon rather
+  than treating remote Complete alone as recovery success.
 - The new runner performance evidence is not an improvement: normal advice
   legacy/uring-1 CPU per operation is 1.050/1.094 ms, wall 1390.920/1686.041 ms;
   random advice 1.138/1.216 ms, wall 1441.670/1683.597 ms. The uring-1 profile
@@ -189,6 +205,16 @@ with these gates; re-review implementation ordering before enabling publication.
   prefixes still retire incrementally, and active READ/checksum pins still
   prevent reclamation. The new suite passes this change; CPU benefit remains
   unmeasured until the follow-up runner benchmark.
+- Runner `33970172874` still shows no material improvement: normal advice
+  legacy/uring-1 CPU per operation 1.064/1.108 ms and wall 1444.990/1758.348 ms;
+  random advice 1.167/1.235 ms and wall 1544.647/1817.660 ms. The uring-1
+  profile has shmem_file_write_iter 35.861%, shmem_undo_range 13.027%, and
+  llhttp 0.668% inclusive. These costs overlap and must not be added.
+  Investigation found an admission asymmetry: legacy uses try_acquire_bulk
+  before speculative expansion and falls back to demand-sized I/O if it fails;
+  uring currently allocates expanded staging then waits for an ordinary lease.
+  Align speculative admission without changing checksum/STORE guarantees or
+  discarding useful in-flight windows; validate with the same runner workload.
 
 - Mount and per-file budget admission now cover every production prefetch
   allocation. Limits are exposed and validated; explicit per-file limits are

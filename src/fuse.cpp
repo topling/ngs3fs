@@ -5676,7 +5676,7 @@ void refresh_directory_once(State& state, fuse_ino_t inode, bool force) {
   sweep_retired_items(state);
 }
 
-void refresh_directory_locked(State& state, fuse_ino_t inode,
+void refresh_directory_snapshot(State& state, fuse_ino_t inode,
                               bool force = false) {
   for (;;) {
     try {
@@ -5712,7 +5712,7 @@ void refresh_directory(State& state, fuse_ino_t inode, bool force = false) {
     children.refreshing.wait(true, std::memory_order_acquire);
   }
   try {
-    refresh_directory_locked(state, inode, force);
+    refresh_directory_snapshot(state, inode, force);
     finish_directory_refresh(children, {});
   } catch (...) {
     finish_directory_refresh(children, std::current_exception());
@@ -6104,9 +6104,13 @@ void publish_written_metadata(OpenHandle& handle,
   }
   InodeFile& item = *handle.item;
   InodeMetadataGuard metadata_guard(item);
-  Directory& children = item.parent()->dir_children();
-  std::unique_lock directory_guard(children.mutex);
-  ++children.mutation_epoch;
+  std::unique_lock<std::shared_mutex> directory_guard;
+  // Recovery uses a private inode, not yet attached to the mounted tree.
+  if (InodeBase* parent = item.parent()) {
+    Directory& children = parent->dir_children();
+    directory_guard = std::unique_lock(children.mutex);
+    ++children.mutation_epoch;
+  }
   item.fsize.store(handle.stream_offset, std::memory_order_relaxed);
   item.mtime.store(mtime, std::memory_order_relaxed);
   item.set_page_cache_valid(!handle.page_cache_store_failed);
@@ -10043,7 +10047,7 @@ void create_cached_file(fuse_req_t request, fuse_ino_t parent, const char* name,
           directory.dir_children().mutation_mutex, std::defer_lock);
       if (!prepared) {
         directory_guard.lock();
-        refresh_directory_locked(state, parent);
+        refresh_directory(state, parent);
       }
       ListedChild child;
       child.name = name;
@@ -17260,7 +17264,7 @@ void ngs3fs_unlink(fuse_req_t request, fuse_ino_t parent,
     }
     std::lock_guard directory_guard(
         directory.dir_children().mutation_mutex);
-    refresh_directory_locked(state, parent);
+    refresh_directory(state, parent);
     InodePin item = pin_cached_child(
         state, directory, name);
     if (!item) {
@@ -17681,15 +17685,16 @@ void ngs3fs_mkdir(fuse_req_t request, fuse_ino_t parent, const char* name,
     {
       std::lock_guard directory_guard(
           directory.dir_children().mutation_mutex);
-      refresh_directory_locked(state, parent);
+      refresh_directory(state, parent);
       const std::string directory_key = item_key(state, directory);
       const std::string key = directory_key + name + '/';
       ListedChild child;
       child.name      = name;
       child.directory = true;
       put_empty_object(state, object_request_path(state, key), true);
+      // A concurrent LIST can already contain our successful conditional PUT.
       inode = install_item(
-          state, parent, std::move(child), 0, true, false, true);
+          state, parent, std::move(child), 0, false, false, true);
       timeout = remaining_directory_timeout(directory);
     }
     fuse_entry_param entry{};
@@ -17728,7 +17733,7 @@ void ngs3fs_rmdir(fuse_req_t request, fuse_ino_t parent,
     }
     const fuse_ino_t inode = item_inode(item.get());
     DirectoryGuards locks = lock_directories(state, {parent, inode});
-    refresh_directory_locked(state, parent);
+    refresh_directory(state, parent);
     {
       InodePin current = pin_cached_child(
           state, inode_item(state, parent), name);
@@ -17739,7 +17744,7 @@ void ngs3fs_rmdir(fuse_req_t request, fuse_ino_t parent,
     if (!item->directory()) {
       throw std::system_error(ENOTDIR, std::generic_category(), "rmdir");
     }
-    refresh_directory_locked(state, inode, true);
+    refresh_directory(state, inode, true);
     {
       std::shared_lock guard(item->dir_children().mutex);
       if (!item->dir_children().empty()) {
@@ -18192,9 +18197,9 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
     {
       DirectoryGuards parent_locks =
           lock_directories(state, {parent, new_parent});
-      refresh_directory_locked(state, parent);
+      refresh_directory(state, parent);
       if (new_parent != parent) {
-        refresh_directory_locked(state, new_parent);
+        refresh_directory(state, new_parent);
       }
       source = pin_cached_child(
           state, inode_item(state, parent), name);
@@ -18214,9 +18219,9 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
                                              : 0;
     DirectoryGuards locks = lock_directories(
         state, {parent, new_parent, source_inode, destination_inode});
-    refresh_directory_locked(state, parent);
+    refresh_directory(state, parent);
     if (new_parent != parent) {
-      refresh_directory_locked(state, new_parent);
+      refresh_directory(state, new_parent);
     }
 
     std::string source_key;
@@ -18271,7 +18276,7 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
         throw std::system_error(EINVAL, std::generic_category(),
                                 "move directory into itself");
       }
-      refresh_directory_locked(state, source_inode, true);
+      refresh_directory(state, source_inode, true);
       {
         std::shared_lock guard(source->dir_children().mutex);
         if (!source->dir_children().empty()) {
@@ -18281,7 +18286,7 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
         }
       }
       if (destination_inode != 0) {
-        refresh_directory_locked(state, destination_inode, true);
+        refresh_directory(state, destination_inode, true);
         {
           std::shared_lock guard(destination->dir_children().mutex);
           if (!destination->dir_children().empty()) {
