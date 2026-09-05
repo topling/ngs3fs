@@ -303,6 +303,13 @@ if(NGS3FS_BUILD_TESTS)
             xxhash128 prefetch-unverifiable uring 2)
   set_tests_properties(fuse_uring_prefetch_unverifiable_test PROPERTIES
     TIMEOUT 60 RESOURCE_LOCK fuse_mounts)
+  foreach(engine IN ITEMS legacy uring)
+    add_test(NAME fuse_${engine}_prefetch_admission_test
+      COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+              xxhash128 prefetch-admission ${engine} 2)
+    set_tests_properties(fuse_${engine}_prefetch_admission_test PROPERTIES
+      TIMEOUT 60 RESOURCE_LOCK fuse_mounts)
+  endforeach()
   add_test(NAME fuse_multi_reactor_prefetch_store_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
             xxhash128 prefetch uring 2)

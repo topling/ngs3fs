@@ -215,6 +215,20 @@ with these gates; re-review implementation ordering before enabling publication.
   uring currently allocates expanded staging then waits for an ordinary lease.
   Align speculative admission without changing checksum/STORE guarantees or
   discarding useful in-flight windows; validate with the same runner workload.
+- Correctness follow-up `c179624` passed the entire runner CI `33971426554`,
+  including all hardening jobs, upstream filesystem stress, multipart recovery,
+  benchmarks, and Pages deployment.
+- Speculative admission now reserves an actual bulk HTTP lease before staging
+  expansion; no lease means demand-sized staging, not a queued expanded GET.
+  The lease follows the request through credentials and reactor submission.
+  Retries keep bulk eligibility. Separate bulk/demand notification pipes avoid
+  a bulk waiter consuming the reserved-slot wakeup intended for demand.
+  Seven paused speculative GETs plus an eighth demand-only GET are tested in
+  both engines, including multi-reactor operation. Both passed three repeats.
+  Normal and TSan full suites passed 76/76 before the notification split;
+  final ASan suite passed 76/76 (81.35 s). Final TSan admission/budget pressure
+  passed all four tests three times each (61.44 s). The performance runner
+  remains pending. No CPU win is claimed yet.
 
 - Mount and per-file budget admission now cover every production prefetch
   allocation. Limits are exposed and validated; explicit per-file limits are

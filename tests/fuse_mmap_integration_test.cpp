@@ -1771,10 +1771,11 @@ int main(int argc, char** argv) {
     const bool verified_clean = argc >= 4 && std::string_view(argv[3]) == "prefetch-verified-clean";
     const bool shutdown_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-shutdown";
     const bool partial_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-unverifiable";
+    const bool admission_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-admission";
     const bool verified_prefetch = verified_clean || (argc >= 4 &&
         std::string_view(argv[3]) == "prefetch-verified");
     const bool budget_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-budget";
-    const bool prefetch_mode = verified_prefetch || budget_prefetch || shutdown_prefetch || partial_prefetch || (argc >= 4 &&
+    const bool prefetch_mode = verified_prefetch || budget_prefetch || shutdown_prefetch || partial_prefetch || admission_prefetch || (argc >= 4 &&
         std::string_view(argv[3]) == "prefetch");
     std::vector<std::byte> expected(512U * 1024U + 37U);
     for (size_t i = 0; i < expected.size(); ++i) {
@@ -1828,6 +1829,13 @@ int main(int argc, char** argv) {
                          "\"read-ahead-random\"");
     add_overwrite_object("read-ahead-store.bin", read_ahead,
                          "\"read-ahead-store\"");
+    if (admission_prefetch) {
+      for (unsigned i = 0; i != 8; ++i) {
+        const std::string name = "admission-" + std::to_string(i) + ".bin";
+        add_overwrite_object(name, read_ahead, '"' + name + '"');
+        shared.special_objects.at(name)->pause_after = 512U * 1024U;
+      }
+    }
     if (verified_prefetch) {
       auto& object = *shared.special_objects.at("read-ahead-store.bin");
       object.bytes.resize(768U * 1024U + 37U);
@@ -1892,6 +1900,56 @@ int main(int argc, char** argv) {
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
+
+    if (admission_prefetch) {
+      std::array<UniqueFd, 8> files;
+      std::array<std::shared_ptr<SpecialObject>, 8> objects;
+      struct ResumeAdmission {
+        decltype(objects)& values;
+        ~ResumeAdmission() {
+          for (const auto& value : values) {
+            if (value) value->resume_tail.store(true, std::memory_order_release);
+          }
+        }
+      } resume{objects};
+      // Open all handles before occupying the seven speculative connections.
+      for (unsigned i = 0; i != files.size(); ++i) {
+        const std::string name = "admission-" + std::to_string(i) + ".bin";
+        { std::lock_guard guard(shared.mutex); objects[i] = shared.special_objects.at(name); }
+        files[i].reset(::open((mountpoint + '/' + name).c_str(), O_RDONLY | O_CLOEXEC));
+        if (!files[i]) fail_errno("open connection admission object");
+        require(::posix_fadvise(files[i].get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+                "disable kernel readahead for connection admission");
+      }
+      std::array<std::byte, 4096> bytes;
+      for (unsigned i = 0; i != 7; ++i) {
+        pread_all(files[i].get(), bytes, 0);
+        for (unsigned attempt = 0; attempt != 2000 &&
+             !objects[i]->tail_paused.load(std::memory_order_acquire); ++attempt) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(objects[i]->tail_paused.load(std::memory_order_acquire),
+                "speculative GET did not retain its connection");
+      }
+      pread_all(files.back().get(), bytes, 0);
+      require(std::equal(bytes.begin(), bytes.end(), read_ahead.begin()),
+              "connection-limited demand bytes differ");
+      {
+        std::lock_guard guard(shared.mutex);
+        const auto& ranges = objects.back()->get_ranges;
+        require(ranges.size() == 1 && ranges[0].first == 0 && ranges[0].last == 4095,
+                "speculation consumed the final demand connection");
+      }
+      for (auto& object : objects) object->resume_tail.store(true, std::memory_order_release);
+      for (auto& fd : files) fd.reset();
+      mounted.stop();
+      shared.stop.store(true);
+      server.request_stop();
+      server.join();
+      require(::rmdir(mountpoint.c_str()) == 0, "remove admission mountpoint");
+      fprintf(stderr, "seven speculative GETs leave a demand-only connection: passed\n");
+      return 0;
+    }
 
     if (budget_prefetch) {
       constexpr std::array<const char*, 3> names{

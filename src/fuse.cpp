@@ -260,15 +260,13 @@ class HttpPool {
     size_t slot_ = 0;
   };
 
-  explicit HttpPool(const MountConfig& config)
-      : release_pipe_(Pipe::create(4096)) {
-    const int release_flags = ::fcntl(
-        release_pipe_.write_fd(), F_GETFL, 0);
-    if (release_flags < 0 ||
-        ::fcntl(release_pipe_.write_fd(), F_SETFL,
-                release_flags | O_NONBLOCK) != 0) {
-      throw std::system_error(errno, std::generic_category(),
-                              "fcntl(HTTP release notification)");
+  explicit HttpPool(const MountConfig& config) {
+    for (const Pipe& pipe : release_pipes_) {
+      const int flags = ::fcntl(pipe.write_fd(), F_GETFL, 0);
+      if (flags < 0 || ::fcntl(pipe.write_fd(), F_SETFL, flags | O_NONBLOCK) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "fcntl(HTTP release notification)");
+      }
     }
     slots_.resize(config.max_connections);
     std::vector<std::exception_ptr> errors(config.max_connections);
@@ -315,13 +313,13 @@ class HttpPool {
     return try_acquire_slots(slots_.size());
   }
 
-  int begin_async_wait() noexcept {
-    reactor_waiters_.fetch_add(1, std::memory_order_acq_rel);
-    return release_pipe_.read_fd();
+  int begin_async_wait(bool bulk = false) noexcept {
+    reactor_waiters_[bulk].fetch_add(1, std::memory_order_acq_rel);
+    return release_pipes_[bulk].read_fd();
   }
 
-  void end_async_wait() noexcept {
-    reactor_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+  void end_async_wait(bool bulk = false) noexcept {
+    reactor_waiters_[bulk].fetch_sub(1, std::memory_order_acq_rel);
   }
 
  private:
@@ -365,11 +363,15 @@ class HttpPool {
     slots_[i]->busy.store(false, std::memory_order_release);
     released_.fetch_add(1, std::memory_order_release);
     released_.notify_one();
-    if (reactor_waiters_.load(std::memory_order_acquire) != 0) {
+    // Bulk waiters cannot use the reserved last slot. Separate notifications
+    // keep one from consuming the only wakeup that could unblock demand.
+    for (unsigned bulk = 0; bulk != 2; ++bulk) {
+      if (bulk && i == slots_.size() - 1) continue;
+      if (reactor_waiters_[bulk].load(std::memory_order_acquire) == 0) continue;
       const std::byte notification{};
       ssize_t result;
       do {
-        result = ::write(release_pipe_.write_fd(), &notification,
+        result = ::write(release_pipes_[bulk].write_fd(), &notification,
                          sizeof(notification));
       } while (result < 0 && errno == EINTR);
       // A full pipe is already readable, so dropping this coalesced wakeup
@@ -381,8 +383,8 @@ class HttpPool {
   std::vector<std::unique_ptr<Slot>> slots_;
   std::atomic<size_t> next_{0};
   std::atomic<uint64_t> released_{0};
-  Pipe release_pipe_;
-  std::atomic<size_t> reactor_waiters_{0};
+  std::array<Pipe, 2> release_pipes_{Pipe::create(4096), Pipe::create(4096)};
+  std::array<std::atomic<size_t>, 2> reactor_waiters_{};
 };
 
 class UploadScheduler {
@@ -3367,6 +3369,12 @@ class AsyncS3Request {
 
   bool ambiguous() const noexcept { return ambiguous_; }
 
+  void set_bulk_lease(HttpPool::Lease lease) noexcept {
+    assert(!started_);
+    bulk_ = true;
+    lease_ = std::move(lease);
+  }
+
  private:
   static void run(void* context) noexcept {
     static_cast<AsyncS3Request*>(context)->acquire();
@@ -3396,7 +3404,7 @@ class AsyncS3Request {
   static void available(void* context, ssize_t result) noexcept {
     auto* request = static_cast<AsyncS3Request*>(context);
     if (request->pool_wait_) {
-      request->state_.http->end_async_wait();
+      request->state_.http->end_async_wait(request->bulk_);
       request->pool_wait_ = false;
     }
     if (result < 0 || request->cancelled_) {
@@ -3422,11 +3430,13 @@ class AsyncS3Request {
         arguments_.headers = std::move(headers);
         resign_ = false;
       }
-      lease_ = state_.http->try_acquire();
+      if (!lease_) lease_ = bulk_ ? state_.http->try_acquire_bulk()
+                                 : state_.http->try_acquire();
       if (!lease_) {
-        const int fd = state_.http->begin_async_wait();
+        const int fd = state_.http->begin_async_wait(bulk_);
         pool_wait_ = true;
-        lease_ = state_.http->try_acquire();
+        lease_ = bulk_ ? state_.http->try_acquire_bulk()
+                      : state_.http->try_acquire();
         if (!lease_) {
           wait_ = {};
           wait_.kind       = AsyncIoRequest::READ;
@@ -3438,12 +3448,12 @@ class AsyncS3Request {
           wait_.context    = this;
           if (reactor_.submit(wait_)) return;
           const int error = errno;
-          state_.http->end_async_wait();
+          state_.http->end_async_wait(bulk_);
           pool_wait_ = false;
           fail(error, "submit S3 connection wait");
           return;
         }
-        state_.http->end_async_wait();
+        state_.http->end_async_wait(bulk_);
         pool_wait_ = false;
       }
       AsyncHttpRequest arguments = max_attempts_ == 1
@@ -3570,6 +3580,7 @@ class AsyncS3Request {
   bool cancelled_ = false;
   bool ambiguous_ = false;
   bool resign_ = false;
+  bool bulk_ = false;
 };
 
 class AsyncExpressSession {
@@ -3872,6 +3883,12 @@ class AsyncSignedS3Request {
 
   bool ambiguous() const noexcept { return ambiguous_; }
 
+  void set_bulk_lease(HttpPool::Lease lease) noexcept {
+    assert(!started_);
+    bulk_ = true;
+    bulk_lease_ = std::move(lease);
+  }
+
  private:
   static void credentials_ready(void* context, ssize_t result) noexcept {
     auto* task = static_cast<AsyncSignedS3Request*>(context);
@@ -3893,6 +3910,7 @@ class AsyncSignedS3Request {
         arguments.headers.end(), headers.begin(), headers.end());
     request_ = std::make_unique<AsyncS3Request>(
         state_, reactor_, std::move(arguments), received, this, attempts_);
+    if (bulk_) request_->set_bulk_lease(std::move(bulk_lease_));
     return request_->start();
   }
 
@@ -3937,6 +3955,8 @@ class AsyncSignedS3Request {
   void* context_;
   unsigned attempts_;
   ssostr<72> payload_hash_;
+  HttpPool::Lease bulk_lease_;
+  bool bulk_ = false;
   unsigned session_attempt_ = 0;
   bool ambiguous_ = false;
   bool started_ = false;
@@ -10851,7 +10871,7 @@ class UncachedFileReader final : public FileReader {
 
   std::shared_ptr<UncachedPrefetch> select_async(
       State& state, fuse_ino_t inode, uint64_t offset, size_t wanted, uint64_t object_size,
-      bool& created);
+      bool& created, HttpPool::Lease& bulk_lease);
 
  private:
   void join() noexcept;
@@ -12358,7 +12378,7 @@ void UncachedFileReader::read(
 
 std::shared_ptr<UncachedPrefetch> UncachedFileReader::select_async(
     State& state, fuse_ino_t inode, uint64_t offset, size_t wanted, uint64_t object_size,
-    bool& created) {
+    bool& created, HttpPool::Lease& bulk_lease) {
   std::lock_guard guard(mutex_);
   created = false;
   const auto contains = [&](UncachedPrefetch& p) {
@@ -12403,10 +12423,19 @@ std::shared_ptr<UncachedPrefetch> UncachedFileReader::select_async(
       next = 1024U * 1024U;
     }
   }
-  const size_t length = size_t(std::min<uint64_t>(
+  size_t length = size_t(std::min<uint64_t>(
       object_size - offset, std::max(wanted, next)));
+  HttpPool::Lease lease;
+  if (length > wanted) {
+    // As in legacy, speculation must leave one connection for demand and
+    // metadata. Keep the actual reservation through request submission;
+    // checking availability alone would race other reactor owners.
+    lease = state.http->try_acquire_bulk();
+    if (!lease) length = wanted;
+  }
   auto selected = allocate_prefetch(state, inode, offset, wanted, object_size, length);
   if (!selected) return {};
+  if (selected->length > wanted) bulk_lease = std::move(lease);
   next_window_ = next;
   if (prefetch_) {
     retained_.push_back(prefetch_);
@@ -12498,6 +12527,7 @@ struct AsyncRangeTransfer {
   std::shared_ptr<UncachedPrefetch> prefetch;
   uint64_t object_size;
   AsyncHttpRequest arguments;
+  HttpPool::Lease bulk_lease;
   std::unique_ptr<AsyncS3Request> http;
   std::unique_ptr<AsyncSignedS3Request> retry_http;
   std::unique_ptr<ReadChecksumContext> checksums;
@@ -12546,9 +12576,9 @@ struct AsyncRangeTransfer {
 
   AsyncRangeTransfer(State& s, FuseReactor& r,
                       std::shared_ptr<UncachedPrefetch> p, uint64_t size,
-                      AsyncHttpRequest args)
+                      AsyncHttpRequest args, HttpPool::Lease lease)
       : state(s), reactor(r), prefetch(std::move(p)), object_size(size),
-        arguments(std::move(args)), sink(*this) {
+        arguments(std::move(args)), bulk_lease(std::move(lease)), sink(*this) {
     arguments.destination = &sink;
   }
 
@@ -12756,10 +12786,12 @@ struct AsyncRangeTransfer {
       if (state.config.directory_bucket) {
         retry_http = std::make_unique<AsyncSignedS3Request>(
             state, reactor, std::move(arguments), received, this);
+        if (bulk_lease) retry_http->set_bulk_lease(std::move(bulk_lease));
         accepted = retry_http->start();
       } else {
         http = std::make_unique<AsyncS3Request>(
             state, reactor, std::move(arguments), received, this);
+        if (bulk_lease) http->set_bulk_lease(std::move(bulk_lease));
         accepted = http->start();
       }
       if (!accepted) {
@@ -12793,6 +12825,7 @@ struct AsyncReadTask {
   OpenRequestGuard active;
   std::shared_lock<ReactorSharedMutex> identity;
   FuseReactor* reactor = nullptr;
+  HttpPool::Lease bulk_lease;
   std::shared_ptr<UncachedPrefetch> prefetch;
   bool prefetch_pinned = false;
   PrefetchContinuation continuation;
@@ -13207,7 +13240,7 @@ struct AsyncReadTask {
         created = true;
       } else {
         prefetch = static_cast<UncachedFileReader*>(handle->reader.get())->select_async(
-            *state, inode, begin, wanted, handle->size, created);
+            *state, inode, begin, wanted, handle->size, created, bulk_lease);
       }
       if (!prefetch) {
         const int fd = state->prefetch_budget.begin_async_wait(budget.revision);
@@ -13268,7 +13301,7 @@ struct AsyncReadTask {
       args.measure_transport = state->config.report_metrics;
       args.capture_headers   = state->config.verify_read_checksum;
       auto transfer = std::make_unique<AsyncRangeTransfer>(
-          *state, *reactor, prefetch, handle->size, std::move(args));
+          *state, *reactor, prefetch, handle->size, std::move(args), std::move(bulk_lease));
       if (!state->local_cache && prefetch->length > wanted &&
           (!state->config.verify_read_checksum || prefetch->checksum_hold) &&
           prefetch->offset % state->page_size == 0 && wanted % state->page_size == 0) {
