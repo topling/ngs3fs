@@ -97,6 +97,8 @@ struct Directory : terark::hash_strmap<
   std::atomic<bool> refreshing{false};
   DirectoryContinuation* refresh_waiters = nullptr;
   uint32_t listing_generation = 0;
+  uint32_t remote_mutations = 0; // Protected by mutex; LIST must not publish meanwhile.
+  uint64_t mutation_epoch = 0; // Protected by mutex; local namespace/metadata changes.
   bool clock_linked           = false;
 };
 

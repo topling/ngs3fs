@@ -132,6 +132,7 @@ struct RequestRange {
 };
 
 struct Request {
+  bool active_get = false;
   std::string method;
   std::string path;
   std::string rename_source;
@@ -204,6 +205,7 @@ struct SharedServerState {
   int active_gets = 0;
   int maximum_active_gets = 0;
   int get_requests = 0;
+  std::vector<std::string> get_paths;
   int head_requests = 0;
   int list_requests = 0;
   int put_requests = 0;
@@ -254,6 +256,16 @@ struct ServerState {
   std::map<int32_t, Request> requests;
   std::map<int32_t, std::unique_ptr<ResponseSource>> responses;
   bool close_without_response = false;
+
+  ~ServerState() {
+    // nghttp2_session_del does not close streams through on_stream_close.
+    // A cancelled speculative GET can terminate its entire connection.
+    std::lock_guard guard(shared->mutex);
+    for (const auto& [id, request] : requests) {
+      (void)id;
+      if (request.active_get) --shared->active_gets;
+    }
+  }
 };
 
 bool parse_range(std::string_view value, RequestRange& range) {
@@ -995,20 +1007,21 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       xml.append(5U * 1024U * 1024U, 'x');
       xml += "-->";
     }
-    if (!deep && !second_root_page &&
-        !state.object_key.starts_with(".~ngs3fs~.pending-delete/")) {
+    if (!deep && !second_root_page) {
       xml += "<s3:IsTruncated>1</s3:IsTruncated>"
              "<s3:NextContinuationToken>root-page&#x2D;2"
              "</s3:NextContinuationToken>";
-      xml += "<s3:Contents><s3:Key>";
-      xml += state.object_key;
-      xml += "</s3:Key><s3:ETag>";
-      xml += state.etag;
-      xml += "</s3:ETag><s3:LastModified>";
-      xml += state.last_modified_iso;
-      xml += "</s3:LastModified><s3:Size>";
-      xml += std::to_string(state.object.size());
-      xml += "</s3:Size></s3:Contents>";
+      if (!state.object_key.starts_with(".~ngs3fs~.pending-delete/")) {
+        xml += "<s3:Contents><s3:Key>";
+        xml += state.object_key;
+        xml += "</s3:Key><s3:ETag>";
+        xml += state.etag;
+        xml += "</s3:ETag><s3:LastModified>";
+        xml += state.last_modified_iso;
+        xml += "</s3:LastModified><s3:Size>";
+        xml += std::to_string(state.object.size());
+        xml += "</s3:Size></s3:Contents>";
+      }
       for (const auto& [key, object] : state.special_objects) {
         if (key.starts_with(".~ngs3fs~.pending-delete/")) {
           continue;
@@ -1292,8 +1305,11 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   }
   ResponseSource* source = response.get();
   connection.responses[frame->hd.stream_id] = std::move(response);
+  request.active_get = true;
   ++state.active_gets;
   ++state.get_requests;
+  state.get_paths.push_back(request.path + " [" + std::to_string(range.first) + "," +
+                            std::to_string(range.last) + "]");
   if (key == "overwrite-dest.bin" || key == state.overwrite_hidden_key) {
     if (is_special) {
       ++state.overwrite_destination_gets;
@@ -1345,12 +1361,10 @@ int on_stream_close(nghttp2_session*, int32_t stream_id,
                     uint32_t, void* user_data) {
   auto& connection = *static_cast<ServerState*>(user_data);
   const auto request = connection.requests.find(stream_id);
-  if (request != connection.requests.end() && request->second.method == "GET") {
+  if (request != connection.requests.end() && request->second.active_get) {
     SharedServerState& state = *connection.shared;
     std::lock_guard state_guard(state.mutex);
-    if (state.active_gets != 0) {
-      --state.active_gets;
-    }
+    --state.active_gets;
   }
   connection.requests.erase(stream_id);
   connection.responses.erase(stream_id);
@@ -1756,10 +1770,11 @@ int main(int argc, char** argv) {
     }
     const bool verified_clean = argc >= 4 && std::string_view(argv[3]) == "prefetch-verified-clean";
     const bool shutdown_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-shutdown";
+    const bool partial_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-unverifiable";
     const bool verified_prefetch = verified_clean || (argc >= 4 &&
         std::string_view(argv[3]) == "prefetch-verified");
     const bool budget_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-budget";
-    const bool prefetch_mode = verified_prefetch || budget_prefetch || shutdown_prefetch || (argc >= 4 &&
+    const bool prefetch_mode = verified_prefetch || budget_prefetch || shutdown_prefetch || partial_prefetch || (argc >= 4 &&
         std::string_view(argv[3]) == "prefetch");
     std::vector<std::byte> expected(512U * 1024U + 37U);
     for (size_t i = 0; i < expected.size(); ++i) {
@@ -1842,7 +1857,13 @@ int main(int argc, char** argv) {
     };
     add_checksum_object("checksum-retry.bin", 1, 128U * 1024U);
     add_checksum_object("checksum-release.bin", 1, 128U * 1024U);
-    add_checksum_object("checksum-rename.bin", 1, 128U * 1024U);
+    add_checksum_object("checksum-rename.bin", 1, 2U * 1024U * 1024U);
+    {
+      auto& object = *shared.special_objects.at("checksum-rename.bin");
+      object.bytes.resize(2U * 1024U * 1024U);
+      object.corrupted_bytes = object.bytes;
+      object.corrupted_bytes[12345] ^= std::byte{0x80};
+    }
     add_checksum_object("checksum-fail.bin", 2);
     add_checksum_object("checksum-unsupported.bin", 0, 0, true);
     add_checksum_object("budget-retry.bin", 1);
@@ -1866,7 +1887,7 @@ int main(int argc, char** argv) {
     const std::string checksum_option(checksum_option_name(checksum));
     const pid_t process = start_daemon(
         argv[1], mountpoint, listener.port, checksum_option, cache_dir,
-        engine, reactors, !prefetch_mode || verified_prefetch || budget_prefetch,
+        engine, reactors, !prefetch_mode || verified_prefetch || budget_prefetch || partial_prefetch,
         verified_prefetch, budget_prefetch);
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
@@ -1994,7 +2015,7 @@ int main(int argc, char** argv) {
         bool published = false;
         for (unsigned i = 0; i < 2000; ++i) {
           require(::mincore(mapping, page, &resident) == 0, "mincore STORE probe");
-          if (((resident & 1) || verified_prefetch) && object->tail_paused.load(std::memory_order_acquire)) {
+          if (((resident & 1) || verified_prefetch || partial_prefetch) && object->tail_paused.load(std::memory_order_acquire)) {
             published = true;
             break;
           }
@@ -2002,14 +2023,14 @@ int main(int argc, char** argv) {
         }
         require(published && !object->resume_tail.load(std::memory_order_acquire),
                 "prefetch did not reach the paused-tail observation point");
-        if (verified_prefetch) {
+        if (verified_prefetch || partial_prefetch) {
           for (unsigned i = 0; i < 20; ++i) {
             require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
                     "unverified prefetched data was proactively STOREd");
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
           }
         }
-        if (!verified_prefetch) {
+        if (!verified_prefetch && !partial_prefetch) {
           bool reclaimed = false;
           for (unsigned i = 0; i < 2000; ++i) {
             size_t bytes;
@@ -2041,6 +2062,31 @@ int main(int argc, char** argv) {
           server.join();
           require(::rmdir(mountpoint.c_str()) == 0, "remove prefetch shutdown mountpoint");
           fprintf(stderr, "shutdown with active prefetch and published prefix: passed\n");
+          return 0;
+        }
+        if (partial_prefetch) {
+          object->resume_tail.store(true, std::memory_order_release);
+          wait_for_gets();
+          require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
+                  "unverifiable partial range was STOREd after download completion");
+          require(prefetch_storage_empty(process), "unverifiable range retained staging");
+          {
+            std::lock_guard guard(shared.mutex);
+            require(object->get_requests == 1, "unexpected GET before demand refetch");
+          }
+          pread_all(second.get(), first_bytes, probe);
+          require(std::equal(first_bytes.begin(), first_bytes.end(), read_ahead.begin() + probe),
+                  "unverifiable range demand refetch differs");
+          require(::munmap(mapping, page) == 0, "unmap unverifiable probe");
+          unmap.mapping = MAP_FAILED;
+          first.reset();
+          second.reset();
+          mounted.stop();
+          shared.stop.store(true);
+          server.request_stop();
+          server.join();
+          require(::rmdir(mountpoint.c_str()) == 0, "remove unverifiable mountpoint");
+          fprintf(stderr, "unverifiable partial range withheld from STORE: passed\n");
           return 0;
         }
         std::array<std::exception_ptr, 8> errors{};
@@ -2106,6 +2152,7 @@ int main(int argc, char** argv) {
                   "overlapping cross-handle READ did not share its in-flight prefetch");
         }
         fprintf(stderr, "%s and overlapping cross-handle READ: passed\n",
+                verified_clean ? "STORE withheld until checksum succeeds" :
                 verified_prefetch ? "STORE withheld until checksum retry succeeds" : "progressive STORE before EOF");
       }
       const std::string path = mountpoint + "/read-ahead.bin";
@@ -2165,8 +2212,14 @@ int main(int argc, char** argv) {
       if (!sequential_fd) {
         fail_errno("open sequential read-ahead object");
       }
+      // Test client-window growth using ordered demand, without the kernel's
+      // independent asynchronous readahead issuing a later offset first.
+      require(::posix_fadvise(sequential_fd.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+              "disable kernel readahead for ordered client-window test");
       std::vector<std::byte> sequential_bytes(1280U * 1024U);
-      pread_all(sequential_fd.get(), sequential_bytes, 0);
+      for (size_t offset = 0; offset != sequential_bytes.size(); offset += 4096) {
+        pread_all(sequential_fd.get(), std::span(sequential_bytes).subspan(offset, 4096), offset);
+      }
       require(std::equal(sequential_bytes.begin(), sequential_bytes.end(),
                          read_ahead.begin()),
               "sequential read-ahead bytes differ");
@@ -2187,6 +2240,12 @@ int main(int argc, char** argv) {
                 "continued run did not grow and clip its window");
         const auto& sequential_ranges = shared.special_objects.at(
             "read-ahead-sequential.bin")->get_ranges;
+        if (sequential_ranges.size() != 2) {
+          for (const auto& range : sequential_ranges) {
+            fprintf(stderr, "sequential GET: first=%llu last=%llu\n",
+                    (unsigned long long)range.first, (unsigned long long)range.last);
+          }
+        }
         require(sequential_ranges.size() == 2,
                 "sequential read-ahead did not cross exactly two windows");
         require(sequential_ranges[0].first == 0 &&
@@ -2620,34 +2679,17 @@ int main(int argc, char** argv) {
         fail_errno("open checksum rename object");
       }
       std::array<std::byte, 4096> checksum_rename_first{};
-      std::exception_ptr checksum_rename_failure;
-      std::jthread checksum_rename_reader([&] {
-        try {
-          pread_all(checksum_rename_file.get(), checksum_rename_first, 0);
-        } catch (...) {
-          checksum_rename_failure = std::current_exception();
-        }
-      });
-      bool checksum_rename_get_started = false;
-      for (unsigned attempt = 0; attempt != 200; ++attempt) {
-        {
-          std::lock_guard state_guard(shared.mutex);
-          checksum_rename_get_started =
-              shared.special_objects.at("checksum-rename.bin")
-                      ->get_requests == 1;
-        }
-        if (checksum_rename_get_started) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-      require(checksum_rename_get_started,
-              "delayed checksum GET did not start before rename");
+      // Fetch only half a checksum unit. Validation cannot start until the
+      // second half is fetched after rename; no timing barrier holds a GET
+      // identity lock while rename needs its exclusive counterpart.
+      require(posix_fadvise(checksum_rename_file.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+              "disable kernel prefetch for checksum rename test");
+      pread_all(checksum_rename_file.get(), checksum_rename_first, 0);
       require(::rename(checksum_rename_source.c_str(),
                        checksum_rename_destination.c_str()) == 0,
-              "rename during delayed checksum validation failed");
-      checksum_rename_reader.join();
-      if (checksum_rename_failure) {
-        std::rethrow_exception(checksum_rename_failure);
-      }
+              "rename before checksum unit completion failed");
+      std::array<std::byte, 4096> checksum_rename_second{};
+      pread_all(checksum_rename_file.get(), checksum_rename_second, 1024U * 1024U);
       require(std::equal(checksum_rename_first.begin(),
                          checksum_rename_first.end(), checksum_test.begin()),
               "renamed checksum object's initial read returned wrong bytes");
@@ -2657,7 +2699,7 @@ int main(int argc, char** argv) {
           std::lock_guard state_guard(shared.mutex);
           renamed_checksum_retry_started =
               shared.special_objects.at("checksum-renamed.bin")
-                      ->get_requests >= 2;
+                      ->get_requests >= 3;
         }
         if (renamed_checksum_retry_started) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -2672,11 +2714,13 @@ int main(int argc, char** argv) {
         std::lock_guard state_guard(shared.mutex);
         const SpecialObject& renamed =
             *shared.special_objects.at("checksum-renamed.bin");
-        require(renamed.get_requests == 2 && renamed.get_paths.size() == 2,
+        require(renamed.get_requests == 3 && renamed.get_paths.size() == 3,
                 "renamed checksum object did not perform one exact retry");
         require(renamed.get_paths[0].starts_with(
                     "/bucket/checksum-rename.bin") &&
                     renamed.get_paths[1].starts_with(
+                    "/bucket/checksum-renamed.bin") &&
+                    renamed.get_paths[2].starts_with(
                     "/bucket/checksum-renamed.bin"),
                 "checksum retry was signed for the pre-rename path");
       }
@@ -2789,8 +2833,14 @@ int main(int argc, char** argv) {
     require(::pwrite(writer.get(), &rejected_byte, 1, 1) < 0 &&
                 errno == ESPIPE,
             "positional write must fail on a sequential writer");
+    struct stat writing_status{};
+    require(::stat(file_path.c_str(), &writing_status) == 0 && writing_status.st_size == 0,
+            "path stat restored pre-truncate size during a local write");
     const size_t first_write = std::min<size_t>(37, small_expected.size());
     test_write_all(writer.get(), std::span(small_expected).first(first_write));
+    require(::stat(file_path.c_str(), &writing_status) == 0 &&
+                writing_status.st_size == off_t(first_write),
+            "path stat did not publish the accepted partial write size");
     if (::fsync(writer.get()) != 0) {
       fail_errno("fsync partial mounted page");
     }
@@ -2880,6 +2930,11 @@ int main(int argc, char** argv) {
     visible_after_flush.reset();
     {
       std::lock_guard state_guard(shared.mutex);
+      if (shared.get_requests != gets_after_small_write) {
+        for (size_t i = size_t(gets_after_small_write); i < shared.get_paths.size(); ++i) {
+          fprintf(stderr, "unexpected post-write GET: %s\n", shared.get_paths[i].c_str());
+        }
+      }
       require(shared.get_requests == gets_after_small_write,
               "read-open discarded page cache left by the local writer");
       require(shared.checksum_mode_requests ==

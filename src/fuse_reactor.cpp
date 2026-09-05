@@ -109,7 +109,6 @@ bool FuseReactor::start_remote_dispatch(
   std::shared_lock guard(group_->external_mutex_);
   if (group_->shutting_down_.load(std::memory_order_acquire)) return false;
   target->task_count_.fetch_add(1, std::memory_order_acquire);
-  dispatch->input_tasks.store(1, std::memory_order_relaxed);
   dispatch->task = {dispatch_entry, nullptr, dispatch, dispatch};
   dispatch->target = target;
   io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
@@ -118,9 +117,12 @@ bool FuseReactor::start_remote_dispatch(
     return false;
   }
   constexpr uintptr_t kTaskTag = 3;
+  // MSG_RING transfers ownership through the kernel. Publish the dispatch
+  // explicitly as well, before the receiving owner reads any of its fields.
+  dispatch->input_tasks.store(1, std::memory_order_release);
   io_uring_prep_msg_ring(
       sqe, target->ring_.ring_fd, 0,
-      uintptr_t(&dispatch->task) | kTaskTag, 0);
+      uintptr_t(dispatch) | kTaskTag, 0);
   // Only failures produce a source CQE. It must retain enough ownership
   // information to undo the reservation when the target never receives it.
   constexpr uintptr_t kDispatchFailureTag = 4;
@@ -2087,9 +2089,10 @@ int FuseReactor::run() noexcept {
       io_uring_cqe_seen(&ring_, cqe);
       const uintptr_t tagged = uintptr_t(data);
       if ((tagged & 7) == 3) {
-        ReactorTask* task = reinterpret_cast<ReactorTask*>(
+        Dispatch* dispatch = reinterpret_cast<Dispatch*>(
             tagged & ~uintptr_t(7));
-        Dispatch* dispatch = static_cast<Dispatch*>(task->input_owner);
+        if (dispatch->input_tasks.load(std::memory_order_acquire) != 1) abort();
+        ReactorTask* task = &dispatch->task;
         if (!start_task(task)) {
           if (task->cancel != nullptr) {
             task->cancel(task->context);

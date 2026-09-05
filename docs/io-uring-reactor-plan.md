@@ -133,6 +133,63 @@ with these gates; re-review implementation ordering before enabling publication.
 
 #### Current follow-up execution evidence
 
+- Cross-client namespace visibility is **best effort**, not a strong guarantee.
+  Tests that directly mutate the server backing directory must not require a
+  LIST already in flight to observe a later external change. Keep same-mount
+  mutation races in scope: a stale LIST must not undo a completed local write,
+  unlink, or rename, or replace the stable source inode during rename.
+- Follow-up CI `33962137323` for `d1de34a`: benchmark, arm64, clang and
+  ASan/UBSan succeeded; build's 73 CTest cases passed but libfuse uring stress
+  failed, and TSan failed. Repairs are in progress, not yet a green CI claim.
+  MSG_RING task publication now has an explicit release/acquire handoff;
+  directory LIST uses a local-mutation epoch. Rename fences LIST publication
+  during its remote/local transition using per-directory state, without a
+  global lock or waiting recursively on the mutation lock. Concurrent readers
+  may use the pre-mutation cache; its expiry stays zero until a later refresh.
+- External fixture setup is isolated per stress worker; mount-originated
+  namespace operations still share a directory. Local uring-1 libfuse stress
+  after the fixture and mkdir repair passed 8 workers x 20 iterations plus
+  20 syscall rounds (94 seconds). Additional rename/LIST identity stress is
+  being added; it is not covered by that earlier passing run.
+- Subsequent uring-4 VersityGW stress passed, including 8 workers x 20
+  rename-overwrite/LIST interleavings with O_PATH inode pins, followed by the
+  upstream syscall rounds (59 seconds). Full normal suite initially passed
+  72/74; both failures exposed a mock LIST bug that hid unrelated objects
+  when the main object moved under the private prefix. That fixture is fixed.
+- Rebuilt TSan full suite passed 72/74 with no reported data races. Remaining
+  failures were legacy prefetch GET accounting and OSS write/read cache
+  retention. The mock now tracks active data GETs individually (not LIST GETs)
+  and retires them on connection destruction. A focused rerun no longer had
+  the leaked-active-GET timeout, but exposed an exact sequential-window-count
+  assertion. Ordered-window accounting now disables independent kernel
+  readahead and issues page-sized application reads; it does not change the
+  production access-pattern policy.
+- OSS retention exposed a real inode-size bug: accepted writes updated the
+  handle but not the inode. A concurrent GETATTR could restore the old size,
+  preventing the partial EOF page from remaining uptodate. Write admission
+  now protects local size from LIST until commit, every accepted write
+  publishes its size, and failed open restores the previous state. No mutex or
+  extra fields were added to InodeFile. Both the OSS and legacy prefetch TSan
+  cases subsequently passed ten consecutive runs each.
+- The rename/checksum regression now downloads half a checksum unit, renames,
+  then completes the unit and verifies that retry uses the new identity.
+  This replaces a timing assumption about which wins the identity lock.
+  Both cached engine variants passed three consecutive runs each. Final normal
+  suite: 74/74 (73.03 seconds); final TSan suite: 74/74 (135.86 seconds), with
+  no reported races. ASan also passed 74/74 (84.72 seconds). The follow-up
+  runner CI and performance comparison remain pending.
+- The new runner performance evidence is not an improvement: normal advice
+  legacy/uring-1 CPU per operation is 1.050/1.094 ms, wall 1390.920/1686.041 ms;
+  random advice 1.138/1.216 ms, wall 1441.670/1683.597 ms. The uring-1 profile
+  attributes 38.524% inclusive cost to io_splice and 12.030% to
+  shmem_undo_range; HTTP parsing is under 1%. Continue investigating staging
+  allocation/reclamation rather than moving header parsing back to workers.
+- Terminal publication now releases completed staging directly instead of
+  punching its last prefix immediately before the final truncate. Earlier
+  prefixes still retire incrementally, and active READ/checksum pins still
+  prevent reclamation. The new suite passes this change; CPU benefit remains
+  unmeasured until the follow-up runner benchmark.
+
 - Mount and per-file budget admission now cover every production prefetch
   allocation. Limits are exposed and validated; explicit per-file limits are
   not clamped to object size. Exhaustion shrinks speculation or waits on an

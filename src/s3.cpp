@@ -921,6 +921,8 @@ bool move_cached_item(InodeBase& item, InodeBase& new_parent,
     item.dentry_slot = uint32_t(inserted.first);
     item.set_parent(&new_parent);
     item.set_detached(false);
+    ++old_directory.mutation_epoch;
+    if (&old_directory != &new_directory) ++new_directory.mutation_epoch;
     return true;
   };
 

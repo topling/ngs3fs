@@ -2487,6 +2487,9 @@ InodeBase& inode_item(State& state, fuse_ino_t inode) {
   InodeBase* item = inode == FUSE_ROOT_ID
                         ? state.root_item.get()
                         : reinterpret_cast<InodeBase*>(uintptr_t(inode));
+  // A pointer inode travels from LOOKUP through the kernel to another owner.
+  // Pair with the lookup-count publication before reading its initialized data.
+  if (item != nullptr) (void)item->nlookup.load(std::memory_order_acquire);
   if (item == nullptr || item->detached()) {
     throw std::system_error(ENOENT, std::generic_category(), "inode");
   }
@@ -2500,6 +2503,7 @@ InodeBase& inode_reference(State& state, fuse_ino_t inode) {
   if (item == nullptr) {
     throw std::system_error(ENOENT, std::generic_category(), "inode");
   }
+  (void)item->nlookup.load(std::memory_order_acquire);
   return *item;
 }
 
@@ -4817,7 +4821,7 @@ void retain_inode_count(std::atomic<uint32_t>& count,
           EOVERFLOW, std::generic_category(), operation);
     }
   } while (!count.compare_exchange_weak(
-      value, value + 1, std::memory_order_relaxed,
+      value, value + 1, std::memory_order_acq_rel,
       std::memory_order_relaxed));
 }
 
@@ -5106,11 +5110,89 @@ bool detach_cached_item(State& state, InodeBase& item) {
     }
     children.erase_i(item.dentry_slot);
     item.set_detached(true);
+    ++children.mutation_epoch;
   }
   item.set_pending(false);
   item.set_truncate_pending(false);
   retire_item(state, item);
   return true;
+}
+
+struct DirectoryListingChanged {};
+struct DirectoryListingDeferred {};
+
+// Only the remote-mutation/publication interval is fenced, not the preliminary
+// refreshes made while holding mutation_mutex. Concurrent readers keep the
+// pre-mutation cache; it remains expired for the next lookup after completion.
+struct DirectoryPublicationGuard {
+  InodeBase* items[4]{};
+  unsigned count = 0;
+
+  DirectoryPublicationGuard() = default;
+  DirectoryPublicationGuard(const DirectoryPublicationGuard&) = delete;
+  DirectoryPublicationGuard& operator=(const DirectoryPublicationGuard&) = delete;
+
+  static void update(InodeBase& item, bool entering) {
+    Directory& children = item.dir_children();
+    std::unique_lock guard(children.mutex);
+    if (entering) ++children.remote_mutations;
+    else --children.remote_mutations;
+    ++children.mutation_epoch;
+    item.expire.store(0, std::memory_order_release);
+  }
+
+  void start(InodeBase& a, InodeBase& b,
+             InodeBase* source = nullptr, InodeBase* destination = nullptr) {
+    if (count) return;
+    for (InodeBase* item : {&a, &b, source, destination}) {
+      if (!item || !item->directory()) continue;
+      bool duplicate = false;
+      for (unsigned i = 0; i != count; ++i) duplicate |= items[i] == item;
+      if (duplicate) continue;
+      update(*item, true);
+      items[count++] = item;
+    }
+  }
+
+  ~DirectoryPublicationGuard() {
+    while (count) update(*items[--count], false);
+  }
+};
+
+void update_truncate_pending(InodeBase& item, bool pending) {
+  Directory& children = item.parent()->dir_children();
+  std::unique_lock guard(children.mutex);
+  if (item.truncate_pending() != pending) {
+    item.set_truncate_pending(pending);
+    ++children.mutation_epoch;
+  }
+}
+
+struct InodeWriteState {
+  uint64_t size;
+  bool truncate_pending;
+};
+
+InodeWriteState begin_inode_write(InodeFile& item) {
+  Directory& children = item.parent()->dir_children();
+  std::unique_lock guard(children.mutex);
+  const InodeWriteState previous{item.fsize.load(std::memory_order_relaxed),
+                                item.truncate_pending()};
+  // LOOKUP must not restore the remote object's old length during O_TRUNC
+  // and sequential writes. Keep LIST from overwriting the local size until
+  // the first flush publishes the committed metadata.
+  item.set_truncate_pending(true);
+  item.set_fsize(0);
+  ++children.mutation_epoch;
+  return previous;
+}
+
+void cancel_inode_write(InodeFile& item, InodeWriteState previous) {
+  Directory& children = item.parent()->dir_children();
+  std::unique_lock guard(children.mutex);
+  item.set_fsize(previous.size);
+  item.set_truncate_pending(previous.truncate_pending);
+  ++children.mutation_epoch;
 }
 
 fuse_ino_t install_item(State& state, fuse_ino_t parent,
@@ -5119,7 +5201,8 @@ fuse_ino_t install_item(State& state, fuse_ino_t parent,
                         bool exclusive = false,
                         bool pending = false,
                         bool lookup = false,
-                        bool defer_file_over_directory = false) {
+                        bool defer_file_over_directory = false,
+                        const uint64_t* mutation_epoch = nullptr) {
   InodeBase& parent_item = inode_item(state, parent);
   if (!parent_item.directory()) {
     throw std::system_error(ENOTDIR, std::generic_category(), "directory");
@@ -5131,6 +5214,10 @@ fuse_ino_t install_item(State& state, fuse_ino_t parent,
   fuse_ino_t invalidate_inode = 0;
   {
     std::unique_lock guard(children.mutex);
+    if (mutation_epoch && children.remote_mutations) throw DirectoryListingDeferred{};
+    if (mutation_epoch && children.mutation_epoch != *mutation_epoch) {
+      throw DirectoryListingChanged{};
+    }
     if (parent_item.detached()) {
       throw std::system_error(ESTALE, std::generic_category(), "directory");
     }
@@ -5182,6 +5269,8 @@ fuse_ino_t install_item(State& state, fuse_ino_t parent,
     if (listing_generation != 0) {
       item->listing_generation.store(
           listing_generation, std::memory_order_relaxed);
+    } else {
+      ++children.mutation_epoch;
     }
     if (!child.directory && item->regular() &&
         !item->pending() && !item->truncate_pending()) {
@@ -5247,11 +5336,16 @@ DirectoryGuards lock_directories(State& state,
 }
 
 void prune_directory_generation(State& state, InodeBase& directory,
-                                uint32_t generation) {
+                                uint32_t generation,
+                                const uint64_t* mutation_epoch = nullptr) {
   std::vector<InodeBase*> stale;
   {
     Directory& children = directory.dir_children();
     std::unique_lock guard(children.mutex);
+    if (mutation_epoch && children.remote_mutations) throw DirectoryListingDeferred{};
+    if (mutation_epoch && children.mutation_epoch != *mutation_epoch) {
+      throw DirectoryListingChanged{};
+    }
     stale.reserve(children.size());
     for (size_t slot = 0; slot < children.end_i(); ++slot) {
       if (children.is_deleted(slot)) {
@@ -5330,6 +5424,7 @@ struct AsyncDirectoryRefresh {
   std::string key;
   std::string token;
   uint32_t generation = 0;
+  uint64_t mutation_epoch = 0;
   std::vector<ListedChild> conflicts;
   std::unique_ptr<AsyncSignedS3Request> request;
 
@@ -5378,7 +5473,7 @@ struct AsyncDirectoryRefresh {
       }
       for (ListedChild& child : page.children) {
         if (install_item(listing->state, listing->inode, child, listing->generation,
-                          false, false, false, true) == 0) {
+                          false, false, false, true, &listing->mutation_epoch) == 0) {
           listing->conflicts.push_back(std::move(child));
         }
       }
@@ -5401,16 +5496,44 @@ struct AsyncDirectoryRefresh {
           }
         }
         if (!directory_won) {
-          install_item(listing->state, listing->inode, std::move(child), listing->generation);
+          install_item(listing->state, listing->inode, std::move(child), listing->generation,
+                       false, false, false, false, &listing->mutation_epoch);
         }
       }
-      prune_directory_generation(listing->state, *listing->pin, listing->generation);
+      prune_directory_generation(listing->state, *listing->pin, listing->generation,
+                                 &listing->mutation_epoch);
       const uint64_t now = fuse_monotonic_ns();
       const uint64_t ttl = listing->state.config.directory_cache_ns;
-      listing->pin->expire.store(ttl > UINT64_MAX - now ? UINT64_MAX : now + ttl,
-                                 std::memory_order_release);
+      {
+        std::unique_lock guard(children.mutex);
+        if (children.remote_mutations) throw DirectoryListingDeferred{};
+        if (children.mutation_epoch != listing->mutation_epoch) throw DirectoryListingChanged{};
+        listing->pin->expire.store(ttl > UINT64_MAX - now ? UINT64_MAX : now + ttl,
+                                   std::memory_order_release);
+      }
       sweep_retired_items(listing->state);
       listing->finish();
+    } catch (const DirectoryListingDeferred&) {
+      listing->finish();
+    } catch (const DirectoryListingChanged&) {
+      // An old LIST must neither erase a completed local create nor resurrect
+      // a local unlink. Restart without marking the stale snapshot complete.
+      Directory& children = listing->pin->dir_children();
+      {
+        std::unique_lock guard(children.mutex);
+        listing->mutation_epoch = children.mutation_epoch;
+        listing->generation = ++children.listing_generation;
+        if (listing->generation == 0) {
+          listing->generation = ++children.listing_generation;
+          for (auto [name, child] : children) {
+            (void)name;
+            child->listing_generation.store(0, std::memory_order_relaxed);
+          }
+        }
+      }
+      listing->token.clear();
+      listing->conflicts.clear();
+      listing->next_page();
     } catch (...) {
       listing->finish(std::current_exception());
     }
@@ -5427,6 +5550,7 @@ bool await_directory_refresh(State& state, FuseReactor& reactor, fuse_ino_t inod
   bool start = false;
   {
     std::unique_lock guard(children.mutex);
+    if (children.remote_mutations) return false;
     if (!force && !children.refreshing.load(std::memory_order_acquire) &&
         item.expire.load(std::memory_order_acquire) > fuse_monotonic_ns()) {
       return false;
@@ -5438,6 +5562,7 @@ bool await_directory_refresh(State& state, FuseReactor& reactor, fuse_ino_t inod
     if (!children.refreshing.load(std::memory_order_relaxed)) {
       start = true;
       children.refreshing.store(true, std::memory_order_release);
+      listing->mutation_epoch = children.mutation_epoch;
       listing->generation = ++children.listing_generation;
       if (listing->generation == 0) {
         listing->generation = ++children.listing_generation;
@@ -5463,8 +5588,7 @@ bool await_directory_refresh(State& state, FuseReactor& reactor, fuse_ino_t inod
   return true;
 }
 
-void refresh_directory_locked(State& state, fuse_ino_t inode,
-                              bool force = false) {
+void refresh_directory_once(State& state, fuse_ino_t inode, bool force) {
   const uint64_t now = fuse_monotonic_ns();
   std::string key;
   InodeBase& directory = inode_item(state, inode);
@@ -5476,13 +5600,19 @@ void refresh_directory_locked(State& state, fuse_ino_t inode,
   }
   key = item_key(state, directory);
   Directory& children = directory.dir_children();
-  uint32_t generation = ++children.listing_generation;
-  if (generation == 0) {
-    generation = ++children.listing_generation;
+  uint64_t mutation_epoch;
+  uint32_t generation;
+  {
     std::unique_lock guard(children.mutex);
-    for (auto [name, child] : children) {
-      (void)name;
-      child->listing_generation.store(0, std::memory_order_relaxed);
+    if (children.remote_mutations) return;
+    mutation_epoch = children.mutation_epoch;
+    generation = ++children.listing_generation;
+    if (generation == 0) {
+      generation = ++children.listing_generation;
+      for (auto [name, child] : children) {
+        (void)name;
+        child->listing_generation.store(0, std::memory_order_relaxed);
+      }
     }
   }
   cache_register_directory(state, static_cast<InodeDir&>(directory));
@@ -5502,7 +5632,7 @@ void refresh_directory_locked(State& state, fuse_ino_t inode,
           for (ListedChild& child : page) {
             const fuse_ino_t installed = install_item(
                 state, inode, child, generation,
-                false, false, false, true);
+                false, false, false, true, &mutation_epoch);
             if (installed == 0) {
               file_conflicts.push_back(std::move(child));
             }
@@ -5523,21 +5653,41 @@ void refresh_directory_locked(State& state, fuse_ino_t inode,
         }
       }
       if (!directory_won) {
-        install_item(state, inode, std::move(child), generation);
+        install_item(state, inode, std::move(child), generation,
+                     false, false, false, false, &mutation_epoch);
       }
     }
-    prune_directory_generation(state, inode_item(state, inode), generation);
+    prune_directory_generation(state, inode_item(state, inode), generation, &mutation_epoch);
     const uint64_t refreshed = fuse_monotonic_ns();
     const uint64_t ttl       = state.config.directory_cache_ns;
     const uint64_t expire    = ttl > UINT64_MAX - refreshed
                                    ? UINT64_MAX
                                    : refreshed + ttl;
-    inode_item(state, inode).expire.store(expire, std::memory_order_relaxed);
+    {
+      std::unique_lock guard(children.mutex);
+      if (children.remote_mutations) throw DirectoryListingDeferred{};
+      if (children.mutation_epoch != mutation_epoch) throw DirectoryListingChanged{};
+      directory.expire.store(expire, std::memory_order_relaxed);
+    }
   } catch (...) {
     invalidate_directory(state, inode);
     throw;
   }
   sweep_retired_items(state);
+}
+
+void refresh_directory_locked(State& state, fuse_ino_t inode,
+                              bool force = false) {
+  for (;;) {
+    try {
+      refresh_directory_once(state, inode, force);
+      return;
+    } catch (const DirectoryListingDeferred&) {
+      return;
+    } catch (const DirectoryListingChanged&) {
+      force = true;
+    }
+  }
 }
 
 void refresh_directory(State& state, fuse_ino_t inode, bool force = false) {
@@ -5954,6 +6104,9 @@ void publish_written_metadata(OpenHandle& handle,
   }
   InodeFile& item = *handle.item;
   InodeMetadataGuard metadata_guard(item);
+  Directory& children = item.parent()->dir_children();
+  std::unique_lock directory_guard(children.mutex);
+  ++children.mutation_epoch;
   item.fsize.store(handle.stream_offset, std::memory_order_relaxed);
   item.mtime.store(mtime, std::memory_order_relaxed);
   item.set_page_cache_valid(!handle.page_cache_store_failed);
@@ -5961,6 +6114,7 @@ void publish_written_metadata(OpenHandle& handle,
   handle.generation_epoch = publish_inode_generation(
       item, object_generation(handle.etag, handle.version_id,
                               handle.stream_offset, mtime));
+  item.set_truncate_pending(false);
 }
 
 void update_written_metadata(State& state, OpenHandle& handle,
@@ -9142,7 +9296,7 @@ struct AsyncTruncate {
 
   void finish(const ObjectMetadata* metadata) {
     publish_written_metadata(handle, committed, metadata);
-    if (!state.atomic_o_trunc) pin->set_truncate_pending(true);
+    if (!state.atomic_o_trunc) update_truncate_pending(*pin, true);
     struct stat status{};
     fill_inode_stat(state, handle.inode, *pin, status);
     status.st_size = 0;
@@ -9265,7 +9419,7 @@ void ngs3fs_setattr(fuse_req_t request, fuse_ino_t inode,
         const Response response = put_object(state, truncated, nullptr);
         update_written_metadata(state, truncated, response);
         if (!state.atomic_o_trunc) {
-          inode_item(state, inode).set_truncate_pending(true);
+          update_truncate_pending(inode_item(state, inode), true);
         }
         handle_size = 0;
       } else if (!handle->writable) {
@@ -9323,6 +9477,7 @@ struct AsyncOpen {
   uint64_t registration_deadline = 0;
   bool registered = false;
   bool truncate_pending = false;
+  std::optional<InodeWriteState> write_started;
   bool keep_cache = false;
   bool generation_conflict = false;
   bool write_prefetch_drained = false;
@@ -9345,6 +9500,7 @@ struct AsyncOpen {
   ~AsyncOpen() {
     if (identity.owns_lock()) identity.unlock();
     if (handle) {
+      if (write_started) cancel_inode_write(*handle->item, *write_started);
       if (handle->current_reservation) {
         release_part_budget(state);
         handle->current_reservation = false;
@@ -9384,7 +9540,6 @@ struct AsyncOpen {
       truncate_pending = item.truncate_pending();
       register_open_handle(state, inode, *handle, false);
       registered = true;
-      if (handle->writable) item.set_truncate_pending(false);
       return true;
     } catch (const std::system_error& error) {
       if (error.code().value() != EAGAIN) throw;
@@ -9634,6 +9789,7 @@ struct AsyncOpen {
       handle->size = 0;
       handle->stream_offset = 0;
       handle->writer = make_file_writer(state, *handle);
+      write_started = begin_inode_write(*handle->item);
     }
     identity.unlock();
     file.fh = reinterpret_cast<uint64_t>(handle.get());
@@ -9694,6 +9850,7 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
   bool keep_cache      = false;
   std::unique_ptr<OpenHandle> handle;
   std::string registered_path;
+  std::optional<InodeWriteState> write_started;
   try {
     handle = std::make_unique<OpenHandle>();
     handle->writable = writable;
@@ -9703,9 +9860,6 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
     }
     const bool truncate_pending = item.truncate_pending();
     register_open_handle(state, inode, *handle);
-    if (writable) {
-      inode_item(state, inode).set_truncate_pending(false);
-    }
     registered = true;
     std::shared_lock identity_guard(handle->identity_mutex);
     registered_path = handle->object_path;
@@ -9781,6 +9935,7 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
       handle->size = 0;
       handle->stream_offset = 0;
       handle->writer = make_file_writer(state, *handle);
+      write_started = begin_inode_write(*handle->item);
     }
 
     identity_guard.unlock();
@@ -9795,6 +9950,8 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
     if (fuse_reply_open(request, file) != 0) {
       std::unique_ptr<OpenHandle> failed_handle(handle_optional(file));
       file->fh = 0;
+      if (write_started) cancel_inode_write(*failed_handle->item, *write_started);
+      write_started.reset();
       if (failed_handle->current_reservation) {
         release_part_budget(state);
         failed_handle->current_reservation = false;
@@ -9811,6 +9968,7 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
     if (budget_reserved) {
       release_part_budget(state);
     }
+    if (write_started) cancel_inode_write(*handle->item, *write_started);
     if (registered) {
       unregister_open_handle(state, registered_path, *handle);
     }
@@ -9933,6 +10091,7 @@ void create_cached_file(fuse_req_t request, fuse_ino_t parent, const char* name,
       handle->current_reservation = true;
     }
     handle->writer = make_file_writer(state, *handle);
+    begin_inode_write(*handle->item);
 
     fuse_entry_param entry{};
     entry.ino           = inode;
@@ -10167,7 +10326,11 @@ struct UncachedPrefetch {
         assert(read_pins != 0);
         --read_pins;
       }
-      if (retire_when_idle && complete && !checksum_retrying && read_pins == 0) {
+      const bool published_all = !checksum_hold && published_prefix == length;
+      if ((retire_when_idle || published_all) && complete &&
+          !checksum_retrying && read_pins == 0) {
+        // The last STORE needs only final truncation. Punching its suffix
+        // immediately before truncating repeats the retirement syscall path.
         released = std::move(storage);
       } else if (storage && read_pins == 0 && !checksum_hold && !checksum_retrying) {
         const size_t page = size_t(::sysconf(_SC_PAGESIZE));
@@ -13309,6 +13472,7 @@ void UncachedFileWriter::write(State& state, OpenHandle& handle,
     }
     handle.stream_offset     = end;
     handle.size              = end;
+    handle.item->set_fsize(end);
     handle.write_in_progress = false;
     notify_handle(handle);
     if (state.config.stats_interval_seconds != 0) {
@@ -13731,6 +13895,7 @@ void CachedFileWriter::write(State& state, OpenHandle& handle,
       handle.cache_entry->publish_dirty(start, length, end);
       handle.stream_offset = end;
       handle.size          = end;
+      handle.item->set_fsize(end);
       submit_ready_cached_parts(state, handle, false);
     } catch (const std::system_error& error) {
       handle.write_in_progress = false;
@@ -14657,6 +14822,7 @@ struct AsyncWriteRequest {
       if (error == 0) {
         handle.stream_offset = end;
         handle.size = end;
+        handle.item->set_fsize(end);
       } else {
         fail_write(handle, error);
       }
@@ -15708,6 +15874,12 @@ void release_write_local_no_network(State& state, OpenHandle& handle) noexcept {
     }
   }
   // Removing a pending dentry must precede dropping the last inode open count.
+  if (!preserve && handle.write_state != WRITE_SEALED && handle.writer &&
+      handle.item && !handle.item->detached()) {
+    update_truncate_pending(*handle.item, false);
+    handle.item->parent()->expire.store(0, std::memory_order_release);
+    handle.item->set_page_cache_valid(false);
+  }
   if (discard_pending) discard_pending_inode(state, handle);
   if (registered) unregister_open_handle(state, handle.object_path, handle);
   else release_open_inode(state, handle);
@@ -17454,7 +17626,9 @@ struct AsyncDirectoryAction {
               ListedChild child;
               child.name = name;
               child.directory = true;
-              const fuse_ino_t inode = install_item(state, parent, std::move(child), 0, true, false, true);
+              // The successful conditional PUT established exclusivity at S3.
+              // An overlapping LIST may already have cached this same marker.
+              const fuse_ino_t inode = install_item(state, parent, std::move(child), 0, false, false, true);
               fuse_entry_param entry{};
               entry.ino = inode;
               entry.generation = 1;
@@ -17595,6 +17769,7 @@ struct AsyncRename {
   unsigned phase = 0;
   InodePin source_parent, destination_parent, source, destination;
   DirectoryGuards locks;
+  DirectoryPublicationGuard publication;
   size_t lock_index = 0;
   DirectoryContinuation listing;
   AsyncCacheRetirement retirement;
@@ -17926,6 +18101,7 @@ struct AsyncRename {
           phase = 8;
           break;
         case 8:
+          publication.start(*source_parent, *destination_parent, source.get(), destination.get());
           if (state.local_cache && !source->directory()) {
             if (!readers_initialized) {
               readers.snapshot(state, reactor, source_path);
@@ -18114,6 +18290,9 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
           }
         }
       }
+      DirectoryPublicationGuard publication;
+      publication.start(inode_item(state, parent), inode_item(state, new_parent),
+                        source.get(), destination.get());
       const ObjectMetadata metadata = head_object(state, source_path);
       rename_remote_object(
           state, source_key, metadata.size, metadata.etag,
@@ -18150,6 +18329,8 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
         handle->key.reserve(destination_key.size());
       }
     }
+    DirectoryPublicationGuard publication;
+    publication.start(inode_item(state, parent), inode_item(state, new_parent));
     const ObjectMetadata metadata = head_object(state, source_path);
     std::string hidden_key;
     std::string hidden_path;

@@ -224,6 +224,8 @@ EOF
 stress_worker() {
   local worker=$1
   local iteration
+  local source_dir=$backend_prefix/external-fixtures-$worker
+  local target_dir=$mount_dir/external-fixtures-$worker
   trap - EXIT
   for ((iteration = 1; iteration <= stress_iterations; ++iteration)); do
     if ! case_skipped fuse_test_unlink; then
@@ -236,13 +238,13 @@ stress_worker() {
       python3 "$checks" fuse_test_rmdir "$mount_dir"
     fi
     if ! case_skipped fuse_test_open_read; then
-      python3 "$checks" fuse_test_open_read "$backend_prefix" "$mount_dir"
+      python3 "$checks" fuse_test_open_read "$source_dir" "$target_dir"
     fi
     if ! case_skipped fuse_test_open_write; then
-      python3 "$checks" fuse_test_open_write "$backend_prefix" "$mount_dir"
+      python3 "$checks" fuse_test_open_write "$source_dir" "$target_dir"
     fi
     if ! case_skipped fuse_test_readdir; then
-      python3 "$checks" fuse_test_readdir "$backend_prefix" "$mount_dir" \
+      python3 "$checks" fuse_test_readdir "$source_dir" "$target_dir" \
         --inode-check nonzero
     fi
   done
@@ -253,6 +255,14 @@ stress_worker() {
 echo "libfuse parallel stress: $stress_jobs workers x $stress_iterations iterations"
 stress_start=$SECONDS
 stress_pids=()
+# These upstream helpers mutate the server's backing directory directly.
+# Isolate that fixture setup from another worker's already-in-flight LIST;
+# Cross-client visibility is best effort, not a strong guarantee: an in-flight
+# LIST need not observe a subsequent external mutation.
+# Mount-originated unlink/mkdir/rmdir above still contend in the SAME directory.
+for ((worker = 1; worker <= stress_jobs; ++worker)); do
+  mkdir "$mount_dir/external-fixtures-$worker"
+done
 for ((worker = 1; worker <= stress_jobs; ++worker)); do
   stress_worker "$worker" &
   stress_pids+=("$!")
@@ -266,6 +276,11 @@ done
 if (( stress_failed != 0 )); then
   echo "parallel libfuse stress failed" >&2
   exit 1
+fi
+
+if [[ $client == ngs3fs ]]; then
+  python3 "$project_dir/tests/rename_list_stress.py" \
+    "$mount_dir" "$stress_jobs" "$stress_iterations"
 fi
 
 echo "libfuse syscall stress: $stress_iterations iterations"
