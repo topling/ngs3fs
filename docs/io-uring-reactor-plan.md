@@ -244,6 +244,30 @@ with these gates; re-review implementation ordering before enabling publication.
   1404.563/1390.237 ms; uring-4 1.973/1.470 ms, wall 1144.694/1020.419 ms.
   These local measurements do not establish runner parity: legacy still has
   lower wall time. Continue the runner comparison and hotspot analysis.
+- Performance correction: withdraw the connection-busy speculative downgrade
+  from `cfa4b3c`. Its RANDOM-advice GET count more than doubled versus legacy,
+  and neither CPU nor wall time was competitive. Restore queued speculative
+  transfers and the single connection notification queue; remove the tests
+  that mandated that withdrawn admission policy. Keep the demand-budget floor
+  fix and all memory, checksum, STORE, and overlap safety tests. Compare this
+  simpler combination before considering a different staging architecture.
+- Bounded experiment: for memory-only range sinks, drain the already received
+  pipe batch directly into memfd on its reactor callback. This removes a second
+  io-wq dispatch for bytes that no longer await the network, without allocating
+  another payload buffer or changing publication/retry ownership. Socket I/O
+  stays asynchronous and disk-cache sinks retain background writes. Keep only
+  if A/B evidence improves the CPU/latency tradeoff; maximum callback batch is
+  the existing preferred-I/O staging size. Memory allocation/reclaim itself can
+  still incur kernel work, so this is not a claim of strict nonblocking memory.
+- Reject the inline-memfd experiment: local RANDOM-advice uring-1 median wall
+  time rose from 1828.178 to 2406.446 ms while CPU/op changed only from 1.353
+  to 1.333 ms. Four reactors improved, but that does not justify degrading the
+  required single-reactor configuration. The experiment is removed; memory
+  and disk writes retain their previous asynchronous transport path.
+- After removing both rejected experiments, the normal regression suite passed
+  74/74 (81.32 s). The two removed tests asserted the withdrawn connection-busy
+  downgrade policy, not filesystem correctness. All earlier correctness fixes
+  and the demand-budget capacity regression remain in place.
 
 - Mount and per-file budget admission now cover every production prefetch
   allocation. Limits are exposed and validated; explicit per-file limits are
