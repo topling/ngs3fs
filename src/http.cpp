@@ -39,6 +39,7 @@ void transfer_pipe_to_file(Pipe& source, RangeFileSink& destination,
                            Response& response);
 
 constexpr size_t kMaximumErrorResponseSize = 64U * 1024U;
+constexpr size_t kMaxResponseHeaderBytes = 64U * 1024U;
 
 struct SslContextDeleter {
   void operator()(SSL_CTX* context) const noexcept {
@@ -598,6 +599,7 @@ uint64_t http2_monotonic_ns() {
 }
 
 class Http2RangeDownload;
+class Http2AsyncOperation;
 
 class Http2Client final : public HttpClient {
  public:
@@ -655,8 +657,13 @@ class Http2Client final : public HttpClient {
   bool probe_server();
   void consume(const RangeResponse& response) override;
 
+  std::unique_ptr<AsyncHttpOperation> make_async_request(
+      IoExecutor& executor, AsyncHttpRequest request,
+      AsyncHttpOperation::Complete complete, void* context) override;
+
  private:
   friend class Http2RangeDownload;
+  friend class Http2AsyncOperation;
 
   struct UploadSource {
     int fd = -1;
@@ -666,6 +673,8 @@ class Http2Client final : public HttpClient {
     size_t sent = 0;
     bool seek = true;
     bool end_stream = true;
+    bool asynchronous = false;
+    bool ready = true;
   };
 
   struct ActiveRequest {
@@ -679,10 +688,19 @@ class Http2Client final : public HttpClient {
     UploadSource* upload = nullptr;
     bool capture_headers = true;
     bool measure_transport = false;
+    std::vector<std::byte>* copied_data = nullptr;
+    std::array<std::byte, kFrameHeaderSize> upload_frame{};
+    size_t upload_frame_length = 0;
+    uint64_t upload_frame_offset = 0;
+    bool upload_frame_ready = false;
+    size_t header_bytes = 0;
+    std::exception_ptr callback_error;
   };
 
   std::shared_ptr<TlsTunnel> tunnel;
   UniqueFd socket;
+  sockaddr_storage peer{};
+  socklen_t peer_length = 0;
   std::string authority;
   std::string host;
   uint16_t port = 0;
@@ -785,33 +803,42 @@ class Http2Client final : public HttpClient {
       return 0;
     }
 
-    constexpr std::string_view status_name = ":status";
-    if (name_length == status_name.size() &&
-        memcmp(name, status_name.data(), name_length) == 0) {
-      int status = 0;
-      const char* first = reinterpret_cast<const char*>(value);
-      const auto parsed = std::from_chars(
-          first, first + value_length, status);
-      if (parsed.ec == std::errc{}) {
-        self.active->response.status = status;
+    try {
+      const size_t remaining = kMaxResponseHeaderBytes - self.active->header_bytes;
+      if (name_length > remaining || value_length > remaining - name_length) {
+        throw std::runtime_error("HTTP/2 response headers exceed 64 KiB");
       }
-    } else if (name_length == sizeof("content-range") - 1 &&
-               memcmp(name, "content-range", name_length) == 0) {
-      self.active->response.content_range.assign(
-          reinterpret_cast<const char*>(value), value_length);
-      if (self.active->capture_headers) {
+      self.active->header_bytes += name_length + value_length;
+      constexpr std::string_view status_name = ":status";
+      if (name_length == status_name.size() &&
+          memcmp(name, status_name.data(), name_length) == 0) {
+        int status = 0;
+        const char* first = reinterpret_cast<const char*>(value);
+        const auto parsed = std::from_chars(first, first + value_length, status);
+        if (parsed.ec == std::errc{} && parsed.ptr == first + value_length) {
+          self.active->response.status = status;
+        }
+      } else if (name_length == sizeof("content-range") - 1 &&
+                 memcmp(name, "content-range", name_length) == 0) {
+        self.active->response.content_range.assign(
+            reinterpret_cast<const char*>(value), value_length);
+        if (self.active->capture_headers) {
+          self.active->response.headers.insert_or_assign(
+              ssostr<32>("content-range"),
+              ssostr<32>(reinterpret_cast<const char*>(value), value_length));
+        }
+      } else if (self.active->capture_headers) {
+        ssostr<32> key(reinterpret_cast<const char*>(name), name_length);
+        ssostr<32> header_value(
+            reinterpret_cast<const char*>(value), value_length);
         self.active->response.headers.insert_or_assign(
-            ssostr<32>("content-range"),
-            ssostr<32>(reinterpret_cast<const char*>(value), value_length));
+            std::move(key), std::move(header_value));
       }
-    } else if (self.active->capture_headers) {
-      ssostr<32> key(reinterpret_cast<const char*>(name), name_length);
-      ssostr<32> header_value(
-          reinterpret_cast<const char*>(value), value_length);
-      self.active->response.headers.insert_or_assign(
-          std::move(key), std::move(header_value));
+      return 0;
+    } catch (...) {
+      self.active->callback_error = std::current_exception();
+      return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
-    return 0;
   }
 
   static ssize_t on_send(nghttp2_session*, const uint8_t* data,
@@ -846,6 +873,9 @@ class Http2Client final : public HttpClient {
                              size_t length, uint32_t* flags,
                              nghttp2_data_source* source, void*) {
     auto& upload = *static_cast<UploadSource*>(source->ptr);
+    if (upload.asynchronous && !upload.ready) {
+      return NGHTTP2_ERR_DEFERRED;
+    }
     const size_t count = std::min(length, upload.remaining);
     *flags |= NGHTTP2_DATA_FLAG_NO_COPY;
     if (count == upload.remaining) {
@@ -865,6 +895,20 @@ class Http2Client final : public HttpClient {
     auto& upload = *static_cast<UploadSource*>(source->ptr);
     if (frame->data.padlen != 0 || length > upload.remaining) {
       return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    if (upload.asynchronous) {
+      if (self.active == nullptr || self.active->upload_frame_ready) {
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+      }
+      memcpy(self.active->upload_frame.data(), frame_header, kFrameHeaderSize);
+      self.active->upload_frame_length = length;
+      self.active->upload_frame_offset = upload.offset;
+      self.active->upload_frame_ready = true;
+      upload.offset += length;
+      upload.remaining -= length;
+      upload.sent += length;
+      upload.ready = false;
+      return NGHTTP2_ERR_PAUSE;
     }
     try {
       send_all(
@@ -908,7 +952,8 @@ class Http2Client final : public HttpClient {
       return 0;
     }
     if (self.active == nullptr || stream_id != self.active->stream_id ||
-        self.active->destination == nullptr) {
+        (self.active->destination == nullptr &&
+         self.active->copied_data == nullptr)) {
       return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     try {
@@ -916,9 +961,14 @@ class Http2Client final : public HttpClient {
                        self.active->response.body_bytes) {
         return NGHTTP2_ERR_CALLBACK_FAILURE;
       }
-      write_all(
-          self.active->destination->write_fd(),
-          std::span(reinterpret_cast<const std::byte*>(data), length));
+      const auto* bytes = reinterpret_cast<const std::byte*>(data);
+      if (self.active->copied_data != nullptr) {
+        self.active->copied_data->insert(
+            self.active->copied_data->end(), bytes, bytes + length);
+      } else {
+        write_all(self.active->destination->write_fd(),
+                  std::span(bytes, length));
+      }
     } catch (...) {
       return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
@@ -1064,6 +1114,10 @@ class Http2RangeDownload final : public RangeDownload {
   Response finish() override {
     try {
       while (!request_.closed) {
+        if (destination_.cancelled()) {
+          abort();
+          return std::move(request_.response);
+        }
         receive_one();
       }
       if (request_.response.status < 300) {
@@ -1181,6 +1235,11 @@ Http2Client::Http2Client(UniqueFd connected_socket,
       probe_timeout_ms(connected_probe_timeout_ms),
       receive_buffer_size(connected_receive_buffer_size),
       tls(tunnel != nullptr) {
+  peer_length = sizeof(peer);
+  if (::getpeername(socket.get(), reinterpret_cast<sockaddr*>(&peer),
+                    &peer_length) != 0) {
+    peer_length = 0;
+  }
   Pipe probe = Pipe::create(kPreferredIoSize);
   maximum_frame_size = uint32_t(std::clamp<size_t>(
       probe.capacity(), 16U * 1024U,
@@ -1905,7 +1964,6 @@ void Http2Client::consume(const RangeResponse& response) {
 
 
 // HTTP/1.1 client.
-constexpr size_t kMaxResponseHeaderBytes = 64U * 1024U;
 constexpr size_t kHttp1ReadSize          = 1024;
 
 [[noreturn]] void http1_throw_errno(const char* operation);
@@ -1968,7 +2026,7 @@ void write_range_file(RangeFileSink& destination,
   while (written != bytes.size()) {
     const ssize_t result = io_pwrite(
         destination.fd(), bytes.data() + written, bytes.size() - written,
-        off_t(destination.offset()));
+        off_t(destination.offset()), 0, destination.background_write());
     if (result > 0) {
       written += size_t(result);
       destination.advance(size_t(result));
@@ -2002,7 +2060,8 @@ void transfer_pipe_to_file(Pipe& source, RangeFileSink& destination,
       do {
         result = io_splice(
             source.read_fd(), nullptr, destination.fd(), &offset,
-            length - transferred, SPLICE_F_MOVE | SPLICE_F_MORE);
+            length - transferred, SPLICE_F_MOVE | SPLICE_F_MORE, 0,
+            destination.background_write());
       } while (result < 0 && errno == EINTR);
       if (result > 0) {
         const size_t moved = size_t(result);
@@ -2141,10 +2200,12 @@ class ResponseParser {
   ResponseParser(Response& response, Pipe* destination,
                  RangeFileSink* file_destination,
                  size_t max_body_bytes, bool head_response,
-                 bool capture_headers, bool capture_content_range)
+                 bool capture_headers, bool capture_content_range,
+                 std::vector<std::byte>* staged_body = nullptr)
       : response_(response),
         destination_(destination),
         file_destination_(file_destination),
+        staged_body_(staged_body),
         max_body_bytes_(max_body_bytes),
         captured_body_(destination == nullptr && file_destination == nullptr
                            ? &response.body : nullptr),
@@ -2279,8 +2340,9 @@ class ResponseParser {
         value.response_.status != 101) {
       return 0;
     }
-    llhttp_pause(parser);
-    return 0;
+    // A callback must return HPE_PAUSED. Calling llhttp_pause here and then
+    // returning success can let llhttp consume the coalesced body as well.
+    return HPE_PAUSED;
   }
 
   static int on_header_value_complete(llhttp_t* parser) {
@@ -2292,7 +2354,8 @@ class ResponseParser {
                      size_t length) {
     auto& value = self(parser);
     const bool error_response = value.response_.status >= 300 &&
-        (value.destination_ != nullptr || value.file_destination_ != nullptr);
+        (value.destination_ != nullptr || value.file_destination_ != nullptr ||
+         value.staged_body_ != nullptr);
     const size_t body_limit = error_response
         ? kMaximumErrorResponseSize : value.max_body_bytes_;
     if (value.response_.body_bytes > body_limit ||
@@ -2304,7 +2367,8 @@ class ResponseParser {
     try {
       const std::span bytes(reinterpret_cast<const std::byte*>(data), length);
       std::vector<std::byte>* captured = error_response
-          ? &value.response_.body : value.captured_body_;
+          ? &value.response_.body : value.staged_body_ != nullptr
+              ? value.staged_body_ : value.captured_body_;
       if (captured != nullptr) {
         const size_t old_size = captured->size();
         captured->resize(old_size + length);
@@ -2382,6 +2446,7 @@ class ResponseParser {
   Response& response_;
   Pipe* destination_;
   RangeFileSink* file_destination_;
+  std::vector<std::byte>* staged_body_;
   size_t max_body_bytes_;
   std::vector<std::byte>* captured_body_;
   llhttp_t parser_{};
@@ -2449,6 +2514,7 @@ struct Http1HeaderRead {
 };
 
 class Http1RangeDownload;
+class Http1AsyncOperation;
 
 class Http1Client final : public HttpClient {
  public:
@@ -2466,7 +2532,13 @@ class Http1Client final : public HttpClient {
         io_timeout_ms(connected_io_timeout_ms),
         connect_timeout_ms(connected_connect_timeout_ms),
         receive_buffer_size(connected_receive_buffer_size),
-        tls(tunnel != nullptr) {}
+        tls(tunnel != nullptr) {
+    peer_length = sizeof(peer);
+    if (::getpeername(socket.get(), reinterpret_cast<sockaddr*>(&peer),
+                      &peer_length) != 0) {
+      peer_length = 0;
+    }
+  }
 
   Response get_range(std::string_view path, uint64_t offset,
                      size_t length, Pipe& destination,
@@ -2509,11 +2581,18 @@ class Http1Client final : public HttpClient {
 
   void consume(const Response&) override {}
 
+  std::unique_ptr<AsyncHttpOperation> make_async_request(
+      IoExecutor& executor, AsyncHttpRequest request,
+      AsyncHttpOperation::Complete complete, void* context) override;
+
  private:
   friend class Http1RangeDownload;
+  friend class Http1AsyncOperation;
 
   std::shared_ptr<TlsTunnel> tunnel;
   UniqueFd socket;
+  sockaddr_storage peer{};
+  socklen_t peer_length = 0;
   std::string authority;
   std::string host;
   std::string request_head;
@@ -2948,6 +3027,10 @@ class Http1RangeDownload final : public RangeDownload {
     try {
       receive_headers();
       while (!complete_) {
+        if (destination_.cancelled()) {
+          abort();
+          return std::move(response_);
+        }
         receive_body_once();
       }
       if (response_.status < 300) {
@@ -3198,6 +3281,1096 @@ class Http1RangeDownload final : public RangeDownload {
   bool complete_ = false;
   bool done_ = false;
 };
+
+UniqueFd http_reconnect_socket(const sockaddr_storage& peer,
+                               socklen_t peer_length, size_t receive_buffer) {
+  if (peer_length == 0 || (peer.ss_family != AF_INET && peer.ss_family != AF_INET6)) {
+    throw std::system_error(ENOTCONN, std::generic_category(),
+                            "HTTP peer address is unavailable");
+  }
+  UniqueFd socket(::socket(peer.ss_family,
+      SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, IPPROTO_TCP));
+  if (!socket) {
+    throw std::system_error(errno, std::generic_category(), "socket(HTTP reconnect)");
+  }
+  if (!configure_socket_receive_buffer(socket.get(), receive_buffer)) {
+    socket.reset(::socket(peer.ss_family,
+        SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, IPPROTO_TCP));
+    if (!socket) {
+      throw std::system_error(errno, std::generic_category(), "socket(HTTP reconnect)");
+    }
+  }
+  return socket;
+}
+
+class HttpAsyncOperation : public AsyncHttpOperation {
+ public:
+  HttpAsyncOperation(IoExecutor& executor, AsyncHttpRequest request,
+                     Complete complete, void* context, int timeout_ms)
+      : executor_(executor), request_(std::move(request)),
+        complete_(complete), context_(context), timeout_ms_(timeout_ms) {
+    if (complete == nullptr) {
+      throw std::invalid_argument("missing HTTP completion");
+    }
+  }
+
+  void start() noexcept final {
+    if (started_) {
+      return;
+    }
+    started_ = true;
+    advancing_ = true;
+    try {
+      check_cancelled();
+      prepare_upload();
+      begin();
+    } catch (...) {
+      finish(std::current_exception());
+    }
+  }
+
+  void cancel() noexcept final {
+    cancelled_ = true;
+    if (pending_) {
+      executor_.cancel(io_);
+    } else if (started_ && !advancing_ && !done_) {
+      fail_cancelled();
+    }
+  }
+
+ protected:
+  virtual void begin() = 0;
+  virtual void advance(ssize_t result) = 0;
+  virtual Response& mutable_response() noexcept = 0;
+  virtual void close_request(bool failed) noexcept = 0;
+
+  void check_cancelled() const {
+    if (cancelled_ || (request_.destination != nullptr &&
+                       request_.destination->cancelled())) {
+      throw std::system_error(ECANCELED, std::generic_category(),
+                              "HTTP request cancelled");
+    }
+  }
+
+  void post(AsyncIoRequest::Kind kind, int fd, void* data, size_t length,
+             bool exact = false, int output_fd = -1,
+             off_t input_offset = -1, off_t output_offset = -1,
+             bool background = false, unsigned flags = 0) {
+    check_cancelled();
+    io_ = {};
+    io_.kind          = kind;
+    io_.fd            = fd;
+    io_.data          = data;
+    io_.length        = length;
+    io_.exact         = exact;
+    io_.output_fd     = output_fd;
+    io_.input_offset  = input_offset;
+    io_.output_offset = output_offset;
+    io_.force_async   = background;
+    io_.flags         = flags;
+    io_.timeout_ms    = timeout_ms_;
+    io_.complete      = on_io;
+    io_.context       = this;
+    advancing_ = false;
+    pending_ = true;
+    if (!executor_.submit(io_)) {
+      pending_ = false;
+      advancing_ = true;
+      throw std::system_error(errno, std::generic_category(),
+                              "submit HTTP I/O");
+    }
+  }
+
+  static size_t require_bytes(ssize_t result, const char* operation) {
+    if (result < 0) {
+      throw std::system_error(int(-result), std::generic_category(), operation);
+    }
+    if (result == 0) {
+      throw std::system_error(ECONNRESET, std::generic_category(), operation);
+    }
+    return size_t(result);
+  }
+
+  void post_connect(int fd, const sockaddr_storage& peer,
+                     socklen_t length, int timeout) {
+    check_cancelled();
+    io_ = {};
+    io_.kind           = AsyncIoRequest::CONNECT;
+    io_.fd             = fd;
+    io_.address        = reinterpret_cast<const sockaddr*>(&peer);
+    io_.address_length = length;
+    io_.timeout_ms     = timeout;
+    io_.complete       = on_io;
+    io_.context        = this;
+    advancing_ = false;
+    pending_ = true;
+    if (!executor_.submit(io_)) {
+      pending_ = false;
+      advancing_ = true;
+      throw std::system_error(errno, std::generic_category(),
+                              "submit HTTP connect");
+    }
+  }
+
+  void finish(std::exception_ptr error = {}) noexcept {
+    if (done_) {
+      return;
+    }
+    done_ = true;
+    close_request(error != nullptr);
+    Response response = std::move(mutable_response());
+    const Complete complete = complete_;
+    void* const context = context_;
+    complete(context, std::move(response), std::move(error));
+  }
+
+  void publish(bool complete) {
+    check_cancelled();
+    Response& response = mutable_response();
+    if (request_.measure_transport && response.body_bytes != 0) {
+      response.wire_last_data_ns = http1_monotonic_ns();
+    }
+    if (request_.destination != nullptr && response.status < 300) {
+      request_.destination->progress(response, complete);
+    }
+    check_cancelled();
+  }
+
+  void prepare_upload() {
+    const bool has_segments = !request_.source_segments.empty();
+    const bool has_fd = request_.source_fd >= 0;
+    if ((!request_.upload && (has_segments || has_fd || !request_.body.empty())) ||
+        (has_segments && (has_fd || !request_.body.empty())) ||
+        (has_fd && !request_.body.empty()) ||
+        (!has_fd && !has_segments && request_.source_length != 0)) {
+      throw std::invalid_argument("conflicting asynchronous upload sources");
+    }
+    const auto add_source = [&](const AsyncHttpSource& source) {
+      if (source.fd < 0 || source.length > SIZE_MAX - upload_length_ ||
+          (source.seek &&
+           (source.offset > uint64_t(INT64_MAX) ||
+            source.length > uint64_t(INT64_MAX) - source.offset))) {
+        throw std::invalid_argument("invalid asynchronous upload source");
+      }
+      upload_length_ += source.length;
+    };
+    if (has_segments) {
+      for (const auto& source : request_.source_segments) add_source(source);
+    } else if (has_fd) {
+      add_source({request_.source_fd, request_.source_offset,
+                  request_.source_length, request_.source_seek});
+    } else {
+      upload_length_ = request_.body.size();
+    }
+  }
+
+  AsyncHttpSource upload_source(size_t maximum) {
+    AsyncHttpSource source;
+    if (!request_.source_segments.empty()) {
+      while (source_index_ < request_.source_segments.size() &&
+             source_consumed_ == request_.source_segments[source_index_].length) {
+        ++source_index_;
+        source_consumed_ = 0;
+      }
+      if (source_index_ == request_.source_segments.size()) {
+        throw std::logic_error("asynchronous upload exhausted its sources");
+      }
+      source = request_.source_segments[source_index_];
+    } else {
+      source = {request_.source_fd,
+                request_.source_fd >= 0 ? request_.source_offset : 0,
+                upload_length_, request_.source_seek};
+    }
+    source.offset += source_consumed_;
+    source.length = std::min(maximum, source.length - source_consumed_);
+    return source;
+  }
+
+  void consume_upload_source(size_t size) noexcept { source_consumed_ += size; }
+
+  IoExecutor& executor_;
+  AsyncHttpRequest request_;
+  AsyncIoRequest io_;
+  Complete complete_;
+  void* context_;
+  int timeout_ms_;
+  size_t upload_length_ = 0;
+
+ private:
+  size_t source_index_ = 0;
+  size_t source_consumed_ = 0;
+  static void on_io(void* context, ssize_t result) noexcept {
+    auto& self = *static_cast<HttpAsyncOperation*>(context);
+    self.pending_ = false;
+    self.advancing_ = true;
+    try {
+      self.check_cancelled();
+      if (result >= 0 && self.io_.exact && size_t(result) != self.io_.length) {
+        throw std::system_error(ECONNRESET, std::generic_category(),
+                                "incomplete asynchronous HTTP I/O");
+      }
+      self.advance(result);
+    } catch (...) {
+      self.finish(std::current_exception());
+    }
+  }
+
+  void fail_cancelled() noexcept {
+    try {
+      check_cancelled();
+    } catch (...) {
+      finish(std::current_exception());
+    }
+  }
+
+  bool started_ = false;
+  bool pending_ = false;
+  bool advancing_ = false;
+  bool cancelled_ = false;
+  bool done_ = false;
+};
+
+class Http1AsyncOperation final : public HttpAsyncOperation {
+ public:
+  Http1AsyncOperation(Http1Client& client, IoExecutor& executor,
+                      AsyncHttpRequest request, Complete complete,
+                      void* context)
+      : HttpAsyncOperation(executor, std::move(request), complete, context,
+                            client.io_timeout_ms), client_(client) {}
+
+  const Response& response() const noexcept override { return response_; }
+
+ private:
+  enum Stage {
+    CONNECT, SEND_HEAD, SEND_BODY, UPLOAD_PIPE, UPLOAD_SEND,
+    RECEIVE_HEADER, RECEIVE_BODY, SOCKET_PIPE, PIPE_FILE, PIPE_COPY, WRITE_FILE
+  } stage_ = SEND_HEAD;
+
+  Response& mutable_response() noexcept override { return response_; }
+
+  void close_request(bool failed) noexcept override {
+    if (!owns_client_) {
+      return;
+    }
+    client_.request_active = false;
+    if (failed || (parser_ && !parser_->should_keep_alive())) {
+      client_.socket.reset();
+      client_.file_staging = {};
+    }
+  }
+
+  void begin() override {
+    if (client_.request_active) {
+      throw std::logic_error("HTTP/1.1 connection already has a request");
+    }
+    if (client_.tls) {
+      throw std::system_error(EOPNOTSUPP, std::generic_category(),
+                              "TLS uses the legacy HTTP transport");
+    }
+    client_.request_active = true;
+    owns_client_ = true;
+    if (!client_.socket) {
+      client_.socket = http_reconnect_socket(
+          client_.peer, client_.peer_length, client_.receive_buffer_size);
+      stage_ = CONNECT;
+      post_connect(client_.socket.get(), client_.peer,
+                     client_.peer_length, client_.connect_timeout_ms);
+      return;
+    }
+    start_request();
+  }
+
+  void start_request() {
+    std::array<Header, 2> generated;
+    size_t generated_count = 0;
+    if (request_.range) {
+      if (request_.length == 0 || request_.destination == nullptr ||
+          request_.destination->fd() < 0 ||
+          request_.offset > UINT64_MAX - (request_.length - 1)) {
+        throw std::invalid_argument("invalid asynchronous GET range");
+      }
+      bool supplied_range = false;
+      for (const Header& header : request_.headers) {
+        if (ascii_equal(sso_view(header.name), "range")) {
+          if (supplied_range) {
+            throw std::invalid_argument("duplicate GET range header");
+          }
+          supplied_range = true;
+        } else if (ascii_equal(sso_view(header.name), "accept-encoding")) {
+          throw std::invalid_argument("conflicting GET accept-encoding");
+        }
+      }
+      if (!supplied_range) {
+        generated[generated_count++] = Header{
+            "range", range_header_value(
+                request_.offset, request_.offset + request_.length - 1)};
+      }
+      generated[generated_count++] = Header{"accept-encoding", "identity"};
+    }
+    upload_remaining_ = upload_length_;
+    build_request_head(client_.request_head,
+        sso_view(request_.method), sso_view(request_.path), client_.authority,
+        std::span(generated).first(generated_count), request_.headers,
+        request_.upload ? std::optional<size_t>(upload_remaining_)
+                        : std::nullopt);
+    response_.wire_start_ns = request_.measure_transport
+        ? http1_monotonic_ns() : 0;
+    reset_parser();
+    stage_ = SEND_HEAD;
+    post(AsyncIoRequest::SEND, client_.socket.get(),
+          client_.request_head.data(), client_.request_head.size(), true,
+          -1, -1, -1, false, MSG_NOSIGNAL);
+  }
+
+  void reset_parser() {
+    parser_.emplace(response_, nullptr, nullptr,
+        request_.range ? request_.length : request_.max_response_body,
+        request_.method == "HEAD", request_.capture_headers, request_.range,
+        request_.range ? &copied_ : nullptr);
+  }
+
+  void receive_header() {
+    stage_ = RECEIVE_HEADER;
+    post(AsyncIoRequest::RECEIVE, client_.socket.get(),
+          buffer_.data(), buffer_.size());
+  }
+
+  void ensure_pipe(size_t capacity) {
+    capacity = std::min(capacity, kPreferredIoSize);
+    if (client_.file_staging.capacity() < capacity) {
+      client_.file_staging = Pipe::create(capacity);
+    }
+  }
+
+  void upload_next() {
+    if (upload_remaining_ == 0) {
+      receive_header();
+      return;
+    }
+    const AsyncHttpSource source = upload_source(upload_remaining_);
+    if (source.fd < 0) {
+      stage_ = SEND_BODY;
+      post(AsyncIoRequest::SEND, client_.socket.get(),
+            request_.body.data() + source.offset, source.length, true,
+            -1, -1, -1, false, MSG_NOSIGNAL);
+    } else if (!source.seek) {
+      stage_ = UPLOAD_SEND;
+      post(AsyncIoRequest::SPLICE, source.fd, nullptr,
+            source.length, false, client_.socket.get(), -1, -1,
+            false, SPLICE_F_MOVE | SPLICE_F_MORE);
+    } else {
+      ensure_pipe(source.length);
+      stage_ = UPLOAD_PIPE;
+      post(AsyncIoRequest::SPLICE, source.fd, nullptr,
+            std::min(source.length, client_.file_staging.capacity()),
+            false, client_.file_staging.write_fd(),
+            off_t(source.offset), -1, true,
+            SPLICE_F_MOVE | SPLICE_F_MORE);
+    }
+  }
+
+  void process_header(size_t length) {
+    size_t begin = 0;
+    while (begin < length) {
+      const size_t consumed = parser_->execute(
+          std::span(buffer_).subspan(begin, length - begin));
+      begin += consumed;
+      header_bytes_ += consumed;
+      if (header_bytes_ > kMaxResponseHeaderBytes) {
+        throw std::runtime_error("HTTP/1.1 response headers exceed 64 KiB");
+      }
+      if (!parser_->headers_complete()) {
+        if (consumed == 0) {
+          throw std::runtime_error("llhttp made no header progress");
+        }
+        receive_header();
+        return;
+      }
+      if (response_.status >= 100 && response_.status < 200 &&
+          response_.status != 101) {
+        if (!parser_->message_complete()) {
+          throw std::runtime_error("incomplete informational response");
+        }
+        const uint64_t start = response_.wire_start_ns;
+        response_ = {};
+        response_.wire_start_ns = start;
+        reset_parser();
+        continue;
+      }
+      if (response_.status == 101) {
+        throw std::runtime_error("unexpected HTTP protocol upgrade");
+      }
+      if (parser_->message_complete() || request_.method == "HEAD" ||
+          response_.status == 204 || response_.status == 304) {
+        if (begin != length) {
+          throw std::runtime_error("bytes after completed HTTP response");
+        }
+        complete_response();
+        return;
+      }
+      fixed_remaining_ = parser_->fixed_body_remaining();
+      const size_t limit = request_.range && response_.status >= 300
+          ? kMaximumErrorResponseSize : request_.range
+              ? request_.length : request_.max_response_body;
+      if (fixed_remaining_) {
+        if (*fixed_remaining_ > limit || length - begin > *fixed_remaining_) {
+          throw std::runtime_error("HTTP/1.1 response exceeds body limit");
+        }
+        if (begin != length) {
+          buffered_ = length - begin;
+          if (request_.range && response_.status < 300) {
+            write_file(buffer_.data() + begin, buffered_, false);
+            return;
+          }
+          response_.body.insert(response_.body.end(),
+              buffer_.begin() + ptrdiff_t(begin),
+              buffer_.begin() + ptrdiff_t(length));
+          response_.body_bytes += buffered_;
+          response_.fallback_copied_bytes += buffered_;
+          *fixed_remaining_ -= buffered_;
+        }
+        body_next();
+        return;
+      }
+      parser_->resume();
+      if (begin != length) {
+        parse_body(std::span(buffer_).subspan(begin, length - begin));
+      } else {
+        body_next();
+      }
+      return;
+    }
+    receive_header();
+  }
+
+  void write_file(void* data, size_t length, bool accounted) {
+    buffered_ = length;
+    write_accounted_ = accounted;
+    stage_ = WRITE_FILE;
+    post(AsyncIoRequest::PWRITE, request_.destination->fd(), data, length,
+          true, -1, -1, off_t(request_.destination->offset()),
+          request_.destination->background_write());
+  }
+
+  void parse_body(std::span<const std::byte> bytes) {
+    const size_t consumed = parser_->execute(bytes);
+    if (consumed != bytes.size()) {
+      throw std::runtime_error("bytes after completed HTTP response");
+    }
+    if (!copied_.empty()) {
+      write_file(copied_.data(), copied_.size(), true);
+      return;
+    }
+    if (parser_->message_complete()) {
+      complete_response();
+    } else {
+      body_next();
+    }
+  }
+
+  void body_next() {
+    if (fixed_remaining_ && *fixed_remaining_ == 0) {
+      complete_response();
+      return;
+    }
+    if (fixed_remaining_ && request_.range && response_.status < 300) {
+      ensure_pipe(*fixed_remaining_);
+      stage_ = SOCKET_PIPE;
+      post(AsyncIoRequest::SPLICE, client_.socket.get(), nullptr,
+            std::min(*fixed_remaining_, client_.file_staging.capacity()),
+            false, client_.file_staging.write_fd(), -1, -1, false,
+            SPLICE_F_MOVE | SPLICE_F_MORE);
+    } else {
+      stage_ = RECEIVE_BODY;
+      post(AsyncIoRequest::RECEIVE, client_.socket.get(), buffer_.data(),
+            fixed_remaining_ ? std::min(*fixed_remaining_, buffer_.size())
+                             : buffer_.size());
+    }
+  }
+
+  void complete_response() {
+    publish(true);
+    finish();
+  }
+
+  void advance(ssize_t result) override {
+    if (stage_ == CONNECT) {
+      if (result < 0) {
+        throw std::system_error(int(-result), std::generic_category(),
+                                "connect(HTTP/1.1)");
+      }
+      configure_blocking_socket(client_.socket.get(), client_.io_timeout_ms);
+      start_request();
+      return;
+    }
+    if (stage_ == RECEIVE_BODY && result == 0 && !fixed_remaining_) {
+      parser_->finish();
+      if (!parser_->message_complete()) {
+        throw std::runtime_error("incomplete HTTP/1.1 response");
+      }
+      client_.socket.reset();
+      complete_response();
+      return;
+    }
+    if (stage_ == PIPE_FILE && io_.transferred == 0 &&
+        (result == -EINVAL || result == -ENOSYS || result == -EOPNOTSUPP)) {
+      client_.file_splice_supported = false;
+      fprintf(stderr, "warning: local-file splice unavailable; copying HTTP body\n");
+      copied_.resize(buffered_);
+      stage_ = PIPE_COPY;
+      post(AsyncIoRequest::READ, client_.file_staging.read_fd(),
+            copied_.data(), copied_.size(), true);
+      return;
+    }
+    const size_t n = require_bytes(result, "asynchronous HTTP/1.1 I/O");
+    switch (stage_) {
+      case CONNECT:
+        abort();
+      case SEND_HEAD:
+        upload_next();
+        return;
+      case SEND_BODY:
+      case UPLOAD_SEND:
+        consume_upload_source(n);
+        upload_remaining_ -= n;
+        response_.externally_sent_bytes += n;
+        upload_next();
+        return;
+      case UPLOAD_PIPE:
+        stage_ = UPLOAD_SEND;
+        post(AsyncIoRequest::SPLICE, client_.file_staging.read_fd(), nullptr,
+              n, true, client_.socket.get(), -1, -1, false,
+              SPLICE_F_MOVE | SPLICE_F_MORE);
+        return;
+      case RECEIVE_HEADER:
+        process_header(n);
+        return;
+      case RECEIVE_BODY:
+        if (!fixed_remaining_) {
+          parse_body(std::span(buffer_).first(n));
+          return;
+        }
+        response_.body.insert(response_.body.end(),
+                               buffer_.begin(), buffer_.begin() + ptrdiff_t(n));
+        response_.body_bytes += n;
+        response_.fallback_copied_bytes += n;
+        *fixed_remaining_ -= n;
+        body_next();
+        return;
+      case SOCKET_PIPE:
+        response_.transport_splice_calls += io_.operations;
+        buffered_ = n;
+        if (client_.file_splice_supported) {
+          stage_ = PIPE_FILE;
+          post(AsyncIoRequest::SPLICE, client_.file_staging.read_fd(), nullptr,
+                n, true, request_.destination->fd(), -1,
+                off_t(request_.destination->offset()),
+                request_.destination->background_write(),
+                SPLICE_F_MOVE | SPLICE_F_MORE);
+        } else {
+          copied_.resize(n);
+          stage_ = PIPE_COPY;
+          post(AsyncIoRequest::READ, client_.file_staging.read_fd(),
+                copied_.data(), n, true);
+        }
+        return;
+      case PIPE_COPY:
+        write_file(copied_.data(), n, false);
+        return;
+      case PIPE_FILE:
+        response_.externally_spliced_bytes += n;
+        response_.body_bytes += n;
+        *fixed_remaining_ -= n;
+        request_.destination->advance(n);
+        publish(false);
+        body_next();
+        return;
+      case WRITE_FILE:
+        request_.destination->advance(n);
+        if (!write_accounted_) {
+          response_.body_bytes += n;
+          response_.fallback_copied_bytes += n;
+          *fixed_remaining_ -= n;
+        }
+        copied_.clear();
+        publish(false);
+        if (!fixed_remaining_ && parser_->message_complete()) {
+          complete_response();
+        } else {
+          body_next();
+        }
+        return;
+    }
+  }
+
+  Http1Client& client_;
+  Response response_;
+  std::optional<ResponseParser> parser_;
+  std::optional<size_t> fixed_remaining_;
+  std::array<std::byte, kHttp1ReadSize> buffer_;
+  std::vector<std::byte> copied_;
+  size_t header_bytes_ = 0;
+  size_t buffered_ = 0;
+  size_t upload_remaining_ = 0;
+  bool owns_client_ = false;
+  bool write_accounted_ = false;
+};
+
+std::unique_ptr<AsyncHttpOperation> Http1Client::make_async_request(
+    IoExecutor& executor, AsyncHttpRequest request,
+    AsyncHttpOperation::Complete complete, void* context) {
+  return std::make_unique<Http1AsyncOperation>(
+      *this, executor, std::move(request), complete, context);
+}
+
+class Http2AsyncOperation final : public HttpAsyncOperation {
+ public:
+  Http2AsyncOperation(Http2Client& client, IoExecutor& executor,
+                      AsyncHttpRequest request, Complete complete,
+                      void* context)
+      : HttpAsyncOperation(executor, std::move(request), complete, context,
+                            client.io_timeout_ms), client_(client) {}
+
+  const Response& response() const noexcept override {
+    return active_.response;
+  }
+
+ private:
+  enum Stage {
+    CONNECT, SEND_CONTROL, FRAME_HEADER, FRAME_PAYLOAD, SOCKET_PIPE, PIPE_FILE,
+    PIPE_COPY, WRITE_FILE, UPLOAD_HEADER, UPLOAD_PIPE, UPLOAD_BODY
+  } stage_ = SEND_CONTROL;
+
+  Response& mutable_response() noexcept override { return active_.response; }
+
+  void close_request(bool failed) noexcept override {
+    if (!owns_client_) {
+      return;
+    }
+    client_.active = nullptr;
+    if (failed) {
+      client_.socket.reset();
+      client_.reconnect_required = true;
+      client_.file_staging = {};
+      client_.error_staging = {};
+      client_.ingress.reset();
+    }
+  }
+
+  void begin() override {
+    if (client_.active != nullptr) {
+      throw std::logic_error("HTTP/2 connection already has a request");
+    }
+    if (client_.tls) {
+      throw std::system_error(EOPNOTSUPP, std::generic_category(),
+                              "TLS uses the legacy HTTP transport");
+    }
+    if (!client_.socket || client_.reconnect_required ||
+        !nghttp2_session_check_request_allowed(client_.session.get())) {
+      client_.socket = http_reconnect_socket(
+          client_.peer, client_.peer_length, client_.receive_buffer_size);
+      client_.active = &active_;
+      owns_client_ = true;
+      stage_ = CONNECT;
+      post_connect(client_.socket.get(), client_.peer,
+                     client_.peer_length, client_.connect_timeout_ms);
+      return;
+    }
+    start_request();
+  }
+
+  void start_request() {
+    if (request_.range &&
+        (request_.length == 0 || request_.destination == nullptr ||
+         request_.destination->fd() < 0 ||
+         request_.offset > UINT64_MAX - (request_.length - 1))) {
+      throw std::invalid_argument("invalid asynchronous HTTP/2 GET range");
+    }
+    std::vector<nghttp2_nv>& headers = client_.request_headers;
+    headers.clear();
+    headers.reserve(request_.headers.size() + 7);
+    headers.push_back(make_header(":method", sso_view(request_.method)));
+    headers.push_back(make_header(":scheme", "http"));
+    headers.push_back(make_header(":authority", client_.authority));
+    headers.push_back(make_header(":path", sso_view(request_.path)));
+    bool supplied_range = false;
+    for (const Header& header : request_.headers) {
+      const std::string_view name = sso_view(header.name);
+      if (name.starts_with(':') ||
+          (request_.range && ascii_equal(name, "accept-encoding")) ||
+          (request_.upload && ascii_equal(name, "content-length"))) {
+        throw std::invalid_argument("conflicting HTTP/2 request header");
+      }
+      if (request_.range && ascii_equal(name, "range")) {
+        if (supplied_range) {
+          throw std::invalid_argument("duplicate HTTP/2 GET range");
+        }
+        supplied_range = true;
+      }
+      headers.push_back(make_header(name, sso_view(header.value)));
+    }
+    if (request_.range) {
+      if (!supplied_range) {
+        range_ = range_header_value(
+            request_.offset, request_.offset + request_.length - 1);
+        headers.push_back(make_header("range", sso_view(range_)));
+      }
+      headers.push_back(make_header("accept-encoding", "identity"));
+    }
+    const size_t upload_length = upload_length_;
+    if (request_.upload) {
+      char size[32];
+      const auto converted = std::to_chars(size, size + sizeof(size), upload_length);
+      content_length_.assign(size, size_t(converted.ptr - size));
+      headers.push_back(make_header("content-length", sso_view(content_length_)));
+    }
+    upload_.fd = request_.source_fd;
+    upload_.offset = 0;
+    upload_.remaining = upload_length;
+    upload_.seek = request_.source_seek;
+    upload_.asynchronous = true;
+    nghttp2_data_provider provider{
+        .source = {.ptr = &upload_},
+        .read_callback = Http2Client::read_upload,
+    };
+    active_.max_body_bytes = request_.range
+        ? request_.length : request_.max_response_body;
+    active_.capture_headers = request_.capture_headers;
+    active_.measure_transport = request_.measure_transport;
+    active_.copied_data = &copied_;
+    active_.upload = request_.upload ? &upload_ : nullptr;
+    if (request_.capture_headers) {
+      active_.response.headers.reserve(16);
+    }
+    const int stream = nghttp2_submit_request(client_.session.get(), nullptr,
+        headers.data(), headers.size(),
+        request_.upload && upload_length != 0 ? &provider : nullptr, nullptr);
+    if (stream < 0) {
+      throw_nghttp2(stream, "nghttp2_submit_request(async)");
+    }
+    active_.stream_id = stream;
+    active_.response.stream_id = stream;
+    active_.response.wire_start_ns = request_.measure_transport
+        ? http2_monotonic_ns() : 0;
+    client_.active = &active_;
+    owns_client_ = true;
+    flush();
+  }
+
+  void feed(std::span<const std::byte> bytes) {
+    const nghttp2_ssize result = nghttp2_session_mem_recv2(
+        client_.session.get(), reinterpret_cast<const uint8_t*>(bytes.data()),
+        bytes.size());
+    if (active_.callback_error) {
+      std::rethrow_exception(active_.callback_error);
+    }
+    require_nghttp2(result, bytes.size(), "nghttp2 async receive");
+  }
+
+  void flush() {
+    const uint8_t* data = nullptr;
+    const nghttp2_ssize size = nghttp2_session_mem_send2(client_.session.get(), &data);
+    if (size < 0) {
+      throw_nghttp2(int(size), "nghttp2 async send");
+    }
+    if (active_.upload_frame_ready) {
+      if (size != 0) {
+        throw std::logic_error("HTTP/2 upload pause returned another frame");
+      }
+      upload_frame_remaining_ = active_.upload_frame_length;
+      upload_frame_sent_ = 0;
+      stage_ = UPLOAD_HEADER;
+      post(AsyncIoRequest::SEND, client_.socket.get(),
+            active_.upload_frame.data(), active_.upload_frame.size(), true,
+            -1, -1, -1, false, MSG_NOSIGNAL);
+      return;
+    }
+    if (size != 0) {
+      stage_ = SEND_CONTROL;
+      post(AsyncIoRequest::SEND, client_.socket.get(),
+            const_cast<uint8_t*>(data), size_t(size), true,
+            -1, -1, -1, false, MSG_NOSIGNAL);
+      return;
+    }
+    if (active_.closed) {
+      if (active_.close_error != NGHTTP2_NO_ERROR) {
+        throw std::system_error(EPROTO, std::generic_category(),
+                                "HTTP/2 stream closed with error");
+      }
+      if (request_.upload && upload_.remaining != 0) {
+        throw std::runtime_error("HTTP/2 stream closed before upload completed");
+      }
+      publish(true);
+      finish();
+      return;
+    }
+    stage_ = FRAME_HEADER;
+    post(AsyncIoRequest::RECEIVE, client_.socket.get(),
+          header_.data(), header_.size(), true);
+  }
+
+  void ensure_pipe(size_t size) {
+    size = std::min(size, kPreferredIoSize);
+    if (client_.file_staging.capacity() < size) {
+      client_.file_staging = Pipe::create(size);
+    }
+  }
+
+  void frame_header() {
+    feed(header_);
+    if (!client_.ingress.header_ready_) {
+      throw std::runtime_error("nghttp2 did not accept the frame header");
+    }
+    frame_ = client_.ingress.header_;
+    client_.ingress.header_ready_ = false;
+    active_.max_body_bytes = request_.range && active_.response.status >= 300
+        ? kMaximumErrorResponseSize : request_.range
+            ? request_.length : request_.max_response_body;
+    if (frame_.type == NGHTTP2_DATA &&
+        frame_.stream_id == active_.stream_id &&
+        (frame_.flags & NGHTTP2_FLAG_PADDED) == 0 &&
+        request_.range && active_.response.status >= 200 &&
+        active_.response.status < 300) {
+      if (active_.response.body_bytes > request_.length ||
+          frame_.length > request_.length - active_.response.body_bytes) {
+        throw std::runtime_error("HTTP/2 DATA exceeds range length");
+      }
+      frame_remaining_ = frame_.length;
+      if (frame_remaining_ == 0) {
+        flush();
+      } else {
+        socket_to_pipe();
+      }
+      return;
+    }
+    if (frame_.length == 0) {
+      flush();
+      return;
+    }
+    payload_.resize(frame_.length);
+    stage_ = FRAME_PAYLOAD;
+    post(AsyncIoRequest::RECEIVE, client_.socket.get(),
+          payload_.data(), payload_.size(), true);
+  }
+
+  void socket_to_pipe() {
+    ensure_pipe(frame_remaining_);
+    stage_ = SOCKET_PIPE;
+    post(AsyncIoRequest::SPLICE, client_.socket.get(), nullptr,
+          std::min(frame_remaining_, client_.file_staging.capacity()), false,
+          client_.file_staging.write_fd(), -1, -1, false,
+          SPLICE_F_MOVE | SPLICE_F_MORE);
+  }
+
+  void return_credit(size_t size) {
+    const int result = nghttp2_session_consume(
+        client_.session.get(), active_.stream_id, size);
+    if (result != 0) {
+      throw_nghttp2(result, "nghttp2 async consume");
+    }
+  }
+
+  void commit_shadow(size_t size, bool copied) {
+    const size_t before = active_.shadow_callback_bytes;
+    client_.ingress.advance_shadow_payload(client_.session.get(), size);
+    if (active_.shadow_callback_bytes - before != size) {
+      throw std::runtime_error("nghttp2 rejected asynchronous DATA");
+    }
+    active_.response.body_bytes += size;
+    if (copied) {
+      active_.response.fallback_copied_bytes += size;
+    } else {
+      active_.response.externally_spliced_bytes += size;
+    }
+    frame_remaining_ -= size;
+    request_.destination->advance(size);
+    return_credit(size);
+    publish(false);
+    if (frame_remaining_ != 0) {
+      socket_to_pipe();
+    } else {
+      flush();
+    }
+  }
+
+  void parsed_payload() {
+    feed(payload_);
+    if (copied_.empty()) {
+      flush();
+      return;
+    }
+    const size_t size = copied_.size();
+    if (request_.range && active_.response.status < 300) {
+      write_shadow_ = false;
+      stage_ = WRITE_FILE;
+      post(AsyncIoRequest::PWRITE, request_.destination->fd(),
+            copied_.data(), size, true, -1, -1,
+            off_t(request_.destination->offset()),
+            request_.destination->background_write());
+    } else {
+      active_.response.body.insert(active_.response.body.end(),
+                                    copied_.begin(), copied_.end());
+      copied_.clear();
+      return_credit(size);
+      flush();
+    }
+  }
+
+  void upload_body() {
+    if (upload_frame_remaining_ == 0) {
+      active_.upload_frame_ready = false;
+      upload_.ready = true;
+      flush();
+      return;
+    }
+    const AsyncHttpSource source = upload_source(upload_frame_remaining_);
+    if (source.fd < 0) {
+      stage_ = UPLOAD_BODY;
+      post(AsyncIoRequest::SEND, client_.socket.get(),
+            request_.body.data() + source.offset,
+            source.length, true, -1, -1, -1, false, MSG_NOSIGNAL);
+    } else if (!source.seek) {
+      stage_ = UPLOAD_BODY;
+      post(AsyncIoRequest::SPLICE, source.fd, nullptr,
+            source.length, false, client_.socket.get(),
+            -1, -1, false, SPLICE_F_MOVE | SPLICE_F_MORE);
+    } else {
+      ensure_pipe(source.length);
+      stage_ = UPLOAD_PIPE;
+      post(AsyncIoRequest::SPLICE, source.fd, nullptr,
+            std::min(source.length, client_.file_staging.capacity()),
+            false, client_.file_staging.write_fd(),
+            off_t(source.offset), -1,
+            true, SPLICE_F_MOVE | SPLICE_F_MORE);
+    }
+  }
+
+  void advance(ssize_t result) override {
+    if (stage_ == CONNECT) {
+      if (result < 0) {
+        throw std::system_error(int(-result), std::generic_category(),
+                                "connect(HTTP/2)");
+      }
+      configure_blocking_socket(client_.socket.get(), client_.io_timeout_ms);
+      client_.session.reset();
+      client_.option.reset();
+      client_.callbacks.reset();
+      client_.ingress.reset();
+      client_.initialize_session();
+      client_.reconnect_required = false;
+      start_request();
+      return;
+    }
+    if (stage_ == PIPE_FILE && io_.transferred == 0 &&
+        (result == -EINVAL || result == -ENOSYS || result == -EOPNOTSUPP)) {
+      client_.file_splice_supported = false;
+      fprintf(stderr, "warning: local-file splice unavailable; copying HTTP/2 body\n");
+      copied_.resize(buffered_);
+      stage_ = PIPE_COPY;
+      post(AsyncIoRequest::READ, client_.file_staging.read_fd(),
+            copied_.data(), copied_.size(), true);
+      return;
+    }
+    const size_t n = require_bytes(result, "asynchronous HTTP/2 I/O");
+    switch (stage_) {
+      case CONNECT:
+        abort();
+      case SEND_CONTROL:
+        flush();
+        return;
+      case FRAME_HEADER:
+        if (n != header_.size()) {
+          throw std::runtime_error("incomplete HTTP/2 frame header");
+        }
+        frame_header();
+        return;
+      case FRAME_PAYLOAD:
+        if (n != payload_.size()) {
+          throw std::runtime_error("incomplete HTTP/2 frame payload");
+        }
+        parsed_payload();
+        return;
+      case SOCKET_PIPE:
+        active_.response.transport_splice_calls += io_.operations;
+        buffered_ = n;
+        if (client_.file_splice_supported) {
+          stage_ = PIPE_FILE;
+          post(AsyncIoRequest::SPLICE, client_.file_staging.read_fd(), nullptr,
+                n, true, request_.destination->fd(), -1,
+                off_t(request_.destination->offset()),
+                request_.destination->background_write(),
+                SPLICE_F_MOVE | SPLICE_F_MORE);
+        } else {
+          copied_.resize(n);
+          stage_ = PIPE_COPY;
+          post(AsyncIoRequest::READ, client_.file_staging.read_fd(),
+                copied_.data(), copied_.size(), true);
+        }
+        return;
+      case PIPE_FILE:
+        commit_shadow(n, false);
+        return;
+      case PIPE_COPY:
+        write_shadow_ = true;
+        stage_ = WRITE_FILE;
+        post(AsyncIoRequest::PWRITE, request_.destination->fd(),
+              copied_.data(), n, true, -1, -1,
+              off_t(request_.destination->offset()),
+              request_.destination->background_write());
+        return;
+      case WRITE_FILE:
+        copied_.clear();
+        if (write_shadow_) {
+          commit_shadow(n, true);
+        } else {
+          request_.destination->advance(n);
+          return_credit(n);
+          publish(false);
+          flush();
+        }
+        return;
+      case UPLOAD_HEADER:
+        upload_body();
+        return;
+      case UPLOAD_PIPE:
+        stage_ = UPLOAD_BODY;
+        post(AsyncIoRequest::SPLICE, client_.file_staging.read_fd(), nullptr,
+              n, true, client_.socket.get(), -1, -1, false,
+              SPLICE_F_MOVE | SPLICE_F_MORE);
+        return;
+      case UPLOAD_BODY:
+        consume_upload_source(n);
+        upload_frame_remaining_ -= n;
+        upload_frame_sent_ += n;
+        active_.response.externally_sent_bytes += n;
+        upload_body();
+        return;
+    }
+  }
+
+  Http2Client& client_;
+  Http2Client::ActiveRequest active_;
+  Http2Client::UploadSource upload_;
+  ssostr<32> range_;
+  ssostr<32> content_length_;
+  std::array<std::byte, kFrameHeaderSize> header_{};
+  nghttp2_frame_hd frame_{};
+  std::vector<std::byte> payload_;
+  std::vector<std::byte> copied_;
+  size_t frame_remaining_ = 0;
+  size_t buffered_ = 0;
+  size_t upload_frame_remaining_ = 0;
+  size_t upload_frame_sent_ = 0;
+  bool owns_client_ = false;
+  bool write_shadow_ = false;
+};
+
+std::unique_ptr<AsyncHttpOperation> Http2Client::make_async_request(
+    IoExecutor& executor, AsyncHttpRequest request,
+    AsyncHttpOperation::Complete complete, void* context) {
+  return std::make_unique<Http2AsyncOperation>(
+      *this, executor, std::move(request), complete, context);
+}
 
 Response Http1Client::get_range(
     std::string_view path, uint64_t offset, size_t length,

@@ -1,4 +1,5 @@
 #include "http.hpp"
+#include "async_io_executor.hpp"
 #include "io.hpp"
 
 #include <nghttp2/nghttp2.h>
@@ -140,7 +141,11 @@ void run_server(int listener,
   }
 }
 
-int main() {
+int main(int argc, char** argv) {
+  const bool segmented =
+      argc == 2 && std::string_view(argv[1]) == "--async-segments";
+  const bool asynchronous = segmented ||
+      (argc == 2 && std::string_view(argv[1]) == "--async");
   UniqueFd listener(
       ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP));
   assert(listener);
@@ -173,8 +178,70 @@ int main() {
   const std::array extra_headers{
       Header{"content-type", "application/octet-stream"},
   };
-  const auto response = client->put_from_fd(
-      "/bucket/key", extra_headers, memory.get(), 0, expected.size());
+  Response response;
+  if (asynchronous) {
+    constexpr size_t prefix_size = 97;
+    constexpr size_t suffix_size = 109;
+    Pipe original;
+    Pipe replay;
+    if (segmented) {
+      original = Pipe::create(prefix_size + suffix_size);
+      replay = Pipe::create(prefix_size + suffix_size);
+      write_all(original.write_fd(), std::span(expected).first(prefix_size));
+      write_all(original.write_fd(), std::span(expected).last(suffix_size));
+      const size_t copied = tee_exact(
+          original.read_fd(), replay.write_fd(), prefix_size + suffix_size, 0);
+      assert(copied == prefix_size + suffix_size);
+    }
+    TestAsyncIoExecutor executor(4093);
+    AsyncHttpRequest request;
+    request.method = "PUT";
+    request.path = "/bucket/key";
+    request.headers.assign(extra_headers.begin(), extra_headers.end());
+    request.upload = true;
+    if (segmented) {
+      request.source_segments = {
+          AsyncHttpSource{replay.read_fd(), 0, prefix_size, false},
+          AsyncHttpSource{replay.read_fd(), 0, 0, false},
+          AsyncHttpSource{memory.get(), prefix_size,
+                          expected.size() - prefix_size - suffix_size, true},
+          AsyncHttpSource{replay.read_fd(), 0, suffix_size, false},
+      };
+    } else {
+      request.source_fd = memory.get();
+      request.source_length = expected.size();
+    }
+    struct Completion {
+      Response* response;
+      std::exception_ptr error;
+      bool done = false;
+    } completion{&response, {}};
+    auto operation = client->make_async_request(executor, std::move(request),
+        [](void* context, Response&& result, std::exception_ptr error) noexcept {
+          auto& completion = *static_cast<Completion*>(context);
+          *completion.response = std::move(result);
+          completion.error = std::move(error);
+          completion.done = true;
+        }, &completion);
+    operation->start();
+    executor.run();
+    assert(completion.done);
+    if (completion.error) std::rethrow_exception(completion.error);
+    assert(executor.parameters_preserved());
+    if (segmented) {
+      std::vector<std::byte> retained(prefix_size + suffix_size);
+      read_all(original.read_fd(), retained);
+      std::vector<std::byte> expected_retained;
+      expected_retained.insert(expected_retained.end(), expected.begin(),
+                               expected.begin() + prefix_size);
+      expected_retained.insert(expected_retained.end(),
+                               expected.end() - suffix_size, expected.end());
+      assert(retained == expected_retained);
+    }
+  } else {
+    response = client->put_from_fd(
+        "/bucket/key", extra_headers, memory.get(), 0, expected.size());
+  }
   assert(response.status == 200);
   assert(response.headers.at("etag") == "\"put-etag\"");
   assert(response.externally_sent_bytes == expected.size());

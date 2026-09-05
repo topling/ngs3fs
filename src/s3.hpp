@@ -73,6 +73,8 @@ struct InodeBase;
 struct InodeFile;
 struct InodeDir;
 
+struct DirectoryContinuation;
+
 struct Directory : terark::hash_strmap<
     InodeBase*,
     terark::fstring_func::hash_unalign,
@@ -87,11 +89,13 @@ struct Directory : terark::hash_strmap<
   Directory& operator=(const Directory&) = delete;
   ~Directory();
 
-  std::mutex mutation_mutex;
+  IoMutex mutation_mutex;
   mutable std::shared_mutex mutex;
   InodeDir* clock_prev = nullptr;
   InodeDir* clock_next = nullptr;
   std::atomic<bool> clock_referenced{false};
+  std::atomic<bool> refreshing{false};
+  DirectoryContinuation* refresh_waiters = nullptr;
   uint32_t listing_generation = 0;
   bool clock_linked           = false;
 };

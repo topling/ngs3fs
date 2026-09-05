@@ -5,10 +5,12 @@
 #include <atomic>
 #include <condition_variable>
 #include <exception>
+#include <errno.h>
 #include <memory>
 #include <mutex>
 #include <stdint.h>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -19,6 +21,12 @@ struct CredentialProviderOptions {
   int protocol_probe_timeout_ms = kProtocolProbeTimeoutMs;
   int metadata_timeout_ms       = 1000;
   int shared_reload_ms          = 60 * 1000;
+};
+
+struct CredentialRefreshPending : std::system_error {
+  CredentialRefreshPending()
+      : std::system_error(EAGAIN, std::generic_category(),
+                          "credentials are refreshing; retry later") {}
 };
 
 class CredentialProvider {
@@ -61,7 +69,7 @@ class CredentialProvider {
   };
 
  private:
-
+  friend struct CredentialProviderTestAccess;
   void discover();
   void refresh_locked(uint64_t now_ns);
   void refresh_loop(std::stop_token stop) noexcept;

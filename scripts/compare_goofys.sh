@@ -137,16 +137,15 @@ wait_for_mount() {
 
 process_cpu_ns() {
   local pid=$1
-  local total=0
-  local runtime
-  local ignored
   local stat
-  for stat in "/proc/$pid/task"/*/schedstat; do
-    if read -r runtime ignored <"$stat"; then
-      total=$((total + runtime))
-    fi
-  done
-  printf '%s\n' "$total"
+  local fields
+  local ticks
+  read -r stat <"/proc/$pid/stat"
+  fields=${stat##*) }
+  read -r -a fields <<<"$fields"
+  ticks=$(getconf CLK_TCK)
+  printf '%s\n' "$((
+      (fields[11] + fields[12]) * 1000000000 / ticks))"
 }
 
 start_ngs3fs() {

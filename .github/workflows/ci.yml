@@ -309,12 +309,38 @@ jobs:
 
       - name: A/B test io engines and reactor counts
         run: |
-          sudo env \
-            BENCHMARK_REPETITIONS=3 \
-            RANDOM_READ_ADVICE=random \
-            ./scripts/benchmark_io_engine.sh \
-            "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine"
-          cat build/benchmarks/github-io-engine/summary.md >> "$GITHUB_STEP_SUMMARY"
+          for advice in random normal; do
+            sudo env \
+              BENCHMARK_REPETITIONS=5 \
+              RANDOM_READ_ADVICE="$advice" \
+              ./scripts/benchmark_io_engine.sh \
+              "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-$advice"
+            printf '\n## I/O engines: %s advice\n\n' "$advice" >> "$GITHUB_STEP_SUMMARY"
+            cat "build/benchmarks/github-io-engine-$advice/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Profile legacy and one/multi-reactor uncached reads
+        if: always()
+        run: |
+          port=17660
+          for configuration in legacy:1 uring:1 uring:4; do
+            engine=${configuration%%:*}
+            reactors=${configuration##*:}
+            sudo env \
+              NGS3FS_IO_ENGINE="$engine" \
+              NGS3FS_REACTORS="$reactors" \
+              WORKLOAD=random-read \
+              RANDOM_READ_ADVICE=normal \
+              CACHE_MODE=none \
+              PERF_BIN="$(command -v perf)" \
+              PERF_LIB_DIR= \
+              PERF_EVENT=cpu-clock \
+              PERF_FREQUENCY=4000 \
+              PORT="$port" \
+              ./scripts/profile_ngs3fs.sh \
+              "$GITHUB_WORKSPACE/build/profiles/github-io-engine-$engine-$reactors"
+            port=$((port + 1))
+          done
 
       - name: Compare Mountpoint concurrent random reads
         run: |
@@ -432,13 +458,27 @@ jobs:
             build/benchmarks/github-random-read-*/*/ngs3fs.log
             build/benchmarks/github-random-read-*/*/goofys.log
             build/benchmarks/github-random-read-*/*/versity.log
-            build/benchmarks/github-io-engine/system.txt
-            build/benchmarks/github-io-engine/samples.csv
-            build/benchmarks/github-io-engine/summary.csv
-            build/benchmarks/github-io-engine/summary.md
-            build/benchmarks/github-io-engine/*/random-read-summary.csv
-            build/benchmarks/github-io-engine/*/ngs3fs.log
-            build/benchmarks/github-io-engine/*/versity.log
+            build/benchmarks/github-io-engine-*/system.txt
+            build/benchmarks/github-io-engine-*/samples.csv
+            build/benchmarks/github-io-engine-*/summary.csv
+            build/benchmarks/github-io-engine-*/summary.md
+            build/benchmarks/github-io-engine-*/*/random-read-summary.csv
+            build/benchmarks/github-io-engine-*/*/ngs3fs.log
+            build/benchmarks/github-io-engine-*/*/versity.log
+            build/profiles/github-io-engine-*/profile-summary.csv
+            build/profiles/github-io-engine-*/profile-metadata.txt
+            build/profiles/github-io-engine-*/system.txt
+            build/profiles/github-io-engine-*/random-read.txt
+            build/profiles/github-io-engine-*/ngs3fs.log
+            build/profiles/github-io-engine-*/versity.log
+            build/profiles/github-io-engine-*/perf.folded
+            build/profiles/github-io-engine-*/perf-stat.csv
+            build/profiles/github-io-engine-*/perf-self.txt
+            build/profiles/github-io-engine-*/perf-self-flat.txt
+            build/profiles/github-io-engine-*/perf-inclusive.txt
+            build/profiles/github-io-engine-*/perf-dso.txt
+            build/profiles/github-io-engine-*/ngs3fs-random-read.svg
+            build/profiles/github-io-engine-*/ngs3fs-random-read-interactive.html
             build/benchmarks/github-mountpoint-random-read-*/system.txt
             build/benchmarks/github-mountpoint-random-read-*/samples.csv
             build/benchmarks/github-mountpoint-random-read-*/summary.csv
@@ -458,6 +498,8 @@ jobs:
             build/benchmarks/github-socket-buffer/*/ngs3fs.log
             build/benchmarks/github-socket-buffer/*/versity.log
             build/profiles/github-*-advice/profile-summary.csv
+            build/profiles/github-*-advice/profile-metadata.txt
+            build/profiles/github-*-advice/system.txt
             build/profiles/github-*-advice/random-read.txt
             build/profiles/github-*-advice/ngs3fs.log
             build/profiles/github-*-advice/versity.log

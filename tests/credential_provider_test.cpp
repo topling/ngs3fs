@@ -9,11 +9,13 @@
 #include <unistd.h>
 
 #include <array>
+#include <chrono>
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
 #include <assert.h>
 #include <errno.h>
+#include <future>
 #include <span>
 #include <stddef.h>
 #include <stdlib.h>
@@ -22,6 +24,25 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+struct CredentialProviderTestAccess {
+  static void refresh(CredentialProvider& provider, std::string process, bool expired) {
+    std::lock_guard guard(provider.mutex_);
+    provider.process_ = std::move(process);
+    if (expired) provider.current_.store(nullptr, std::memory_order_release);
+    provider.next_refresh_ns_.store(0, std::memory_order_release);
+    provider.condition_.notify_one();
+  }
+
+  static void await_refresh(CredentialProvider& provider) {
+    std::lock_guard guard(provider.mutex_);
+  }
+};
+
+struct CredentialTestExecutor : IoExecutor {
+  bool submit(AsyncIoRequest&) noexcept override { abort(); }
+  bool cancel(AsyncIoRequest&) noexcept override { abort(); }
+};
 
 struct TemporaryCredentials {
   TemporaryCredentials() {
@@ -266,6 +287,57 @@ void test_process(const char* helper) {
   assert(provider.refreshable());
 }
 
+void test_slow_process_refresh(const char* helper) {
+  TemporaryCredentials files;
+  configure_files(files);
+  files.write_file(files.credentials, "");
+  files.write_file(files.config,
+      std::string("[default]\ncredential_process = ") + helper + "\n");
+  CredentialProvider provider(options());
+  CredentialTestExecutor executor;
+  for (bool expired : {false, true}) {
+    ::unlink(files.token.c_str());
+    CredentialProviderTestAccess::refresh(provider,
+        std::string(helper) + " " + files.token + " 750", expired);
+    for (unsigned retry = 0; ::access(files.token.c_str(), F_OK) != 0; ++retry) {
+      assert(retry < 200);
+      ::usleep(5'000);
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    bool pending = false;
+    {
+      IoExecutorScope scope(&executor, 0);
+      try {
+        assert(provider.get().access_key_id == "process-key");
+      } catch (const CredentialRefreshPending& error) {
+        assert(error.code().value() == EAGAIN);
+        pending = true;
+      }
+    }
+    assert(pending == expired);
+    assert(std::chrono::steady_clock::now() - begin < std::chrono::milliseconds(250));
+    std::promise<void> entered;
+    auto started = entered.get_future();
+    auto legacy = std::async(std::launch::async, [&] {
+      IoExecutorScope scope(nullptr, 0);
+      entered.set_value();
+      return provider.get().access_key_id;
+    });
+    started.get();
+    if (expired) {
+      // Legacy is a functional fallback, not an async caller: it must wait
+      // through the same slow refresh instead of spending four retries on it.
+      assert(legacy.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+    } else {
+      assert(legacy.wait_for(std::chrono::milliseconds(250)) == std::future_status::ready);
+    }
+    assert(legacy.get() == "process-key");
+    CredentialProviderTestAccess::await_refresh(provider);
+    // A transient busy result must not poison a successfully refreshed source.
+    assert(provider.get().access_key_id == "process-key");
+  }
+}
+
 void test_anonymous() {
   TemporaryCredentials files;
   configure_files(files);
@@ -391,6 +463,7 @@ int main(int argc, char** argv) {
   test_partial_environment();
   test_shared_file();
   test_process(argv[1]);
+  test_slow_process_refresh(argv[1]);
   test_anonymous();
   test_web_identity();
   test_container();

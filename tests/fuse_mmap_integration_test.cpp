@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <errno.h>
 #include <charconv>
 #include <chrono>
@@ -67,7 +68,7 @@ void retry_after_fuse_release(const char* name, Operation&& operation) {
   }
 }
 
-void write_all(int fd, std::span<const std::byte> bytes) {
+void test_write_all(int fd, std::span<const std::byte> bytes) {
   size_t offset = 0;
   while (offset < bytes.size()) {
     const ssize_t count =
@@ -181,6 +182,7 @@ struct SpecialObject {
   bool attributes_unsupported = false;
   bool invalid_content_range = false;
   std::vector<RequestRange> get_ranges;
+  std::vector<std::string> get_paths;
 };
 
 struct SharedServerState {
@@ -743,6 +745,22 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
           response_headers.size(), nullptr);
       return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
     }
+    if (source_key == "checksum-rename.bin" &&
+        destination_key == "checksum-renamed.bin") {
+      require(source_object != state.special_objects.end(),
+              "checksum rename source was not present");
+      state.special_objects.emplace(
+          destination_key, std::move(source_object->second));
+      state.special_objects.erase(source_key);
+      const std::array response_headers{
+          header(":status", "200"),
+          header("content-length", "0"),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     if (request.rename_source == "/bucket/unlink-open.bin") {
       require(destination.starts_with(
                   "/bucket/.~ngs3fs~.pending-delete/"),
@@ -822,6 +840,23 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   if (request.method == "DELETE" && frame->hd.type == NGHTTP2_HEADERS) {
+    if (request.path.find("?uploadId=") != std::string::npos) {
+      require(request.path == "/bucket/mmap.bin?uploadId=upload-1",
+              "AbortMultipartUpload used an unexpected object or upload ID");
+      fprintf(stderr, "mock S3: AbortMultipartUpload path=%s retained_parts=%zu\n",
+              request.path.c_str(), state.uploaded_parts.size());
+      // Abort discards only the in-progress upload, never the published object.
+      // Keep attempt counters intact so a failed upload remains diagnosable.
+      state.uploaded_parts.clear();
+      const std::array response_headers{
+          header(":status", "204"),
+          header("content-length", "0"),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     if (request.path == "/bucket/active-unlink-writer.bin") {
       state.active_writer_delete_completed = true;
       const std::array response_headers{
@@ -1211,6 +1246,7 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   if (is_special) {
     ++response_object->get_requests;
     response_object->get_ranges.push_back(range);
+    response_object->get_paths.push_back(request.path);
     if (response_object->corrupt_gets_remaining != 0) {
       --response_object->corrupt_gets_remaining;
       object = &response_object->corrupted_bytes;
@@ -1312,9 +1348,19 @@ void flush_server(nghttp2_session* session, int socket_fd) {
     if (length == 0) {
       return;
     }
-    write_all(socket_fd,
-              std::span(reinterpret_cast<const std::byte*>(bytes),
-                        static_cast<size_t>(length)));
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(length)) {
+      const ssize_t sent = ::send(
+          socket_fd, bytes + offset,
+          static_cast<size_t>(length) - offset, MSG_NOSIGNAL);
+      if (sent > 0) {
+        offset += static_cast<size_t>(sent);
+      } else if (sent < 0 && errno == EINTR) {
+        continue;
+      } else {
+        fail_errno("server send");
+      }
+    }
   }
 }
 
@@ -1720,6 +1766,8 @@ int main(int argc, char** argv) {
       shared.special_objects.emplace(std::move(key), std::move(object));
     };
     add_checksum_object("checksum-retry.bin", 1, 128U * 1024U);
+    add_checksum_object("checksum-release.bin", 1, 128U * 1024U);
+    add_checksum_object("checksum-rename.bin", 1, 128U * 1024U);
     add_checksum_object("checksum-fail.bin", 2);
     add_checksum_object("checksum-unsupported.bin", 0, 0, true);
     add_checksum_object("invalid-content-range.bin", 0);
@@ -1755,6 +1803,19 @@ int main(int argc, char** argv) {
             }
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        {
+          std::lock_guard state_guard(shared.mutex);
+          fprintf(stderr, "read-ahead GET timeout: active=%d ranges=",
+                  shared.active_gets);
+          const auto& ranges = shared.special_objects.at(
+              "read-ahead.bin")->get_ranges;
+          for (const RequestRange& range : ranges) {
+            fprintf(stderr, " [%llu,%llu]",
+                    static_cast<unsigned long long>(range.first),
+                    static_cast<unsigned long long>(range.last));
+          }
+          fprintf(stderr, "\n");
         }
         throw std::runtime_error("timed out waiting for read-ahead GET");
       };
@@ -2027,6 +2088,53 @@ int main(int argc, char** argv) {
     require(std::equal(second_read.begin(), second_read.end(),
                        expected.begin() + second_read_offset),
             "second concurrent read returned wrong bytes");
+    if (cache_dir.empty()) {
+      UniqueFd parallel_a(::open(
+          (mountpoint + "/read-ahead.bin").c_str(),
+          O_RDONLY | O_CLOEXEC));
+      UniqueFd parallel_b(::open(
+          (mountpoint + "/read-ahead-random.bin").c_str(),
+          O_RDONLY | O_CLOEXEC));
+      if (!parallel_a || !parallel_b) {
+        fail_errno("open independent concurrent readers");
+      }
+      std::array<std::byte, concurrent_read_size> parallel_a_bytes{};
+      std::array<std::byte, concurrent_read_size> parallel_b_bytes{};
+      std::exception_ptr parallel_a_failure;
+      std::exception_ptr parallel_b_failure;
+      std::barrier launch(3);
+      std::jthread parallel_a_reader([&] {
+        launch.arrive_and_wait();
+        try {
+          pread_all(parallel_a.get(), parallel_a_bytes, 0);
+        } catch (...) {
+          parallel_a_failure = std::current_exception();
+        }
+      });
+      std::jthread parallel_b_reader([&] {
+        launch.arrive_and_wait();
+        try {
+          pread_all(parallel_b.get(), parallel_b_bytes, 0);
+        } catch (...) {
+          parallel_b_failure = std::current_exception();
+        }
+      });
+      launch.arrive_and_wait();
+      parallel_a_reader.join();
+      parallel_b_reader.join();
+      if (parallel_a_failure) {
+        std::rethrow_exception(parallel_a_failure);
+      }
+      if (parallel_b_failure) {
+        std::rethrow_exception(parallel_b_failure);
+      }
+      require(std::equal(parallel_a_bytes.begin(), parallel_a_bytes.end(),
+                         read_ahead.begin()),
+              "first independent concurrent read returned wrong bytes");
+      require(std::equal(parallel_b_bytes.begin(), parallel_b_bytes.end(),
+                         read_ahead.begin()),
+              "second independent concurrent read returned wrong bytes");
+    }
     {
       std::lock_guard state_guard(shared.mutex);
       require(shared.request_timeout_errors == 1 &&
@@ -2099,10 +2207,45 @@ int main(int argc, char** argv) {
       if (retry_b_failure) {
         std::rethrow_exception(retry_b_failure);
       }
+      bool checksum_retry_started = false;
+      for (unsigned attempt = 0; attempt != 2000; ++attempt) {
+        {
+          std::lock_guard state_guard(shared.mutex);
+          checksum_retry_started =
+              shared.special_objects.at("checksum-retry.bin")
+                      ->get_requests >= 2;
+        }
+        if (checksum_retry_started) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(checksum_retry_started,
+              "background checksum retry did not reach the server");
       std::array<std::byte, 4096> retry_verified{};
-      pread_all(retry_first.get(), retry_verified, 64U * 1024U);
-      require(std::equal(retry_verified.begin(), retry_verified.end(),
-                         checksum_test.begin() + 64U * 1024U),
+      constexpr uint64_t corrupt_page_offset = 12U * 1024U;
+      const auto corrected_part_visible = [&](int fd,
+                                               std::span<std::byte> output) {
+        for (unsigned attempt = 0; attempt != 400; ++attempt) {
+          ssize_t result;
+          do {
+            result = ::pread(fd, output.data(), output.size(),
+                             off_t(corrupt_page_offset));
+          } while (result < 0 && errno == EINTR);
+          if (result < 0) {
+            fail_errno("read checksum-corrected page");
+          }
+          require(result == ssize_t(output.size()),
+                  "short read while waiting for checksum correction");
+          if (std::equal(output.begin(), output.end(),
+                         checksum_test.begin() + corrupt_page_offset)) {
+            return true;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+      };
+      require(corrected_part_visible(retry_first.get(), retry_verified),
               "checksum retry did not replace the corrupt cached part");
       {
         std::lock_guard state_guard(shared.mutex);
@@ -2117,6 +2260,122 @@ int main(int argc, char** argv) {
                     retried.get_ranges[1].first == 0 &&
                     retried.get_ranges[1].last == 128U * 1024U - 1,
                 "checksum retry did not GET the exact multipart part");
+      }
+
+      const std::string release_path =
+          mountpoint + "/checksum-release.bin";
+      UniqueFd release_file(
+          ::open(release_path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!release_file) {
+        fail_errno("open checksum release object");
+      }
+      std::array<std::byte, 4096> release_first{};
+      pread_all(release_file.get(), release_first, 0);
+      require(std::equal(release_first.begin(), release_first.end(),
+                         checksum_test.begin()),
+              "checksum release initial read returned wrong bytes");
+      release_file.reset();
+      bool released_retry_started = false;
+      for (unsigned attempt = 0; attempt != 2000; ++attempt) {
+        {
+          std::lock_guard state_guard(shared.mutex);
+          released_retry_started =
+              shared.special_objects.at("checksum-release.bin")
+                      ->get_requests >= 2;
+        }
+        if (released_retry_started) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(released_retry_started,
+              "release cancelled the background checksum retry");
+      UniqueFd released_reopen(
+          ::open(release_path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!released_reopen) {
+        fail_errno("reopen checksum release object");
+      }
+      std::array<std::byte, 4096> released_verified{};
+      require(corrected_part_visible(
+                  released_reopen.get(), released_verified),
+              "background checksum retry did not survive release");
+      {
+        std::lock_guard state_guard(shared.mutex);
+        const SpecialObject& released =
+            *shared.special_objects.at("checksum-release.bin");
+        require(released.get_requests == 2,
+                "released checksum read did not perform exactly one retry");
+      }
+
+      const std::string checksum_rename_source =
+          mountpoint + "/checksum-rename.bin";
+      const std::string checksum_rename_destination =
+          mountpoint + "/checksum-renamed.bin";
+      UniqueFd checksum_rename_file(
+          ::open(checksum_rename_source.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!checksum_rename_file) {
+        fail_errno("open checksum rename object");
+      }
+      std::array<std::byte, 4096> checksum_rename_first{};
+      std::exception_ptr checksum_rename_failure;
+      std::jthread checksum_rename_reader([&] {
+        try {
+          pread_all(checksum_rename_file.get(), checksum_rename_first, 0);
+        } catch (...) {
+          checksum_rename_failure = std::current_exception();
+        }
+      });
+      bool checksum_rename_get_started = false;
+      for (unsigned attempt = 0; attempt != 200; ++attempt) {
+        {
+          std::lock_guard state_guard(shared.mutex);
+          checksum_rename_get_started =
+              shared.special_objects.at("checksum-rename.bin")
+                      ->get_requests == 1;
+        }
+        if (checksum_rename_get_started) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(checksum_rename_get_started,
+              "delayed checksum GET did not start before rename");
+      require(::rename(checksum_rename_source.c_str(),
+                       checksum_rename_destination.c_str()) == 0,
+              "rename during delayed checksum validation failed");
+      checksum_rename_reader.join();
+      if (checksum_rename_failure) {
+        std::rethrow_exception(checksum_rename_failure);
+      }
+      require(std::equal(checksum_rename_first.begin(),
+                         checksum_rename_first.end(), checksum_test.begin()),
+              "renamed checksum object's initial read returned wrong bytes");
+      bool renamed_checksum_retry_started = false;
+      for (unsigned attempt = 0; attempt != 2000; ++attempt) {
+        {
+          std::lock_guard state_guard(shared.mutex);
+          renamed_checksum_retry_started =
+              shared.special_objects.at("checksum-renamed.bin")
+                      ->get_requests >= 2;
+        }
+        if (renamed_checksum_retry_started) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(renamed_checksum_retry_started,
+              "checksum retry did not follow the renamed identity");
+      std::array<std::byte, 4096> renamed_checksum_verified{};
+      require(corrected_part_visible(
+                  checksum_rename_file.get(), renamed_checksum_verified),
+              "renamed checksum retry did not replace corrupt cached bytes");
+      {
+        std::lock_guard state_guard(shared.mutex);
+        const SpecialObject& renamed =
+            *shared.special_objects.at("checksum-renamed.bin");
+        require(renamed.get_requests == 2 && renamed.get_paths.size() == 2,
+                "renamed checksum object did not perform one exact retry");
+        require(renamed.get_paths[0].starts_with(
+                    "/bucket/checksum-rename.bin") &&
+                    renamed.get_paths[1].starts_with(
+                    "/bucket/checksum-renamed.bin"),
+                "checksum retry was signed for the pre-rename path");
       }
 
       const std::string unsupported_path =
@@ -2228,7 +2487,7 @@ int main(int argc, char** argv) {
                 errno == ESPIPE,
             "positional write must fail on a sequential writer");
     const size_t first_write = std::min<size_t>(37, small_expected.size());
-    write_all(writer.get(), std::span(small_expected).first(first_write));
+    test_write_all(writer.get(), std::span(small_expected).first(first_write));
     if (::fsync(writer.get()) != 0) {
       fail_errno("fsync partial mounted page");
     }
@@ -2236,7 +2495,7 @@ int main(int argc, char** argv) {
     while (write_offset < small_expected.size()) {
       const size_t length = std::min<size_t>(
           64U * 1024U, small_expected.size() - write_offset);
-      write_all(writer.get(),
+      test_write_all(writer.get(),
                 std::span(small_expected).subspan(write_offset, length));
       write_offset += length;
     }
@@ -2421,7 +2680,7 @@ int main(int argc, char** argv) {
     while (write_offset < final_expected.size()) {
       const size_t length = std::min(
           write_chunk, final_expected.size() - write_offset);
-      write_all(multipart_writer.get(),
+      test_write_all(multipart_writer.get(),
                 std::span(final_expected).subspan(write_offset, length));
       write_offset += length;
     }
@@ -2544,7 +2803,7 @@ int main(int argc, char** argv) {
       if (!recovery_writer) {
         fail_errno("open cached crash-recovery writer");
       }
-      write_all(recovery_writer.get(), recovery_expected);
+      test_write_all(recovery_writer.get(), recovery_expected);
       mounted.crash();
       recovery_writer.reset();
 
@@ -2601,7 +2860,7 @@ int main(int argc, char** argv) {
       if (!new_append) {
         fail_errno("open new file with O_APPEND");
       }
-      write_all(new_append.get(), new_append_bytes);
+      test_write_all(new_append.get(), new_append_bytes);
       new_append.reset();
       {
         std::lock_guard state_guard(shared.mutex);
@@ -2625,7 +2884,7 @@ int main(int argc, char** argv) {
       if (!truncate_append) {
         fail_errno("open non-empty file with O_TRUNC|O_APPEND");
       }
-      write_all(truncate_append.get(), truncate_append_bytes);
+      test_write_all(truncate_append.get(), truncate_append_bytes);
       truncate_append.reset();
       {
         std::lock_guard state_guard(shared.mutex);
@@ -2654,7 +2913,7 @@ int main(int argc, char** argv) {
         fail_errno("open existing empty file with O_APPEND");
       }
       const std::array empty_append_bytes{std::byte{'e'}};
-      write_all(empty_append.get(), empty_append_bytes);
+      test_write_all(empty_append.get(), empty_append_bytes);
       empty_append.reset();
       {
         std::lock_guard state_guard(shared.mutex);
@@ -2698,7 +2957,7 @@ int main(int argc, char** argv) {
       if (!active_unlink_writer) {
         fail_errno("create active-unlink writer");
       }
-      write_all(active_unlink_writer.get(), active_unlink_bytes);
+      test_write_all(active_unlink_writer.get(), active_unlink_bytes);
       require(::unlink(active_unlink_path.c_str()) == 0,
               "cached unlink with an active writer failed");
 
@@ -2779,7 +3038,7 @@ int main(int argc, char** argv) {
       if (!unlink_writer) {
         fail_errno("create object for native unlink");
       }
-      write_all(unlink_writer.get(), expected);
+      test_write_all(unlink_writer.get(), expected);
       unlink_writer.reset();
 
       UniqueFd unlink_reader(

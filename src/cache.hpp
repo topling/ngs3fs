@@ -6,13 +6,18 @@
 
 #include <atomic>
 #include <array>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
+
+class CacheRetirementPending : public std::system_error {
+ public:
+  CacheRetirementPending();
+};
 
 enum CachePageState : uint8_t {
   CACHE_PAGE_MISSING      = 0b00,
@@ -42,6 +47,14 @@ struct CacheIdentity {
   std::string_view version_id;
   uint64_t size = 0;
   time_t mtime  = 0;
+};
+
+struct CacheIdentitySnapshot {
+  std::string key;
+  std::string etag;
+  std::string version_id;
+  uint64_t size  = 0;
+  uint64_t epoch = 0;
 };
 
 struct CacheFetchClaim {
@@ -100,6 +113,7 @@ class CacheEntry {
   [[nodiscard]] uint64_t written_end() const noexcept;
   [[nodiscard]] std::string etag() const;
   [[nodiscard]] std::string version_id() const;
+  [[nodiscard]] CacheIdentitySnapshot identity_snapshot() const;
   [[nodiscard]] std::string write_id() const;
   [[nodiscard]] size_t page_size() const noexcept;
   [[nodiscard]] bool stale() const noexcept;
@@ -126,6 +140,16 @@ class CacheEntry {
   CacheFetchClaim claim_fetch(uint64_t wanted_offset, size_t wanted_length,
                               size_t expansion);
   void wait_for_range(uint64_t offset, size_t length);
+  // Returns -1 when a recheck is already useful; otherwise registers a waiter
+  // before exposing the notification fd. Pair with end_async_wait after CQE.
+  int begin_async_wait(uint64_t offset, size_t length);
+  int begin_checksum_wait(uint64_t offset, size_t length);
+  int begin_manifest_wait();
+  // Used after LocalCache::retiring_entry marks this generation stale. Returns
+  // -1 when quiescent; otherwise registers on the existing cache eventfd.
+  int begin_retire_wait();
+  bool checksum_failed(uint64_t offset, size_t length) const;
+  void end_async_wait() noexcept;
   void publish_clean(const CacheFetchClaim& claim, size_t published,
                      size_t length, bool final);
   void finish_fetch(const CacheFetchClaim& claim) noexcept;
@@ -133,16 +157,21 @@ class CacheEntry {
   void mark_bad(const CacheFetchClaim& claim) noexcept;
   void begin_retry(const CacheFetchClaim& claim);
   void finish_retry(const CacheFetchClaim& claim, bool valid) noexcept;
-  bool begin_checksum_manifest();
+  bool begin_checksum_manifest(bool wait = true);
   void finish_checksum_manifest(
       std::vector<CacheChecksumPart> parts);
   void checksum_manifest_unavailable() noexcept;
   [[nodiscard]] bool checksum_manifest_available() const noexcept;
-  CacheChecksumClaim claim_checksum(uint64_t offset, size_t length);
+  CacheChecksumClaim claim_checksum(uint64_t offset, size_t length,
+                                    bool skip_in_progress = false);
   void wait_for_checksum(uint64_t offset, size_t length);
   void checksum_mismatch(const CacheChecksumClaim& claim) noexcept;
   void finish_checksum(const CacheChecksumClaim& claim,
                        bool valid) noexcept;
+  // A retry signed for an identity that was renamed while its handle closed
+  // proves nothing about the current key. Drop the affected clean pages so a
+  // later opener refetches them instead of poisoning or trusting this part.
+  void abandon_checksum(const CacheChecksumClaim& claim) noexcept;
 
  private:
   friend class LocalCache;
@@ -160,8 +189,11 @@ class CacheEntry {
   [[nodiscard]] bool range_ready_locked(uint64_t offset,
                                         size_t length) const noexcept;
   bool end_fetch_locked(const CacheFetchClaim& claim) noexcept;
+  uint8_t checksum_blocked_locked(uint64_t offset, size_t length) const noexcept;
+  void wait_locked(std::unique_lock<std::mutex>& guard);
+  void notify_waiters_locked() noexcept;
   void ensure_write_capacity(uint64_t end);
-  void retire_generation();
+  void retire_generation(bool wait = true);
   uint64_t evict_one_region() noexcept;
 
   LocalCache* owner_ = nullptr;
@@ -177,7 +209,8 @@ class CacheEntry {
   size_t page_count_   = 0;
   size_t bitmap_offset_ = 0;
   mutable std::mutex mutex_;
-  std::condition_variable condition_;
+  int wait_fd_ = -1;
+  unsigned waiters_ = 0;
   std::vector<uint8_t> referenced_;
   std::vector<uint32_t> region_pins_;
   std::vector<uint64_t> active_claims_;
@@ -204,9 +237,12 @@ class LocalCache {
   LocalCache(const LocalCache&) = delete;
   LocalCache& operator=(const LocalCache&) = delete;
 
-  std::shared_ptr<CacheEntry> open(const CacheIdentity& identity);
+  std::shared_ptr<CacheEntry> open(const CacheIdentity& identity, bool wait = true);
   std::shared_ptr<CacheEntry> create_writer(const CacheIdentity& base,
-                                            uint64_t maximum_size);
+                                            uint64_t maximum_size, bool wait = true);
+  std::shared_ptr<CacheEntry> retiring_entry(
+      std::string_view key, const CacheIdentity* reuse = nullptr,
+      bool preserve_generation = false);
   std::vector<std::shared_ptr<CacheEntry>> recover_dirty(
       std::vector<std::string>* isolated_keys = nullptr);
   std::vector<CachePendingDelete> recover_pending_deletes();
@@ -215,12 +251,15 @@ class LocalCache {
       std::string_view replacement_etag = {});
   void commit_pending_delete(std::string_view key);
   void finish_pending_delete(std::string_view key) noexcept;
-  bool remove(std::string_view key, bool preserve_generation) noexcept;
-  bool rename(std::string_view old_key, std::string_view new_key) noexcept;
+  bool remove(std::string_view key, bool preserve_generation,
+              bool* retry = nullptr, bool wait = true) noexcept;
+  bool rename(std::string_view old_key, std::string_view new_key,
+              bool* retry = nullptr, bool wait = true) noexcept;
   [[nodiscard]] const CacheConfig& config() const noexcept { return config_; }
 
  private:
   friend class CacheEntry;
+  friend struct CacheTestAccess;
 
   void probe_filesystem();
   bool prepare_range(CacheEntry& entry, uint64_t offset, size_t length,

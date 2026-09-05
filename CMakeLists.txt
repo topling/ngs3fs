@@ -178,6 +178,13 @@ if(NGS3FS_BUILD_TESTS)
   enable_testing()
   add_compile_options(-UNDEBUG)
 
+  add_executable(reactor_io_test tests/reactor_io_test.cpp src/fuse_reactor.cpp)
+  target_link_libraries(reactor_io_test PRIVATE ngs3fs_core FUSE3::fuse3 LIBURING::uring)
+  target_compile_definitions(reactor_io_test PRIVATE FUSE_USE_VERSION=318)
+  target_compile_options(reactor_io_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+  add_test(NAME reactor_io_test COMMAND reactor_io_test)
+  set_tests_properties(reactor_io_test PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+
   add_executable(mounted_e2e_client tests/mounted_e2e_client.cpp)
   target_compile_options(mounted_e2e_client PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
@@ -217,10 +224,16 @@ if(NGS3FS_BUILD_TESTS)
   add_executable(h2_range_client_test tests/h2_range_client_test.cpp)
   target_link_libraries(h2_range_client_test PRIVATE ngs3fs_core)
   add_test(NAME h2_range_client_test COMMAND h2_range_client_test)
+  add_test(NAME h2_range_client_async_test
+    COMMAND h2_range_client_test --async)
 
   add_executable(h2_put_client_test tests/h2_put_client_test.cpp)
   target_link_libraries(h2_put_client_test PRIVATE ngs3fs_core)
   add_test(NAME h2_put_client_test COMMAND h2_put_client_test)
+  add_test(NAME h2_put_client_async_test
+    COMMAND h2_put_client_test --async)
+  add_test(NAME h2_put_client_async_segments_test
+    COMMAND h2_put_client_test --async-segments)
 
   add_executable(fuse_mmap_integration_test
     tests/fuse_mmap_integration_test.cpp)
@@ -260,6 +273,20 @@ if(NGS3FS_BUILD_TESTS)
             xxhash128 prefetch)
   set_tests_properties(fuse_uncached_read_ahead_integration_test
     PROPERTIES TIMEOUT 60)
+
+  # Each mounted test already exercises concurrent operations. Do not run
+  # independent mounts against the same per-user kernel pipe budget at once.
+  set_tests_properties(
+    fuse_mmap_integration_test
+    fuse_uring_integration_test
+    fuse_legacy_integration_test
+    fuse_multi_reactor_integration_test
+    fuse_multi_reactor_cached_integration_test
+    fuse_crc64nvme_integration_test
+    fuse_oss_crc64_integration_test
+    fuse_cached_mmap_integration_test
+    fuse_uncached_read_ahead_integration_test
+    PROPERTIES RESOURCE_LOCK fuse_mounts)
 
   add_test(NAME prefetch_window_environment_test
     COMMAND ngs3fs --help)
@@ -343,6 +370,10 @@ if(NGS3FS_BUILD_TESTS)
   add_executable(h1_client_test tests/h1_client_test.cpp)
   target_link_libraries(h1_client_test PRIVATE ngs3fs_core)
   add_test(NAME h1_client_test COMMAND h1_client_test)
+  add_executable(async_http_test tests/async_http_test.cpp)
+  target_link_libraries(async_http_test PRIVATE ngs3fs_core)
+  add_test(NAME async_http_test COMMAND async_http_test)
+  set_tests_properties(async_http_test PROPERTIES TIMEOUT 10)
 
   add_executable(protocol_probe_timeout_test
     tests/protocol_probe_timeout_test.cpp)
@@ -358,6 +389,7 @@ if(NGS3FS_BUILD_TESTS)
   add_executable(credential_provider_test
     tests/credential_provider_test.cpp)
   target_link_libraries(credential_provider_test PRIVATE ngs3fs_core)
+  add_dependencies(credential_provider_test credential_process_helper)
   add_test(NAME credential_provider_test
     COMMAND credential_provider_test $<TARGET_FILE:credential_process_helper>)
   set_tests_properties(credential_provider_test PROPERTIES TIMEOUT 30)

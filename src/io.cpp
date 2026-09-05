@@ -1,5 +1,7 @@
 #include "io.hpp"
 
+#include <errno.h>
+#include <sys/eventfd.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
@@ -10,7 +12,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -22,8 +23,58 @@
 #include <string>
 #include <system_error>
 
+IoMutex::~IoMutex() {
+  const int fd = event_.load(std::memory_order_relaxed);
+  if (fd >= 0) ::close(fd);
+}
+
+int IoMutex::begin_async_wait() {
+  int fd = event_.load(std::memory_order_acquire);
+  if (fd < 0) {
+    UniqueFd candidate(::eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE));
+    if (!candidate) {
+      throw std::system_error(errno, std::generic_category(), "eventfd(directory mutex)");
+    }
+    fd = -1;
+    if (event_.compare_exchange_strong(fd, candidate.get(),
+            std::memory_order_release, std::memory_order_acquire)) {
+      fd = candidate.release();
+    }
+  }
+  waiters_.fetch_add(1, std::memory_order_acq_rel);
+  return fd;
+}
+
+void IoMutex::unlock() noexcept {
+  locked_.store(false, std::memory_order_release);
+  locked_.notify_one();
+  const uint64_t waiters = waiters_.load(std::memory_order_acquire);
+  if (waiters == 0) return;
+  const int saved_errno = errno;
+  const int fd = event_.load(std::memory_order_acquire);
+  ssize_t result;
+  do {
+    result = ::write(fd, &waiters, sizeof(waiters));
+  } while (result < 0 && errno == EINTR);
+  errno = saved_errno;
+}
+
 thread_local IoExecutor* current_io_executor = nullptr;
 thread_local int current_io_timeout_ms       = 0;
+
+IoExecutor* io_executor() noexcept {
+  return current_io_executor;
+}
+
+bool IoExecutor::submit(AsyncIoRequest&) noexcept {
+  errno = ENOTSUP;
+  return false;
+}
+
+bool IoExecutor::cancel(AsyncIoRequest&) noexcept {
+  errno = ENOTSUP;
+  return false;
+}
 
 IoExecutorScope::IoExecutorScope(IoExecutor* executor,
                                  int timeout_ms) noexcept
@@ -43,37 +94,45 @@ int effective_io_timeout(int timeout_ms) noexcept {
 }
 
 ssize_t io_receive(int fd, void* data, size_t length, int flags,
-                   int timeout_ms) noexcept {
+                   int) noexcept {
   if (current_io_executor != nullptr) {
-    return current_io_executor->receive(
-        fd, data, length, flags, effective_io_timeout(timeout_ms));
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   return ::recv(fd, data, length, flags);
 }
 
 ssize_t io_read(int fd, void* data, size_t length,
-                int timeout_ms) noexcept {
+                int) noexcept {
   if (current_io_executor != nullptr) {
-    return current_io_executor->read(
-        fd, data, length, effective_io_timeout(timeout_ms));
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   return ::read(fd, data, length);
 }
 
 ssize_t io_pread(int fd, void* data, size_t length, off_t offset,
-                 int timeout_ms) noexcept {
+                 int) noexcept {
   if (current_io_executor != nullptr) {
-    return current_io_executor->pread(
-        fd, data, length, offset, effective_io_timeout(timeout_ms));
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   return ::pread(fd, data, length, offset);
 }
 
 ssize_t io_receive_exact(int fd, void* data, size_t length, int flags,
-                         int timeout_ms) noexcept {
+                         int) noexcept {
   if (current_io_executor != nullptr) {
-    return current_io_executor->receive_exact(
-        fd, data, length, flags, effective_io_timeout(timeout_ms));
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   size_t offset = 0;
   while (offset != length) {
@@ -102,9 +161,10 @@ ssize_t io_receive_exact_then(
     return -1;
   }
   if (current_io_executor != nullptr) {
-    return current_io_executor->receive_exact_then(
-        fd, data, length, flags, effective_io_timeout(timeout_ms),
-        processor, context);
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   const ssize_t received = io_receive_exact(
       fd, data, length, flags, timeout_ms);
@@ -121,15 +181,16 @@ ssize_t io_receive_exact_then(
 
 ssize_t io_receive_until(int fd, void* data, size_t length, int flags,
                          IoExecutor::ReceiveProcessor processor,
-                         void* context, int timeout_ms) noexcept {
+                         void* context, int) noexcept {
   if (processor == nullptr || length == 0) {
     errno = EINVAL;
     return -1;
   }
   if (current_io_executor != nullptr) {
-    return current_io_executor->receive_until(
-        fd, data, length, flags, effective_io_timeout(timeout_ms),
-        processor, context);
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   size_t total = 0;
   for (;;) {
@@ -156,19 +217,23 @@ ssize_t io_receive_until(int fd, void* data, size_t length, int flags,
 }
 
 ssize_t io_send(int fd, const void* data, size_t length, int flags,
-                int timeout_ms) noexcept {
+                int) noexcept {
   if (current_io_executor != nullptr) {
-    return current_io_executor->send(
-        fd, data, length, flags, effective_io_timeout(timeout_ms));
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   return ::send(fd, data, length, flags);
 }
 
 ssize_t io_send_exact(int fd, const void* data, size_t length, int flags,
-                      int timeout_ms) noexcept {
+                      int) noexcept {
   if (current_io_executor != nullptr) {
-    return current_io_executor->send_exact(
-        fd, data, length, flags, effective_io_timeout(timeout_ms));
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   size_t offset = 0;
   while (offset != length) {
@@ -191,10 +256,13 @@ ssize_t io_send_exact(int fd, const void* data, size_t length, int flags,
 }
 
 ssize_t io_pwrite(int fd, const void* data, size_t length,
-                  off_t offset, int timeout_ms) noexcept {
+                  off_t offset, int,
+                  bool) noexcept {
   if (current_io_executor != nullptr) {
-    return current_io_executor->pwrite(
-        fd, data, length, offset, effective_io_timeout(timeout_ms));
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   return ::pwrite(fd, data, length, offset);
 }
@@ -202,11 +270,12 @@ ssize_t io_pwrite(int fd, const void* data, size_t length,
 ssize_t io_splice(int input_fd, off_t* input_offset,
                   int output_fd, off_t* output_offset,
                   size_t length, unsigned flags,
-                  int timeout_ms) noexcept {
+                  int, bool) noexcept {
   if (current_io_executor != nullptr) {
-    return current_io_executor->splice(
-        input_fd, input_offset, output_fd, output_offset,
-        length, flags, effective_io_timeout(timeout_ms));
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   return ::splice(input_fd, input_offset, output_fd, output_offset,
                   length, flags);
@@ -215,11 +284,13 @@ ssize_t io_splice(int input_fd, off_t* input_offset,
 ssize_t io_splice_exact(int input_fd, off_t* input_offset,
                         int output_fd, off_t* output_offset,
                         size_t length, unsigned flags,
-                        int timeout_ms, size_t* calls) noexcept {
+                        int, size_t* calls,
+                        bool) noexcept {
   if (current_io_executor != nullptr) {
-    return current_io_executor->splice_exact(
-        input_fd, input_offset, output_fd, output_offset,
-        length, flags, effective_io_timeout(timeout_ms), calls);
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   size_t transferred = 0;
   while (transferred != length) {
@@ -244,10 +315,12 @@ ssize_t io_splice_exact(int input_fd, off_t* input_offset,
 }
 
 int io_connect(int fd, const sockaddr* address,
-               socklen_t address_length, int timeout_ms) noexcept {
+               socklen_t address_length, int) noexcept {
   if (current_io_executor != nullptr) {
-    return current_io_executor->connect(
-        fd, address, address_length, timeout_ms);
+    // A legacy blocking operation on the reactor is an implementation bug,
+    // never a reason to recreate the removed synchronous handoff bridge.
+    errno = EDEADLK;
+    return -1;
   }
   return ::connect(fd, address, address_length);
 }
@@ -297,7 +370,8 @@ Pipe Pipe::create(size_t preferred_capacity) {
 size_t splice_exact(int source_fd, int destination_fd,
                     size_t length, unsigned int flags, size_t* calls) {
   const ssize_t result = io_splice_exact(
-      source_fd, nullptr, destination_fd, nullptr, length, flags, 0, calls);
+      source_fd, nullptr, destination_fd, nullptr, length, flags, 0, calls,
+      false);
   if (result < 0) {
     pipe_throw_errno("splice");
   }
@@ -397,7 +471,7 @@ size_t splice_to_fd_exact(int source_fd, int destination_fd,
     off_t offset = static_cast<off_t>(destination_offset);
     const ssize_t result =
         io_splice(source_fd, nullptr, destination_fd, &offset,
-                  length - transferred, flags);
+                  length - transferred, flags, 0, true);
     if (result > 0) {
       transferred += static_cast<size_t>(result);
       destination_offset = static_cast<uint64_t>(offset);

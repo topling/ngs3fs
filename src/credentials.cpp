@@ -1,6 +1,7 @@
 #include "credentials.hpp"
 
 #include "http.hpp"
+#include "io.hpp"
 
 #include <yyjson.h>
 
@@ -1005,7 +1006,18 @@ const Credentials& CredentialProvider::get() {
   if (snapshot != nullptr) {
     return snapshot->credentials;
   }
-  std::lock_guard guard(mutex_);
+  // The refresher owns this mutex while it runs the credential source. A
+  // missing snapshot must not make an I/O reactor wait for that network or
+  // child process; legacy callers can wait normally. EAGAIN is transient and
+  // does not replace refresh_error_ or consume a legacy network retry.
+  std::unique_lock guard(mutex_, std::defer_lock);
+  if (io_executor() == nullptr) {
+    guard.lock();
+  } else if (!guard.try_lock()) {
+    snapshot = current_.load(std::memory_order_acquire);
+    if (snapshot != nullptr) return snapshot->credentials;
+    throw CredentialRefreshPending();
+  }
   snapshot = current_.load(std::memory_order_relaxed);
   if (snapshot != nullptr) {
     return snapshot->credentials;

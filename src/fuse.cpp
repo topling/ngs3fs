@@ -13,12 +13,15 @@
 #include <linux/fs.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <assert.h>
 #include <atomic>
 #include <errno.h>
 #include <charconv>
@@ -168,6 +171,9 @@ struct PipeSegment {
 };
 
 struct RetainedPart {
+  // TODO: charge physical pipe page slots, not only logical part bytes.
+  // Tiny FD-backed writes can exhaust slots long before payload capacity;
+  // the current payload budget then understates pinned memory and fd usage.
   std::vector<PipeSegment> segments;
   ChecksumValue checksum;
   uint64_t bytes  = 0;
@@ -175,6 +181,7 @@ struct RetainedPart {
 };
 
 struct State;
+class AsyncExpressSession;
 struct OpenHandle;
 
 class FileReader {
@@ -191,6 +198,10 @@ class FileWriter {
   virtual void write(State& state, OpenHandle& handle,
                      fuse_req_t request, fuse_ino_t inode,
                      fuse_bufvec* input, off_t offset) = 0;
+  virtual void write_async(State& state, OpenHandle& handle,
+                           fuse_req_t request, fuse_ino_t inode,
+                           fuse_bufvec* input, off_t offset,
+                           FuseReactor& reactor) = 0;
   virtual void flush(State& state, OpenHandle& handle) = 0;
   virtual void fsync(State& state, OpenHandle& handle, bool data_only) = 0;
   virtual void release(State& state, OpenHandle& handle) noexcept = 0;
@@ -295,7 +306,24 @@ class HttpPool {
   }
 
   Lease try_acquire_bulk() noexcept {
-    const size_t usable = slots_.size() - 1;
+    return try_acquire_slots(slots_.size() - 1);
+  }
+
+  Lease try_acquire() noexcept {
+    return try_acquire_slots(slots_.size());
+  }
+
+  int begin_async_wait() noexcept {
+    reactor_waiters_.fetch_add(1, std::memory_order_acq_rel);
+    return release_pipe_.read_fd();
+  }
+
+  void end_async_wait() noexcept {
+    reactor_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+ private:
+  Lease try_acquire_slots(size_t usable) noexcept {
     const size_t begin = next_.fetch_add(1, std::memory_order_relaxed) %
         usable;
     for (size_t n = 0; n < usable; ++n) {
@@ -310,8 +338,10 @@ class HttpPool {
     return {};
   }
 
- private:
   Lease acquire_slots(size_t usable) {
+    if (current_fuse_reactor() != nullptr) {
+      throw std::system_error(EDEADLK, std::generic_category(), "blocking HTTP acquisition on reactor");
+    }
     for (;;) {
       const uint64_t released = released_.load(std::memory_order_acquire);
       const size_t begin = next_.fetch_add(1, std::memory_order_relaxed) %
@@ -324,33 +354,6 @@ class HttpPool {
                 std::memory_order_relaxed)) {
           return Lease(this, i);
         }
-      }
-      FuseReactor* reactor = current_fuse_reactor();
-      if (reactor != nullptr && reactor->in_current_task()) {
-        reactor_waiters_.fetch_add(1, std::memory_order_acquire);
-        for (size_t n = 0; n < usable; ++n) {
-          const size_t i = (begin + n) % usable;
-          bool available = false;
-          if (slots_[i]->busy.compare_exchange_strong(
-                  available, true, std::memory_order_acquire,
-                  std::memory_order_relaxed)) {
-            reactor_waiters_.fetch_sub(1, std::memory_order_release);
-            return Lease(this, i);
-          }
-        }
-        std::byte notification;
-        ssize_t result;
-        do {
-          result = io_read(release_pipe_.read_fd(), &notification,
-                           sizeof(notification));
-        } while (result < 0 && errno == EINTR);
-        reactor_waiters_.fetch_sub(1, std::memory_order_release);
-        if (result != ssize_t(sizeof(notification))) {
-          throw std::system_error(
-              result < 0 ? errno : EIO, std::generic_category(),
-              "wait for HTTP connection");
-        }
-        continue;
       }
       released_.wait(released, std::memory_order_acquire);
     }
@@ -386,11 +389,13 @@ class UploadScheduler {
     const void* owner;
     FuseReactor* reactor;
     std::function<void()> run;
+    bool upload = false;
+    bool asynchronous = false;
   };
 
  public:
   UploadScheduler(unsigned concurrency, int io_timeout_ms)
-      : io_timeout_ms_(io_timeout_ms) {
+      : io_timeout_ms_(io_timeout_ms), max_uploads_(concurrency) {
     threads_.reserve(concurrency);
     for (unsigned i = 0; i < concurrency; ++i) {
       threads_.emplace_back([this] { worker(); });
@@ -418,9 +423,38 @@ class UploadScheduler {
   void submit(const void* owner, std::function<void()> run) {
     {
       std::lock_guard guard(mutex_);
+      if (stopping_) {
+        throw std::system_error(ECANCELED, std::generic_category(),
+                                "upload scheduler stopped");
+      }
       jobs_.push_back(Job{owner, current_fuse_reactor(), std::move(run)});
     }
     condition_.notify_one();
+  }
+
+  void submit_upload(const void* owner, std::function<void()> run,
+                     bool asynchronous = false) {
+    {
+      std::lock_guard guard(mutex_);
+      if (stopping_) {
+        throw std::system_error(ECANCELED, std::generic_category(),
+                                "upload scheduler stopped");
+      }
+      jobs_.push_back(Job{owner, current_fuse_reactor(), std::move(run),
+                          true, asynchronous});
+    }
+    condition_.notify_one();
+  }
+
+  // Asynchronous upload admission lasts through its final network/local
+  // completion, not merely until the CPU preparation worker returns.
+  void finish_upload() noexcept {
+    {
+      std::lock_guard guard(mutex_);
+      if (active_uploads_ == 0) abort();
+      --active_uploads_;
+    }
+    condition_.notify_all();
   }
 
  private:
@@ -429,16 +463,22 @@ class UploadScheduler {
       Job job;
       {
         std::unique_lock guard(mutex_);
-        condition_.wait(guard, [&] { return stopping_ || !jobs_.empty(); });
+        const auto eligible = [&](const Job& candidate) {
+          return !candidate.upload || active_uploads_ < max_uploads_;
+        };
+        condition_.wait(guard, [&] {
+          return (stopping_ && jobs_.empty()) ||
+              std::any_of(jobs_.begin(), jobs_.end(), eligible);
+        });
         if (jobs_.empty()) {
           return;
         }
-        auto selected = jobs_.begin();
+        auto selected = std::find_if(jobs_.begin(), jobs_.end(), eligible);
         if (last_owner_ != nullptr) {
           const auto different = std::find_if(
               jobs_.begin(), jobs_.end(),
               [&](const Job& candidate) {
-                return candidate.owner != last_owner_;
+                return candidate.owner != last_owner_ && eligible(candidate);
               });
           if (different != jobs_.end()) {
             selected = different;
@@ -447,10 +487,11 @@ class UploadScheduler {
         job = std::move(*selected);
         jobs_.erase(selected);
         last_owner_ = job.owner;
+        if (job.upload) ++active_uploads_;
       }
       try {
         std::optional<FuseReactorReplyScope> scope;
-        if (job.reactor != nullptr) {
+        if (job.reactor != nullptr && !job.asynchronous) {
           scope.emplace(job.reactor, io_timeout_ms_);
         }
         job.run();
@@ -459,6 +500,7 @@ class UploadScheduler {
       } catch (...) {
         fprintf(stderr, "unhandled upload job error\n");
       }
+      if (job.upload && !job.asynchronous) finish_upload();
     }
   }
 
@@ -467,11 +509,146 @@ class UploadScheduler {
   std::mutex mutex_;
   std::condition_variable condition_;
   int io_timeout_ms_ = kRequestIoTimeoutMs;
+  size_t max_uploads_ = 0;
+  size_t active_uploads_ = 0;
   const void* last_owner_ = nullptr;
   bool stopping_ = false;
 };
 
+class ReactorSharedMutex {
+ public:
+  ReactorSharedMutex() : event_(::eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE)) {
+    if (!event_) {
+      throw std::system_error(errno, std::generic_category(),
+                              "eventfd(reactor shared mutex)");
+    }
+  }
+
+  ReactorSharedMutex(const ReactorSharedMutex&) = delete;
+  ReactorSharedMutex& operator=(const ReactorSharedMutex&) = delete;
+
+  void lock() {
+    waiting_writers_.fetch_add(1, std::memory_order_acq_rel);
+    try {
+      for (;;) {
+        const uint32_t generation = wake_generation_.load(
+            std::memory_order_acquire);
+        uint32_t expected = 0;
+        if (state_.compare_exchange_strong(
+                expected, kWriter, std::memory_order_acquire,
+                std::memory_order_relaxed)) {
+          waiting_writers_.fetch_sub(1, std::memory_order_release);
+          return;
+        }
+        wait(generation);
+      }
+    } catch (...) {
+      waiting_writers_.fetch_sub(1, std::memory_order_release);
+      notify();
+      throw;
+    }
+  }
+
+  bool try_lock() noexcept {
+    uint32_t expected = 0;
+    return state_.compare_exchange_strong(
+        expected, kWriter, std::memory_order_acquire,
+        std::memory_order_relaxed);
+  }
+
+  void unlock() noexcept {
+    state_.store(0, std::memory_order_release);
+    notify();
+  }
+
+  void lock_shared() {
+    for (;;) {
+      const uint32_t generation = wake_generation_.load(
+          std::memory_order_acquire);
+      if (try_lock_shared()) {
+        return;
+      }
+      wait(generation);
+    }
+  }
+
+  bool try_lock_shared() noexcept {
+    if (waiting_writers_.load(std::memory_order_acquire) != 0) {
+      return false;
+    }
+    uint32_t state = state_.load(std::memory_order_relaxed);
+    do {
+      if ((state & kWriter) != 0 || (state & kReaders) == kReaders) {
+        return false;
+      }
+    } while (!state_.compare_exchange_weak(
+        state, state + 1, std::memory_order_acquire,
+        std::memory_order_relaxed));
+    return true;
+  }
+
+  void unlock_shared() noexcept {
+    const uint32_t previous =
+        state_.fetch_sub(1, std::memory_order_release);
+    if ((previous & kReaders) == 0 || (previous & kWriter) != 0) {
+      abort();
+    }
+    if (previous == 1) {
+      notify();
+    }
+  }
+
+  int begin_async_wait() noexcept {
+    reactor_waiters_.fetch_add(1, std::memory_order_acq_rel);
+    return event_.get();
+  }
+
+  void end_async_wait() noexcept {
+    reactor_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+ private:
+  void wait(uint32_t observed) {
+    if (current_fuse_reactor() != nullptr) {
+      throw std::system_error(EDEADLK, std::generic_category(), "blocking identity lock on reactor");
+    }
+    wake_generation_.wait(observed, std::memory_order_acquire);
+  }
+
+  void notify() noexcept {
+    // A pending writer can make a reader wait while state_ is already zero.
+    // Use a generation so a complete lock/unlock cycle cannot hide the wakeup.
+    wake_generation_.fetch_add(1, std::memory_order_release);
+    wake_generation_.notify_all();
+    const uint64_t waiters =
+        reactor_waiters_.load(std::memory_order_acquire);
+    if (waiters == 0) {
+      return;
+    }
+    ssize_t result;
+    do {
+      result = ::write(event_.get(), &waiters, sizeof(waiters));
+    } while (result < 0 && errno == EINTR);
+  }
+
+  static constexpr uint32_t kWriter  = 1U << 31;
+  static constexpr uint32_t kReaders = kWriter - 1;
+  UniqueFd event_;
+  std::atomic<uint32_t> state_{0};
+  std::atomic<uint32_t> wake_generation_{0};
+  std::atomic<unsigned> waiting_writers_{0};
+  std::atomic<unsigned> reactor_waiters_{0};
+};
+
 struct OpenHandle {
+  OpenHandle()
+      : state_event(::eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE)) {
+    if (!state_event) {
+      throw std::system_error(errno, std::generic_category(),
+                              "eventfd(open handle)");
+    }
+  }
+
   fuse_ino_t inode  = 0;
   uint64_t id       = 0;
   InodeFile* item   = nullptr;
@@ -490,6 +667,7 @@ struct OpenHandle {
   std::vector<uint64_t> part_sizes;
   std::vector<std::pair<uint64_t, uint64_t>> partial_write_pages;
   std::unique_ptr<RetainedPart> current_part;
+  UniqueFd state_event;
   Pipe cache_write_pipe;
   uint64_t size                = 0;
   uint64_t stream_offset       = 0;
@@ -513,13 +691,50 @@ struct OpenHandle {
   bool page_cache_store_failed = false;
   bool cache_read_seen         = false;
   bool write_after_flush_warned = false;
-  std::atomic<uint64_t> request_state{0};
+  // The initial reference belongs to the application's open handle. Release
+  // closes admission and drops it; the final asynchronous request retires us.
+  std::atomic<uint64_t> request_state{1};
+  void (*release_ready)(void*) noexcept = nullptr;
+  void* release_context = nullptr;
   std::atomic<bool> stale{false};
+  std::atomic<bool> read_checksum_bad{false};
   std::atomic<bool> unlinked{false};
-  mutable std::shared_mutex identity_mutex;
+  std::atomic<unsigned> reactor_waiters{0};
+  mutable ReactorSharedMutex identity_mutex;
   std::mutex mutex;
   std::condition_variable condition;
 };
+
+void drop_open_request(OpenHandle& handle) noexcept {
+  constexpr uint64_t closing = 1ULL << 63;
+  const uint64_t previous = handle.request_state.fetch_sub(
+      1, std::memory_order_acq_rel);
+  if (previous == (closing | 1)) {
+    // This decrement owns retirement. Neither release nor another guard may
+    // delete the handle concurrently; callback publication precedes closing.
+    handle.release_ready(handle.release_context);
+  }
+}
+
+void notify_handle(OpenHandle& handle) noexcept {
+  const uint64_t wake =
+      handle.reactor_waiters.load(std::memory_order_acquire);
+  if (wake != 0) {
+    ssize_t result;
+    do {
+      result = ::write(handle.state_event.get(), &wake, sizeof(wake));
+    } while (result < 0 && errno == EINTR);
+  }
+  handle.condition.notify_all();
+}
+
+void wait_handle(OpenHandle& handle,
+                 std::unique_lock<std::mutex>& guard) {
+  if (current_fuse_reactor() != nullptr) {
+    throw std::system_error(EDEADLK, std::generic_category(), "blocking handle state wait on reactor");
+  }
+  handle.condition.wait(guard);
+}
 
 class OpenRequestGuard {
  public:
@@ -543,14 +758,23 @@ class OpenRequestGuard {
   }
 
   ~OpenRequestGuard() {
-    const uint64_t previous =
-        handle_.request_state.fetch_sub(1, std::memory_order_release);
-    if ((previous & kActiveMask) == 1) {
-      handle_.request_state.notify_all();
-    }
+    drop_open_request(handle_);
   }
 
-  OpenRequestGuard(const OpenRequestGuard&) = delete;
+  // A continuation belongs to an already admitted request. It may retain that
+  // request after close, but must not admit a new application operation.
+  OpenRequestGuard(const OpenRequestGuard& other) : handle_(other.handle_) {
+    uint64_t state = handle_.request_state.load(std::memory_order_relaxed);
+    for (;;) {
+      if ((state & kActiveMask) == kActiveMask) {
+        throw std::system_error(EOVERFLOW, std::generic_category(),
+                                "too many active file continuations");
+      }
+      if (handle_.request_state.compare_exchange_weak(
+              state, state + 1, std::memory_order_acquire,
+              std::memory_order_relaxed)) break;
+    }
+  }
   OpenRequestGuard& operator=(const OpenRequestGuard&) = delete;
   OpenRequestGuard(OpenRequestGuard&&) = delete;
   OpenRequestGuard& operator=(OpenRequestGuard&&) = delete;
@@ -565,6 +789,14 @@ struct DirHandle {
   InodeDir* item = nullptr;
   std::atomic<uint8_t> initialized{0};
 };
+
+void notify_dir_handle(DirHandle& handle) noexcept {
+  handle.initialized.notify_all();
+}
+
+void wait_dir_handle(DirHandle& handle) {
+  handle.initialized.wait(1, std::memory_order_acquire);
+}
 
 time_t wall_time_seconds() {
   struct timespec now{};
@@ -645,6 +877,111 @@ void cache_reclaim_loop(std::stop_token stop, State* state) noexcept;
 void cache_recovery_loop(std::stop_token stop, State* state) noexcept;
 void stats_report_loop(std::stop_token stop, State* state) noexcept;
 
+class ReadAheadStoragePool {
+ public:
+  struct Storage {
+    UniqueFd fd;
+    void* mapping = nullptr;
+    size_t size = 0;
+
+    Storage() = default;
+    Storage(const Storage&) = delete;
+    Storage& operator=(const Storage&) = delete;
+    Storage(Storage&& other) noexcept
+        : fd(std::move(other.fd)),
+          mapping(std::exchange(other.mapping, nullptr)),
+          size(std::exchange(other.size, 0)) {}
+    Storage& operator=(Storage&& other) noexcept {
+      if (this != &other) {
+        unmap();
+        fd      = std::move(other.fd);
+        mapping = std::exchange(other.mapping, nullptr);
+        size    = std::exchange(other.size, 0);
+      }
+      return *this;
+    }
+    ~Storage() { unmap(); }
+
+    void unmap() noexcept {
+      if (mapping != nullptr) {
+        ::munmap(mapping, size);
+        mapping = nullptr;
+      }
+    }
+  };
+
+  explicit ReadAheadStoragePool(size_t capacity) : capacity_(capacity) {
+    entries_.reserve(16);
+  }
+
+  Storage acquire(size_t size) {
+    Storage storage;
+    {
+      std::lock_guard guard(mutex_);
+      auto found = std::find_if(
+          entries_.begin(), entries_.end(),
+          [&](const Storage& entry) { return entry.size == size; });
+      if (found == entries_.end() && !entries_.empty()) {
+        found = entries_.end() - 1;
+      }
+      if (found != entries_.end()) {
+        storage = std::move(*found);
+        retained_ -= storage.size;
+        *found = std::move(entries_.back());
+        entries_.pop_back();
+      }
+    }
+    if (!storage.fd) {
+      storage.fd.reset(::memfd_create("ngs3fs-read-ahead", MFD_CLOEXEC));
+      if (!storage.fd) {
+        throw std::system_error(errno, std::generic_category(),
+                                "memfd_create(read-ahead)");
+      }
+    }
+    if (storage.size != size) {
+      storage.unmap();
+      if (::ftruncate(storage.fd.get(), off_t(size)) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "ftruncate(read-ahead)");
+      }
+      storage.size = size;
+    }
+    if (storage.mapping == nullptr) {
+      storage.mapping = ::mmap(
+          nullptr, size, PROT_READ, MAP_SHARED, storage.fd.get(), 0);
+      if (storage.mapping == MAP_FAILED) {
+        storage.mapping = nullptr;
+        throw std::system_error(errno, std::generic_category(),
+                                "mmap(read-ahead)");
+      }
+    }
+    return storage;
+  }
+
+  void release(Storage storage) noexcept {
+    if (!storage.fd || storage.size > capacity_) {
+      return;
+    }
+    std::lock_guard guard(mutex_);
+    if (retained_ > capacity_ - storage.size) {
+      return;
+    }
+    try {
+      const size_t size = storage.size;
+      entries_.push_back(std::move(storage));
+      retained_ += size;
+    } catch (...) {
+      // Storage retains ownership if growing the pool fails.
+    }
+  }
+
+ private:
+  std::mutex mutex_;
+  std::vector<Storage> entries_;
+  size_t retained_ = 0;
+  size_t capacity_;
+};
+
 struct State {
   explicit State(MountConfig value)
       : config(std::move(value)),
@@ -657,7 +994,11 @@ struct State {
             .metadata_timeout_ms = config.metadata_timeout_ms,
         }),
         directory_mtime(wall_time_seconds()),
+        page_size(size_t(::sysconf(_SC_PAGESIZE))),
         root_item(std::make_unique<InodeDir>()),
+        read_ahead_pool(std::make_shared<ReadAheadStoragePool>(
+            std::min<size_t>(64U * 1024U * 1024U,
+                             config.max_connections * 1024U * 1024U))),
         http(std::make_unique<HttpPool>(config)),
         uploads(std::make_unique<UploadScheduler>(
             config.max_uploads, config.request_timeout_ms)),
@@ -735,12 +1076,16 @@ struct State {
     fuse_ino_t inode;
     off_t offset;
     off_t length;
+    uint64_t generation_epoch;
+    std::shared_ptr<InodeFile> item;
   };
 
   MountConfig config;
   CredentialProvider credentials;
   time_t directory_mtime;
+  size_t page_size;
   std::unique_ptr<InodeDir> root_item;
+  std::shared_ptr<ReadAheadStoragePool> read_ahead_pool;
   std::unique_ptr<LocalCache> local_cache;
   AmzDateTimeCache date_time;
   std::mutex retired_mutex;
@@ -754,6 +1099,8 @@ struct State {
   std::condition_variable credentials_condition;
   std::mutex budget_mutex;
   std::condition_variable budget_condition;
+  UniqueFd budget_event;
+  std::atomic<unsigned> budget_reactor_waiters{0};
   std::condition_variable cache_condition;
   std::condition_variable stats_condition;
   std::mutex stats_wait_mutex;
@@ -769,6 +1116,7 @@ struct State {
   std::unique_ptr<UploadScheduler> uploads;
   fuse_session* session = nullptr;
   Credentials express_credentials;
+  AsyncExpressSession* express_async_waiters = nullptr;
   uint64_t express_expiration_ns   = 0;
   bool express_refreshing          = false;
   uint64_t pinned_bytes            = 0;
@@ -884,7 +1232,11 @@ void invalidate_page_cache(State& state, fuse_ino_t inode,
   }
 }
 
-void queue_page_invalidation(State& state, fuse_ino_t inode,
+void retain_inode_count(std::atomic<uint32_t>& count,
+                         const char* operation);
+bool release_inode_count(std::atomic<uint32_t>& count) noexcept;
+
+void queue_page_invalidation(State& state, OpenHandle& handle,
                              off_t offset, off_t length) noexcept {
   try {
     std::lock_guard guard(state.cache_mutex);
@@ -892,12 +1244,21 @@ void queue_page_invalidation(State& state, fuse_ino_t inode,
         state.pending_invalidations.begin(),
         state.pending_invalidations.end(),
         [&](const State::PendingInvalidation& pending) {
-          return pending.inode == inode && pending.offset == offset &&
-              pending.length == length;
+          return pending.inode == handle.inode && pending.offset == offset &&
+              pending.length == length &&
+              pending.generation_epoch == handle.generation_epoch;
         });
     if (duplicate == state.pending_invalidations.end()) {
+      // The admitted read still owns the handle's inode pin here. Retain a
+      // separate pin until this deferred notification is consumed, so forget
+      // cannot recycle its pointer-valued inode number in the meantime.
+      retain_inode_count(handle.item->open_count, "pin pending invalidation");
+      std::shared_ptr<InodeFile> item(handle.item, [](InodeFile* file) {
+        release_inode_count(file->open_count);
+      });
       state.pending_invalidations.push_back(
-          State::PendingInvalidation{inode, offset, length});
+          State::PendingInvalidation{handle.inode, offset, length,
+                                      handle.generation_epoch, std::move(item)});
     }
     state.cache_condition.notify_all();
   } catch (...) {
@@ -906,7 +1267,7 @@ void queue_page_invalidation(State& state, fuse_ino_t inode,
       fprintf(stderr,
               "warning: unable to queue stale page-cache invalidation: "
               "inode=%" PRIu64 "\n",
-              uint64_t(inode));
+              uint64_t(handle.inode));
     }
   }
 }
@@ -994,21 +1355,7 @@ struct WorkerState {
 WorkerState& worker_state(State& state) {
   // Each FUSE worker reuses its transport pipe and header scratch. HTTP
   // connections are leased from the mount-global pool.
-  FuseReactor* reactor = current_fuse_reactor();
-  WorkerState* selected = nullptr;
-  if (reactor != nullptr && reactor->in_current_task()) {
-    selected = static_cast<WorkerState*>(reactor->task_local_data());
-    if (selected == nullptr) {
-      selected = new WorkerState;
-      reactor->set_task_local_data(selected, [](void* data) noexcept {
-        delete static_cast<WorkerState*>(data);
-      });
-    }
-  } else {
-    thread_local WorkerState worker;
-    selected = &worker;
-  }
-  WorkerState& worker = *selected;
+  thread_local WorkerState worker;
   if (worker.owner != &state) {
     worker.transport_pipe           = Pipe();
     worker.request_headers          = HeaderList();
@@ -1243,13 +1590,21 @@ void warn_random_read(State& state, std::string_view path,
     return;
   }
 
+  uint64_t previous =
+      state.random_read_warning_ns.load(std::memory_order_relaxed);
+  if (previous != 0) {
+    static thread_local unsigned probe = 0;
+    if (++probe != 1024) {
+      return;
+    }
+    probe = 0;
+  }
+
   const uint64_t now = fuse_monotonic_ns_noexcept();
   if (now == 0) {
     return;
   }
   constexpr uint64_t interval = 60ULL * 1000ULL * 1000ULL * 1000ULL;
-  uint64_t previous =
-      state.random_read_warning_ns.load(std::memory_order_relaxed);
   if (previous != 0 && now - previous < interval) {
     return;
   }
@@ -1994,8 +2349,32 @@ fuse_ino_t item_inode(const State& state, const InodeBase* item) {
 }
 
 std::string item_key(const State& state, const InodeBase& item) {
-  std::vector<std::pair<std::string, bool>> path;
-  std::vector<std::shared_lock<std::shared_mutex>> guards;
+  struct Scratch {
+    Scratch() {
+      path.reserve(8);
+      guards.reserve(8);
+    }
+
+    std::vector<std::pair<ssostr<128>, bool>> path;
+    std::vector<std::shared_lock<std::shared_mutex>> guards;
+    bool active = false;
+  };
+  thread_local Scratch scratch;
+  if (scratch.active) {
+    throw std::logic_error("recursive inode path construction");
+  }
+  scratch.path.clear();
+  scratch.guards.clear();
+  scratch.active = true;
+  struct Reset {
+    ~Reset() {
+      scratch.path.clear();
+      scratch.guards.clear();
+      scratch.active = false;
+    }
+    Scratch& scratch;
+  } reset{scratch};
+
   const InodeBase* current = &item;
   while (current != state.root_item.get()) {
     InodeBase* parent = current->parent();
@@ -2003,7 +2382,7 @@ std::string item_key(const State& state, const InodeBase& item) {
       throw std::logic_error("inode parent chain does not reach root");
     }
     const Directory& children = parent->dir_children();
-    guards.emplace_back(children.mutex);
+    scratch.guards.emplace_back(children.mutex);
     if (current->parent() != parent || current->detached() ||
         current->dentry_slot == UINT32_MAX ||
         current->dentry_slot >= children.end_i() ||
@@ -2013,13 +2392,13 @@ std::string item_key(const State& state, const InodeBase& item) {
           EAGAIN, std::generic_category(), "inode path changed");
     }
     const terark::fstring name = children.key(current->dentry_slot);
-    path.emplace_back(
-        std::string(name.data(), name.size()), current->directory());
+    scratch.path.emplace_back(
+        ssostr<128>(name.data(), name.size()), current->directory());
     current = parent;
   }
   std::string key = state.config.prefix;
-  for (auto i = path.rbegin(); i != path.rend(); ++i) {
-    key += i->first;
+  for (auto i = scratch.path.rbegin(); i != scratch.path.rend(); ++i) {
+    key.append(i->first.data(), i->first.size());
     if (i->second) {
       key.push_back('/');
     }
@@ -2198,6 +2577,9 @@ void authorization_headers_for_credentials(
 
 [[noreturn]] void throw_s3_response(const Response& response,
                                     const char* operation);
+void invalidate_express_session(State& state) noexcept;
+void finish_async_express_waiters(
+    State& state, std::exception_ptr error = {}) noexcept;
 
 void ensure_express_session(State& state) {
   if (!state.config.directory_bucket) {
@@ -2269,9 +2651,7 @@ void ensure_express_session(State& state) {
     }
     expiration = fuse_monotonic_ns() + 285ULL * 1'000'000'000ULL;
   } catch (...) {
-    std::lock_guard guard(state.credentials_mutex);
-    state.express_refreshing = false;
-    state.credentials_condition.notify_all();
+    finish_async_express_waiters(state, std::current_exception());
     throw;
   }
 
@@ -2279,9 +2659,8 @@ void ensure_express_session(State& state) {
     std::lock_guard guard(state.credentials_mutex);
     state.express_credentials = std::move(credentials);
     state.express_expiration_ns = expiration;
-    state.express_refreshing = false;
   }
-  state.credentials_condition.notify_all();
+  finish_async_express_waiters(state);
 }
 
 void authorization_headers(
@@ -2307,10 +2686,20 @@ void authorization_headers(
     return;
   }
 
-  ensure_express_session(state);
   Credentials credentials;
-  {
+  if (current_fuse_reactor() == nullptr) {
+    ensure_express_session(state);
     std::lock_guard guard(state.credentials_mutex);
+    credentials = state.express_credentials;
+  } else {
+    const uint64_t now = fuse_monotonic_ns();
+    std::lock_guard guard(state.credentials_mutex);
+    if (state.express_refreshing ||
+        state.express_credentials.access_key_id.empty() ||
+        state.express_expiration_ns <= now + 15ULL * 1'000'000'000ULL) {
+      throw std::system_error(EAGAIN, std::generic_category(),
+                              "S3 Express session refresh required");
+    }
     credentials = state.express_credentials;
   }
   const std::string token = credentials.session_token;
@@ -2505,7 +2894,7 @@ void initialize_local_cache(State& state) {
       .reserve_bytes = state.config.cache_reserve,
       .reserve_percent = unsigned(state.config.cache_reserve),
       .max_prefetch_window_size = state.config.max_prefetch_window_size,
-      .page_size = size_t(::sysconf(_SC_PAGESIZE)),
+      .page_size = state.page_size,
       .upload_part_size = state.config.part_size,
       .checksum_algorithm = uint32_t(state.config.checksum),
       .reserve_is_percent = state.config.cache_reserve_is_percent,
@@ -2774,20 +3163,709 @@ bool stale_old_inode_readers(State& state, InodeFile& file,
           handle->generation_epoch != 0 &&
           handle->generation_epoch != generation_epoch) {
         handle->stale.store(true, std::memory_order_release);
-        found = true;
+        found |= (handle->request_state.load(std::memory_order_acquire) >> 63) == 0;
       }
     }
   }
   return found;
 }
 
-ObjectMetadata head_object(State& state, std::string_view path) {
-  const Response response = request_with_retries([&] {
-    const auto authorization = authorization_headers(
-        state, "HEAD", path, {}, kEmptyPayloadSha256);
-    HttpPool::Lease client = state.http->acquire();
-    return client->request_no_body("HEAD", path, authorization);
-  }, "HeadObject");
+uint64_t async_retry_milliseconds(const Response& response, unsigned attempt) noexcept {
+  const auto header = response.headers.find("retry-after");
+  if (header != response.headers.end()) {
+    uint64_t seconds = 0;
+    if (parse_unsigned(sso_view(header->second), seconds)) {
+      // A zero timerfd interval disarms the timer instead of waking immediately.
+      return std::max<uint64_t>(1, std::min<uint64_t>(seconds, 30) * 1000);
+    }
+    try {
+      const time_t deadline = parse_http_mtime(sso_view(header->second));
+      timespec now{};
+      if (::clock_gettime(CLOCK_REALTIME, &now) == 0 && deadline > now.tv_sec) {
+        return std::min<uint64_t>(uint64_t(deadline - now.tv_sec), 30) * 1000;
+      }
+    } catch (...) {
+    }
+  }
+  return (25ULL << std::min(attempt, 3U)) + fuse_monotonic_ns_noexcept() % 25;
+}
+
+void strip_request_authorization(std::vector<Header>& headers) {
+  std::erase_if(headers, [](const Header& header) {
+    return header.name == "authorization" || header.name == "x-amz-date" ||
+        header.name == "x-amz-security-token" || header.name == "x-amz-s3session-token" ||
+        header.name == "x-amz-content-sha256";
+  });
+}
+
+// Only used when base credentials have no usable snapshot while their source
+// is refreshing. Keep this rare path off both the reactor and CPU worker waits.
+struct AsyncCredentialWait {
+  UniqueFd timer;
+  AsyncIoRequest io;
+  uint64_t notification = 0;
+  uint64_t deadline = 0;
+  void (*complete)(void*, ssize_t) noexcept = nullptr;
+  void* context = nullptr;
+
+  bool start(State& state, FuseReactor& reactor,
+             void (*done)(void*, ssize_t) noexcept, void* value) {
+    const uint64_t now = fuse_monotonic_ns();
+    if (deadline == 0) {
+      const uint64_t duration = uint64_t(std::max(state.config.request_timeout_ms, 1)) * 1'000'000;
+      deadline = now > UINT64_MAX - duration ? UINT64_MAX : now + duration;
+    }
+    if (now >= deadline) {
+      throw std::system_error(ETIMEDOUT, std::generic_category(), "credential refresh wait expired");
+    }
+    if (!timer) {
+      timer.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC));
+      if (!timer) throw std::system_error(errno, std::generic_category(), "timerfd(credentials)");
+    }
+    const uint64_t delay = std::min<uint64_t>(10'000'000, deadline - now);
+    itimerspec timeout{};
+    timeout.it_value.tv_nsec = long(delay);
+    if (::timerfd_settime(timer.get(), 0, &timeout, nullptr) != 0) {
+      throw std::system_error(errno, std::generic_category(), "timerfd_settime(credentials)");
+    }
+    complete = done;
+    context = value;
+    io = {};
+    io.kind = AsyncIoRequest::READ;
+    io.fd = timer.get();
+    io.data = &notification;
+    io.length = sizeof(notification);
+    io.complete = ready;
+    io.context = this;
+    return reactor.submit(io);
+  }
+
+  void cancel(FuseReactor& reactor) noexcept { if (io.pending()) reactor.cancel(io); }
+
+  static void ready(void* context, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncCredentialWait*>(context);
+    if (result >= 0) {
+      const uint64_t now = fuse_monotonic_ns_noexcept();
+      if (now == 0 || now >= self->deadline) result = -ETIMEDOUT;
+    }
+    self->complete(self->context, result);
+  }
+};
+
+class AsyncS3Request {
+ public:
+  using Complete = AsyncHttpOperation::Complete;
+
+  AsyncS3Request(State& state, FuseReactor& reactor, AsyncHttpRequest arguments,
+                 Complete complete, void* context, unsigned max_attempts = 4)
+      : state_(state), reactor_(reactor), arguments_(std::move(arguments)),
+        complete_(complete), context_(context), max_attempts_(max_attempts) {
+    task_ = {run, cancel_queued, this};
+  }
+
+  bool start() noexcept {
+    if (started_ || complete_ == nullptr || max_attempts_ == 0) {
+      errno = EINVAL;
+      return false;
+    }
+    started_ = true;
+    if (reactor_.post(&task_)) return true;
+    started_ = false;
+    return false;
+  }
+
+  void cancel() noexcept {
+    cancelled_ = true;
+    credentials_wait_.cancel(reactor_);
+    if (http_) {
+      http_->cancel();
+    } else if (wait_.pending()) {
+      reactor_.cancel(wait_);
+    }
+  }
+
+  bool ambiguous() const noexcept { return ambiguous_; }
+
+ private:
+  static void run(void* context) noexcept {
+    static_cast<AsyncS3Request*>(context)->acquire();
+  }
+
+  static void cancel_queued(void* context) noexcept {
+    static_cast<AsyncS3Request*>(context)->fail(ECANCELED, "S3 request cancelled");
+  }
+
+  void fail(int error, const char* operation) noexcept {
+    try {
+      throw std::system_error(error, std::generic_category(), operation);
+    } catch (...) {
+      finish(Response{}, std::current_exception());
+    }
+  }
+
+  void finish(Response&& response, std::exception_ptr error) noexcept {
+    http_.reset();
+    lease_ = {};
+    const Complete complete = complete_;
+    void* context = context_;
+    complete_ = nullptr;
+    complete(context, std::move(response), std::move(error));
+  }
+
+  static void available(void* context, ssize_t result) noexcept {
+    auto* request = static_cast<AsyncS3Request*>(context);
+    if (request->pool_wait_) {
+      request->state_.http->end_async_wait();
+      request->pool_wait_ = false;
+    }
+    if (result < 0 || request->cancelled_) {
+      request->fail(request->cancelled_ ? ECANCELED : -int(result),
+                    "wait for S3 request");
+      return;
+    }
+    request->acquire();
+  }
+
+  void acquire() noexcept {
+    if (cancelled_) {
+      fail(ECANCELED, "S3 request cancelled");
+      return;
+    }
+    try {
+      if (resign_) {
+        auto headers = arguments_.headers;
+        strip_request_authorization(headers);
+        const auto authorization = authorization_headers(state_, sso_view(arguments_.method),
+            sso_view(arguments_.path), headers, kEmptyPayloadSha256);
+        headers.insert(headers.end(), authorization.begin(), authorization.end());
+        arguments_.headers = std::move(headers);
+        resign_ = false;
+      }
+      lease_ = state_.http->try_acquire();
+      if (!lease_) {
+        const int fd = state_.http->begin_async_wait();
+        pool_wait_ = true;
+        lease_ = state_.http->try_acquire();
+        if (!lease_) {
+          wait_ = {};
+          wait_.kind       = AsyncIoRequest::READ;
+          wait_.fd         = fd;
+          wait_.data       = &notification_;
+          wait_.length     = 1;
+          wait_.timeout_ms = 0;
+          wait_.complete   = available;
+          wait_.context    = this;
+          if (reactor_.submit(wait_)) return;
+          const int error = errno;
+          state_.http->end_async_wait();
+          pool_wait_ = false;
+          fail(error, "submit S3 connection wait");
+          return;
+        }
+        state_.http->end_async_wait();
+        pool_wait_ = false;
+      }
+      AsyncHttpRequest arguments = max_attempts_ == 1
+          ? std::move(arguments_) : arguments_;
+      http_ = lease_->make_async_request(
+          reactor_, std::move(arguments), received, this);
+      http_->start();
+    } catch (const CredentialRefreshPending&) {
+      try {
+        if (!credentials_wait_.start(state_, reactor_, available, this)) {
+          fail(errno, "submit credential refresh wait");
+        }
+      } catch (...) { finish(Response{}, std::current_exception()); }
+    } catch (...) {
+      received(this, Response{}, std::current_exception());
+    }
+  }
+
+
+  static void received(void* context, Response&& response,
+                        std::exception_ptr error) noexcept {
+    auto* request = static_cast<AsyncS3Request*>(context);
+    // The HTTP response may reside inside the completed operation. Move it
+    // out before destroying that operation and returning its pool lease.
+    Response value = std::move(response);
+    const bool published = request->arguments_.range && request->http_ &&
+        (request->http_->response().status == 200 || request->http_->response().status == 206) &&
+        request->http_->response().body_bytes != 0;
+    request->ambiguous_ |= bool(error);
+    request->http_.reset();
+    request->lease_ = {};
+    if (request->cancelled_) {
+      request->fail(ECANCELED, "S3 request cancelled");
+      return;
+    }
+    bool retry = !error && retryable_response(value);
+    if (!published && !error && value.status == 403 && request->arguments_.range &&
+        !request->state_.config.directory_bucket &&
+        request->attempt_ + 1 < request->max_attempts_) {
+      try {
+        bool signed_range = false;
+        for (const Header& header : request->arguments_.headers) {
+          if (header.name != "authorization") continue;
+          const auto auth = sso_view(header.value);
+          const size_t begin = auth.find("SignedHeaders=");
+          if (begin == std::string_view::npos) break;
+          auto names = auth.substr(begin + 14);
+          names = names.substr(0, names.find(','));
+          while (!names.empty()) {
+            const size_t end = names.find(';');
+            if (names.substr(0, end) == "range") signed_range = true;
+            if (end == std::string_view::npos) break;
+            names.remove_prefix(end + 1);
+          }
+        }
+        if (!signed_range) {
+          request->resign_ = true;
+          if (request->state_.range_signing_mode.exchange(2, std::memory_order_relaxed) != 2) {
+            fprintf(stderr, "warning: S3 endpoint rejected unsigned Range; signing Range for this mount\n");
+          }
+          retry = true;
+        }
+      } catch (...) {
+        request->finish(std::move(value), std::current_exception());
+        return;
+      }
+    }
+    if (published || (!error && !retry) ||
+        request->attempt_ + 1 >= request->max_attempts_) {
+      request->finish(std::move(value), std::move(error));
+      return;
+    }
+    const uint64_t milliseconds = async_retry_milliseconds(value, request->attempt_);
+    ++request->attempt_;
+    fprintf(stderr, "warning: retrying asynchronous S3 request status=%d attempt=%u\n",
+            value.status, request->attempt_);
+    try {
+      if (!request->timer_) {
+        request->timer_.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC));
+        if (!request->timer_) {
+          request->fail(errno, "timerfd_create(S3 retry)");
+          return;
+        }
+      }
+      const uint64_t nanoseconds = std::max<uint64_t>(1, milliseconds * 1'000'000);
+      itimerspec timer{};
+      timer.it_value.tv_sec  = time_t(nanoseconds / 1'000'000'000);
+      timer.it_value.tv_nsec = long(nanoseconds % 1'000'000'000);
+      if (::timerfd_settime(request->timer_.get(), 0, &timer, nullptr) != 0) {
+        request->fail(errno, "timerfd_settime(S3 retry)");
+        return;
+      }
+      request->wait_ = {};
+      request->wait_.kind     = AsyncIoRequest::READ;
+      request->wait_.fd       = request->timer_.get();
+      request->wait_.data     = &request->notification_;
+      request->wait_.length   = sizeof(request->notification_);
+      request->wait_.complete = available;
+      request->wait_.context  = request;
+      if (!request->reactor_.submit(request->wait_)) {
+        request->fail(errno, "submit S3 retry timer");
+      }
+    } catch (...) {
+      request->finish(Response{}, std::current_exception());
+    }
+  }
+
+  State& state_;
+  FuseReactor& reactor_;
+  AsyncHttpRequest arguments_;
+  Complete complete_;
+  void* context_;
+  unsigned max_attempts_;
+  unsigned attempt_ = 0;
+  HttpPool::Lease lease_;
+  std::unique_ptr<AsyncHttpOperation> http_;
+  AsyncCredentialWait credentials_wait_;
+  AsyncIoRequest wait_;
+  FuseReactor::ReactorTask task_;
+  UniqueFd timer_;
+  uint64_t notification_ = 0;
+  bool pool_wait_ = false;
+  bool started_ = false;
+  bool cancelled_ = false;
+  bool ambiguous_ = false;
+  bool resign_ = false;
+};
+
+class AsyncExpressSession {
+ public:
+  using Complete = void (*)(void*, std::exception_ptr) noexcept;
+
+  AsyncExpressSession(State& state, FuseReactor& reactor,
+                      Complete complete, void* context) noexcept
+      : state_(state), reactor_(reactor), complete_(complete),
+        context_(context) {
+    completion_ = {ready_task, cancel_task, this};
+  }
+
+  static bool ready(State& state) noexcept {
+    if (!state.config.directory_bucket) return true;
+    const uint64_t now = fuse_monotonic_ns_noexcept();
+    std::lock_guard guard(state.credentials_mutex);
+    return !state.express_refreshing &&
+        !state.express_credentials.access_key_id.empty() && now != 0 &&
+        state.express_expiration_ns > now + 15ULL * 1'000'000'000ULL;
+  }
+
+  bool start() noexcept {
+    if (started_ || complete_ == nullptr) {
+      errno = EINVAL;
+      return false;
+    }
+    if (!reactor_.reserve_completion(&completion_)) return false;
+    started_ = true;
+    enter();
+    return true;
+  }
+
+  void cancel() noexcept { cancelled_ = true; }
+
+ private:
+  friend void finish_async_express_waiters(
+      State&, std::exception_ptr) noexcept;
+
+  void finish_enter(std::exception_ptr error) noexcept {
+    error_ = std::move(error);
+    completed_ = true;
+    reactor_.complete(&completion_);
+  }
+
+  static void base_ready(void* context, ssize_t result) noexcept {
+    auto* session = static_cast<AsyncExpressSession*>(context);
+    if (result >= 0) { session->enter(); return; }
+    try {
+      throw std::system_error(-int(result), std::generic_category(), "base credential refresh wait");
+    } catch (...) { session->finish_enter(std::current_exception()); }
+  }
+
+  void enter() noexcept {
+    // This prerequisite is also used by pre-signed native/copy operations.
+    // Checking base credentials here avoids turning their transient EAGAIN
+    // into either an immediate callback loop or a permanent write failure.
+    try {
+      if (cancelled_) throw std::system_error(ECANCELED, std::generic_category(), "authorization cancelled");
+      (void)state_.credentials.get();
+    } catch (const CredentialRefreshPending&) {
+      try {
+        if (!credentials_wait_.start(state_, reactor_, base_ready, this)) {
+          throw std::system_error(errno, std::generic_category(), "submit base credential wait");
+        }
+      } catch (...) { finish_enter(std::current_exception()); }
+      return;
+    } catch (...) { finish_enter(std::current_exception()); return; }
+    bool refresh = false;
+    {
+      std::lock_guard guard(state_.credentials_mutex);
+      const uint64_t now = fuse_monotonic_ns_noexcept();
+      const bool valid = !state_.config.directory_bucket ||
+          (!state_.express_credentials.access_key_id.empty() && now != 0 &&
+           state_.express_expiration_ns >
+               now + 15ULL * 1'000'000'000ULL);
+      if (valid) {
+        completed_ = true;
+      } else {
+        next_ = state_.express_async_waiters;
+        state_.express_async_waiters = this;
+        if (!state_.express_refreshing) {
+          state_.express_refreshing = true;
+          refresh = true;
+        }
+      }
+    }
+    if (completed_) {
+      reactor_.complete(&completion_);
+    } else if (refresh) {
+      begin_refresh();
+    }
+  }
+
+  static void ready_task(void* context) noexcept {
+    auto* session = static_cast<AsyncExpressSession*>(context);
+    std::exception_ptr error = std::move(session->error_);
+    if (session->cancelled_ && !error) {
+      try {
+        throw std::system_error(ECANCELED, std::generic_category(),
+                                "S3 Express session wait cancelled");
+      } catch (...) {
+        error = std::current_exception();
+      }
+    }
+    const Complete complete = session->complete_;
+    void* const target = session->context_;
+    session->complete_ = nullptr;
+    complete(target, std::move(error));
+  }
+
+  static void cancel_task(void* context) noexcept {
+    auto* session = static_cast<AsyncExpressSession*>(context);
+    try {
+      throw std::system_error(ECANCELED, std::generic_category(),
+                              "S3 Express session wait cancelled");
+    } catch (...) {
+      session->error_ = std::current_exception();
+    }
+    ready_task(context);
+  }
+
+  static void credentials_ready(void* context, ssize_t result) noexcept {
+    auto* session = static_cast<AsyncExpressSession*>(context);
+    if (result >= 0) { session->begin_refresh(); return; }
+    try {
+      throw std::system_error(-int(result), std::generic_category(), "wait for CreateSession credentials");
+    } catch (...) {
+      finish_async_express_waiters(session->state_, std::current_exception());
+    }
+  }
+
+  void begin_refresh() noexcept {
+    try {
+      AsyncHttpRequest arguments;
+      arguments.method = "GET";
+      arguments.path = "/?session";
+      arguments.max_response_body = kMaximumListResponseSize;
+      arguments.headers = {
+          Header{"x-amz-create-session-mode", "ReadWrite"},
+      };
+      append_mount_request_headers(arguments.headers, state_.config);
+      HeaderList authorization;
+      authorization_headers_for_credentials(
+          authorization, state_, state_.credentials.get(), "GET",
+          sso_view(arguments.path), arguments.headers, kEmptyPayloadSha256);
+      arguments.headers.insert(
+          arguments.headers.end(),
+          std::make_move_iterator(authorization.begin()),
+          std::make_move_iterator(authorization.end()));
+      request_ = std::make_unique<AsyncS3Request>(
+          state_, reactor_, std::move(arguments), refreshed, this);
+      if (!request_->start()) {
+        throw std::system_error(errno, std::generic_category(),
+                                "submit asynchronous CreateSession");
+      }
+    } catch (const CredentialRefreshPending&) {
+      try {
+        if (!credentials_wait_.start(state_, reactor_, credentials_ready, this)) {
+          throw std::system_error(errno, std::generic_category(), "submit CreateSession credential wait");
+        }
+      } catch (...) {
+        finish_async_express_waiters(state_, std::current_exception());
+      }
+    } catch (...) {
+      finish_async_express_waiters(state_, std::current_exception());
+    }
+  }
+
+  static void refreshed(void* context, Response&& response,
+                        std::exception_ptr error) noexcept {
+    auto* session = static_cast<AsyncExpressSession*>(context);
+    Response value = std::move(response);
+    session->request_.reset();
+    if (error) {
+      finish_async_express_waiters(session->state_, std::move(error));
+      return;
+    }
+    try {
+      if (value.status != 200) {
+        throw_s3_response(value, "CreateSession");
+      }
+      S3Xml xml(response_xml(value), "CreateSession");
+      const tinyxml2::XMLElement& root =
+          xml.result_root("CreateSessionResult");
+      const tinyxml2::XMLElement& values =
+          xml.required_child(root, "Credentials");
+      Credentials credentials;
+      credentials.access_key_id =
+          xml.required_text(values, "AccessKeyId");
+      credentials.secret_access_key =
+          xml.required_text(values, "SecretAccessKey");
+      credentials.session_token =
+          xml.required_text(values, "SessionToken");
+      if (credentials.access_key_id.empty() ||
+          credentials.secret_access_key.empty() ||
+          credentials.session_token.empty()) {
+        throw std::runtime_error(
+            "CreateSession response omitted temporary credentials");
+      }
+      if (credentials.access_key_id.find_first_of("\r\n") !=
+              std::string::npos ||
+          credentials.session_token.find_first_of("\r\n") !=
+              std::string::npos) {
+        throw std::runtime_error(
+            "CreateSession returned unsafe credential header text");
+      }
+      const uint64_t expiration =
+          fuse_monotonic_ns() + 285ULL * 1'000'000'000ULL;
+      {
+        std::lock_guard guard(session->state_.credentials_mutex);
+        session->state_.express_credentials = std::move(credentials);
+        session->state_.express_expiration_ns = expiration;
+      }
+      finish_async_express_waiters(session->state_);
+    } catch (...) {
+      finish_async_express_waiters(
+          session->state_, std::current_exception());
+    }
+  }
+
+  State& state_;
+  FuseReactor& reactor_;
+  Complete complete_;
+  void* context_;
+  AsyncExpressSession* next_ = nullptr;
+  AsyncCredentialWait credentials_wait_;
+  std::unique_ptr<AsyncS3Request> request_;
+  FuseReactor::ReactorTask completion_;
+  std::exception_ptr error_;
+  bool started_ = false;
+  bool completed_ = false;
+  bool cancelled_ = false;
+};
+
+void finish_async_express_waiters(
+    State& state, std::exception_ptr error) noexcept {
+  AsyncExpressSession* waiters;
+  {
+    std::lock_guard guard(state.credentials_mutex);
+    state.express_refreshing = false;
+    waiters = std::exchange(state.express_async_waiters, nullptr);
+  }
+  state.credentials_condition.notify_all();
+  while (waiters != nullptr) {
+    AsyncExpressSession* const next = waiters->next_;
+    waiters->next_ = nullptr;
+    waiters->request_.reset();
+    waiters->error_ = error;
+    waiters->completed_ = true;
+    waiters->reactor_.complete(&waiters->completion_);
+    waiters = next;
+  }
+}
+
+// Metadata requests carry unsigned operation headers until the asynchronous
+// Express credential prerequisite has completed. Ordinary S3 takes no extra
+// reactor turn: only the socket request itself is queued.
+class AsyncSignedS3Request {
+ public:
+  using Complete = AsyncHttpOperation::Complete;
+
+  AsyncSignedS3Request(State& state, FuseReactor& reactor, AsyncHttpRequest args,
+                        Complete complete, void* context, unsigned attempts = 4,
+                        std::string_view payload_hash = kEmptyPayloadSha256)
+      : state_(state), reactor_(reactor), args_(std::move(args)),
+        complete_(complete), context_(context), attempts_(attempts),
+        payload_hash_(payload_hash) {}
+
+  bool start() {
+    if (started_ || complete_ == nullptr) {
+      errno = EINVAL;
+      return false;
+    }
+    started_ = true;
+    return advance();
+  }
+
+  bool advance() {
+    if (cancelled_) throw std::system_error(ECANCELED, std::generic_category(), "signed S3 request cancelled");
+    if (AsyncExpressSession::ready(state_)) {
+      try {
+        return send();
+      } catch (const CredentialRefreshPending&) {
+        return credentials_wait_.start(state_, reactor_, credentials_ready, this);
+      } catch (const std::system_error& error) {
+        if (error.code().value() != EAGAIN || !state_.config.directory_bucket) throw;
+      }
+    }
+    session_ = std::make_unique<AsyncExpressSession>(state_, reactor_, authorized, this);
+    return session_->start();
+  }
+
+  void cancel() noexcept {
+    cancelled_ = true;
+    credentials_wait_.cancel(reactor_);
+    if (session_) session_->cancel();
+    if (request_) request_->cancel();
+  }
+
+  bool ambiguous() const noexcept { return ambiguous_; }
+
+ private:
+  static void credentials_ready(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncSignedS3Request*>(context);
+    try {
+      if (result < 0) throw std::system_error(-int(result), std::generic_category(), "credential refresh wait");
+      if (!task->advance()) throw std::system_error(errno, std::generic_category(), "submit signed S3 request");
+    } catch (...) {
+      task->complete_(task->context_, Response{}, std::current_exception());
+    }
+  }
+
+  bool send() {
+    AsyncHttpRequest arguments = args_;
+    const auto headers = authorization_headers(
+        state_, sso_view(arguments.method), sso_view(arguments.path),
+        arguments.headers,
+        sso_view(payload_hash_));
+    arguments.headers.insert(
+        arguments.headers.end(), headers.begin(), headers.end());
+    request_ = std::make_unique<AsyncS3Request>(
+        state_, reactor_, std::move(arguments), received, this, attempts_);
+    return request_->start();
+  }
+
+  static void authorized(void* context, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncSignedS3Request*>(context);
+    task->session_.reset();
+    try {
+      if (error) std::rethrow_exception(error);
+      if (!task->advance()) throw std::system_error(errno, std::generic_category(), "submit signed S3 request");
+    } catch (...) {
+      task->complete_(task->context_, Response{}, std::current_exception());
+    }
+  }
+
+  static void received(void* context, Response&& response, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncSignedS3Request*>(context);
+    task->ambiguous_ |= task->request_->ambiguous();
+    task->request_.reset();
+    if (!error && (response.status == 401 || response.status == 403) &&
+        task->state_.config.directory_bucket && task->attempts_ > 1 &&
+        task->session_attempt_++ < 3) {
+      invalidate_express_session(task->state_);
+      try {
+        if (!task->advance()) {
+          throw std::system_error(errno, std::generic_category(),
+                                  "resubmit signed S3 request");
+        }
+      } catch (...) {
+        task->complete_(task->context_, Response{},
+                        std::current_exception());
+      }
+      return;
+    }
+    if (!error) task->session_attempt_ = 0;
+    task->complete_(task->context_, std::move(response), std::move(error));
+  }
+
+  State& state_;
+  FuseReactor& reactor_;
+  AsyncHttpRequest args_;
+  Complete complete_;
+  void* context_;
+  unsigned attempts_;
+  ssostr<72> payload_hash_;
+  unsigned session_attempt_ = 0;
+  bool ambiguous_ = false;
+  bool started_ = false;
+  bool cancelled_ = false;
+  AsyncCredentialWait credentials_wait_;
+  std::unique_ptr<AsyncExpressSession> session_;
+  std::unique_ptr<AsyncS3Request> request_;
+};
+
+ObjectMetadata decode_head_response(const Response& response) {
   if (response.status == 404) {
     throw std::system_error(ENOENT, std::generic_category(), "S3 HEAD");
   }
@@ -2832,6 +3910,16 @@ ObjectMetadata head_object(State& state, std::string_view path) {
   return metadata;
 }
 
+ObjectMetadata head_object(State& state, std::string_view path) {
+  const Response response = request_with_retries([&] {
+    const auto authorization = authorization_headers(
+        state, "HEAD", path, {}, kEmptyPayloadSha256);
+    HttpPool::Lease client = state.http->acquire();
+    return client->request_no_body("HEAD", path, authorization);
+  }, "HeadObject");
+  return decode_head_response(response);
+}
+
 bool recover_write_commit(State& state, const OpenHandle& handle,
                           Response& response) noexcept {
   try {
@@ -2864,27 +3952,39 @@ bool recover_write_commit(State& state, const OpenHandle& handle,
   }
 }
 
-bool refresh_open_metadata(State& state, OpenHandle& handle) {
+struct OpenGenerationConflict : std::system_error {
+  OpenGenerationConflict()
+      : std::system_error(EBUSY, std::generic_category(),
+                            "old object generation still has open readers") {}
+};
+
+bool publish_open_metadata(State& state, OpenHandle& handle, ObjectMetadata metadata) {
   InodeFile& item = *handle.item;
-  InodeMetadataGuard metadata_guard(item);
-  ObjectMetadata metadata = head_object(state, handle.object_path);
   const ObjectGeneration generation = object_generation(
       metadata.etag, metadata.version_id, metadata.size, metadata.mtime);
-  const uint64_t previous_epoch =
-      item.generation_epoch.load(std::memory_order_acquire) &
-      ((1ULL << 63) - 1);
-  const bool changed = previous_epoch != 0 &&
-      item.generation_hash.load(std::memory_order_relaxed) != generation;
-  const bool keep_cache = item.page_cache_valid() && !changed &&
-      item.fsize.load(std::memory_order_relaxed) == metadata.size;
-  if (changed) {
-    item.set_page_cache_valid(false);
+  bool changed;
+  bool keep_cache;
+  {
+    // Every open performs its own HeadObject.  Serialize only the short
+    // in-memory publication so a reactor never blocks while another
+    // operation owns this state across network I/O.
+    InodeMetadataGuard metadata_guard(item);
+    const uint64_t previous_epoch =
+        item.generation_epoch.load(std::memory_order_acquire) &
+        ((1ULL << 63) - 1);
+    changed = previous_epoch != 0 &&
+        item.generation_hash.load(std::memory_order_relaxed) != generation;
+    keep_cache = item.page_cache_valid() && !changed &&
+        item.fsize.load(std::memory_order_relaxed) == metadata.size;
+    if (changed) {
+      item.set_page_cache_valid(false);
+    }
+    item.fsize.store(metadata.size, std::memory_order_relaxed);
+    item.mtime.store(metadata.mtime, std::memory_order_relaxed);
+    handle.generation_epoch = publish_inode_generation(item, generation);
+    handle.stale.store(false, std::memory_order_release);
+    item.set_page_cache_valid(keep_cache);
   }
-  item.fsize.store(metadata.size, std::memory_order_relaxed);
-  item.mtime.store(metadata.mtime, std::memory_order_relaxed);
-  handle.generation_epoch = publish_inode_generation(item, generation);
-  handle.stale.store(false, std::memory_order_release);
-  item.set_page_cache_valid(keep_cache);
   handle.size        = metadata.size;
   handle.etag        = std::move(metadata.etag);
   handle.version_id  = std::move(metadata.version_id);
@@ -2896,18 +3996,26 @@ bool refresh_open_metadata(State& state, OpenHandle& handle) {
   }
   if (changed || old_readers) {
     item.set_page_cache_valid(false);
-    invalidate_page_cache(state, handle.inode);
+    // Conflicting reactor opens must await notification completion before
+    // replying EBUSY, otherwise the old descriptor can still hit stale pages.
+    // Ordinary reads must remain free to reply while invalidation waits for
+    // any locked folios; serializing all FUSE output would deadlock them.
+    if (!old_readers || current_fuse_reactor() == nullptr) {
+      invalidate_page_cache(state, handle.inode);
+    }
   }
   if (old_readers) {
-    throw std::system_error(
-        EBUSY, std::generic_category(),
-        "old object generation still has open readers");
+    throw OpenGenerationConflict();
   }
   return keep_cache;
 }
 
+bool refresh_open_metadata(State& state, OpenHandle& handle) {
+  return publish_open_metadata(state, handle, head_object(state, handle.object_path));
+}
+
 void register_open_handle(State& state, fuse_ino_t inode,
-                          OpenHandle& handle) {
+                          OpenHandle& handle, bool wait_for_release = true) {
   std::unique_lock open_files_guard(state.open_files_mutex);
   InodeBase& base = inode_item(state, inode);
   if (!base.regular()) {
@@ -2956,6 +4064,10 @@ void register_open_handle(State& state, fuse_ino_t inode,
            (!handle.writable && opened.writer);
   };
   if (conflicts()) {
+    if (!wait_for_release) {
+      throw std::system_error(EAGAIN, std::generic_category(),
+                              "open is waiting for queued release");
+    }
     // FUSE_RELEASE can be processed just after a close returns while a later
     // FUSE_OPEN is already running on another worker. Give that queued release
     // a bounded chance to retire its handle before reporting a real conflict.
@@ -3098,8 +4210,21 @@ void unregister_open_handle(State& state, std::string_view path,
 struct OpenHandleIdentityLocks {
   std::vector<OpenHandle*> handles;
   std::vector<std::unique_ptr<OpenRequestGuard>> pins;
-  std::vector<std::unique_lock<std::shared_mutex>> identities;
+  std::vector<std::unique_lock<ReactorSharedMutex>> identities;
 };
+
+bool reader_snapshot_matches(std::span<OpenHandle* const> current,
+                               std::span<OpenHandle* const> snapshot) noexcept {
+  for (OpenHandle* handle : current) {
+    if (std::find(snapshot.begin(), snapshot.end(), handle) == snapshot.end() &&
+        (handle->request_state.load(std::memory_order_acquire) >> 63) == 0) return false;
+  }
+  for (OpenHandle* handle : snapshot) {
+    if (std::find(current.begin(), current.end(), handle) == current.end() &&
+        (handle->request_state.load(std::memory_order_acquire) >> 63) == 0) return false;
+  }
+  return true;
+}
 
 OpenHandleIdentityLocks lock_open_handle_identities(
     State& state, std::string_view path, const char* operation) {
@@ -3122,8 +4247,12 @@ OpenHandleIdentityLocks lock_open_handle_identities(
         throw std::logic_error(
             std::string(operation) + " reader registry is invalid");
       }
-      result.handles.push_back(handle);
-      result.pins.push_back(std::make_unique<OpenRequestGuard>(*handle));
+      try {
+        result.pins.push_back(std::make_unique<OpenRequestGuard>(*handle));
+        result.handles.push_back(handle);
+      } catch (const std::system_error& error) {
+        if (error.code().value() != EBADF) throw;
+      }
     }
   }
   result.identities.reserve(result.handles.size());
@@ -3133,8 +4262,7 @@ OpenHandleIdentityLocks lock_open_handle_identities(
   return result;
 }
 
-bool preserve_renamed_destination(State& state, std::string_view path,
-                                  std::string_view key) {
+bool renamed_destination_fully_cached(State& state, std::string_view path) {
   if (!state.local_cache) {
     return false;
   }
@@ -3152,7 +4280,31 @@ bool preserve_renamed_destination(State& state, std::string_view path,
               handle->cache_entry && handle->cache_entry->fully_clean();
         });
   }
-  return can_preserve && state.local_cache->remove(key, true);
+  return can_preserve;
+}
+
+// Snapshot under open_files_mutex, without taking a cache entry's mutex.
+std::vector<std::shared_ptr<CacheEntry>> cached_reader_entries(
+    std::span<OpenHandle* const> handles) {
+  std::vector<std::shared_ptr<CacheEntry>> entries;
+  entries.reserve(handles.size());
+  for (const OpenHandle* handle : handles) {
+    if (handle == nullptr || handle->writable || !handle->cache_entry) return {};
+    entries.push_back(handle->cache_entry);
+  }
+  return entries;
+}
+
+// Consume the snapshot in the storage worker, including the last reference's
+// possible local fd/metadata-mapping cleanup.
+bool cached_readers_fully_clean(std::vector<std::shared_ptr<CacheEntry>> entries) {
+  return !entries.empty() && std::all_of(entries.begin(), entries.end(),
+      [](const auto& entry) { return entry->fully_clean(); });
+}
+
+bool preserve_renamed_destination(State& state, std::string_view path,
+                                  std::string_view key) {
+  return renamed_destination_fully_cached(state, path) && state.local_cache->remove(key, true);
 }
 
 void finish_open_file_rename(State& state,
@@ -3173,16 +4325,17 @@ void finish_open_file_rename(State& state,
 
   auto source = state.open_files.find(source_path);
   if (source == state.open_files.end()) {
-    if (!source_handles.empty()) {
+    if (!reader_snapshot_matches({}, source_handles)) {
       throw std::logic_error("rename source reader registry disappeared");
     }
     return;
   }
-  if (source->second.handles != source_handles) {
+  if (!reader_snapshot_matches(source->second.handles, source_handles)) {
     throw std::logic_error("rename source reader registry changed");
   }
   for (OpenHandle* handle : source->second.handles) {
-    if (handle == nullptr) {
+    if (handle == nullptr ||
+        std::find(source_handles.begin(), source_handles.end(), handle) == source_handles.end()) {
       continue;
     }
     handle->object_path.assign(destination_path);
@@ -3256,7 +4409,7 @@ AuthorizedRangeRequest make_range_request(State& state,
                                            const OpenHandle& handle,
                                            WorkerState& worker,
                                            uint64_t offset,
-                                           size_t length) {
+                                           size_t length, bool authorize = true) {
   HeaderList& headers = worker.request_headers;
   AuthorizedRangeRequest request{
       .base_path = &handle.object_path,
@@ -3302,7 +4455,7 @@ AuthorizedRangeRequest make_range_request(State& state,
   const bool sign_range = state.config.directory_bucket || signing_mode == 2;
   request.range_signed = sign_range;
   const std::array<uint64_t, 2> date = state.date_time.now();
-  const bool cacheable = !state.config.directory_bucket && !sign_range &&
+  const bool cacheable = authorize && !state.config.directory_bucket && !sign_range &&
       !request_checksum;
   const bool cache_hit =
       cacheable && worker.authorization_valid &&
@@ -3333,11 +4486,15 @@ AuthorizedRangeRequest make_range_request(State& state,
       canonical_headers[canonical_count++] =
           Header{"x-amz-checksum-mode", "ENABLED"};
     }
-    authorization_headers(
-        headers, state, "GET", request.path(),
-        std::span(canonical_headers.data(), canonical_count),
-        kEmptyPayloadSha256, true,
-        std::string_view(date_text.data(), date_text.size()));
+    if (authorize) {
+      authorization_headers(
+          headers, state, "GET", request.path(),
+          std::span(canonical_headers.data(), canonical_count),
+          kEmptyPayloadSha256, true,
+          std::string_view(date_text.data(), date_text.size()));
+    } else {
+      headers.clear();
+    }
     worker.authorization_count = headers.size();
     headers.push_back(
         Header{"range", ssostr<32>(range.data(), range_length)});
@@ -3480,24 +4637,20 @@ ListedXmlPage parse_list_xml(const Response& response,
   return page;
 }
 
-ListedPage list_directory_page(State& state, std::string_view prefix,
-                               std::string_view token) {
+std::string directory_request_path(State& state, std::string_view prefix,
+                                    std::string_view token) {
   std::string query = "delimiter=%2F&encoding-type=url&list-type=2&prefix=";
   query += uri_encode(prefix, false);
   if (!token.empty()) {
     query += "&continuation-token=" + uri_encode(token, false);
   }
   query += "&max-keys=" + std::to_string(kDirectoryListLimit);
-  const std::string path = query_path(
+  return query_path(
       state.config.bucket_path.empty() ? "/" : state.config.bucket_path,
       query);
-  const Response response = request_with_retries([&] {
-    const HeaderList headers = authorization_headers(
-        state, "GET", path, {}, kEmptyPayloadSha256);
-    HttpPool::Lease client = state.http->acquire();
-    return client->request_no_body(
-        "GET", path, headers, kMaximumListResponseSize);
-  }, "ListObjectsV2");
+}
+
+ListedPage decode_directory_response(const Response& response, std::string_view prefix) {
   if (response.status != 200) {
     throw_s3_response(response, "ListObjectsV2");
   }
@@ -3544,6 +4697,18 @@ ListedPage list_directory_page(State& state, std::string_view prefix,
   page.truncated = listed.truncated;
   page.token     = std::move(listed.token);
   return page;
+}
+
+ListedPage list_directory_page(State& state, std::string_view prefix,
+                               std::string_view token) {
+  const std::string path = directory_request_path(state, prefix, token);
+  const Response response = request_with_retries([&] {
+    const HeaderList headers = authorization_headers(
+        state, "GET", path, {}, kEmptyPayloadSha256);
+    HttpPool::Lease client = state.http->acquire();
+    return client->request_no_body("GET", path, headers, kMaximumListResponseSize);
+  }, "ListObjectsV2");
+  return decode_directory_response(response, prefix);
 }
 
 template<class Function>
@@ -3970,7 +5135,7 @@ void invalidate_directory(State& state, fuse_ino_t inode) noexcept;
 
 struct DirectoryGuards {
   std::vector<Directory*> directories;
-  std::vector<std::unique_lock<std::mutex>> guards;
+  std::vector<std::unique_lock<IoMutex>> guards;
 };
 
 DirectoryGuards lock_directories(State& state,
@@ -4032,6 +5197,192 @@ void prune_directory_generation(State& state, InodeBase& directory,
   for (InodeBase* child : stale) {
     retire_item(state, *child);
   }
+}
+
+struct DirectoryContinuation {
+  using Complete = void (*)(void*, std::exception_ptr) noexcept;
+  DirectoryContinuation* next = nullptr;
+  FuseReactor* reactor = nullptr;
+  Complete complete = nullptr;
+  void* context = nullptr;
+  std::exception_ptr error;
+  FuseReactor::ReactorTask task;
+
+  static void ready(void* context) noexcept {
+    auto* waiter = static_cast<DirectoryContinuation*>(context);
+    const Complete complete = waiter->complete;
+    void* target = waiter->context;
+    auto error = std::move(waiter->error);
+    complete(target, std::move(error));
+  }
+
+  static void cancelled(void* context) noexcept {
+    auto* waiter = static_cast<DirectoryContinuation*>(context);
+    try {
+      throw std::system_error(ECANCELED, std::generic_category(), "directory refresh cancelled");
+    } catch (...) {
+      waiter->error = std::current_exception();
+    }
+    ready(context);
+  }
+};
+
+void finish_directory_refresh(Directory& children, std::exception_ptr error) noexcept {
+  DirectoryContinuation* waiters;
+  {
+    std::unique_lock guard(children.mutex);
+    waiters = std::exchange(children.refresh_waiters, nullptr);
+    children.refreshing.store(false, std::memory_order_release);
+  }
+  children.refreshing.notify_all();
+  while (waiters != nullptr) {
+    DirectoryContinuation* next = waiters->next;
+    waiters->next = nullptr;
+    waiters->error = error;
+    waiters->reactor->complete(&waiters->task);
+    waiters = next;
+  }
+}
+
+struct AsyncDirectoryRefresh {
+  State& state;
+  FuseReactor& reactor;
+  InodePin pin;
+  fuse_ino_t inode;
+  std::string key;
+  std::string token;
+  uint32_t generation = 0;
+  std::vector<ListedChild> conflicts;
+  std::unique_ptr<AsyncSignedS3Request> request;
+
+  AsyncDirectoryRefresh(State& s, FuseReactor& r, InodeBase& item, fuse_ino_t ino)
+      : state(s), reactor(r), inode(ino), key(item_key(s, item)) {
+    retain_inode_count(item.open_count, "directory refresh pin");
+    pin = InodePin(state, item);
+  }
+
+  void finish(std::exception_ptr error = {}) noexcept {
+    std::unique_ptr<AsyncDirectoryRefresh> owner(this);
+    request.reset();
+    if (error) invalidate_directory(state, inode);
+    finish_directory_refresh(pin->dir_children(), std::move(error));
+  }
+
+  void next_page() noexcept {
+    try {
+      AsyncHttpRequest args;
+      args.path = directory_request_path(state, key, token);
+      args.max_response_body = kMaximumListResponseSize;
+      request = std::make_unique<AsyncSignedS3Request>(
+          state, reactor, std::move(args), received, this);
+      if (!request->start()) {
+        throw std::system_error(errno, std::generic_category(), "submit directory listing");
+      }
+    } catch (...) {
+      finish(std::current_exception());
+    }
+  }
+
+  static void received(void* context, Response&& response,
+                        std::exception_ptr error) noexcept {
+    auto* listing = static_cast<AsyncDirectoryRefresh*>(context);
+    try {
+      listing->request.reset();
+      if (error) std::rethrow_exception(error);
+      if (listing->pin->detached() || item_key(listing->state, *listing->pin) != listing->key) {
+        throw std::system_error(ESTALE, std::generic_category(), "directory changed during listing");
+      }
+      ListedPage page = decode_directory_response(response, listing->key);
+      Directory& children = listing->pin->dir_children();
+      {
+        std::unique_lock guard(children.mutex);
+        children.reserve(children.end_i() + page.children.size());
+      }
+      for (ListedChild& child : page.children) {
+        if (install_item(listing->state, listing->inode, child, listing->generation,
+                          false, false, false, true) == 0) {
+          listing->conflicts.push_back(std::move(child));
+        }
+      }
+      if (page.truncated) {
+        if (page.token == listing->token) {
+          throw std::runtime_error("ListObjectsV2 repeated a continuation token");
+        }
+        listing->token = std::move(page.token);
+        listing->next_page();
+        return;
+      }
+      for (ListedChild& child : listing->conflicts) {
+        bool directory_won = false;
+        {
+          std::shared_lock guard(children.mutex);
+          const auto i = children.find(terark::fstring(child.name.data(), ptrdiff_t(child.name.size())));
+          if (i != children.end()) {
+            directory_won = i->second->directory() &&
+                i->second->listing_generation.load(std::memory_order_relaxed) == listing->generation;
+          }
+        }
+        if (!directory_won) {
+          install_item(listing->state, listing->inode, std::move(child), listing->generation);
+        }
+      }
+      prune_directory_generation(listing->state, *listing->pin, listing->generation);
+      const uint64_t now = fuse_monotonic_ns();
+      const uint64_t ttl = listing->state.config.directory_cache_ns;
+      listing->pin->expire.store(ttl > UINT64_MAX - now ? UINT64_MAX : now + ttl,
+                                 std::memory_order_release);
+      sweep_retired_items(listing->state);
+      listing->finish();
+    } catch (...) {
+      listing->finish(std::current_exception());
+    }
+  }
+};
+
+// The caller keeps its continuation and inode pin alive until completion.
+// false means the cache was fresh and no callback was registered.
+bool await_directory_refresh(State& state, FuseReactor& reactor, fuse_ino_t inode,
+                              DirectoryContinuation& waiter, bool force = false) {
+  InodeBase& item = inode_item(state, inode);
+  Directory& children = item.dir_children();
+  auto listing = std::make_unique<AsyncDirectoryRefresh>(state, reactor, item, inode);
+  bool start = false;
+  {
+    std::unique_lock guard(children.mutex);
+    if (!force && !children.refreshing.load(std::memory_order_acquire) &&
+        item.expire.load(std::memory_order_acquire) > fuse_monotonic_ns()) {
+      return false;
+    }
+    waiter.task = {DirectoryContinuation::ready, DirectoryContinuation::cancelled, &waiter};
+    if (!reactor.reserve_completion(&waiter.task)) {
+      throw std::system_error(errno, std::generic_category(), "reserve directory continuation");
+    }
+    if (!children.refreshing.load(std::memory_order_relaxed)) {
+      start = true;
+      children.refreshing.store(true, std::memory_order_release);
+      listing->generation = ++children.listing_generation;
+      if (listing->generation == 0) {
+        listing->generation = ++children.listing_generation;
+        for (auto [name, child] : children) {
+          (void)name;
+          child->listing_generation.store(0, std::memory_order_relaxed);
+        }
+      }
+    }
+    waiter.reactor = &reactor;
+    waiter.next = children.refresh_waiters;
+    children.refresh_waiters = &waiter;
+  }
+  if (start) {
+    try {
+      cache_register_directory(state, static_cast<InodeDir&>(item));
+    } catch (...) {
+      listing.release()->finish(std::current_exception());
+      return true;
+    }
+    listing.release()->next_page();
+  }
+  return true;
 }
 
 void refresh_directory_locked(State& state, fuse_ino_t inode,
@@ -4117,8 +5468,28 @@ void refresh_directory(State& state, fuse_ino_t inode, bool force = false) {
     throw std::system_error(ENOTDIR, std::generic_category(), "directory");
   }
   cache_touch(static_cast<InodeDir&>(item));
-  std::lock_guard directory_guard(item.dir_children().mutation_mutex);
-  refresh_directory_locked(state, inode, force);
+  Directory& children = item.dir_children();
+  for (;;) {
+    {
+      std::unique_lock guard(children.mutex);
+      if (!children.refreshing.load(std::memory_order_relaxed)) {
+        children.refreshing.store(true, std::memory_order_release);
+        break;
+      }
+    }
+    if (current_fuse_reactor() != nullptr) {
+      throw std::system_error(EAGAIN, std::generic_category(),
+                              "directory refresh requires asynchronous completion");
+    }
+    children.refreshing.wait(true, std::memory_order_acquire);
+  }
+  try {
+    refresh_directory_locked(state, inode, force);
+    finish_directory_refresh(children, {});
+  } catch (...) {
+    finish_directory_refresh(children, std::current_exception());
+    throw;
+  }
 }
 
 void invalidate_directory(State& state, fuse_ino_t inode) noexcept {
@@ -4148,6 +5519,7 @@ double remaining_inode_timeout(State& state,
 size_t reclaim_cached_children(State& state, InodeDir& item) {
   std::lock_guard mutation_guard(item.children.mutation_mutex);
   if (item.detached() ||
+      item.children.refreshing.load(std::memory_order_acquire) ||
       item.open_count.load(std::memory_order_acquire) != 1 ||
       item.expire.load(std::memory_order_relaxed) > fuse_monotonic_ns()) {
     return 0;
@@ -4223,8 +5595,17 @@ void cache_reclaim_loop(std::stop_token stop, State* state) noexcept {
       }
     }
     for (const State::PendingInvalidation& pending : invalidations) {
+      if (pending.generation_epoch != 0 &&
+          (pending.item->generation_epoch.load(std::memory_order_acquire) &
+           ((1ULL << 63) - 1)) != pending.generation_epoch) {
+        continue;
+      }
       invalidate_page_cache(*state, pending.inode,
                             pending.offset, pending.length);
+    }
+    if (!invalidations.empty()) {
+      invalidations.clear();
+      sweep_retired_items(*state);
     }
     if (scan_limit == 0) {
       continue;
@@ -4458,27 +5839,27 @@ void verify_read_checksum(const Response& response, Pipe& pipe,
   }
 }
 
-void update_written_metadata(State& state, OpenHandle& handle,
-                             const Response& response,
-                             std::string_view body_etag = {}) {
-  ObjectMetadata metadata;
-  bool used_head = false;
+void publish_written_metadata(OpenHandle& handle,
+                              const Response& response,
+                              const ObjectMetadata* metadata,
+                              std::string_view body_etag = {}) {
   time_t mtime;
   const auto modified = response.headers.find("last-modified");
   if (modified != response.headers.end()) {
     mtime = parse_http_mtime(sso_view(modified->second));
   } else {
-    metadata  = head_object(state, handle.object_path);
-    used_head = true;
-    mtime     = metadata.mtime;
+    if (metadata == nullptr) {
+      throw std::logic_error("write commit lacks server mtime");
+    }
+    mtime = metadata->mtime;
   }
   const auto etag = response.headers.find("etag");
   if (etag != response.headers.end()) {
     assign_string(handle.etag, etag->second);
   } else if (!body_etag.empty()) {
     handle.etag.assign(body_etag);
-  } else if (used_head) {
-    handle.etag = std::move(metadata.etag);
+  } else if (metadata != nullptr) {
+    handle.etag = metadata->etag;
   } else {
     handle.etag.clear();
   }
@@ -4488,8 +5869,8 @@ void update_written_metadata(State& state, OpenHandle& handle,
   }
   if (version != response.headers.end() && version->second != "null") {
     assign_string(handle.version_id, version->second);
-  } else if (used_head) {
-    handle.version_id = std::move(metadata.version_id);
+  } else if (metadata != nullptr) {
+    handle.version_id = metadata->version_id;
   } else {
     handle.version_id.clear();
   }
@@ -4502,6 +5883,17 @@ void update_written_metadata(State& state, OpenHandle& handle,
   handle.generation_epoch = publish_inode_generation(
       item, object_generation(handle.etag, handle.version_id,
                               handle.stream_offset, mtime));
+}
+
+void update_written_metadata(State& state, OpenHandle& handle,
+                             const Response& response,
+                             std::string_view body_etag = {}) {
+  std::optional<ObjectMetadata> metadata;
+  if (response.headers.find("last-modified") == response.headers.end()) {
+    metadata = head_object(state, handle.object_path);
+  }
+  publish_written_metadata(handle, response,
+                            metadata ? &*metadata : nullptr, body_etag);
 }
 
 void require_s3_success(const Response& response, const char* operation) {
@@ -4519,7 +5911,7 @@ void fail_write(OpenHandle& handle, int error) noexcept {
     handle.write_state = WRITE_FAILED;
     handle.write_error = error > 0 ? error : EIO;
   }
-  handle.condition.notify_all();
+  notify_handle(handle);
 }
 
 void warn_budget_locked(State& state) noexcept {
@@ -4532,7 +5924,8 @@ void warn_budget_locked(State& state) noexcept {
             " limit=%" PRIu64 " part_size=%" PRIu64
             " waiting_handles=%u\n",
             state.pinned_bytes, state.config.max_pinned_memory,
-            state.config.part_size, state.waiting_writers);
+            state.config.part_size, state.waiting_writers +
+                state.budget_reactor_waiters.load(std::memory_order_relaxed));
     state.budget_warning_ns = now;
   }
   state.budget_exhausted = true;
@@ -4584,6 +5977,12 @@ void release_part_budget(State& state) noexcept {
     }
   }
   state.budget_condition.notify_all();
+  const uint64_t wake = state.budget_reactor_waiters.load(std::memory_order_acquire);
+  if (wake != 0) {
+    ssize_t result;
+    do { result = ::write(state.budget_event.get(), &wake, sizeof(wake)); }
+    while (result < 0 && errno == EINTR);
+  }
 }
 
 PipeSegment& writable_segment(RetainedPart& part, PipeInput input) {
@@ -4857,7 +6256,7 @@ void ensure_multipart(State& state, OpenHandle& handle) {
   {
     std::unique_lock guard(handle.mutex);
     while (handle.multipart_starting) {
-      handle.condition.wait(guard);
+      wait_handle(handle, guard);
     }
     if (!handle.upload_id.empty()) {
       return;
@@ -4941,7 +6340,7 @@ void ensure_multipart(State& state, OpenHandle& handle) {
         handle.part_sizes.reserve(kMaximumMultipartParts);
       }
       handle.multipart_starting = false;
-      handle.condition.notify_all();
+      notify_handle(handle);
     }
   } catch (...) {
     std::lock_guard guard(handle.mutex);
@@ -5037,11 +6436,385 @@ void upload_part_job(State& state, OpenHandle& handle,
     fail_write(handle, error_code);
   }
   --handle.pending_parts;
-  handle.condition.notify_all();
+  notify_handle(handle);
+}
+
+ChecksumValue checksum_file_range(ChecksumAlgorithm algorithm, int fd,
+                                  uint64_t offset, size_t length);
+
+struct AsyncPartUpload {
+  AsyncPartUpload(State& s, OpenHandle& h, FuseReactor& r,
+                  std::shared_ptr<RetainedPart> p, unsigned n,
+                  uint64_t off, size_t len, const OpenRequestGuard* parent)
+      : state(s), handle(h), reactor(r),
+        active(parent ? OpenRequestGuard(*parent) : OpenRequestGuard(h)),
+        part(std::move(p)),
+        number(n), offset(off), length(len) {}
+
+  State& state;
+  OpenHandle& handle;
+  FuseReactor& reactor;
+  OpenRequestGuard active;
+  std::shared_ptr<RetainedPart> part;
+  unsigned number;
+  uint64_t offset;
+  size_t length;
+  ChecksumValue checksum;
+  ssostr<64> etag;
+  ssostr<248> created_id;
+  std::vector<Pipe> replay;
+  std::unique_ptr<AsyncSignedS3Request> http;
+  FuseReactor::ReactorTask continuation;
+  AsyncIoRequest wait;
+  UniqueFd timer;
+  uint64_t notification = 0;
+  std::exception_ptr worker_error;
+  unsigned attempt = 0;
+  bool admitted = false;
+  bool creating = false;
+  bool waiting = false;
+  bool store_failed = false;
+
+  static int error_code(std::exception_ptr error) noexcept {
+    if (!error) return 0;
+    try { std::rethrow_exception(error); }
+    catch (const std::system_error& value) { return value.code().value(); }
+    catch (const std::bad_alloc&) { return ENOMEM; }
+    catch (...) { return EIO; }
+  }
+
+  void finish(int error) noexcept {
+    std::unique_ptr<AsyncPartUpload> self(this);
+    http.reset();
+    replay.clear();
+    if (part) {
+      part.reset();
+      release_part_budget(state);
+    }
+    try {
+      std::lock_guard guard(handle.mutex);
+      if (creating) handle.multipart_starting = false;
+      if (handle.unlinked.load(std::memory_order_acquire)) error = ESTALE;
+      if (error == 0) {
+        handle.page_cache_store_failed |= store_failed;
+        handle.part_etags[number - 1].assign(etag.data(), etag.size());
+        if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
+          handle.part_checksums[number - 1] = std::move(checksum.base64);
+        }
+        if (state.config.checksum == CHECKSUM_CRC64NVME ||
+            state.config.checksum == CHECKSUM_CRC64XZ) {
+          handle.part_checksum_values[number - 1] = checksum.integer;
+          handle.part_sizes[number - 1] = length;
+        }
+      } else {
+        fail_write(handle, error);
+      }
+      --handle.pending_parts;
+      notify_handle(handle);
+    } catch (...) {
+      std::lock_guard guard(handle.mutex);
+      fail_write(handle, error_code(std::current_exception()));
+      --handle.pending_parts;
+      notify_handle(handle);
+    }
+    if (admitted) state.uploads->finish_upload();
+  }
+
+  void reserve_completion(void (*run)(void*) noexcept) {
+    continuation = {run, run, this};
+    if (!reactor.reserve_completion(&continuation)) {
+      throw std::system_error(errno, std::generic_category(), "reserve multipart completion");
+    }
+  }
+
+  template<class Work>
+  void local(void (*run)(void*) noexcept, Work work) {
+    reserve_completion(run);
+    try {
+      state.uploads->submit(&handle, [this, work = std::move(work)]() mutable {
+        try {
+          IoExecutorScope local_only(nullptr, 0);
+          work();
+        } catch (...) { worker_error = std::current_exception(); }
+        reactor.complete(&continuation);
+      });
+    } catch (...) {
+      worker_error = std::current_exception();
+      reactor.complete(&continuation);
+    }
+  }
+
+  void prepare_replay() {
+    replay.clear();
+    if (!part) return;
+    replay.reserve(part->segments.size());
+    for (const PipeSegment& segment : part->segments) {
+      if (segment.bytes == 0) continue;
+      Pipe copy = Pipe::create(segment.pipe.capacity());
+      if (copy.capacity() < segment.bytes) {
+        throw std::system_error(ENOBUFS, std::generic_category(),
+                                "multipart replay pipe is too small");
+      }
+      tee_exact(segment.pipe.read_fd(), copy.write_fd(), segment.bytes, 0);
+      copy.close_write_end();
+      replay.push_back(std::move(copy));
+    }
+  }
+
+  void prepare() noexcept {
+    admitted = true;
+    try {
+      IoExecutorScope local_only(nullptr, 0);
+      if (checksum_has_digest(state.config.checksum)) {
+        checksum = part ? retained_checksum(state.config.checksum, part.get())
+            : checksum_file_range(state.config.checksum,
+                handle.cache_entry->data_fd(), offset, length);
+      }
+      prepare_replay();
+    } catch (...) { worker_error = std::current_exception(); }
+    reactor.complete(&continuation);
+  }
+
+  static void prepared(void* context) noexcept {
+    auto* self = static_cast<AsyncPartUpload*>(context);
+    if (self->worker_error) {
+      self->finish(error_code(self->worker_error));
+      return;
+    }
+    self->begin();
+  }
+
+  static void awakened(void* context, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncPartUpload*>(context);
+    if (self->waiting) {
+      self->handle.reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+      self->waiting = false;
+    }
+    if (result < 0) {
+      self->finish(-int(result));
+      return;
+    }
+    self->begin();
+  }
+
+  void begin() noexcept {
+    try {
+      {
+        std::lock_guard guard(handle.mutex);
+        if (handle.write_state == WRITE_FAILED || handle.unlinked.load()) {
+          throw std::system_error(handle.unlinked.load() ? ESTALE : handle.write_error,
+                                  std::generic_category(), "multipart write failed");
+        }
+        if (handle.multipart_starting && !creating) {
+          handle.reactor_waiters.fetch_add(1, std::memory_order_acq_rel);
+          waiting = true;
+        } else if (!creating && handle.upload_id.empty()) {
+          handle.multipart_starting = true;
+          creating = true;
+        }
+      }
+      if (waiting) {
+        wait = {};
+        wait.kind       = AsyncIoRequest::READ;
+        wait.fd         = handle.state_event.get();
+        wait.data       = &notification;
+        wait.length     = sizeof(notification);
+        wait.timeout_ms = 0; // The creating request owns its network deadline.
+        wait.complete   = awakened;
+        wait.context    = this;
+        if (reactor.submit(wait)) return;
+        handle.reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+        waiting = false;
+        throw std::system_error(errno, std::generic_category(), "wait multipart start");
+      }
+      AsyncHttpRequest args;
+      if (creating) {
+        args.method = "POST";
+        args.path = query_path(handle.object_path, "uploads=");
+        if (checksum_is_s3(state.config.checksum)) {
+          args.headers.push_back({"x-amz-checksum-algorithm",
+                                  checksum_s3_name(state.config.checksum)});
+          args.headers.push_back({"x-amz-checksum-type",
+                                  checksum_multipart_type(state.config.checksum)});
+        }
+        if (!handle.write_id.empty()) {
+          args.headers.push_back({"x-amz-meta-ngs3fs-write-id", handle.write_id});
+        }
+      } else {
+        args.method = "PUT";
+        const std::string query = "partNumber=" + std::to_string(number) +
+            "&uploadId=" + uri_encode(handle.upload_id, false);
+        args.path = query_path(handle.object_path, query);
+        args.upload = true;
+        if (part) {
+          size_t i = 0;
+          args.source_segments.reserve(replay.size());
+          for (const auto& segment : part->segments) {
+            if (segment.bytes == 0) continue;
+            args.source_segments.push_back(
+                {replay[i++].read_fd(), 0, segment.bytes, false});
+          }
+        } else {
+          args.source_fd = handle.cache_entry->data_fd();
+          args.source_offset = offset;
+          args.source_length = length;
+        }
+        append_upload_checksum(args.headers, state.config.checksum, checksum);
+      }
+      http = std::make_unique<AsyncSignedS3Request>(
+          state, reactor, std::move(args), received, this, 1,
+          creating ? kEmptyPayloadSha256 : kUnsignedPayload);
+      if (!http->start()) {
+        throw std::system_error(errno, std::generic_category(), "start multipart request");
+      }
+    } catch (...) { finish(error_code(std::current_exception())); }
+  }
+
+  static void retry_ready(void* context, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncPartUpload*>(context);
+    if (result < 0) { self->finish(-int(result)); return; }
+    try {
+      self->local(prepared, [self] { self->prepare_replay(); });
+    } catch (...) { self->finish(error_code(std::current_exception())); }
+  }
+
+  void retry(const Response& response) {
+    const uint64_t ms = async_retry_milliseconds(response, attempt++);
+    timer.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC));
+    if (!timer) throw std::system_error(errno, std::generic_category(), "multipart retry timer");
+    itimerspec spec{};
+    spec.it_value.tv_sec = time_t(ms / 1000);
+    spec.it_value.tv_nsec = long((ms % 1000) * 1'000'000);
+    if (::timerfd_settime(timer.get(), 0, &spec, nullptr) != 0) {
+      throw std::system_error(errno, std::generic_category(), "arm multipart retry");
+    }
+    wait = {};
+    wait.kind = AsyncIoRequest::READ;
+    wait.fd = timer.get();
+    wait.data = &notification;
+    wait.length = sizeof(notification);
+    wait.complete = retry_ready;
+    wait.context = this;
+    if (!reactor.submit(wait)) {
+      throw std::system_error(errno, std::generic_category(), "submit multipart retry");
+    }
+  }
+
+  static void created(void* context) noexcept {
+    auto* self = static_cast<AsyncPartUpload*>(context);
+    if (self->worker_error) {
+      self->finish(error_code(self->worker_error));
+      return;
+    }
+    try {
+      std::lock_guard guard(self->handle.mutex);
+      self->handle.upload_id.assign(self->created_id.data(), self->created_id.size());
+      self->handle.multipart_starting = false;
+      self->creating = false;
+      notify_handle(self->handle);
+    } catch (...) {
+      self->finish(error_code(std::current_exception()));
+      return;
+    }
+    self->begin();
+  }
+
+  static void stored(void* context) noexcept {
+    auto* self = static_cast<AsyncPartUpload*>(context);
+    self->finish(error_code(self->worker_error));
+  }
+
+  static void received(void* context, Response&& response,
+                       std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncPartUpload*>(context);
+    self->http.reset();
+    try {
+      if (!error && self->state.config.directory_bucket &&
+          (response.status == 401 || response.status == 403) && self->attempt < 3) {
+        invalidate_express_session(self->state);
+        // The response may have consumed a pipe prefix; only a fresh tee is
+        // replayable. CreateMultipartUpload has no request body to replay.
+        self->retry(response);
+        return;
+      }
+      if (!self->creating && (error || retryable_response(response)) &&
+          error_code(error) != ECANCELED && self->attempt < 3) {
+        self->retry(response);
+        return;
+      }
+      if (error) std::rethrow_exception(error);
+      if (self->creating) {
+        require_s3_success(response, "CreateMultipartUpload");
+        if (checksum_is_s3(self->state.config.checksum)) {
+          const auto algorithm = response.headers.find("x-amz-checksum-algorithm");
+          const auto type = response.headers.find("x-amz-checksum-type");
+          if (algorithm == response.headers.end() || type == response.headers.end() ||
+              sso_view(algorithm->second) != checksum_s3_name(self->state.config.checksum) ||
+              sso_view(type->second) != checksum_multipart_type(self->state.config.checksum)) {
+            throw std::runtime_error("CreateMultipartUpload rejected its checksum");
+          }
+        }
+        S3Xml xml(response_xml(response), "CreateMultipartUpload");
+        self->created_id = xml.required_text(
+            xml.result_root("InitiateMultipartUploadResult"), "UploadId");
+        if (self->created_id.empty()) throw std::runtime_error("missing UploadId");
+        if (self->handle.cache_entry) {
+          self->local(created, [self] {
+            self->handle.cache_entry->set_upload_id(sso_view(self->created_id));
+          });
+        } else {
+          created(self);
+        }
+        return;
+      }
+      require_s3_success(response, "UploadPart");
+      verify_upload_checksum(response, self->state.config.checksum,
+                             self->checksum, "UploadPart");
+      const auto etag = response.headers.find("etag");
+      if (etag == response.headers.end() || etag->second.empty()) {
+        throw std::runtime_error("UploadPart response omitted ETag");
+      }
+      self->etag.assign(etag->second.data(), etag->second.size());
+      if (!self->part) { self->finish(0); return; }
+      self->local(stored, [self] {
+        self->store_failed = !store_page_cache(
+            self->state, self->handle, *self->part, self->offset);
+      });
+    } catch (...) {
+      if (self->creating) {
+        fprintf(stderr, "error: CreateMultipartUpload outcome unknown; orphan cleanup may be required: %s\n",
+                self->handle.object_path.c_str());
+      }
+      self->finish(error_code(std::current_exception()));
+    }
+  }
+};
+
+void submit_async_part(State& state, OpenHandle& handle, FuseReactor& reactor,
+                        std::shared_ptr<RetainedPart> part, unsigned number,
+                        uint64_t offset, size_t length,
+                        const OpenRequestGuard* parent) {
+  auto* task = new AsyncPartUpload(
+      state, handle, reactor, std::move(part), number, offset, length, parent);
+  try {
+    task->reserve_completion(AsyncPartUpload::prepared);
+  } catch (...) {
+    delete task;
+    throw;
+  }
+  try {
+    state.uploads->submit_upload(&handle, [task] { task->prepare(); }, true);
+  } catch (...) {
+    // Admission already pins the reactor and this handle. Complete on its
+    // owner even when the CPU queue rejects the preparation job.
+    task->worker_error = std::current_exception();
+    reactor.complete(&task->continuation);
+  }
 }
 
 void submit_part(State& state, OpenHandle& handle,
-                 std::shared_ptr<RetainedPart> part) {
+                 std::shared_ptr<RetainedPart> part,
+                 const OpenRequestGuard* parent = nullptr) {
   if (handle.next_part_number > kMaximumMultipartParts) {
     throw std::system_error(EFBIG, std::generic_category(),
                             "S3 multipart part limit exceeded");
@@ -5062,10 +6835,17 @@ void submit_part(State& state, OpenHandle& handle,
   handle.multipart_required = true;
   ++handle.pending_parts;
   try {
-    state.uploads->submit(
-        &handle, [&state, &handle, part = std::move(part)] {
-          upload_part_job(state, handle, part);
-        });
+    if (FuseReactor* reactor = current_fuse_reactor();
+        reactor != nullptr && !state.config.tls) {
+      const size_t length = size_t(part->bytes);
+      submit_async_part(state, handle, *reactor, std::move(part), number,
+                         uint64_t(number - 1) * state.config.part_size, length, parent);
+    } else {
+      state.uploads->submit_upload(
+          &handle, [&state, &handle, part = std::move(part)] {
+            upload_part_job(state, handle, part);
+          });
+    }
   } catch (...) {
     --handle.pending_parts;
     handle.next_part_number   = number;
@@ -5116,7 +6896,8 @@ void ensure_current_part(State& state, OpenHandle& handle,
   }
 }
 
-void submit_current_part(State& state, OpenHandle& handle) {
+void submit_current_part(State& state, OpenHandle& handle,
+                          const OpenRequestGuard* parent = nullptr) {
   if (!handle.current_part ||
       handle.current_part->bytes != state.config.part_size) {
     return;
@@ -5127,7 +6908,7 @@ void submit_current_part(State& state, OpenHandle& handle) {
   }
   handle.current_reservation   = false;
   try {
-    submit_part(state, handle, std::move(part));
+    submit_part(state, handle, std::move(part), parent);
   } catch (...) {
     release_part_budget(state);
     throw;
@@ -5378,10 +7159,10 @@ void complete_multipart(State& state, OpenHandle& handle) {
 void seal_write(State& state, OpenHandle& handle) {
   std::unique_lock guard(handle.mutex);
   while (handle.write_in_progress) {
-    handle.condition.wait(guard);
+    wait_handle(handle, guard);
   }
   while (handle.write_state == WRITE_SEALING) {
-    handle.condition.wait(guard);
+    wait_handle(handle, guard);
   }
   if (handle.write_state == WRITE_SEALED) {
     return;
@@ -5441,7 +7222,7 @@ void seal_write(State& state, OpenHandle& handle) {
       }
       while (handle.pending_parts != 0 &&
              handle.write_state != WRITE_FAILED) {
-        handle.condition.wait(guard);
+        wait_handle(handle, guard);
       }
       if (handle.write_state == WRITE_FAILED) {
         throw std::system_error(handle.write_error,
@@ -5474,7 +7255,7 @@ void seal_write(State& state, OpenHandle& handle) {
       guard.lock();
     }
     handle.write_state = WRITE_SEALED;
-    handle.condition.notify_all();
+    notify_handle(handle);
   } catch (const std::system_error& error) {
     if (!guard.owns_lock()) {
       guard.lock();
@@ -5957,6 +7738,914 @@ void rename_remote_object(State& state, std::string_view key,
   }
 }
 
+class AsyncNativeRename {
+ public:
+  using Complete = void (*)(void*, bool, std::exception_ptr) noexcept;
+
+  AsyncNativeRename(State& state, FuseReactor& reactor,
+                    std::string key, std::string etag,
+                    std::string destination, bool no_replace,
+                    Complete complete, void* context)
+      : state_(state), reactor_(reactor), key_(std::move(key)),
+        etag_(std::move(etag)), destination_(std::move(destination)),
+        no_replace_(no_replace), complete_(complete), context_(context) {
+    task_ = {run, cancel_queued, this};
+  }
+
+  bool start() noexcept {
+    if (started_ || complete_ == nullptr) {
+      errno = EINVAL;
+      return false;
+    }
+    started_ = true;
+    if (reactor_.post(&task_)) return true;
+    started_ = false;
+    return false;
+  }
+
+  void cancel() noexcept {
+    cancelled_ = true;
+    if (session_) session_->cancel();
+    if (request_) request_->cancel();
+  }
+
+ private:
+  enum Stage { PROBE, DELETE_PROBE, RENAME } stage_ = PROBE;
+  enum SessionAction {
+    RESUME_ADVANCE,
+    SUBMIT_PROBE,
+    SUBMIT_PROBE_DELETE,
+    SUBMIT_RENAME,
+  } session_action_ = RESUME_ADVANCE;
+
+  static void run(void* context) noexcept {
+    static_cast<AsyncNativeRename*>(context)->advance();
+  }
+
+  static void cancel_queued(void* context) noexcept {
+    auto* operation = static_cast<AsyncNativeRename*>(context);
+    operation->cancelled_ = true;
+    try {
+      throw std::system_error(ECANCELED, std::generic_category(),
+                              "RenameObject cancelled");
+    } catch (...) {
+      operation->finish(false, std::current_exception());
+    }
+  }
+
+  void finish(bool renamed, std::exception_ptr error = {}) noexcept {
+    session_.reset();
+    request_.reset();
+    const Complete complete = complete_;
+    void* const context = context_;
+    complete_ = nullptr;
+    complete(context, renamed, std::move(error));
+  }
+
+  void submit(AsyncHttpRequest arguments) {
+    request_ = std::make_unique<AsyncS3Request>(
+        state_, reactor_, std::move(arguments), received, this);
+    if (!request_->start()) {
+      throw std::system_error(errno, std::generic_category(),
+                              "submit asynchronous RenameObject");
+    }
+  }
+
+  void advance() noexcept {
+    try {
+      if (cancelled_) {
+        throw std::system_error(ECANCELED, std::generic_category(),
+                                "RenameObject cancelled");
+      }
+      if (!AsyncExpressSession::ready(state_)) {
+        await_session(RESUME_ADVANCE);
+        return;
+      }
+      const int support =
+          state_.rename_object_support.load(std::memory_order_acquire);
+      if (support < 0) {
+        finish(false);
+      } else if (support > 0) {
+        submit_authorized(SUBMIT_RENAME);
+      } else {
+        submit_authorized(SUBMIT_PROBE);
+      }
+    } catch (...) {
+      finish(false, std::current_exception());
+    }
+  }
+
+  void await_session(SessionAction action) {
+    session_action_ = action;
+    session_ = std::make_unique<AsyncExpressSession>(
+        state_, reactor_, session_ready, this);
+    if (!session_->start()) {
+      throw std::system_error(errno, std::generic_category(),
+                              "submit S3 Express session refresh");
+    }
+  }
+
+  void submit_authorized(SessionAction action) {
+    if (!AsyncExpressSession::ready(state_)) {
+      await_session(action);
+      return;
+    }
+    try {
+      switch (action) {
+        case RESUME_ADVANCE:
+          advance();
+          return;
+        case SUBMIT_PROBE:
+          submit_probe();
+          return;
+        case SUBMIT_PROBE_DELETE:
+          submit_probe_delete();
+          return;
+        case SUBMIT_RENAME:
+          submit_rename();
+          return;
+      }
+    } catch (const std::system_error& error) {
+      if (error.code().value() == EAGAIN) {
+        await_session(action);
+        return;
+      }
+      throw;
+    }
+  }
+
+  static void session_ready(void* context,
+                            std::exception_ptr error) noexcept {
+    auto* operation = static_cast<AsyncNativeRename*>(context);
+    operation->session_.reset();
+    if (error) {
+      operation->finish(false, std::move(error));
+      return;
+    }
+    if (operation->cancelled_) {
+      try {
+        throw std::system_error(ECANCELED, std::generic_category(),
+                                "RenameObject cancelled");
+      } catch (...) {
+        operation->finish(false, std::current_exception());
+      }
+      return;
+    }
+    try {
+      operation->submit_authorized(operation->session_action_);
+    } catch (...) {
+      operation->finish(false, std::current_exception());
+    }
+  }
+
+  void submit_probe() {
+    const std::string source = object_request_path(state_, key_);
+    const std::string probe_name =
+        ".ngs3fs-rename-probe-" + std::to_string(::getpid()) + '-' +
+        std::to_string(fuse_monotonic_ns());
+    probe_destination_ = destination_path(source, probe_name);
+    const std::string missing_source = probe_destination_ + ".missing";
+    AsyncHttpRequest arguments;
+    arguments.method = "PUT";
+    arguments.path = probe_destination_ + "?renameObject";
+    arguments.headers = {
+        Header{"x-amz-rename-source", missing_source},
+        Header{"if-none-match", "*"},
+        Header{"x-amz-client-token", rename_client_token()},
+    };
+    HeaderList authorization = authorization_headers(
+        state_, "PUT", sso_view(arguments.path), arguments.headers,
+        kEmptyPayloadSha256);
+    arguments.headers.insert(
+        arguments.headers.end(),
+        std::make_move_iterator(authorization.begin()),
+        std::make_move_iterator(authorization.end()));
+    stage_ = PROBE;
+    submit(std::move(arguments));
+  }
+
+  void submit_probe_delete() {
+    AsyncHttpRequest arguments;
+    arguments.method = "DELETE";
+    arguments.path = probe_destination_;
+    const HeaderList authorization = authorization_headers(
+        state_, "DELETE", sso_view(arguments.path), {}, kEmptyPayloadSha256);
+    arguments.headers.assign(authorization.begin(), authorization.end());
+    stage_ = DELETE_PROBE;
+    submit(std::move(arguments));
+  }
+
+  void submit_rename() {
+    const std::string source = object_request_path(state_, key_);
+    AsyncHttpRequest arguments;
+    arguments.method = "PUT";
+    arguments.path = destination_ + "?renameObject";
+    arguments.headers = {
+        Header{"x-amz-rename-source", request_path_without_query(source)},
+        Header{"x-amz-client-token", rename_client_token()},
+    };
+    if (!etag_.empty()) {
+      arguments.headers.push_back(
+          Header{"x-amz-rename-source-if-match", etag_});
+    }
+    if (no_replace_) {
+      arguments.headers.push_back(Header{"if-none-match", "*"});
+    }
+    HeaderList authorization = authorization_headers(
+        state_, "PUT", sso_view(arguments.path), arguments.headers,
+        kEmptyPayloadSha256);
+    arguments.headers.insert(
+        arguments.headers.end(),
+        std::make_move_iterator(authorization.begin()),
+        std::make_move_iterator(authorization.end()));
+    stage_ = RENAME;
+    submit(std::move(arguments));
+  }
+
+  static void received(void* context, Response&& response,
+                       std::exception_ptr error) noexcept {
+    auto* operation = static_cast<AsyncNativeRename*>(context);
+    Response value = std::move(response);
+    operation->request_.reset();
+    try {
+      if (error) std::rethrow_exception(error);
+      if ((value.status == 401 || value.status == 403) &&
+          operation->state_.config.directory_bucket &&
+          operation->session_attempt_++ < 3) {
+        invalidate_express_session(operation->state_);
+        switch (operation->stage_) {
+          case PROBE:
+            operation->submit_authorized(SUBMIT_PROBE);
+            return;
+          case DELETE_PROBE:
+            operation->submit_authorized(SUBMIT_PROBE_DELETE);
+            return;
+          case RENAME:
+            operation->submit_authorized(SUBMIT_RENAME);
+            return;
+        }
+      }
+      operation->session_attempt_ = 0;
+      if (operation->cancelled_) {
+        throw std::system_error(ECANCELED, std::generic_category(),
+                                "RenameObject cancelled");
+      }
+      switch (operation->stage_) {
+        case PROBE:
+          operation->probe_received(value);
+          return;
+        case DELETE_PROBE:
+          if (value.status != 200 && value.status != 204 &&
+              value.status != 404) {
+            throw_s3_response(
+                value, "DeleteObject RenameObject capability probe");
+          }
+          operation->state_.rename_object_support.store(
+              -1, std::memory_order_release);
+          operation->finish(false);
+          return;
+        case RENAME:
+          operation->rename_received(value);
+          return;
+      }
+    } catch (...) {
+      operation->finish(false, std::current_exception());
+    }
+  }
+
+  void probe_received(const Response& response) {
+    if (response.status == 200 || response.status == 201 ||
+        response.status == 204) {
+      submit_authorized(SUBMIT_PROBE_DELETE);
+      return;
+    }
+    if (rename_object_source_missing(response)) {
+      state_.rename_object_support.store(1, std::memory_order_release);
+      submit_authorized(SUBMIT_RENAME);
+      return;
+    }
+    if (rename_object_unsupported(response)) {
+      state_.rename_object_support.store(-1, std::memory_order_release);
+      finish(false);
+      return;
+    }
+    throw_s3_response(response, "RenameObject capability probe");
+  }
+
+  void rename_received(const Response& response) {
+    if (response.status == 200) {
+      state_.rename_object_support.store(1, std::memory_order_release);
+      finish(true);
+      return;
+    }
+    if (response.status == 412) {
+      throw std::system_error(
+          no_replace_ ? EEXIST : ESTALE, std::generic_category(),
+          no_replace_ ? "RenameObject destination exists"
+                      : "RenameObject source changed");
+    }
+    if (!rename_object_unsupported(response)) {
+      throw_s3_response(response, "RenameObject");
+    }
+    state_.rename_object_support.store(-1, std::memory_order_release);
+    finish(false);
+  }
+
+  State& state_;
+  FuseReactor& reactor_;
+  std::string key_;
+  std::string etag_;
+  std::string destination_;
+  std::string probe_destination_;
+  bool no_replace_;
+  Complete complete_;
+  void* context_;
+  std::unique_ptr<AsyncExpressSession> session_;
+  std::unique_ptr<AsyncS3Request> request_;
+  FuseReactor::ReactorTask task_;
+  unsigned session_attempt_ = 0;
+  bool started_ = false;
+  bool cancelled_ = false;
+};
+
+class AsyncRemoteRename {
+ public:
+  using Complete = void (*)(void*, std::exception_ptr) noexcept;
+
+  AsyncRemoteRename(State& state, FuseReactor& reactor,
+                    std::string key, uint64_t size, std::string etag,
+                    std::string version_id, std::string destination,
+                    bool no_replace, Complete complete, void* context)
+      : state_(state), reactor_(reactor), key_(std::move(key)), size_(size),
+        etag_(std::move(etag)), version_id_(std::move(version_id)),
+        destination_(std::move(destination)), no_replace_(no_replace),
+        complete_(complete), context_(context),
+        source_(object_request_path(state_, key_)) {
+    native_ = std::make_unique<AsyncNativeRename>(
+        state_, reactor_, key_, etag_, destination_, no_replace_,
+        native_complete, this);
+  }
+
+  bool start() noexcept {
+    if (started_ || complete_ == nullptr) {
+      errno = EINVAL;
+      return false;
+    }
+    started_ = true;
+    if (!native_->start()) {
+      native_.reset();
+      started_ = false;
+      return false;
+    }
+    return true;
+  }
+
+  void cancel() noexcept {
+    cancelled_ = true;
+    if (native_) native_->cancel();
+    if (session_) session_->cancel();
+    if (request_) request_->cancel();
+  }
+
+ private:
+  enum Stage {
+    COPY_OBJECT,
+    PUT_MARKER,
+    DELETE_SOURCE,
+    CREATE_MULTIPART,
+    COPY_PART,
+    COMPLETE_MULTIPART,
+    ABORT_MULTIPART,
+  } stage_ = COPY_OBJECT;
+
+  static constexpr uint64_t kMaximumSingleCopySize =
+      5ULL * 1024ULL * 1024ULL * 1024ULL;
+  static constexpr uint64_t kCopyPartSize =
+      1024ULL * 1024ULL * 1024ULL;
+
+  void finish(std::exception_ptr error = {}) noexcept {
+    native_.reset();
+    session_.reset();
+    request_.reset();
+    const Complete complete = complete_;
+    void* const context = context_;
+    complete_ = nullptr;
+    complete(context, std::move(error));
+  }
+
+  void submit(AsyncHttpRequest arguments) {
+    request_ = std::make_unique<AsyncS3Request>(
+        state_, reactor_, std::move(arguments), received, this);
+    if (!request_->start()) {
+      throw std::system_error(errno, std::generic_category(),
+                              "submit asynchronous remote rename");
+    }
+  }
+
+  static bool needs_express_session(Stage stage) noexcept {
+    switch (stage) {
+      case PUT_MARKER:
+      case DELETE_SOURCE:
+      case CREATE_MULTIPART:
+      case COMPLETE_MULTIPART:
+      case ABORT_MULTIPART:
+        return true;
+      case COPY_OBJECT:
+      case COPY_PART:
+        return false;
+    }
+    return false;
+  }
+
+  void submit_stage(Stage stage) {
+    switch (stage) {
+      case COPY_OBJECT:
+        submit_copy_object();
+        return;
+      case PUT_MARKER:
+        submit_empty_marker();
+        return;
+      case DELETE_SOURCE:
+        submit_delete_source();
+        return;
+      case CREATE_MULTIPART:
+        submit_create_multipart();
+        return;
+      case COPY_PART:
+        submit_copy_part();
+        return;
+      case COMPLETE_MULTIPART:
+        submit_complete_multipart();
+        return;
+      case ABORT_MULTIPART:
+        submit_abort_multipart();
+        return;
+    }
+  }
+
+  void await_session(Stage stage) {
+    resume_stage_ = stage;
+    session_ = std::make_unique<AsyncExpressSession>(
+        state_, reactor_, session_ready, this);
+    if (!session_->start()) {
+      throw std::system_error(errno, std::generic_category(),
+                              "submit S3 Express session refresh");
+    }
+  }
+
+  void schedule(Stage stage) {
+    if (cancelled_ && stage != ABORT_MULTIPART) {
+      throw std::system_error(ECANCELED, std::generic_category(),
+                              "remote rename cancelled");
+    }
+    if (needs_express_session(stage) &&
+        !AsyncExpressSession::ready(state_)) {
+      await_session(stage);
+      return;
+    }
+    try {
+      submit_stage(stage);
+    } catch (const CredentialRefreshPending&) {
+      await_session(stage);
+      return;
+    } catch (const std::system_error& error) {
+      if (needs_express_session(stage) && error.code().value() == EAGAIN) {
+        await_session(stage);
+        return;
+      }
+      throw;
+    }
+  }
+
+  static void session_ready(void* context,
+                            std::exception_ptr error) noexcept {
+    auto* operation = static_cast<AsyncRemoteRename*>(context);
+    operation->session_.reset();
+    if (error) {
+      if (operation->resume_stage_ == ABORT_MULTIPART &&
+          operation->pending_error_) {
+        operation->warn_abort_failure(std::move(error));
+      } else {
+        operation->fail_or_abort(std::move(error));
+      }
+      return;
+    }
+    try {
+      operation->schedule(operation->resume_stage_);
+    } catch (...) {
+      operation->fail_or_abort(std::current_exception());
+    }
+  }
+
+  static void native_complete(void* context, bool renamed,
+                              std::exception_ptr error) noexcept {
+    auto* operation = static_cast<AsyncRemoteRename*>(context);
+    operation->native_.reset();
+    if (error) {
+      operation->finish(std::move(error));
+      return;
+    }
+    if (renamed) {
+      operation->finish();
+      return;
+    }
+    try {
+      operation->start_fallback();
+    } catch (...) {
+      operation->finish(std::current_exception());
+    }
+  }
+
+  void start_fallback() {
+    if (cancelled_) {
+      throw std::system_error(ECANCELED, std::generic_category(),
+                              "remote rename cancelled");
+    }
+    if (state_.config.bucket.empty()) {
+      throw std::system_error(EOPNOTSUPP, std::generic_category(),
+                              "CopyObject fallback requires --bucket");
+    }
+    if (size_ > kMaximumSingleCopySize) {
+      const uint64_t part_count =
+          (size_ + kCopyPartSize - 1) / kCopyPartSize;
+      if (part_count > kMaximumMultipartParts) {
+        throw std::system_error(EFBIG, std::generic_category(),
+                                "multipart copy exceeds 10,000 parts");
+      }
+      schedule(CREATE_MULTIPART);
+    } else {
+      schedule(COPY_OBJECT);
+    }
+  }
+
+  std::string copy_source() const {
+    return make_copy_source(
+        state_.config.bucket, source_, version_id_,
+        authority_uses_virtual_bucket(
+            state_.config.authority, state_.config.bucket));
+  }
+
+  void submit_copy_object() {
+    AsyncHttpRequest arguments;
+    arguments.method = "PUT";
+    arguments.path = destination_;
+    arguments.headers = {Header{"x-amz-copy-source", copy_source()}};
+    if (!etag_.empty()) {
+      arguments.headers.push_back(
+          Header{"x-amz-copy-source-if-match", etag_});
+    }
+    if (no_replace_) {
+      arguments.headers.push_back(Header{"if-none-match", "*"});
+    }
+    HeaderList authorization = base_authorization_headers(
+        state_, "PUT", sso_view(arguments.path), arguments.headers,
+        kEmptyPayloadSha256);
+    arguments.headers.insert(
+        arguments.headers.end(),
+        std::make_move_iterator(authorization.begin()),
+        std::make_move_iterator(authorization.end()));
+    stage_ = COPY_OBJECT;
+    submit(std::move(arguments));
+  }
+
+  void submit_empty_marker() {
+    AsyncHttpRequest arguments;
+    arguments.method = "PUT";
+    arguments.path = destination_;
+    const HeaderList authorization = authorization_headers(
+        state_, "PUT", sso_view(arguments.path), {}, kEmptyPayloadSha256);
+    arguments.headers.assign(authorization.begin(), authorization.end());
+    stage_ = PUT_MARKER;
+    submit(std::move(arguments));
+  }
+
+  void submit_delete_source() {
+    AsyncHttpRequest arguments;
+    arguments.method = "DELETE";
+    arguments.path = source_;
+    if (!etag_.empty()) {
+      arguments.headers.push_back(Header{"if-match", etag_});
+    }
+    HeaderList authorization = authorization_headers(
+        state_, "DELETE", sso_view(arguments.path), arguments.headers,
+        kEmptyPayloadSha256);
+    arguments.headers.insert(
+        arguments.headers.end(),
+        std::make_move_iterator(authorization.begin()),
+        std::make_move_iterator(authorization.end()));
+    stage_ = DELETE_SOURCE;
+    submit(std::move(arguments));
+  }
+
+  void submit_create_multipart() {
+    AsyncHttpRequest arguments;
+    arguments.method = "POST";
+    arguments.path = query_path(destination_, "uploads=");
+    const HeaderList authorization = authorization_headers(
+        state_, "POST", sso_view(arguments.path), {}, kEmptyPayloadSha256);
+    arguments.headers.assign(authorization.begin(), authorization.end());
+    stage_ = CREATE_MULTIPART;
+    submit(std::move(arguments));
+  }
+
+  void submit_copy_part() {
+    const uint64_t begin = part_index_ * kCopyPartSize;
+    const uint64_t end = std::min(size_, begin + kCopyPartSize) - 1;
+    AsyncHttpRequest arguments;
+    arguments.method = "PUT";
+    arguments.path = query_path(
+        destination_, "partNumber=" + std::to_string(part_index_ + 1) +
+            "&uploadId=" + uri_encode(upload_id_, false));
+    arguments.headers = {
+        Header{"x-amz-copy-source", copy_source()},
+        Header{"x-amz-copy-source-range",
+               "bytes=" + std::to_string(begin) + '-' +
+                   std::to_string(end)},
+    };
+    if (!etag_.empty()) {
+      arguments.headers.push_back(
+          Header{"x-amz-copy-source-if-match", etag_});
+    }
+    HeaderList authorization = base_authorization_headers(
+        state_, "PUT", sso_view(arguments.path), arguments.headers,
+        kEmptyPayloadSha256);
+    arguments.headers.insert(
+        arguments.headers.end(),
+        std::make_move_iterator(authorization.begin()),
+        std::make_move_iterator(authorization.end()));
+    stage_ = COPY_PART;
+    submit(std::move(arguments));
+  }
+
+  void submit_complete_multipart() {
+    std::string body;
+    body.reserve(64 + part_etags_.size() * 96);
+    body += "<CompleteMultipartUpload>";
+    for (size_t i = 0; i < part_etags_.size(); ++i) {
+      body += "<Part><PartNumber>" + std::to_string(i + 1) +
+              "</PartNumber><ETag>" + part_etags_[i] +
+              "</ETag></Part>";
+    }
+    body += "</CompleteMultipartUpload>";
+
+    AsyncHttpRequest arguments;
+    arguments.method = "POST";
+    arguments.path = query_path(
+        destination_, "uploadId=" + uri_encode(upload_id_, false));
+    arguments.headers = {Header{"content-type", "application/xml"}};
+    if (no_replace_) {
+      arguments.headers.push_back(Header{"if-none-match", "*"});
+    }
+    append_authorization(arguments.headers, state_, "POST",
+                         sso_view(arguments.path), kUnsignedPayload);
+    arguments.upload = true;
+    arguments.body.resize(body.size());
+    memcpy(arguments.body.data(), body.data(), body.size());
+    stage_ = COMPLETE_MULTIPART;
+    submit(std::move(arguments));
+  }
+
+  void submit_abort_multipart() {
+    AsyncHttpRequest arguments;
+    arguments.method = "DELETE";
+    arguments.path = query_path(
+        destination_, "uploadId=" + uri_encode(upload_id_, false));
+    const HeaderList authorization = authorization_headers(
+        state_, "DELETE", sso_view(arguments.path), {}, kEmptyPayloadSha256);
+    arguments.headers.assign(authorization.begin(), authorization.end());
+    stage_ = ABORT_MULTIPART;
+    submit(std::move(arguments));
+  }
+
+  static void received(void* context, Response&& response,
+                       std::exception_ptr error) noexcept {
+    auto* operation = static_cast<AsyncRemoteRename*>(context);
+    Response value = std::move(response);
+    operation->request_.reset();
+    if (!error && (value.status == 401 || value.status == 403) &&
+        operation->state_.config.directory_bucket &&
+        needs_express_session(operation->stage_) &&
+        operation->session_attempt_++ < 3) {
+      invalidate_express_session(operation->state_);
+      try {
+        operation->schedule(operation->stage_);
+      } catch (...) {
+        if (operation->stage_ == ABORT_MULTIPART &&
+            operation->pending_error_) {
+          operation->warn_abort_failure(std::current_exception());
+        } else {
+          operation->fail_or_abort(std::current_exception());
+        }
+      }
+      return;
+    }
+    if (!error) operation->session_attempt_ = 0;
+    if (operation->stage_ == ABORT_MULTIPART) {
+      if (error) {
+        try {
+          std::rethrow_exception(error);
+        } catch (const std::exception& failure) {
+          fprintf(stderr, "warning: failed to abort multipart copy: %s\n",
+                  failure.what());
+        } catch (...) {
+          fprintf(stderr, "warning: failed to abort multipart copy\n");
+        }
+      }
+      operation->upload_id_.clear();
+      operation->finish(std::move(operation->pending_error_));
+      return;
+    }
+    if (error) {
+      if (operation->stage_ == CREATE_MULTIPART) {
+        fprintf(stderr,
+                "error: multipart-copy CreateMultipartUpload outcome unknown; "
+                "lifecycle cleanup may be required: %s\n",
+                operation->destination_.c_str());
+        operation->finish(std::move(error));
+      } else if (operation->stage_ == COMPLETE_MULTIPART) {
+        fprintf(stderr,
+                "error: multipart-copy completion outcome unknown: %s\n",
+                operation->destination_.c_str());
+        operation->finish(std::move(error));
+      } else {
+        operation->fail_or_abort(std::move(error));
+      }
+      return;
+    }
+    try {
+      if (operation->cancelled_) {
+        throw std::system_error(ECANCELED, std::generic_category(),
+                                "remote rename cancelled");
+      }
+      operation->response_received(value);
+    } catch (...) {
+      operation->fail_or_abort(std::current_exception());
+    }
+  }
+
+  void fail_or_abort(std::exception_ptr error) noexcept {
+    if (upload_id_.empty()) {
+      finish(std::move(error));
+      return;
+    }
+    pending_error_ = std::move(error);
+    try {
+      schedule(ABORT_MULTIPART);
+    } catch (const std::exception& failure) {
+      fprintf(stderr, "warning: failed to abort multipart copy: %s\n",
+              failure.what());
+      upload_id_.clear();
+      finish(std::move(pending_error_));
+    } catch (...) {
+      fprintf(stderr, "warning: failed to abort multipart copy\n");
+      upload_id_.clear();
+      finish(std::move(pending_error_));
+    }
+  }
+
+  void warn_abort_failure(std::exception_ptr error) noexcept {
+    try {
+      if (error) std::rethrow_exception(error);
+    } catch (const std::exception& failure) {
+      fprintf(stderr, "warning: failed to abort multipart copy: %s\n",
+              failure.what());
+    } catch (...) {
+      fprintf(stderr, "warning: failed to abort multipart copy\n");
+    }
+    upload_id_.clear();
+    finish(std::move(pending_error_));
+  }
+
+  void response_received(const Response& response) {
+    switch (stage_) {
+      case COPY_OBJECT:
+        copy_received(response);
+        return;
+      case PUT_MARKER:
+        require_s3_success(response, "PutObject rename marker fallback");
+        schedule(DELETE_SOURCE);
+        return;
+      case DELETE_SOURCE:
+        if (response.status == 412) {
+          throw std::system_error(
+              ESTALE, std::generic_category(),
+              "CopyObject succeeded but the source changed before DeleteObject");
+        }
+        if (response.status != 200 && response.status != 204) {
+          throw_s3_response(response, "CopyObject succeeded but DeleteObject");
+        }
+        finish();
+        return;
+      case CREATE_MULTIPART:
+        create_received(response);
+        return;
+      case COPY_PART:
+        part_received(response);
+        return;
+      case COMPLETE_MULTIPART:
+        complete_received(response);
+        return;
+      case ABORT_MULTIPART:
+        return;
+    }
+  }
+
+  void copy_received(const Response& response) {
+    if (response.status == 412) {
+      throw std::system_error(
+          no_replace_ ? EEXIST : ESTALE, std::generic_category(),
+          no_replace_ ? "CopyObject destination exists"
+                      : "CopyObject source changed");
+    }
+    if (response.status != 200) {
+      const bool marker_copy_unsupported =
+          size_ == 0 && key_.ends_with('/') &&
+          (response.status == 400 || response.status == 405 ||
+           response.status == 501);
+      if (marker_copy_unsupported) {
+        schedule(PUT_MARKER);
+        return;
+      }
+      throw_s3_response(response, "CopyObject rename fallback");
+    }
+    require_s3_success(response, "CopyObject rename fallback");
+    S3Xml xml(response_xml(response), "CopyObject rename fallback");
+    const tinyxml2::XMLElement& root = xml.result_root("CopyObjectResult");
+    if (xml.required_text(root, "ETag").empty()) {
+      throw std::runtime_error("CopyObject response omitted ETag");
+    }
+    schedule(DELETE_SOURCE);
+  }
+
+  void create_received(const Response& response) {
+    require_s3_success(response, "multipart-copy CreateMultipartUpload");
+    S3Xml xml(response_xml(response), "multipart-copy CreateMultipartUpload");
+    const tinyxml2::XMLElement& root =
+        xml.result_root("InitiateMultipartUploadResult");
+    upload_id_ = xml.required_text(root, "UploadId");
+    if (upload_id_.empty()) {
+      throw std::runtime_error(
+          "multipart-copy CreateMultipartUpload omitted UploadId");
+    }
+    part_etags_.reserve(size_t(
+        (size_ + kCopyPartSize - 1) / kCopyPartSize));
+    schedule(COPY_PART);
+  }
+
+  void part_received(const Response& response) {
+    require_s3_success(response, "UploadPartCopy");
+    S3Xml xml(response_xml(response), "UploadPartCopy");
+    const tinyxml2::XMLElement& root = xml.result_root("CopyPartResult");
+    std::string etag = xml.required_text(root, "ETag");
+    if (etag.empty()) {
+      throw std::runtime_error("UploadPartCopy omitted ETag");
+    }
+    part_etags_.push_back(std::move(etag));
+    ++part_index_;
+    if (part_index_ * kCopyPartSize < size_) {
+      schedule(COPY_PART);
+    } else {
+      schedule(COMPLETE_MULTIPART);
+    }
+  }
+
+  void complete_received(const Response& response) {
+    if (response.status == 412 && no_replace_) {
+      throw std::system_error(
+          EEXIST, std::generic_category(),
+          "multipart-copy destination exists");
+    }
+    require_s3_success(response, "multipart-copy completion");
+    S3Xml xml(response_xml(response), "multipart-copy completion");
+    xml.result_root("CompleteMultipartUploadResult");
+    upload_id_.clear();
+    schedule(DELETE_SOURCE);
+  }
+
+  State& state_;
+  FuseReactor& reactor_;
+  std::string key_;
+  uint64_t size_;
+  std::string etag_;
+  std::string version_id_;
+  std::string destination_;
+  bool no_replace_;
+  Complete complete_;
+  void* context_;
+  std::string source_;
+  std::unique_ptr<AsyncNativeRename> native_;
+  std::unique_ptr<AsyncExpressSession> session_;
+  std::unique_ptr<AsyncS3Request> request_;
+  std::string upload_id_;
+  std::vector<std::string> part_etags_;
+  std::exception_ptr pending_error_;
+  uint64_t part_index_ = 0;
+  unsigned session_attempt_ = 0;
+  Stage resume_stage_ = COPY_OBJECT;
+  bool started_ = false;
+  bool cancelled_ = false;
+};
+
 void ngs3fs_init(void* userdata, fuse_conn_info* connection) {
   auto& state = *static_cast<State*>(userdata);
   connection->no_interrupt = 1;
@@ -6019,7 +8708,7 @@ void ngs3fs_forget_multi(fuse_req_t request, size_t count,
   fuse_reply_none(request);
 }
 
-void ngs3fs_lookup(fuse_req_t request, fuse_ino_t parent, const char* name) {
+void reply_lookup_result(fuse_req_t request, fuse_ino_t parent, const char* name) {
   if (name == nullptr || !valid_fuse_component(name)) {
     fuse_reply_err(request, ENOENT);
     return;
@@ -6030,8 +8719,6 @@ void ngs3fs_lookup(fuse_req_t request, fuse_ino_t parent, const char* name) {
     if (!directory.directory()) {
       throw std::system_error(ENOTDIR, std::generic_category(), "lookup");
     }
-    cache_touch(static_cast<InodeDir&>(directory));
-    refresh_directory(state, parent);
     const double timeout = remaining_directory_timeout(directory);
     fuse_ino_t inode = 0;
     fuse_entry_param entry{};
@@ -6067,6 +8754,70 @@ void ngs3fs_lookup(fuse_req_t request, fuse_ino_t parent, const char* name) {
   }
 }
 
+struct AsyncLookup {
+  State& state;
+  FuseReactor& reactor;
+  fuse_req_t request;
+  fuse_ino_t inode;
+  ssostr<248> name;
+  InodePin pin;
+  DirectoryContinuation waiter;
+
+  AsyncLookup(State& s, FuseReactor& r, fuse_req_t req,
+               fuse_ino_t ino, const char* component)
+      : state(s), reactor(r), request(req), inode(ino), name(component) {
+    InodeBase& item = inode_item(state, inode);
+    retain_inode_count(item.open_count, "lookup directory pin");
+    pin = InodePin(state, item);
+    waiter.complete = completed;
+    waiter.context = this;
+  }
+
+  static void completed(void* context, std::exception_ptr error) noexcept {
+    std::unique_ptr<AsyncLookup> task(static_cast<AsyncLookup*>(context));
+    try {
+      if (error) std::rethrow_exception(error);
+      reply_lookup_result(task->request, task->inode, task->name.c_str());
+    } catch (...) {
+      reply_callback_error(task->request);
+    }
+  }
+
+  void start() noexcept {
+    try {
+      if (!await_directory_refresh(state, reactor, inode, waiter)) completed(this, {});
+    } catch (...) {
+      completed(this, std::current_exception());
+    }
+  }
+};
+
+void ngs3fs_lookup(fuse_req_t request, fuse_ino_t parent, const char* name) {
+  if (name == nullptr || !valid_fuse_component(name)) {
+    fuse_reply_err(request, ENOENT);
+    return;
+  }
+  try {
+    State& state = state_from(request);
+    InodeBase& item = inode_item(state, parent);
+    if (!item.directory()) {
+      throw std::system_error(ENOTDIR, std::generic_category(), "lookup");
+    }
+    cache_touch(static_cast<InodeDir&>(item));
+    if (FuseReactor* reactor = current_fuse_reactor()) {
+      if (item.expire.load(std::memory_order_acquire) <= fuse_monotonic_ns()) {
+        (new AsyncLookup(state, *reactor, request, parent, name))->start();
+        return;
+      }
+    } else {
+      refresh_directory(state, parent);
+    }
+    reply_lookup_result(request, parent, name);
+  } catch (...) {
+    reply_callback_error(request);
+  }
+}
+
 void ngs3fs_getattr(fuse_req_t request, fuse_ino_t inode,
                     fuse_file_info* file) {
   try {
@@ -6085,6 +8836,289 @@ void ngs3fs_getattr(fuse_req_t request, fuse_ino_t inode,
     reply_callback_error(request);
   }
 }
+
+struct AsyncLocalCacheWork {
+  using Work = void (*)(void*);
+  using Complete = void (*)(void*, std::exception_ptr) noexcept;
+  FuseReactor::ReactorTask ticket;
+  FuseReactor* reactor = nullptr;
+  Work work = nullptr;
+  Complete complete = nullptr;
+  void* context = nullptr;
+  std::exception_ptr failure;
+
+  void start(State& state, FuseReactor& owner, Work run,
+               Complete done, void* value) {
+    reactor = &owner;
+    work = run;
+    complete = done;
+    context = value;
+    failure = {};
+    ticket = {completed, completed, this};
+    if (!owner.reserve_completion(&ticket)) {
+      throw std::system_error(errno, std::generic_category(), "reserve local cache work");
+    }
+    try {
+      state.uploads->submit(value, [this] {
+        try {
+          IoExecutorScope local_only(nullptr, 0);
+          work(context);
+        } catch (...) { failure = std::current_exception(); }
+        reactor->complete(&ticket);
+      });
+    } catch (...) {
+      failure = std::current_exception();
+      owner.complete(&ticket);
+    }
+  }
+
+  static void completed(void* value) noexcept {
+    auto* task = static_cast<AsyncLocalCacheWork*>(value);
+    task->complete(task->context, std::move(task->failure));
+  }
+};
+
+struct AsyncCacheRetirement {
+  State* state = nullptr;
+  FuseReactor* reactor = nullptr;
+  std::shared_ptr<CacheEntry> entry;
+  FuseReactor::ReactorTask ticket;
+  AsyncIoRequest wait;
+  ssostr<248> key;
+  ssostr<64> etag;
+  ssostr<64> version;
+  CacheIdentity identity{};
+  uint64_t notification = 0;
+  int wait_fd = -1;
+  bool reuse = false;
+  bool preserve = false;
+  bool ready_result = false;
+  std::exception_ptr failure;
+  void (*complete)(void*, std::exception_ptr) noexcept = nullptr;
+  void* context = nullptr;
+
+  bool ready(State& s, FuseReactor& r, std::string_view name,
+               const CacheIdentity* value = nullptr, bool keep = false) {
+    if (ready_result) {
+      ready_result = false;
+      if (sso_view(key) == name && reuse == (value != nullptr) && preserve == keep &&
+          (value == nullptr || (sso_view(etag) == value->etag &&
+              sso_view(version) == value->version_id &&
+              identity.size == value->size && identity.mtime == value->mtime))) {
+        return true;
+      }
+    }
+    state = &s;
+    reactor = &r;
+    key = name;
+    reuse = value != nullptr;
+    preserve = keep;
+    etag = value ? value->etag : std::string_view{};
+    version = value ? value->version_id : std::string_view{};
+    identity = CacheIdentity{
+        .key = sso_view(key), .etag = sso_view(etag),
+        .version_id = sso_view(version),
+        .size = value ? value->size : 0, .mtime = value ? value->mtime : 0,
+    };
+    failure = {};
+    schedule();
+    return false;
+  }
+
+  void schedule() {
+    ticket = {completed, completed, this};
+    if (!reactor->reserve_completion(&ticket)) {
+      throw std::system_error(errno, std::generic_category(), "reserve cache retirement");
+    }
+    try {
+      state->uploads->submit(this, [this] {
+        {
+          IoExecutorScope local_only(nullptr, 0);
+          work();
+        }
+        reactor->complete(&ticket);
+      });
+    } catch (...) {
+      failure = std::current_exception();
+      // Only allocation/admission failure can take this short local cleanup
+      // path. No generation wait, filesystem operation or network runs here.
+      if (entry) {
+        fprintf(stderr, "warning: cache retirement worker unavailable; "
+                        "unregistering its waiter inline\n");
+        entry->end_async_wait();
+        entry.reset();
+        wait_fd = -1;
+      }
+      reactor->complete(&ticket);
+    }
+  }
+
+  void work() noexcept {
+    try {
+      if (entry) {
+        entry->end_async_wait();
+        entry.reset();
+        wait_fd = -1;
+      }
+      if (failure) return;
+      for (;;) {
+        entry = state->local_cache->retiring_entry(
+            sso_view(key), reuse ? &identity : nullptr, preserve);
+        if (!entry) return;
+        wait_fd = entry->begin_retire_wait();
+        if (wait_fd >= 0) return;
+        entry.reset();
+      }
+    } catch (...) {
+      failure = std::current_exception();
+      entry.reset();
+      wait_fd = -1;
+    }
+  }
+
+  static void completed(void* context) noexcept {
+    auto* task = static_cast<AsyncCacheRetirement*>(context);
+    if (task->failure || !task->entry) {
+      task->ready_result = !task->failure;
+      task->complete(task->context, std::move(task->failure));
+      return;
+    }
+    task->wait = {};
+    task->wait.kind = AsyncIoRequest::READ;
+    task->wait.fd = task->wait_fd;
+    task->wait.data = &task->notification;
+    task->wait.length = sizeof(task->notification);
+    task->wait.timeout_ms = 0;
+    task->wait.complete = available;
+    task->wait.context = task;
+    if (task->reactor->submit(task->wait)) return;
+    available(task, -errno);
+  }
+
+  static void available(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncCacheRetirement*>(context);
+    try {
+      if (result < 0) {
+        try {
+          throw std::system_error(-int(result), std::generic_category(),
+                                  "cache retirement wait");
+        } catch (...) { task->failure = std::current_exception(); }
+      }
+      task->schedule();
+    } catch (...) {
+      // An admitted continuation normally may always reserve local cleanup.
+      // Keep the failure path terminal if that invariant cannot be honored.
+      task->failure = std::current_exception();
+      if (task->entry) {
+        task->entry->end_async_wait();
+        task->entry.reset();
+      }
+      task->complete(task->context, std::move(task->failure));
+    }
+  }
+};
+
+struct AsyncTruncate {
+  State& state;
+  FuseReactor& reactor;
+  fuse_req_t request;
+  InodePin pin;
+  OpenHandle handle;
+  std::unique_ptr<PathMutationGuard> mutation;
+  std::unique_ptr<AsyncSignedS3Request> remote;
+  Response committed;
+  ChecksumValue checksum;
+  std::exception_ptr failure;
+  unsigned phase = 0;
+
+  AsyncTruncate(State& s, FuseReactor& r, fuse_req_t req, fuse_ino_t inode)
+      : state(s), reactor(r), request(req) {
+    InodeBase& item = inode_item(state, inode);
+    if (!item.regular()) throw std::system_error(EISDIR, std::generic_category(), "truncate");
+    retain_inode_count(item.open_count, "truncate pin");
+    pin = InodePin(state, item);
+    handle.inode = inode;
+    handle.item = static_cast<InodeFile*>(&item);
+    handle.object_path = object_request_path(state, item_key(state, item));
+    mutation = std::make_unique<PathMutationGuard>(
+        state, handle.object_path, false, std::string_view{}, false, "truncate");
+    if (object_request_path(state, item_key(state, item)) != handle.object_path) {
+      throw std::system_error(EAGAIN, std::generic_category(), "truncate path changed");
+    }
+  }
+
+  void send(const char* method, unsigned next) {
+    AsyncHttpRequest args;
+    args.method = method;
+    args.path = handle.object_path;
+    if (next == 2) {
+      args.headers.push_back(Header{"content-type", "application/octet-stream"});
+      if (!handle.etag.empty()) args.headers.push_back(Header{"if-match", handle.etag});
+      if (checksum_has_digest(state.config.checksum)) checksum = retained_checksum(state.config.checksum, nullptr);
+      append_upload_checksum(args.headers, state.config.checksum, checksum);
+    }
+    remote = std::make_unique<AsyncSignedS3Request>(state, reactor, std::move(args), received, this);
+    phase = next;
+    if (!remote->start()) throw std::system_error(errno, std::generic_category(), "submit truncate");
+  }
+
+  void finish(const ObjectMetadata* metadata) {
+    publish_written_metadata(handle, committed, metadata);
+    if (!state.atomic_o_trunc) pin->set_truncate_pending(true);
+    struct stat status{};
+    fill_inode_stat(state, handle.inode, *pin, status);
+    status.st_size = 0;
+    fuse_reply_attr(request, &status, 0.0);
+  }
+
+  static void received(void* context, Response&& response, std::exception_ptr error) noexcept {
+    std::unique_ptr<AsyncTruncate> task(static_cast<AsyncTruncate*>(context));
+    const bool ambiguous = task->remote->ambiguous();
+    Response value = std::move(response);
+    task->remote.reset();
+    try {
+      if (task->phase == 2 && (error || (ambiguous && value.status == 412))) {
+        task->failure = error;
+        if (!task->failure) {
+          task->failure = std::make_exception_ptr(std::system_error(
+              EIO, std::generic_category(), "PutObject commit outcome unknown"));
+        }
+        task->send("HEAD", 4);
+        task.release();
+        return;
+      }
+      if (error) std::rethrow_exception(error);
+      if (task->phase == 1) {
+        task->handle.etag = decode_head_response(value).etag;
+        task->send("PUT", 2);
+        task.release();
+      } else if (task->phase == 2) {
+        require_s3_success(value, "PutObject");
+        verify_upload_checksum(value, task->state.config.checksum, task->checksum, "PutObject");
+        task->committed = std::move(value);
+        if (task->committed.headers.find("last-modified") == task->committed.headers.end()) {
+          task->send("HEAD", 3);
+          task.release();
+        } else {
+          task->finish(nullptr);
+        }
+      } else {
+        const ObjectMetadata metadata = decode_head_response(value);
+        if (task->phase == 4) {
+          if (metadata.size != 0 || (!task->handle.etag.empty() && metadata.etag == task->handle.etag)) {
+            std::rethrow_exception(task->failure);
+          }
+          task->committed = std::move(value);
+          fprintf(stderr, "warning: recovered an ambiguous S3 truncate with HeadObject: %s\n",
+                  task->handle.object_path.c_str());
+        }
+        task->finish(&metadata);
+      }
+    } catch (...) {
+      reply_callback_error(task->request);
+    }
+  }
+};
 
 void ngs3fs_setattr(fuse_req_t request, fuse_ino_t inode,
                     struct stat* attributes, int to_set,
@@ -6129,6 +9163,12 @@ void ngs3fs_setattr(fuse_req_t request, fuse_ino_t inode,
         if (size != 0) {
           throw std::system_error(EOPNOTSUPP, std::generic_category(),
                                   "only truncation to zero is supported");
+        }
+        if (FuseReactor* reactor = current_fuse_reactor()) {
+          auto task = std::make_unique<AsyncTruncate>(state, *reactor, request, inode);
+          task->send("HEAD", 1);
+          task.release();
+          return;
         }
         PathMutationGuard mutation(
             state, object_path, false, {}, false, "truncate");
@@ -6183,6 +9223,321 @@ void ngs3fs_setattr(fuse_req_t request, fuse_ino_t inode,
   }
 }
 
+void abandon_created_inode(State& state, fuse_ino_t parent,
+                             fuse_ino_t inode) noexcept;
+
+struct AsyncOpen {
+  State& state;
+  FuseReactor& reactor;
+  fuse_req_t request;
+  fuse_ino_t inode;
+  fuse_file_info file;
+  std::unique_ptr<OpenHandle> handle;
+  std::shared_lock<ReactorSharedMutex> identity;
+  std::unique_ptr<AsyncSignedS3Request> head;
+  AsyncCacheRetirement retirement;
+  FuseReactor::ReactorTask cache_ticket;
+  std::shared_ptr<CacheEntry> cache_result;
+  std::exception_ptr cache_failure;
+  AsyncIoRequest wait;
+  UniqueFd retry_timer;
+  uint64_t notification = 0;
+  uint64_t registration_deadline = 0;
+  bool registered = false;
+  bool truncate_pending = false;
+  bool keep_cache = false;
+  bool cache_initialized = false;
+  bool cache_retry = false;
+  fuse_ino_t created_parent = 0;
+  double created_timeout = 0;
+
+  AsyncOpen(State& s, FuseReactor& r, fuse_req_t req, fuse_ino_t ino,
+             const fuse_file_info& info,
+             std::unique_ptr<OpenHandle> prepared = {})
+      : state(s), reactor(r), request(req), inode(ino), file(info),
+        handle(prepared ? std::move(prepared) : std::make_unique<OpenHandle>()),
+        identity(handle->identity_mutex, std::defer_lock) {
+    handle->writable = (file.flags & O_ACCMODE) == O_WRONLY;
+    retirement.complete = retired;
+    retirement.context = this;
+  }
+
+  ~AsyncOpen() {
+    if (identity.owns_lock()) identity.unlock();
+    if (handle) {
+      if (handle->current_reservation) {
+        release_part_budget(state);
+        handle->current_reservation = false;
+      }
+      if (created_parent != 0) abandon_created_inode(state, created_parent, inode);
+      if (registered) unregister_open_handle(state, handle->object_path, *handle);
+    }
+  }
+
+  static void available(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncOpen*>(context);
+    task->handle->identity_mutex.end_async_wait();
+    if (result < 0) {
+      std::unique_ptr<AsyncOpen> owner(task);
+      fuse_reply_err(task->request, -int(result));
+      return;
+    }
+    task->resume();
+  }
+
+  static void retry_registration(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncOpen*>(context);
+    if (result < 0) {
+      std::unique_ptr<AsyncOpen> owner(task);
+      fuse_reply_err(task->request, -int(result));
+      return;
+    }
+    task->resume();
+  }
+
+  bool register_handle() {
+    try {
+      InodeBase& item = inode_item(state, inode);
+      if (item.directory()) {
+        throw std::system_error(EISDIR, std::generic_category(), "open");
+      }
+      truncate_pending = item.truncate_pending();
+      register_open_handle(state, inode, *handle, false);
+      registered = true;
+      if (handle->writable) item.set_truncate_pending(false);
+      return true;
+    } catch (const std::system_error& error) {
+      if (error.code().value() != EAGAIN) throw;
+      const uint64_t now = fuse_monotonic_ns();
+      if (registration_deadline == 0) registration_deadline = now + 100'000'000;
+      if (now >= registration_deadline) {
+        throw std::system_error(EBUSY, std::generic_category(),
+                                "object already open with conflicting access");
+      }
+      if (!retry_timer) {
+        retry_timer.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC));
+        if (!retry_timer) {
+          throw std::system_error(errno, std::generic_category(), "timerfd(open)");
+        }
+      }
+      itimerspec timer{};
+      timer.it_value.tv_nsec = 1'000'000;
+      if (::timerfd_settime(retry_timer.get(), 0, &timer, nullptr) != 0) {
+        throw std::system_error(errno, std::generic_category(), "timerfd_settime(open)");
+      }
+      wait = {};
+      wait.kind = AsyncIoRequest::READ;
+      wait.fd = retry_timer.get();
+      wait.data = &notification;
+      wait.length = sizeof(notification);
+      wait.complete = retry_registration;
+      wait.context = this;
+      if (!reactor.submit(wait)) {
+        throw std::system_error(errno, std::generic_category(), "submit open wait");
+      }
+      return false;
+    }
+  }
+
+  void resume() noexcept {
+    std::unique_ptr<AsyncOpen> owner(this);
+    try {
+      if (!registered && !register_handle()) {
+        owner.release();
+        return;
+      }
+      if (!identity.owns_lock() && !identity.try_lock()) {
+        const int fd = handle->identity_mutex.begin_async_wait();
+        if (!identity.try_lock()) {
+          wait = {};
+          wait.kind = AsyncIoRequest::READ;
+          wait.fd = fd;
+          wait.data = &notification;
+          wait.length = sizeof(notification);
+          wait.timeout_ms = 0;
+          wait.complete = available;
+          wait.context = this;
+          if (reactor.submit(wait)) {
+            owner.release();
+            return;
+          }
+          const int error = errno;
+          handle->identity_mutex.end_async_wait();
+          throw std::system_error(error, std::generic_category(), "submit open identity wait");
+        }
+        handle->identity_mutex.end_async_wait();
+      }
+      if (!handle->recovery_read && (!handle->writable || !handle->create_exclusive)) {
+        AsyncHttpRequest args;
+        args.method = "HEAD";
+        args.path = handle->object_path;
+        head = std::make_unique<AsyncSignedS3Request>(
+            state, reactor, std::move(args), received, this);
+        if (!head->start()) {
+          throw std::system_error(errno, std::generic_category(), "submit HeadObject");
+        }
+        owner.release();
+        return;
+      }
+      if (!finish()) owner.release();
+    } catch (...) {
+      reply_callback_error(request);
+    }
+  }
+
+  static void received(void* context, Response&& response,
+                        std::exception_ptr error) noexcept {
+    std::unique_ptr<AsyncOpen> task(static_cast<AsyncOpen*>(context));
+    try {
+      task->head.reset();
+      if (error) std::rethrow_exception(error);
+      task->keep_cache = publish_open_metadata(
+          task->state, *task->handle, decode_head_response(response));
+      if (!task->finish()) task.release();
+    } catch (const OpenGenerationConflict&) {
+      try {
+        task->invalidate_conflict();
+        task.release();
+      } catch (...) { reply_callback_error(task->request); }
+    } catch (...) {
+      reply_callback_error(task->request);
+    }
+  }
+
+  static void invalidated(void* context, int result) noexcept {
+    std::unique_ptr<AsyncOpen> task(static_cast<AsyncOpen*>(context));
+    if (result != 0 && result != -ENOENT) {
+      fprintf(stderr, "warning: stale page-cache invalidation failed: path=%s: %s\n",
+              task->handle->object_path.c_str(), strerror(-result));
+    }
+    fuse_reply_err(task->request, result != 0 && result != -ENOENT ? -result : EBUSY);
+  }
+
+  void invalidate_conflict() {
+    // A local notification can wait for locked folios whose READ still needs
+    // a storage worker. Await its io-wq completion without occupying that pool.
+    if (!reactor.notify_inval_inode(inode, 0, 0, invalidated, this)) {
+      throw std::system_error(errno, std::generic_category(),
+                              "submit open generation invalidation");
+    }
+  }
+
+  static void retired(void* context, std::exception_ptr error) noexcept {
+    std::unique_ptr<AsyncOpen> task(static_cast<AsyncOpen*>(context));
+    try {
+      if (error) std::rethrow_exception(error);
+      if (!task->finish()) task.release();
+    } catch (...) { reply_callback_error(task->request); }
+  }
+
+  static void initialized(void* context) noexcept {
+    std::unique_ptr<AsyncOpen> task(static_cast<AsyncOpen*>(context));
+    try {
+      if (task->cache_failure) std::rethrow_exception(task->cache_failure);
+      if (!task->cache_retry) {
+        task->handle->cache_entry = std::move(task->cache_result);
+        task->cache_initialized = true;
+      }
+      if (!task->finish()) task.release();
+    } catch (...) { reply_callback_error(task->request); }
+  }
+
+  void initialize_cache(const CacheIdentity& cache_identity) {
+    cache_ticket = {initialized, initialized, this};
+    if (!reactor.reserve_completion(&cache_ticket)) {
+      throw std::system_error(errno, std::generic_category(), "reserve cache initialization");
+    }
+    cache_retry = false;
+    cache_failure = {};
+    try {
+      // identity remains locked and the registered handle owns these identity
+      // strings until the terminal owner callback; only the result is shared.
+      state.uploads->submit(handle.get(), [this, cache_identity] {
+        try {
+          IoExecutorScope local_only(nullptr, 0);
+          cache_result = handle->writable
+              ? state.local_cache->create_writer(cache_identity,
+                    std::min(state.config.part_size * kMaximumMultipartParts,
+                             kMaximumObjectSize), false)
+              : state.local_cache->open(cache_identity, false);
+        } catch (const CacheRetirementPending&) {
+          // The generation may change between the preliminary gate and the
+          // actual key-locked operation. Never wait for it in the worker pool.
+          cache_retry = true;
+        } catch (...) { cache_failure = std::current_exception(); }
+        reactor.complete(&cache_ticket);
+      });
+    } catch (...) {
+      cache_failure = std::current_exception();
+      reactor.complete(&cache_ticket);
+    }
+  }
+
+  bool finish() {
+    const bool writable = handle->writable;
+    if (handle->unlinked.load(std::memory_order_acquire) ||
+        handle->stale.load(std::memory_order_acquire)) {
+      throw std::system_error(ESTALE, std::generic_category(), "open identity changed");
+    }
+    if (writable && handle->size != 0 &&
+        (file.flags & O_TRUNC) == 0 && !truncate_pending) {
+      throw std::system_error(EOPNOTSUPP, std::generic_category(),
+                              "existing non-empty write open requires O_TRUNC");
+    }
+    if (!cache_initialized && state.local_cache && (writable || !handle->recovery_read)) {
+      const CacheIdentity cache_identity{
+          .key = handle->key, .etag = handle->etag,
+          .version_id = handle->version_id, .size = handle->size,
+          .mtime = created_parent != 0 ? 0 : handle->item->mtime.load(std::memory_order_relaxed),
+      };
+      if (cache_retry && !retirement.ready(state, reactor, handle->key,
+                              writable ? nullptr : &cache_identity)) return false;
+      initialize_cache(cache_identity);
+      return false;
+    }
+    if (cache_initialized) {
+      if (!writable && !handle->cache_entry) warn_cache_bypass(state, handle->object_path);
+    }
+    if (!writable) handle->reader = make_file_reader(state, *handle);
+    if (writable) {
+      handle->item->set_page_cache_valid(false);
+      keep_cache = false;
+      if (state.local_cache) {
+        handle->write_id = handle->cache_entry->write_id();
+      } else {
+        if (!reserve_part_budget(state, false)) {
+          throw std::system_error(EAGAIN, std::generic_category(), "pinned write budget exhausted");
+        }
+        handle->current_reservation = true;
+      }
+      handle->size = 0;
+      handle->stream_offset = 0;
+      handle->writer = make_file_writer(state, *handle);
+    }
+    identity.unlock();
+    file.fh = reinterpret_cast<uint64_t>(handle.get());
+    file.direct_io = 0;
+    file.keep_cache = keep_cache ? 1 : 0;
+    file.nonseekable = writable ? 1 : 0;
+    file.noflush = writable ? 0 : 1;
+    int result;
+    if (created_parent != 0) {
+      fuse_entry_param entry{};
+      entry.ino = inode;
+      entry.generation = 1;
+      entry.attr_timeout = created_timeout;
+      entry.entry_timeout = created_timeout;
+      fill_inode_stat(state, inode, inode_item(state, inode), entry.attr);
+      result = fuse_reply_create(request, &entry, &file);
+    } else {
+      result = fuse_reply_open(request, &file);
+    }
+    if (result == 0) handle.release();
+    else file.fh = 0;
+    return true;
+  }
+};
+
 void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
                  fuse_file_info* file) {
   State& state = state_from(request);
@@ -6202,6 +9557,15 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
   const bool writable = access_mode == O_WRONLY;
   if (writable && (file->flags & (O_SYNC | O_DSYNC)) != 0) {
     fuse_reply_err(request, EOPNOTSUPP);
+    return;
+  }
+  if (FuseReactor* reactor = current_fuse_reactor()) {
+    try {
+      auto* task = new AsyncOpen(state, *reactor, request, inode, *file);
+      task->resume();
+    } catch (...) {
+      reply_callback_error(request);
+    }
     return;
   }
   bool registered      = false;
@@ -6321,9 +9685,10 @@ void abandon_created_inode(State& state, fuse_ino_t parent,
                            fuse_ino_t inode) noexcept {
   bool forgotten = false;
   try {
-    InodeBase& directory = inode_item(state, parent);
-    std::lock_guard guard(directory.dir_children().mutation_mutex);
     InodeBase& item = inode_reference(state, inode);
+    // Abandon this exact inode, not its name. detach_cached_item validates the
+    // parent slot pointer under children.mutex, so a concurrently installed
+    // replacement is untouched and no cross-network mutation lock is needed.
     forget_inode(inode, 1);
     forgotten = true;
     if (!item.detached()) {
@@ -6340,8 +9705,15 @@ void abandon_created_inode(State& state, fuse_ino_t parent,
   }
 }
 
-void ngs3fs_create(fuse_req_t request, fuse_ino_t parent, const char* name,
-                   mode_t, fuse_file_info* file) {
+void start_directory_action(fuse_req_t request, fuse_ino_t parent,
+                              const char* name, fuse_file_info* file, int kind);
+
+void create_cached_file(fuse_req_t request, fuse_ino_t parent, const char* name,
+                         fuse_file_info* file,
+                         std::unique_lock<IoMutex>* held = nullptr,
+                         bool* cache_retry = nullptr) {
+  if (cache_retry != nullptr) *cache_retry = false;
+  const bool prepared = held != nullptr;
   if (name == nullptr || !valid_fuse_component(name)) {
     fuse_reply_err(request, EINVAL);
     return;
@@ -6372,18 +9744,34 @@ void ngs3fs_create(fuse_req_t request, fuse_ino_t parent, const char* name,
     handle->create_exclusive = true;
     double timeout;
     {
-      std::lock_guard directory_guard(
-          directory.dir_children().mutation_mutex);
-      refresh_directory_locked(state, parent);
+      std::unique_lock directory_guard(
+          directory.dir_children().mutation_mutex, std::defer_lock);
+      if (!prepared) {
+        directory_guard.lock();
+        refresh_directory_locked(state, parent);
+      }
       ListedChild child;
       child.name = name;
       inode = install_item(
           state, parent, std::move(child), 0, true, true, true);
       inode_item(state, inode).set_fsize(0);
-      register_open_handle(state, inode, *handle);
+      register_open_handle(state, inode, *handle, !prepared);
       path       = handle->object_path;
       registered = true;
       timeout    = remaining_directory_timeout(directory);
+    }
+    if (held != nullptr) held->unlock();
+    if (FuseReactor* reactor = current_fuse_reactor();
+        prepared && reactor != nullptr && state.local_cache) {
+      auto task = std::make_unique<AsyncOpen>(
+          state, *reactor, request, inode, *file, std::move(handle));
+      task->registered = true;
+      task->created_parent = parent;
+      task->created_timeout = timeout;
+      registered = false;
+      inode = 0;
+      task.release()->resume();
+      return;
     }
     if (state.local_cache) {
       const uint64_t maximum_size = std::min(
@@ -6432,6 +9820,8 @@ void ngs3fs_create(fuse_req_t request, fuse_ino_t parent, const char* name,
       registered = false;
     }
   } catch (...) {
+    const std::exception_ptr failure = std::current_exception();
+    if (held != nullptr && held->owns_lock()) held->unlock();
     if (budget_reserved) {
       release_part_budget(state);
     }
@@ -6441,7 +9831,26 @@ void ngs3fs_create(fuse_req_t request, fuse_ino_t parent, const char* name,
     if (registered) {
       unregister_open_handle(state, path, *handle);
     }
+    if (cache_retry != nullptr) {
+      try { std::rethrow_exception(failure); }
+      catch (const CacheRetirementPending&) { *cache_retry = true; return; }
+      catch (...) {}
+    }
     reply_callback_error(request);
+  }
+}
+
+void ngs3fs_create(fuse_req_t request, fuse_ino_t parent, const char* name,
+                    mode_t, fuse_file_info* file) {
+  if (current_fuse_reactor() != nullptr && name != nullptr &&
+      valid_fuse_component(name) && file != nullptr &&
+      (file->flags & O_ACCMODE) == O_WRONLY &&
+      (file->flags & (O_DIRECT | O_SYNC | O_DSYNC)) == 0) {
+    start_directory_action(request, parent, name, file, 0);
+  } else if (file != nullptr) {
+    create_cached_file(request, parent, name, file);
+  } else {
+    fuse_reply_err(request, EINVAL);
   }
 }
 
@@ -6554,41 +9963,91 @@ class CacheRetrySink final : public RangeFileSink {
   void progress(const Response&, bool) override {}
 };
 
+struct PrefetchContinuation {
+  PrefetchContinuation* next = nullptr;
+  FuseReactor* reactor = nullptr;
+  FuseReactor::ReactorTask task;
+  size_t wanted = 0;
+};
+
 struct UncachedPrefetch {
-  explicit UncachedPrefetch(UniqueFd storage, uint64_t begin,
-                            size_t count)
-      : fd(std::move(storage)), notification(Pipe::create(4096)),
+  explicit UncachedPrefetch(
+      std::shared_ptr<ReadAheadStoragePool> storage_pool,
+      ReadAheadStoragePool::Storage acquired,
+      uint64_t begin, size_t count)
+      : pool(std::move(storage_pool)), storage(std::move(acquired)),
         offset(begin), length(count), sink(*this) {}
 
-  UniqueFd fd;
-  Pipe notification;
+  ~UncachedPrefetch() {
+    pool->release(std::move(storage));
+  }
+
+  std::shared_ptr<ReadAheadStoragePool> pool;
+  ReadAheadStoragePool::Storage storage;
   uint64_t offset;
   size_t length;
   size_t produced = 0;
-  Response response;
   std::exception_ptr error;
   std::mutex mutex;
   std::condition_variable condition;
+  std::atomic<bool> cancelled{false};
+  bool range_valid = false;
   bool complete = false;
-  size_t waiters = 0;
+  bool checksum_retrying = false;
+  bool checksum_bad = false;
+  PrefetchContinuation* continuations = nullptr;
 
-  void notify_waiters(size_t wake) {
-    condition.notify_all();
-    std::array<std::byte, 64> notifications{};
-    while (wake != 0) {
-      const size_t count = std::min(wake, notifications.size());
-      write_all(notification.write_fd(),
-                std::span(notifications).first(count));
-      wake -= count;
+  bool subscribe(PrefetchContinuation& waiter) noexcept {
+    std::lock_guard guard(mutex);
+    if (!checksum_retrying &&
+        (produced >= waiter.wanted || complete || error != nullptr)) {
+      return false;
     }
+    waiter.next = continuations;
+    continuations = &waiter;
+    return true;
+  }
+
+  void notify_waiters() {
+    PrefetchContinuation* ready = nullptr;
+    {
+      std::lock_guard guard(mutex);
+      PrefetchContinuation** p = &continuations;
+      while (*p != nullptr) {
+        PrefetchContinuation* waiter = *p;
+        if (!checksum_retrying &&
+            (produced >= waiter->wanted || complete || error != nullptr)) {
+          *p = waiter->next;
+          waiter->next = ready;
+          ready = waiter;
+        } else {
+          p = &waiter->next;
+        }
+      }
+    }
+    while (ready != nullptr) {
+      PrefetchContinuation* waiter = ready;
+      ready = ready->next;
+      waiter->next = nullptr;
+      waiter->reactor->complete(&waiter->task);
+    }
+    condition.notify_all();
   }
 
   class Sink final : public RangeFileSink {
    public:
     explicit Sink(UncachedPrefetch& prefetch) noexcept
-        : RangeFileSink(prefetch.fd.get(), 0), prefetch_(prefetch) {}
+        : RangeFileSink(prefetch.storage.fd.get(), 0, false),
+          prefetch_(prefetch) {}
+
+    [[nodiscard]] bool cancelled() const noexcept override {
+      return prefetch_.cancelled.load(std::memory_order_acquire);
+    }
 
     void progress(const Response& response, bool complete) override {
+      if (cancelled()) {
+        return;
+      }
       if (!publishing_) {
         return;
       }
@@ -6603,17 +10062,11 @@ struct UncachedPrefetch {
    private:
     void publish(const Response& response, bool complete) {
       (void)complete;
-      size_t wake = 0;
       {
         std::lock_guard guard(prefetch_.mutex);
         prefetch_.produced = response.body_bytes;
-        prefetch_.response.status = response.status;
-        prefetch_.response.content_range = response.content_range;
-        prefetch_.response.body_bytes = response.body_bytes;
-        wake = prefetch_.waiters;
-        prefetch_.waiters = 0;
       }
-      prefetch_.notify_waiters(wake);
+      prefetch_.notify_waiters();
     }
 
     UncachedPrefetch& prefetch_;
@@ -6624,90 +10077,40 @@ struct UncachedPrefetch {
 };
 
 bool wait_for_prefetch(UncachedPrefetch& prefetch, size_t wanted) {
-  if (current_fuse_reactor() == nullptr) {
-    std::unique_lock guard(prefetch.mutex);
-    prefetch.condition.wait(guard, [&] {
-      return prefetch.produced >= wanted || prefetch.complete ||
-          prefetch.error != nullptr;
-    });
-    return prefetch.produced >= wanted;
-  }
-  for (;;) {
-    {
-      std::lock_guard guard(prefetch.mutex);
-      if (prefetch.produced >= wanted) {
-        return true;
-      }
-      if (prefetch.complete || prefetch.error != nullptr) {
-        return false;
-      }
-      ++prefetch.waiters;
-    }
-    std::byte notification;
-    ssize_t result;
-    do {
-      result = io_read(prefetch.notification.read_fd(),
-                       &notification, sizeof(notification));
-    } while (result < 0 && errno == EINTR);
-    if (result != ssize_t(sizeof(notification))) {
-      throw std::system_error(
-          result < 0 ? errno : EIO, std::generic_category(),
-          "wait for read-ahead progress");
-    }
-  }
+  assert(current_fuse_reactor() == nullptr);
+  std::unique_lock guard(prefetch.mutex);
+  prefetch.condition.wait(guard, [&] {
+    return prefetch.produced >= wanted || prefetch.complete ||
+        prefetch.error != nullptr;
+  });
+  return prefetch.produced >= wanted;
 }
 
 bool wait_for_prefetch_complete(UncachedPrefetch& prefetch) {
-  if (current_fuse_reactor() == nullptr) {
-    std::unique_lock guard(prefetch.mutex);
-    prefetch.condition.wait(guard, [&] {
-      return prefetch.complete || prefetch.error != nullptr;
-    });
-    return prefetch.complete && prefetch.error == nullptr;
-  }
-  for (;;) {
-    {
-      std::lock_guard guard(prefetch.mutex);
-      if (prefetch.complete || prefetch.error != nullptr) {
-        return prefetch.complete && prefetch.error == nullptr;
-      }
-      ++prefetch.waiters;
-    }
-    std::byte notification;
-    ssize_t result;
-    do {
-      result = io_read(prefetch.notification.read_fd(),
-                       &notification, sizeof(notification));
-    } while (result < 0 && errno == EINTR);
-    if (result != ssize_t(sizeof(notification))) {
-      throw std::system_error(
-          result < 0 ? errno : EIO, std::generic_category(),
-          "wait for read-ahead completion");
-    }
-  }
+  assert(current_fuse_reactor() == nullptr);
+  std::unique_lock guard(prefetch.mutex);
+  prefetch.condition.wait(guard, [&] {
+    return prefetch.complete || prefetch.error != nullptr;
+  });
+  return prefetch.complete && prefetch.error == nullptr;
 }
 
 struct PrefetchTailTask {
   std::shared_ptr<UncachedPrefetch> prefetch;
-  uint64_t object_size;
   bool collect_stats;
   std::atomic<uint64_t>* remote_reads;
   std::atomic<uint64_t>* remote_read_bytes;
   HttpPool::Lease lease;
   std::unique_ptr<RangeDownload> download;
-  FuseReactor::ReactorTask reactor_task;
 };
 
 void run_prefetch_tail(void* context) noexcept {
   std::unique_ptr<PrefetchTailTask> task(
       static_cast<PrefetchTailTask*>(context));
   (void)task->lease;
-  size_t wake = 0;
   try {
     Response finished = task->download->finish();
-    const bool valid = content_range_matches(
-        finished, task->prefetch->offset, task->prefetch->length,
-        task->object_size) &&
+    const bool valid = task->prefetch->range_valid &&
         finished.body_bytes == task->prefetch->length;
     if (task->collect_stats && valid) {
       task->remote_reads->fetch_add(1, std::memory_order_relaxed);
@@ -6716,38 +10119,15 @@ void run_prefetch_tail(void* context) noexcept {
     }
     {
       std::lock_guard guard(task->prefetch->mutex);
-      task->prefetch->response = std::move(finished);
-      task->prefetch->produced = task->prefetch->response.body_bytes;
+      task->prefetch->produced = finished.body_bytes;
       task->prefetch->complete = true;
-      wake = task->prefetch->waiters;
-      task->prefetch->waiters = 0;
     }
   } catch (...) {
     std::lock_guard guard(task->prefetch->mutex);
     task->prefetch->error = std::current_exception();
     task->prefetch->complete = true;
-    wake = task->prefetch->waiters;
-    task->prefetch->waiters = 0;
   }
-  task->prefetch->notify_waiters(wake);
-}
-
-void cancel_prefetch_tail(void* context) noexcept {
-  std::unique_ptr<PrefetchTailTask> task(
-      static_cast<PrefetchTailTask*>(context));
-  size_t wake;
-  {
-    std::lock_guard guard(task->prefetch->mutex);
-    try {
-      throw std::runtime_error("read-ahead reactor stopped");
-    } catch (...) {
-      task->prefetch->error = std::current_exception();
-    }
-    task->prefetch->complete = true;
-    wake = task->prefetch->waiters;
-    task->prefetch->waiters = 0;
-  }
-  task->prefetch->notify_waiters(wake);
+  task->prefetch->notify_waiters();
 }
 
 class UncachedFileReader final : public FileReader {
@@ -6760,6 +10140,10 @@ class UncachedFileReader final : public FileReader {
   bool try_prefetch(State& state, OpenHandle& handle,
                     fuse_req_t request, uint64_t offset,
                     size_t wanted, uint64_t object_size);
+
+  std::shared_ptr<UncachedPrefetch> select_async(
+      State& state, uint64_t offset, size_t wanted, uint64_t object_size,
+      bool& created);
 
  private:
   void join() noexcept;
@@ -6881,12 +10265,81 @@ bool part_checksum(const S3Xml& xml,
   return false;
 }
 
+struct ChecksumManifestState {
+  std::vector<CacheChecksumPart> parts;
+  unsigned expected_number = 1;
+  unsigned marker = 0;
+  uint64_t offset = 0;
+};
+
+bool parse_checksum_manifest_page(
+    ChecksumManifestState& state, const Response& response,
+    uint64_t object_size, ChecksumAlgorithm preferred) {
+  if (response.status != 200) {
+    throw_s3_response(response, "GetObjectAttributes");
+  }
+  S3Xml xml(response_xml(response), "GetObjectAttributes");
+  const tinyxml2::XMLElement& root =
+      xml.result_root("GetObjectAttributesOutput");
+  const tinyxml2::XMLElement& parts =
+      xml.required_child(root, "ObjectParts");
+  for (const tinyxml2::XMLElement* part = parts.FirstChildElement();
+       part != nullptr; part = part->NextSiblingElement()) {
+    if (!S3Xml::named(*part, "Part")) {
+      continue;
+    }
+    uint64_t number = 0;
+    uint64_t size = 0;
+    const std::string number_text =
+        xml.required_text(*part, "PartNumber");
+    const std::string size_text = xml.required_text(*part, "Size");
+    if (!parse_unsigned(trim_xml_space(number_text), number) ||
+        number != state.expected_number ||
+        number > kMaximumMultipartParts ||
+        !parse_unsigned(trim_xml_space(size_text), size) || size == 0 ||
+        state.offset > object_size || size > object_size - state.offset) {
+      throw std::runtime_error(
+          "GetObjectAttributes returned an invalid part sequence");
+    }
+    ChecksumAlgorithm algorithm = CHECKSUM_NONE;
+    std::string value;
+    if (!part_checksum(xml, *part, preferred, algorithm, value)) {
+      throw std::runtime_error(
+          "GetObjectAttributes omitted a usable part checksum");
+    }
+    state.parts.push_back(CacheChecksumPart{
+        .offset    = state.offset,
+        .size      = size,
+        .algorithm = uint32_t(algorithm),
+        .value     = std::move(value),
+    });
+    state.offset += size;
+    ++state.expected_number;
+  }
+  const bool truncated = xml.required_bool(parts, "IsTruncated");
+  if (!truncated) {
+    if (state.offset != object_size) {
+      throw std::runtime_error(
+          "GetObjectAttributes part sizes do not match the object");
+    }
+    return true;
+  }
+  uint64_t next = 0;
+  const std::string next_text =
+      xml.required_text(parts, "NextPartNumberMarker");
+  if (!parse_unsigned(trim_xml_space(next_text), next) ||
+      next <= state.marker || next != state.expected_number - 1 ||
+      next > kMaximumMultipartParts) {
+    throw std::runtime_error(
+        "GetObjectAttributes returned invalid part pagination");
+  }
+  state.marker = unsigned(next);
+  return false;
+}
+
 std::vector<CacheChecksumPart> get_checksum_manifest(
     State& state, const OpenHandle& handle) {
-  std::vector<CacheChecksumPart> result;
-  unsigned expected_number = 1;
-  unsigned marker          = 0;
-  uint64_t offset          = 0;
+  ChecksumManifestState manifest;
   for (;;) {
     std::string path = query_path(handle.object_path, "attributes");
     if (!handle.version_id.empty()) {
@@ -6899,8 +10352,8 @@ std::vector<CacheChecksumPart> get_checksum_manifest(
     signed_headers[signed_count++] =
         Header{"x-amz-object-attributes", "ObjectParts,Checksum"};
     std::string marker_text;
-    if (marker != 0) {
-      marker_text = std::to_string(marker);
+    if (manifest.marker != 0) {
+      marker_text = std::to_string(manifest.marker);
       signed_headers[signed_count++] =
           Header{"x-amz-part-number-marker", marker_text};
     }
@@ -6917,65 +10370,10 @@ std::vector<CacheChecksumPart> get_checksum_manifest(
           "GET", path, std::span<const Header>(headers),
           kMaximumListResponseSize);
     }, "GetObjectAttributes");
-    if (response.status != 200) {
-      throw_s3_response(response, "GetObjectAttributes");
+    if (parse_checksum_manifest_page(
+            manifest, response, handle.size, state.config.checksum)) {
+      return std::move(manifest.parts);
     }
-    S3Xml xml(response_xml(response), "GetObjectAttributes");
-    const tinyxml2::XMLElement& root =
-        xml.result_root("GetObjectAttributesOutput");
-    const tinyxml2::XMLElement& parts =
-        xml.required_child(root, "ObjectParts");
-    for (const tinyxml2::XMLElement* part = parts.FirstChildElement();
-         part != nullptr; part = part->NextSiblingElement()) {
-      if (!S3Xml::named(*part, "Part")) {
-        continue;
-      }
-      uint64_t number = 0;
-      uint64_t size   = 0;
-      const std::string number_text =
-          xml.required_text(*part, "PartNumber");
-      const std::string size_text = xml.required_text(*part, "Size");
-      if (!parse_unsigned(trim_xml_space(number_text), number) ||
-          number != expected_number || number > kMaximumMultipartParts ||
-          !parse_unsigned(trim_xml_space(size_text), size) || size == 0 ||
-          offset > handle.size || size > handle.size - offset) {
-        throw std::runtime_error(
-            "GetObjectAttributes returned an invalid part sequence");
-      }
-      ChecksumAlgorithm algorithm = CHECKSUM_NONE;
-      std::string value;
-      if (!part_checksum(xml, *part, state.config.checksum,
-                         algorithm, value)) {
-        throw std::runtime_error(
-            "GetObjectAttributes omitted a usable part checksum");
-      }
-      result.push_back(CacheChecksumPart{
-          .offset    = offset,
-          .size      = size,
-          .algorithm = uint32_t(algorithm),
-          .value     = std::move(value),
-      });
-      offset += size;
-      ++expected_number;
-    }
-    const bool truncated = xml.required_bool(parts, "IsTruncated");
-    if (!truncated) {
-      if (offset != handle.size) {
-        throw std::runtime_error(
-            "GetObjectAttributes part sizes do not match the object");
-      }
-      return result;
-    }
-    uint64_t next = 0;
-    const std::string next_text =
-        xml.required_text(parts, "NextPartNumberMarker");
-    if (!parse_unsigned(trim_xml_space(next_text), next) ||
-        next <= marker || next != expected_number - 1 ||
-        next > kMaximumMultipartParts) {
-      throw std::runtime_error(
-          "GetObjectAttributes returned invalid part pagination");
-    }
-    marker = unsigned(next);
   }
 }
 
@@ -7060,6 +10458,493 @@ bool service_cached_checksums(State& state, OpenHandle& handle,
   }
 }
 
+struct ReadChecksumContext {
+  State& state;
+  FuseReactor& reactor;
+  OpenHandle& handle;
+  OpenRequestGuard active;
+  std::shared_ptr<CacheEntry> entry;
+  ssostr<248> path;
+  ssostr<64> etag;
+  ssostr<64> version;
+  std::string cache_key;
+  uint64_t cache_epoch = 0;
+  uint64_t size;
+
+  ReadChecksumContext(State& s, FuseReactor& r, OpenHandle& h,
+                        const OpenRequestGuard& guard)
+      : state(s), reactor(r), handle(h), active(guard), entry(h.cache_entry),
+        path(h.object_path), etag(h.etag), version(h.version_id),
+        size(h.size) {}
+
+  void refresh_identity() {
+    constexpr uint64_t closing = 1ULL << 63;
+    const bool handle_closing =
+        (handle.request_state.load(std::memory_order_acquire) & closing) != 0;
+    if (handle.stale.load(std::memory_order_acquire) ||
+        handle.cache_entry != entry) {
+      throw std::system_error(ESTALE, std::generic_category(),
+                              "stale read checksum identity");
+    }
+    if (handle_closing && entry) {
+      const CacheIdentitySnapshot snapshot = entry->identity_snapshot();
+      if (entry->stale()) {
+        throw std::system_error(ESTALE, std::generic_category(),
+                                "stale closing checksum identity");
+      }
+      cache_key = snapshot.key;
+      cache_epoch = snapshot.epoch;
+      const std::string current_path = object_request_path(state, snapshot.key);
+      path.assign(current_path.data(), current_path.size());
+      etag.assign(snapshot.etag.data(), snapshot.etag.size());
+      version.assign(snapshot.version_id.data(), snapshot.version_id.size());
+      size = snapshot.size;
+      return;
+    }
+    if (handle_closing) return;
+    if (handle.generation_epoch != 0 &&
+        (handle.item->generation_epoch.load(std::memory_order_acquire) &
+         ((1ULL << 63) - 1)) != handle.generation_epoch) {
+      throw std::system_error(ESTALE, std::generic_category(),
+                              "stale read checksum generation");
+    }
+    cache_key = handle.key;
+    cache_epoch = entry ? entry->epoch() : 0;
+    path.assign(handle.object_path.data(), handle.object_path.size());
+    etag.assign(handle.etag.data(), handle.etag.size());
+    version.assign(handle.version_id.data(), handle.version_id.size());
+    size = handle.size;
+  }
+
+  bool closing_cache_identity_changed() const {
+    constexpr uint64_t closing = 1ULL << 63;
+    if (!entry ||
+        (handle.request_state.load(std::memory_order_acquire) & closing) == 0) {
+      return false;
+    }
+    const CacheIdentitySnapshot snapshot = entry->identity_snapshot();
+    return snapshot.epoch != cache_epoch || snapshot.key != cache_key;
+  }
+};
+
+struct AsyncReadIdentityGate {
+  using Complete = void (*)(void*, std::exception_ptr) noexcept;
+
+  explicit AsyncReadIdentityGate(ReadChecksumContext& value)
+      : context(value), identity(value.handle.identity_mutex, std::defer_lock) {}
+
+  bool acquire(Complete callback, void* value) {
+    complete = callback;
+    owner = value;
+    if (identity.try_lock()) {
+      context.refresh_identity();
+      return true;
+    }
+    ReactorSharedMutex& mutex = *identity.mutex();
+    const int fd = mutex.begin_async_wait();
+    if (identity.try_lock()) {
+      mutex.end_async_wait();
+      context.refresh_identity();
+      return true;
+    }
+    wait = {};
+    wait.kind       = AsyncIoRequest::READ;
+    wait.fd         = fd;
+    wait.data       = &notification;
+    wait.length     = sizeof(notification);
+    wait.timeout_ms = 0;
+    wait.complete   = available;
+    wait.context    = this;
+    if (context.reactor.submit(wait)) return false;
+    const int error = errno;
+    mutex.end_async_wait();
+    throw std::system_error(error, std::generic_category(),
+                            "submit read identity wait");
+  }
+
+  void unlock() noexcept {
+    if (identity.owns_lock()) identity.unlock();
+  }
+
+  static void available(void* value, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncReadIdentityGate*>(value);
+    self->identity.mutex()->end_async_wait();
+    std::exception_ptr error;
+    try {
+      if (result < 0) {
+        throw std::system_error(-int(result), std::generic_category(),
+                                "read identity wait");
+      }
+      if (!self->acquire(self->complete, self->owner)) return;
+    } catch (...) {
+      error = std::current_exception();
+    }
+    self->complete(self->owner, error);
+  }
+
+  ReadChecksumContext& context;
+  std::shared_lock<ReactorSharedMutex> identity;
+  AsyncIoRequest wait;
+  uint64_t notification = 0;
+  Complete complete = nullptr;
+  void* owner = nullptr;
+};
+
+AsyncHttpRequest checksum_retry_request(
+    const ReadChecksumContext& context, uint64_t offset, size_t length,
+    RangeFileSink& sink) {
+  AsyncHttpRequest args;
+  args.method.assign("GET");
+  args.path = context.path;
+  if (!context.version.empty()) {
+    const std::string path = query_path(sso_view(context.path),
+        "versionId=" + uri_encode(sso_view(context.version), false));
+    args.path.assign(path.data(), path.size());
+  }
+  char range[64];
+  const int count = snprintf(range, sizeof(range), "bytes=%" PRIu64 "-%" PRIu64,
+                             offset, offset + length - 1);
+  if (count < 0 || size_t(count) >= sizeof(range)) {
+    throw std::runtime_error("checksum retry range overflow");
+  }
+  std::array<Header, 3> signed_headers;
+  size_t n = 0;
+  signed_headers[n++] = {"range", std::string_view(range, size_t(count))};
+  if (context.version.empty() && !context.etag.empty()) {
+    signed_headers[n++] = {"if-match", sso_view(context.etag)};
+  }
+  if (offset == 0 && length == context.size &&
+      context.state.config.checksum_service != CHECKSUM_SERVICE_OSS &&
+      context.state.config.checksum_service != CHECKSUM_SERVICE_GCS) {
+    signed_headers[n++] = {"x-amz-checksum-mode", "ENABLED"};
+  }
+  args.headers.assign(signed_headers.begin(), signed_headers.begin() + n);
+  args.range       = true;
+  args.offset      = offset;
+  args.length      = length;
+  args.destination = &sink;
+  args.capture_headers = true;
+  return args;
+}
+
+void start_cached_checksums(const ReadChecksumContext& context,
+                            uint64_t offset, size_t length) noexcept;
+
+struct AsyncCacheChecksum {
+  ReadChecksumContext context;
+  AsyncReadIdentityGate identity;
+  CacheChecksumClaim part;
+  CacheFetchClaim whole;
+  Response response;
+  std::unique_ptr<CacheRetrySink> sink;
+  std::unique_ptr<AsyncSignedS3Request> http;
+  FuseReactor::ReactorTask completion;
+  AsyncIoRequest wait;
+  uint64_t notification = 0;
+  std::exception_ptr error;
+  bool retrying = false;
+  bool valid = false;
+
+  AsyncCacheChecksum(const ReadChecksumContext& ctx, CacheChecksumClaim claim)
+      : context(ctx), identity(context), part(std::move(claim)) {}
+  AsyncCacheChecksum(const ReadChecksumContext& ctx, CacheFetchClaim claim,
+                      Response result)
+      : context(ctx), identity(context), whole(claim), response(std::move(result)) {}
+
+  uint64_t offset() const { return whole ? whole.offset : part.offset; }
+  size_t length() const { return whole ? whole.length : size_t(part.size); }
+
+  void finish(bool accepted, bool obsolete_identity = false) noexcept {
+    if (whole) {
+      if (obsolete_identity) context.entry->fail_fetch(whole);
+      else if (!accepted || retrying) context.entry->finish_retry(whole, accepted);
+      else context.entry->finish_fetch(whole);
+    } else {
+      if (obsolete_identity) context.entry->abandon_checksum(part);
+      else context.entry->finish_checksum(part, accepted);
+    }
+    if (!accepted && !obsolete_identity) {
+      fprintf(stderr, "error: asynchronous read checksum failed: path=%s "
+              "offset=%" PRIu64 " bytes=%zu\n",
+              context.path.c_str(), offset(), length());
+      queue_page_invalidation(context.state, context.handle,
+                              off_t(offset()), off_t(length()));
+    }
+    delete this;
+  }
+
+  static void verified(void* value) noexcept {
+    std::unique_ptr<AsyncCacheChecksum> self(
+        static_cast<AsyncCacheChecksum*>(value));
+    if (self->error || self->valid || self->retrying) {
+      const bool accepted = !self->error && self->valid;
+      self.release()->finish(accepted);
+      return;
+    }
+    try {
+      self->retrying = true;
+      if (self->whole) self->context.entry->begin_retry(self->whole);
+      else self->context.entry->checksum_mismatch(self->part);
+      // Already completed FUSE reads cannot be recalled. Invalidation ensures
+      // later faults wait for the retry or observe its failure.
+      queue_page_invalidation(self->context.state, self->context.handle,
+                               off_t(self->offset()), off_t(self->length()));
+      if (!self->identity.acquire(identity_ready, self.get())) {
+        self.release();
+        return;
+      }
+      self.release()->start_retry();
+    } catch (...) {
+      self.release()->finish(false);
+    }
+  }
+
+  static void identity_ready(void* value, std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncCacheChecksum*>(value);
+    if (error) {
+      self->finish(false);
+      return;
+    }
+    self->start_retry();
+  }
+
+  void start_retry() noexcept {
+    try {
+      sink = std::make_unique<CacheRetrySink>(*context.entry, offset());
+      auto args = checksum_retry_request(context, offset(), length(), *sink);
+      http = std::make_unique<AsyncSignedS3Request>(
+          context.state, context.reactor, std::move(args), received, this, 1);
+      if (!http->start()) {
+        throw std::system_error(errno, std::generic_category(),
+                                "submit checksum retry");
+      }
+    } catch (...) {
+      identity.unlock();
+      finish(false);
+    }
+  }
+
+  static void received(void* value, Response&& result,
+                         std::exception_ptr failure) noexcept {
+    auto* self = static_cast<AsyncCacheChecksum*>(value);
+    self->http.reset();
+    self->identity.unlock();
+    const bool rejected = failure ||
+        !content_range_matches(result, self->offset(), self->length(),
+                               self->context.size) ||
+        result.body_bytes != self->length();
+    bool obsolete_identity = false;
+    if (rejected) {
+      try {
+        obsolete_identity = self->context.closing_cache_identity_changed();
+      } catch (...) {
+        obsolete_identity = true;
+      }
+      fprintf(stderr, "error: checksum retry response rejected: path=%s status=%d "
+              "offset=%" PRIu64 " expected=%zu received=%zu transport_error=%d\n",
+              self->context.path.c_str(), result.status, self->offset(), self->length(),
+              size_t(result.body_bytes), int(bool(failure)));
+      if (failure) {
+        try { std::rethrow_exception(failure); }
+        catch (const std::exception& error) { fprintf(stderr, "checksum retry: %s\n", error.what()); }
+        catch (...) {}
+      }
+      self->finish(false, obsolete_identity);
+      return;
+    }
+    self->response = std::move(result);
+    self->verify();
+  }
+
+  void verify() noexcept {
+    completion = {verified, nullptr, this};
+    if (!context.reactor.reserve_completion(&completion)) {
+      finish(false);
+      return;
+    }
+    try {
+      context.state.uploads->submit(&context.handle, [this] {
+        try {
+          IoExecutorScope local_only(nullptr, 0);
+          if (whole) {
+            const auto result = verify_cached_checksum(
+                response, *context.entry, whole.offset, whole.length,
+                context.state.config.checksum);
+            valid = result == CACHE_CHECKSUM_VALID ||
+                (!retrying && result == CACHE_CHECKSUM_UNAVAILABLE);
+          } else {
+            valid = verify_cached_part(*context.entry, part);
+          }
+        } catch (...) {
+          error = std::current_exception();
+        }
+        context.reactor.complete(&completion);
+      });
+    } catch (...) {
+      error = std::current_exception();
+      context.reactor.complete(&completion);
+    }
+  }
+
+  static void manifest_ready(void* value, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncCacheChecksum*>(value);
+    self->context.entry->end_async_wait();
+    if (result < 0) self->finish(false);
+    else self->start();
+  }
+
+  void start() noexcept {
+    try {
+      if (whole) {
+        const int fd = context.entry->begin_manifest_wait();
+        if (fd >= 0) {
+          wait.kind       = AsyncIoRequest::READ;
+          wait.fd         = fd;
+          wait.data       = &notification;
+          wait.length     = sizeof(notification);
+          wait.timeout_ms = 0;
+          wait.complete   = manifest_ready;
+          wait.context    = this;
+          if (context.reactor.submit(wait)) return;
+          context.entry->end_async_wait();
+          throw std::system_error(errno, std::generic_category(), "submit manifest wait");
+        }
+        if (context.entry->checksum_manifest_available()) {
+          context.entry->finish_fetch(whole);
+          start_cached_checksums(context, whole.offset, whole.length);
+          delete this;
+          return;
+        }
+      }
+      verify();
+    } catch (...) {
+      finish(false);
+    }
+  }
+};
+
+void start_cached_checksums(const ReadChecksumContext& context,
+                            uint64_t offset, size_t length) noexcept {
+  for (;;) {
+    CacheChecksumClaim claim;
+    try {
+      claim = context.entry->claim_checksum(offset, length, true);
+      if (claim.action != CACHE_CHECKSUM_VERIFY) return;
+      auto* task = new AsyncCacheChecksum(context, claim);
+      task->start();
+    } catch (...) {
+      if (claim.action == CACHE_CHECKSUM_VERIFY) {
+        context.entry->finish_checksum(claim, false);
+        queue_page_invalidation(context.state, context.handle,
+                                 off_t(claim.offset), off_t(claim.size));
+      }
+      fprintf(stderr, "warning: cannot start asynchronous part checksum: path=%s\n",
+              context.path.c_str());
+      return;
+    }
+  }
+}
+
+struct AsyncChecksumManifest {
+  ReadChecksumContext context;
+  AsyncReadIdentityGate identity;
+  ChecksumManifestState manifest;
+  std::unique_ptr<AsyncSignedS3Request> http;
+
+  explicit AsyncChecksumManifest(const ReadChecksumContext& ctx)
+      : context(ctx), identity(context) {}
+
+  void unavailable() noexcept {
+    context.entry->checksum_manifest_unavailable();
+    fprintf(stderr, "warning: multipart read checksum unavailable: path=%s; "
+            "whole-object checksum remains best effort\n", context.path.c_str());
+    delete this;
+  }
+
+  static void received(void* value, Response&& result,
+                         std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncChecksumManifest*>(value);
+    self->http.reset();
+    self->identity.unlock();
+    try {
+      if (error) std::rethrow_exception(error);
+      if (parse_checksum_manifest_page(self->manifest, result, self->context.size,
+                                       self->context.state.config.checksum)) {
+        self->context.entry->finish_checksum_manifest(std::move(self->manifest.parts));
+        start_cached_checksums(self->context, 0, size_t(self->context.size));
+        delete self;
+      } else {
+        self->start();
+      }
+    } catch (...) {
+      self->unavailable();
+    }
+  }
+
+  void start() noexcept {
+    try {
+      if (!checksum_is_s3(context.state.config.checksum)) {
+        unavailable();
+        return;
+      }
+      if (!identity.acquire(identity_ready, this)) return;
+      start_request();
+    } catch (...) {
+      identity.unlock();
+      unavailable();
+    }
+  }
+
+  static void identity_ready(void* value, std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncChecksumManifest*>(value);
+    if (error) {
+      self->unavailable();
+      return;
+    }
+    self->start_request();
+  }
+
+  void start_request() noexcept {
+    try {
+      std::string path = query_path(sso_view(context.path), "attributes");
+      if (!context.version.empty()) {
+        path += "&versionId=" + uri_encode(sso_view(context.version), false);
+      }
+      std::array<Header, 3> signed_headers;
+      size_t n = 0;
+      signed_headers[n++] = {"x-amz-max-parts", "1000"};
+      signed_headers[n++] = {"x-amz-object-attributes", "ObjectParts,Checksum"};
+      if (manifest.marker != 0) {
+        signed_headers[n++] = {"x-amz-part-number-marker", std::to_string(manifest.marker)};
+      }
+      AsyncHttpRequest args;
+      args.method.assign("GET");
+      args.path.assign(path.data(), path.size());
+      args.headers.assign(signed_headers.begin(), signed_headers.begin() + n);
+      args.max_response_body = kMaximumListResponseSize;
+      http = std::make_unique<AsyncSignedS3Request>(context.state, context.reactor,
+          std::move(args), received, this);
+      if (!http->start()) {
+        throw std::system_error(errno, std::generic_category(), "submit checksum manifest");
+      }
+    } catch (...) {
+      identity.unlock();
+      unavailable();
+    }
+  }
+};
+
+void ensure_async_checksum_manifest(const ReadChecksumContext& context) {
+  if (!context.entry->begin_checksum_manifest(false)) return;
+  try {
+    auto* task = new AsyncChecksumManifest(context);
+    task->start();
+  } catch (...) {
+    context.entry->checksum_manifest_unavailable();
+    throw;
+  }
+}
+
 bool cache_response_matches(const Response& response,
                             const CacheFetchClaim& claim,
                             uint64_t object_size) noexcept {
@@ -7087,45 +10972,24 @@ size_t cache_fetch_expansion(State& state, OpenHandle& handle,
   return std::max(wanted, handle.cache_read_window);
 }
 
-struct AsyncCacheReadTask {
-  State* state;
-  OpenHandle* handle;
-  fuse_req_t request;
-  uint64_t offset;
-  size_t wanted;
-  CacheFetchClaim claim;
-  HttpPool::Lease lease;
-  std::unique_ptr<OpenRequestGuard> active;
-  FuseReactor::ReactorTask reactor_task;
-};
-
-void run_async_cache_read(void* context) noexcept;
-void cancel_async_cache_read(void* context) noexcept;
-
 bool read_cached(State& state, OpenHandle& handle,
-                 fuse_req_t request, uint64_t offset, size_t wanted,
-                 std::unique_ptr<OpenRequestGuard>* active = nullptr,
-                 const CacheFetchClaim* assigned_claim = nullptr,
-                 HttpPool::Lease* supplied_lease = nullptr) {
+                 fuse_req_t request, uint64_t offset, size_t wanted) {
   CacheEntry& entry = *handle.cache_entry;
-  const bool preassigned = assigned_claim != nullptr;
-  if (assigned_claim == nullptr &&
-      state.config.verify_read_checksum && entry.stale()) {
+  if (state.config.verify_read_checksum && entry.stale()) {
     throw std::system_error(ESTALE, std::generic_category(),
                             "stale cached S3 generation");
   }
-  if (assigned_claim == nullptr && state.config.verify_read_checksum) {
+  if (state.config.verify_read_checksum) {
     ensure_checksum_manifest(state, handle);
   }
-  const size_t expansion = assigned_claim == nullptr
-      ? cache_fetch_expansion(state, handle, offset, wanted) : wanted;
+  const size_t expansion = cache_fetch_expansion(state, handle, offset, wanted);
   for (;;) {
-    if (assigned_claim == nullptr && state.config.verify_read_checksum &&
+    if (state.config.verify_read_checksum &&
         !service_cached_checksums(state, handle, offset, wanted)) {
       throw std::system_error(EIO, std::generic_category(),
                               "cached S3 part checksum mismatch");
     }
-    if (assigned_claim == nullptr && entry.pin_clean(offset, wanted)) {
+    if (entry.pin_clean(offset, wanted)) {
       const int result = reply_pinned_cached_range(
           request, entry, offset, wanted);
       if (result != 0) {
@@ -7134,17 +10998,13 @@ bool read_cached(State& state, OpenHandle& handle,
       }
       return true;
     }
-    if (assigned_claim == nullptr && entry.range_bad(offset, wanted)) {
+    if (entry.range_bad(offset, wanted)) {
       throw std::system_error(EIO, std::generic_category(),
                               "cached S3 checksum mismatch");
     }
-    HttpPool::Lease lease = supplied_lease != nullptr
-        ? std::move(*supplied_lease) : HttpPool::Lease{};
+    HttpPool::Lease lease;
     CacheFetchClaim claim;
-    if (assigned_claim != nullptr) {
-      claim = *assigned_claim;
-      assigned_claim = nullptr;
-    } else {
+    {
       size_t selected_expansion = wanted;
       if (expansion > wanted) {
         lease = state.http->try_acquire_bulk();
@@ -7167,27 +11027,6 @@ bool read_cached(State& state, OpenHandle& handle,
         entry.fail_fetch(claim);
         throw;
       }
-    }
-
-    if (!preassigned && !state.config.verify_read_checksum &&
-        active != nullptr && *active &&
-        current_fuse_reactor() != nullptr) {
-      auto task = std::make_unique<AsyncCacheReadTask>(
-          AsyncCacheReadTask{&state, &handle, request, offset, wanted,
-                             claim, std::move(lease),
-                             std::move(*active), {}});
-      FuseReactor* reactor = current_fuse_reactor();
-      task->reactor_task = {
-          run_async_cache_read, cancel_async_cache_read, task.get()};
-      AsyncCacheReadTask* submitted = task.release();
-      if (!reactor->submit_task(&submitted->reactor_task)) {
-        task.reset(submitted);
-        entry.fail_fetch(claim);
-        throw std::system_error(
-            EAGAIN, std::generic_category(),
-            "submit asynchronous cache fill");
-      }
-      return true;
     }
 
     CacheReadSink sink(entry, claim, request, offset, wanted);
@@ -7275,7 +11114,7 @@ bool read_cached(State& state, OpenHandle& handle,
                     "offset=%" PRIu64 " bytes=%zu\n",
                     handle.object_path.c_str(), claim.offset, claim.length);
             queue_page_invalidation(
-                state, handle.inode, off_t(claim.offset),
+                state, handle, off_t(claim.offset),
                 off_t(claim.length));
             return true;
           }
@@ -7294,7 +11133,7 @@ bool read_cached(State& state, OpenHandle& handle,
                   "offset=%" PRIu64 " bytes=%zu\n",
                   handle.object_path.c_str(), claim.offset, claim.length);
           queue_page_invalidation(
-              state, handle.inode, off_t(claim.offset),
+              state, handle, off_t(claim.offset),
               off_t(claim.length));
           return true;
         }
@@ -7306,7 +11145,7 @@ bool read_cached(State& state, OpenHandle& handle,
       if (sink.replied()) {
         if (entry.range_bad(claim.offset, claim.length)) {
           queue_page_invalidation(
-              state, handle.inode, off_t(claim.offset),
+              state, handle, off_t(claim.offset),
               off_t(claim.length));
         }
         try {
@@ -7337,30 +11176,10 @@ bool read_cached(State& state, OpenHandle& handle,
   }
 }
 
-void run_async_cache_read(void* context) noexcept {
-  std::unique_ptr<AsyncCacheReadTask> task(
-      static_cast<AsyncCacheReadTask*>(context));
-  try {
-    read_cached(*task->state, *task->handle, task->request,
-                task->offset, task->wanted, nullptr,
-                &task->claim, &task->lease);
-  } catch (...) {
-    reply_callback_error(task->request);
-  }
-}
-
-void cancel_async_cache_read(void* context) noexcept {
-  std::unique_ptr<AsyncCacheReadTask> task(
-      static_cast<AsyncCacheReadTask*>(context));
-  task->handle->cache_entry->fail_fetch(task->claim);
-  fuse_reply_err(task->request, EIO);
-}
-
 void read_open_file(State& state, OpenHandle& handle, bool use_cache,
                     UncachedFileReader* uncached,
                     fuse_req_t request, fuse_ino_t inode, size_t size,
-                    off_t offset,
-                    std::unique_ptr<OpenRequestGuard>* active = nullptr) {
+                    off_t offset) {
   if (offset < 0) {
     fuse_reply_err(request, EINVAL);
     return;
@@ -7414,8 +11233,7 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
       return;
     }
     if (use_cache && handle.cache_entry != nullptr &&
-        read_cached(state, handle, request, unsigned_offset, wanted,
-                    active)) {
+        read_cached(state, handle, request, unsigned_offset, wanted)) {
       return;
     }
     if (uncached != nullptr && !state.config.verify_read_checksum &&
@@ -7578,13 +11396,16 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
           std::min<uint64_t>(size, object_size - begin));
       if (wanted != 0 && handle.cache_entry->range_bad(begin, wanted)) {
         queue_page_invalidation(
-            state, handle.inode, offset, off_t(wanted));
+            state, handle, offset, off_t(wanted));
       }
     }
   }
 }
 
 UncachedFileReader::~UncachedFileReader() {
+  if (prefetch_) {
+    prefetch_->cancelled.store(true, std::memory_order_release);
+  }
   join();
 }
 
@@ -7648,9 +11469,7 @@ bool UncachedFileReader::try_prefetch(
         std::lock_guard guard(prefetch_->mutex);
         valid = prefetch_->error == nullptr && prefetch_->complete &&
             prefetch_->produced == prefetch_->length &&
-            content_range_matches(
-                prefetch_->response, prefetch_->offset,
-                prefetch_->length, object_size);
+            prefetch_->range_valid;
       }
       if (valid && offset == end) {
         const size_t maximum = state.config.max_prefetch_window_size;
@@ -7685,41 +11504,32 @@ bool UncachedFileReader::try_prefetch(
       return false;
     }
 
-    UniqueFd fd(::memfd_create("ngs3fs-read-ahead", MFD_CLOEXEC));
-    if (!fd) {
-      throw std::system_error(errno, std::generic_category(),
-                              "memfd_create(read-ahead)");
-    }
-    if (::ftruncate(fd.get(), off_t(length)) != 0) {
-      throw std::system_error(errno, std::generic_category(),
-                              "ftruncate(read-ahead)");
-    }
+    ReadAheadStoragePool::Storage storage =
+        state.read_ahead_pool->acquire(length);
 
     WorkerState& worker = worker_state(state);
     const AuthorizedRangeRequest range = make_range_request(
         state, handle, worker, offset, length);
     selected = std::make_shared<UncachedPrefetch>(
-        std::move(fd), offset, length);
+        state.read_ahead_pool, std::move(storage), offset, length);
     prefetch_ = selected;
     reader_guard.unlock();
     try {
       started_download = started_lease->begin_range_to_fd(
           range.path(), selected->offset, selected->length, selected->sink,
           range.headers, true, false);
-      if (started_download->receive_at_least(wanted) < wanted ||
-          !content_range_matches(started_download->response(),
-                                 selected->offset, selected->length,
-                                 object_size)) {
-        size_t wake = 0;
+      const size_t received = started_download->receive_at_least(wanted);
+      const bool range_valid = content_range_matches(
+          started_download->response(), selected->offset,
+          selected->length, object_size);
+      if (received < wanted || !range_valid) {
         {
           std::lock_guard guard(selected->mutex);
           selected->error = std::make_exception_ptr(
               std::runtime_error("invalid read-ahead response"));
           selected->complete = true;
-          wake = selected->waiters;
-          selected->waiters = 0;
         }
-        selected->notify_waiters(wake);
+        selected->notify_waiters();
         reader_guard.lock();
         if (prefetch_ == selected) {
           prefetch_.reset();
@@ -7727,17 +11537,15 @@ bool UncachedFileReader::try_prefetch(
         reader_guard.unlock();
         return false;
       }
+      selected->range_valid = true;
       selected->sink.start_publishing(started_download->response());
     } catch (...) {
-      size_t wake = 0;
       {
         std::lock_guard guard(selected->mutex);
         selected->error = std::current_exception();
         selected->complete = true;
-        wake = selected->waiters;
-        selected->waiters = 0;
       }
-      selected->notify_waiters(wake);
+      selected->notify_waiters();
       reader_guard.lock();
       if (prefetch_ == selected) {
         prefetch_.reset();
@@ -7749,74 +11557,56 @@ bool UncachedFileReader::try_prefetch(
   }
 
   const size_t relative = size_t(offset - selected->offset);
-  Response response;
-  if (started_download) {
-    response.status        = started_download->response().status;
-    response.content_range = started_download->response().content_range;
-    response.body_bytes    = started_download->response().body_bytes;
-  } else {
+  if (!started_download) {
     reader_guard.unlock();
     if (!wait_for_prefetch(*selected, relative + wanted)) {
       return false;
     }
-    std::lock_guard guard(selected->mutex);
-    response.status = selected->response.status;
-    response.content_range = selected->response.content_range;
-    response.body_bytes = selected->produced;
   }
-  if (!content_range_matches(response, selected->offset,
-                             selected->length, object_size)) {
+  if (!selected->range_valid) {
     return false;
   }
 
   if (started_download) {
     auto tail = std::make_unique<PrefetchTailTask>(PrefetchTailTask{
-        selected, object_size,
+        selected,
         state.config.stats_interval_seconds != 0,
         &state.remote_reads, &state.remote_read_bytes,
-        std::move(started_lease), std::move(started_download), {}});
-    FuseReactor* reactor = current_fuse_reactor();
+        std::move(started_lease), std::move(started_download)});
     try {
-      if (reactor != nullptr) {
-        tail->reactor_task = {
-            run_prefetch_tail, cancel_prefetch_tail, tail.get()};
-        PrefetchTailTask* submitted = tail.release();
-        if (!reactor->submit_task(&submitted->reactor_task)) {
-          tail.reset(submitted);
-          throw std::system_error(
-              EAGAIN, std::generic_category(),
-              "submit read-ahead tail");
-        }
-      } else {
-        PrefetchTailTask* submitted = tail.release();
-        try {
-          thread_ = std::thread(run_prefetch_tail, submitted);
-        } catch (...) {
-          tail.reset(submitted);
-          throw;
-        }
+      PrefetchTailTask* submitted = tail.release();
+      try {
+        thread_ = std::thread(run_prefetch_tail, submitted);
+      } catch (...) {
+        tail.reset(submitted);
+        throw;
       }
     } catch (...) {
-      size_t wake = 0;
       {
         std::lock_guard guard(selected->mutex);
         selected->error = std::current_exception();
         selected->complete = true;
-        wake = selected->waiters;
-        selected->waiters = 0;
       }
-      selected->notify_waiters(wake);
+      selected->notify_waiters();
     }
   }
-  fuse_bufvec buffers{};
-  buffers.count        = 1;
-  buffers.buf[0].size  = wanted;
-  buffers.buf[0].flags = fuse_buf_flags(
-      FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
-  buffers.buf[0].fd    = selected->fd.get();
-  buffers.buf[0].pos   = off_t(relative);
-  const int result = fuse_reply_data(
-      request, &buffers, FUSE_BUF_SPLICE_MOVE);
+  int result;
+  if (wanted < 2 * state.page_size) {
+    result = fuse_reply_buf(
+        request,
+        static_cast<const char*>(selected->storage.mapping) + relative,
+        wanted);
+  } else {
+    fuse_bufvec buffers{};
+    buffers.count        = 1;
+    buffers.buf[0].size  = wanted;
+    buffers.buf[0].flags = fuse_buf_flags(
+        FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
+    buffers.buf[0].fd    = selected->storage.fd.get();
+    buffers.buf[0].pos   = off_t(relative);
+    result = fuse_reply_data(
+        request, &buffers, FUSE_BUF_SPLICE_MOVE);
+  }
   if (result != 0) {
     fprintf(stderr, "fuse_reply_data(read-ahead) failed: %s\n",
             strerror(-result));
@@ -7829,6 +11619,70 @@ void UncachedFileReader::read(
     fuse_ino_t inode, size_t size, off_t offset) {
   read_open_file(state, handle, false, this,
                  request, inode, size, offset);
+}
+
+std::shared_ptr<UncachedPrefetch> UncachedFileReader::select_async(
+    State& state, uint64_t offset, size_t wanted, uint64_t object_size,
+    bool& created) {
+  std::lock_guard guard(mutex_);
+  created = false;
+  const auto contains = [&](const UncachedPrefetch& p) {
+    return offset >= p.offset && wanted <= p.length &&
+        offset - p.offset <= p.length - wanted;
+  };
+  if (prefetch_ && contains(*prefetch_)) {
+    return prefetch_;
+  }
+  for (auto i = retained_.rbegin(); i != retained_.rend(); ++i) {
+    if (contains(**i)) {
+      return *i;
+    }
+  }
+  const size_t maximum = state.config.max_prefetch_window_size;
+  if (prefetch_ && offset != prefetch_->offset + prefetch_->length) {
+    bool pending;
+    {
+      std::lock_guard progress_guard(prefetch_->mutex);
+      pending = !prefetch_->complete && !prefetch_->error;
+    }
+    if (pending) {
+      // A disjoint demand must not cancel the useful in-flight window or
+      // expand another speculative window. Keep its bytes for overlap reuse.
+      auto storage = state.read_ahead_pool->acquire(wanted);
+      auto selected = std::make_shared<UncachedPrefetch>(
+          state.read_ahead_pool, std::move(storage), offset, wanted);
+      retained_.push_back(selected);
+      retained_bytes_ += wanted;
+      while (retained_.size() > 1 && retained_bytes_ > maximum) {
+        retained_bytes_ -= retained_.front()->length;
+        retained_.pop_front();
+      }
+      created = true;
+      return selected;
+    }
+  }
+  if (prefetch_) {
+    if (offset == prefetch_->offset + prefetch_->length) {
+      next_window_ += std::min(next_window_, maximum - next_window_);
+    } else {
+      next_window_ = 1024U * 1024U;
+    }
+    retained_.push_back(prefetch_);
+    retained_bytes_ += prefetch_->length;
+  }
+  const size_t length = size_t(std::min<uint64_t>(
+      object_size - offset, std::max(wanted, next_window_)));
+  auto storage = state.read_ahead_pool->acquire(length);
+  auto selected = std::make_shared<UncachedPrefetch>(
+      state.read_ahead_pool, std::move(storage), offset, length);
+  while (!retained_.empty() &&
+         (length >= maximum || retained_bytes_ > maximum - length)) {
+    retained_bytes_ -= retained_.front()->length;
+    retained_.pop_front();
+  }
+  prefetch_ = selected;
+  created = true;
+  return selected;
 }
 
 class CachedFileReader final : public FileReader {
@@ -7844,6 +11698,8 @@ class UncachedFileWriter final : public FileWriter {
  public:
   void write(State& state, OpenHandle& handle, fuse_req_t request,
              fuse_ino_t inode, fuse_bufvec* input, off_t offset) override;
+  void write_async(State&, OpenHandle&, fuse_req_t, fuse_ino_t,
+                    fuse_bufvec*, off_t, FuseReactor&) override;
   void flush(State& state, OpenHandle& handle) override;
   void fsync(State& state, OpenHandle& handle, bool data_only) override;
   void release(State& state, OpenHandle& handle) noexcept override;
@@ -7853,6 +11709,8 @@ class CachedFileWriter final : public FileWriter {
  public:
   void write(State& state, OpenHandle& handle, fuse_req_t request,
              fuse_ino_t inode, fuse_bufvec* input, off_t offset) override;
+  void write_async(State&, OpenHandle&, fuse_req_t, fuse_ino_t,
+                    fuse_bufvec*, off_t, FuseReactor&) override;
   void flush(State& state, OpenHandle& handle) override;
   void fsync(State& state, OpenHandle& handle, bool data_only) override;
   void release(State& state, OpenHandle& handle) noexcept override;
@@ -7874,13 +11732,234 @@ std::unique_ptr<FileWriter> make_file_writer(State& state,
   return std::make_unique<UncachedFileWriter>();
 }
 
+struct AsyncRangeTransfer {
+  State& state;
+  FuseReactor& reactor;
+  std::shared_ptr<UncachedPrefetch> prefetch;
+  uint64_t object_size;
+  AsyncHttpRequest arguments;
+  std::unique_ptr<AsyncS3Request> http;
+  std::unique_ptr<AsyncSignedS3Request> retry_http;
+  std::unique_ptr<ReadChecksumContext> checksums;
+  std::unique_ptr<AsyncReadIdentityGate> retry_identity;
+  Response checksum_response;
+  FuseReactor::ReactorTask checksum_completion;
+  std::exception_ptr checksum_error;
+  bool retried = false;
+  bool checksum_valid = false;
+
+  struct Sink final : RangeFileSink {
+    AsyncRangeTransfer& owner;
+    explicit Sink(AsyncRangeTransfer& value)
+        : RangeFileSink(value.prefetch->storage.fd.get(), 0, false),
+          owner(value) {}
+    bool cancelled() const noexcept override {
+      return owner.prefetch->cancelled.load(std::memory_order_acquire);
+    }
+    void progress(const Response& response, bool complete) override {
+      if (cancelled()) return;
+      if (owner.retried) return;
+      if (!owner.prefetch->range_valid) {
+        if (!content_range_matches(response, owner.prefetch->offset,
+                                   owner.prefetch->length,
+                                   owner.object_size)) {
+          throw_inconsistent_range_response(
+              response, owner.prefetch->offset, owner.prefetch->length,
+              owner.object_size, "asynchronous GetObject");
+        }
+        owner.prefetch->range_valid = true;
+        owner.prefetch->sink.start_publishing(response);
+      } else {
+        owner.prefetch->sink.progress(response, complete);
+      }
+    }
+  } sink;
+
+  AsyncRangeTransfer(State& s, FuseReactor& r,
+                      std::shared_ptr<UncachedPrefetch> p, uint64_t size,
+                      AsyncHttpRequest args)
+      : state(s), reactor(r), prefetch(std::move(p)), object_size(size),
+        arguments(std::move(args)), sink(*this) {
+    arguments.destination = &sink;
+  }
+
+  static void received(void* context, Response&& response,
+                        std::exception_ptr error) noexcept {
+    std::unique_ptr<AsyncRangeTransfer> task(
+        static_cast<AsyncRangeTransfer*>(context));
+    task->http.reset();
+    task->retry_http.reset();
+    if (task->retry_identity) task->retry_identity->unlock();
+    try {
+      if (!error && (!content_range_matches(response, task->prefetch->offset,
+                                            task->prefetch->length, task->object_size) ||
+                    response.body_bytes != task->prefetch->length)) {
+        throw std::system_error(EIO, std::generic_category(),
+                                "incomplete asynchronous GetObject");
+      }
+      if (!error && task->state.config.stats_interval_seconds != 0) {
+        task->state.remote_reads.fetch_add(1, std::memory_order_relaxed);
+        task->state.remote_read_bytes.fetch_add(
+            response.body_bytes, std::memory_order_relaxed);
+      }
+    } catch (...) {
+      error = std::current_exception();
+    }
+    if (task->checksums && !error) {
+      task->checksum_response = std::move(response);
+      task.release()->verify();
+      return;
+    }
+    if (task->checksums && task->retried && error) {
+      task->checksums->handle.read_checksum_bad.store(true, std::memory_order_release);
+      queue_page_invalidation(task->state, task->checksums->handle,
+                              off_t(task->prefetch->offset), off_t(task->prefetch->length));
+    }
+    {
+      std::lock_guard guard(task->prefetch->mutex);
+      task->prefetch->error = error;
+      task->prefetch->complete = true;
+      task->prefetch->checksum_retrying = false;
+      task->prefetch->checksum_bad = task->retried && error != nullptr;
+    }
+    task->prefetch->notify_waiters();
+  }
+
+  static void verified(void* value) noexcept {
+    std::unique_ptr<AsyncRangeTransfer> task(static_cast<AsyncRangeTransfer*>(value));
+    if (!task->checksum_error && !task->checksum_valid && !task->retried) {
+      try {
+        task->retried = true;
+        {
+          std::lock_guard guard(task->prefetch->mutex);
+          task->prefetch->checksum_retrying = true;
+          task->prefetch->complete = false;
+        }
+        queue_page_invalidation(task->state, task->checksums->handle,
+                                 off_t(task->prefetch->offset), off_t(task->prefetch->length));
+        task->retry_identity = std::make_unique<AsyncReadIdentityGate>(*task->checksums);
+        if (!task->retry_identity->acquire(identity_ready, task.get())) {
+          task.release();
+          return;
+        }
+        task.release()->start_retry();
+        return;
+      } catch (...) {
+        task->checksum_error = std::current_exception();
+      }
+    }
+    const bool valid = !task->checksum_error && task->checksum_valid;
+    if (!valid) {
+      task->checksums->handle.read_checksum_bad.store(true, std::memory_order_release);
+      queue_page_invalidation(task->state, task->checksums->handle,
+                               off_t(task->prefetch->offset), off_t(task->prefetch->length));
+      fprintf(stderr, "error: asynchronous uncached checksum retry failed: path=%s\n",
+              task->checksums->path.c_str());
+    }
+    {
+      std::lock_guard guard(task->prefetch->mutex);
+      task->prefetch->complete = true;
+      task->prefetch->checksum_retrying = false;
+      task->prefetch->checksum_bad = !valid;
+    }
+    task->prefetch->notify_waiters();
+  }
+
+  static void identity_ready(void* value, std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncRangeTransfer*>(value);
+    if (error) {
+      self->checksum_error = error;
+      verified(self);
+      return;
+    }
+    self->start_retry();
+  }
+
+  void start_retry() noexcept {
+    try {
+      auto args = checksum_retry_request(
+          *checksums, prefetch->offset, prefetch->length, sink);
+      args.capture_headers = true;
+      retry_http = std::make_unique<AsyncSignedS3Request>(
+          state, reactor, std::move(args), received, this, 1);
+      if (!retry_http->start()) {
+        throw std::system_error(errno, std::generic_category(),
+                                "submit uncached checksum retry");
+      }
+    } catch (...) {
+      retry_identity->unlock();
+      checksum_error = std::current_exception();
+      verified(this);
+    }
+  }
+
+  void verify() noexcept {
+    checksum_completion = {verified, nullptr, this};
+    if (!reactor.reserve_completion(&checksum_completion)) {
+      retried = true;
+      verified(this);
+      return;
+    }
+    try {
+      state.uploads->submit(&checksums->handle, [this] {
+        try {
+          IoExecutorScope local_only(nullptr, 0);
+          ChecksumAlgorithm algorithm = CHECKSUM_NONE;
+          std::string_view expected;
+          if (!read_checksum_from_response(checksum_response, state.config.checksum,
+                                            algorithm, expected)) {
+            checksum_valid = !retried;
+          } else {
+            DataChecksum checksum(algorithm);
+            checksum.update(std::span(
+                static_cast<const std::byte*>(prefetch->storage.mapping), prefetch->length));
+            const auto actual = checksum.finish();
+            uint64_t value = 0;
+            checksum_valid = algorithm == CHECKSUM_CRC64XZ
+                ? parse_unsigned(expected, value) && value == actual.integer
+                : expected == sso_view(actual.base64);
+          }
+        } catch (...) {
+          checksum_error = std::current_exception();
+        }
+        reactor.complete(&checksum_completion);
+      });
+    } catch (...) {
+      checksum_error = std::current_exception();
+      reactor.complete(&checksum_completion);
+    }
+  }
+
+  void start() noexcept {
+    try {
+      bool accepted;
+      if (state.config.directory_bucket) {
+        retry_http = std::make_unique<AsyncSignedS3Request>(
+            state, reactor, std::move(arguments), received, this);
+        accepted = retry_http->start();
+      } else {
+        http = std::make_unique<AsyncS3Request>(
+            state, reactor, std::move(arguments), received, this);
+        accepted = http->start();
+      }
+      if (!accepted) {
+        throw std::system_error(errno, std::generic_category(),
+                                "submit asynchronous GetObject");
+      }
+    } catch (...) {
+      received(this, Response{}, std::current_exception());
+    }
+  }
+};
+
 struct AsyncReadTask {
   AsyncReadTask(State& state_value, OpenHandle& handle_value,
                 fuse_req_t request_value, fuse_ino_t inode_value,
                 size_t size_value, off_t offset_value)
       : state(&state_value), handle(&handle_value),
         request(request_value), inode(inode_value), size(size_value),
-        offset(offset_value), active(handle_value) {}
+        offset(offset_value), active(handle_value),
+        identity(handle_value.identity_mutex, std::defer_lock) {}
 
   State* state;
   OpenHandle* handle;
@@ -7889,28 +11968,465 @@ struct AsyncReadTask {
   size_t size;
   off_t offset;
   OpenRequestGuard active;
-  FuseReactor::ReactorTask reactor_task;
-};
+  std::shared_lock<ReactorSharedMutex> identity;
+  FuseReactor* reactor = nullptr;
+  std::shared_ptr<UncachedPrefetch> prefetch;
+  PrefetchContinuation continuation;
+  AsyncIoRequest wait;
+  uint64_t notification = 0;
+  size_t wanted = 0;
+  size_t expansion = 0;
+  CacheFetchClaim cache_claim;
+  std::unique_ptr<CacheReadSink> cache_sink;
+  std::unique_ptr<AsyncS3Request> cache_http;
+  std::unique_ptr<AsyncSignedS3Request> cache_signed_http;
+  std::exception_ptr prepare_error;
+  bool cache_prepared = false;
+  std::unique_ptr<ReadChecksumContext> checksums;
+  AsyncCredentialWait credential_wait;
+  bool credential_cached = false;
 
-void run_async_read(void* context) noexcept {
-  std::unique_ptr<AsyncReadTask> task(
-      static_cast<AsyncReadTask*>(context));
-  try {
-    read_open_file(
-        *task->state, *task->handle, false,
-        static_cast<UncachedFileReader*>(task->handle->reader.get()),
-        task->request, task->inode, task->size, task->offset,
-        nullptr);
-  } catch (...) {
-    reply_callback_error(task->request);
+  void credential_failed(std::exception_ptr error) noexcept {
+    if (credential_cached) {
+      cache_received(this, Response{}, error);
+      return;
+    }
+    {
+      std::lock_guard guard(prefetch->mutex);
+      prefetch->error = error;
+      prefetch->complete = true;
+    }
+    prefetch->notify_waiters();
+    try { std::rethrow_exception(error); }
+    catch (...) { reply_callback_error(request); }
+    delete this;
   }
-}
 
-void cancel_async_read(void* context) noexcept {
-  std::unique_ptr<AsyncReadTask> task(
-      static_cast<AsyncReadTask*>(context));
-  fuse_reply_err(task->request, EIO);
-}
+  static void credentials_ready(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncReadTask*>(context);
+    try {
+      if (result < 0) {
+        throw std::system_error(int(-result), std::generic_category(),
+                                "wait for read credentials");
+      }
+      if (task->credential_cached) cache_prepared_ready(task);
+      else task->start_uncached_transfer();
+    } catch (...) {
+      task->credential_failed(std::current_exception());
+    }
+  }
+
+  void credentials_pending(bool cached) noexcept {
+    credential_cached = cached;
+    try {
+      if (credential_wait.start(*state, *reactor, credentials_ready, this)) return;
+      throw std::system_error(errno, std::generic_category(),
+                              "submit read credential wait");
+    } catch (...) {
+      credential_failed(std::current_exception());
+    }
+  }
+
+  static void cancel(void* context) noexcept {
+    std::unique_ptr<AsyncReadTask> task(static_cast<AsyncReadTask*>(context));
+    if (task->cache_claim) {
+      task->handle->cache_entry->fail_fetch(task->cache_claim);
+    }
+    if (!task->cache_sink || !task->cache_sink->replied()) {
+      fuse_reply_err(task->request, EIO);
+    }
+  }
+
+  static void cache_available(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncReadTask*>(context);
+    task->handle->cache_entry->end_async_wait();
+    if (result < 0) {
+      fuse_reply_err(task->request, -int(result));
+      delete task;
+      return;
+    }
+    task->read_cache();
+  }
+
+  static void cache_received(void* context, Response&& response,
+                              std::exception_ptr error) noexcept {
+    std::unique_ptr<AsyncReadTask> task(static_cast<AsyncReadTask*>(context));
+    CacheEntry& entry = *task->handle->cache_entry;
+    try {
+      if (error) std::rethrow_exception(error);
+      if (!cache_response_matches(response, task->cache_claim, task->handle->size)) {
+        throw_inconsistent_range_response(
+            response, task->cache_claim.offset, task->cache_claim.length,
+            task->handle->size, "asynchronous cached GetObject");
+      }
+      const CacheFetchClaim fetched = task->cache_claim;
+      if (task->checksums && fetched.offset == 0 &&
+          fetched.length == task->handle->size &&
+          !entry.checksum_manifest_available()) {
+        auto* check = new AsyncCacheChecksum(
+            *task->checksums, fetched, std::move(response));
+        task->cache_claim = {};
+        check->start();
+      } else {
+        entry.finish_fetch(fetched);
+        if (task->checksums) {
+          start_cached_checksums(*task->checksums, fetched.offset, fetched.length);
+        }
+      }
+      task->cache_claim = {};
+      if (task->state->config.stats_interval_seconds != 0) {
+        task->state->remote_reads.fetch_add(1, std::memory_order_relaxed);
+        task->state->remote_read_bytes.fetch_add(
+            fetched.length, std::memory_order_relaxed);
+      }
+      if (task->cache_sink->replied()) return;
+      task->cache_http.reset();
+      task->cache_signed_http.reset();
+      task->cache_sink.reset();
+      task.release()->read_cache();
+    } catch (...) {
+      entry.fail_fetch(task->cache_claim);
+      if (!task->cache_sink || !task->cache_sink->replied()) {
+        reply_callback_error(task->request);
+      } else {
+        fprintf(stderr, "warning: cache fill failed after asynchronous read reply\n");
+      }
+    }
+  }
+
+  static void cache_prepared_ready(void* context) noexcept {
+    auto* task = static_cast<AsyncReadTask*>(context);
+    try {
+      if (task->prepare_error) std::rethrow_exception(task->prepare_error);
+      if (!task->cache_prepared) {
+        task->handle->cache_entry->fail_fetch(task->cache_claim);
+        task->cache_claim = {};
+        task->read_uncached();
+        return;
+      }
+      WorkerState& worker = worker_state(*task->state);
+      const auto range = make_range_request(
+          *task->state, *task->handle, worker,
+          task->cache_claim.offset, task->cache_claim.length,
+          !task->state->config.directory_bucket);
+      task->cache_sink = std::make_unique<CacheReadSink>(
+          *task->handle->cache_entry, task->cache_claim, task->request,
+          uint64_t(task->offset), task->wanted);
+      AsyncHttpRequest args;
+      args.method.assign("GET");
+      args.path.assign(range.path().data(), range.path().size());
+      args.headers.assign(range.headers.begin(), range.headers.end());
+      args.destination       = task->cache_sink.get();
+      args.range             = true;
+      args.offset            = task->cache_claim.offset;
+      args.length            = task->cache_claim.length;
+      args.measure_transport = task->state->config.report_metrics;
+      args.capture_headers   = task->state->config.verify_read_checksum;
+      bool accepted;
+      if (task->state->config.directory_bucket) {
+        task->cache_signed_http = std::make_unique<AsyncSignedS3Request>(
+            *task->state, *task->reactor, std::move(args), cache_received, task);
+        accepted = task->cache_signed_http->start();
+      } else {
+        task->cache_http = std::make_unique<AsyncS3Request>(
+            *task->state, *task->reactor, std::move(args), cache_received, task);
+        accepted = task->cache_http->start();
+      }
+      if (!accepted) {
+        throw std::system_error(errno, std::generic_category(),
+                                "submit asynchronous cached GetObject");
+      }
+    } catch (const CredentialRefreshPending&) {
+      task->credentials_pending(true);
+    } catch (...) {
+      cache_received(task, Response{}, std::current_exception());
+    }
+  }
+
+  void read_cache() noexcept {
+    try {
+      CacheEntry& entry = *handle->cache_entry;
+      if (state->config.verify_read_checksum && !checksums) {
+        checksums = std::make_unique<ReadChecksumContext>(
+            *state, *reactor, *handle, active);
+        ensure_async_checksum_manifest(*checksums);
+      }
+      if (expansion == 0) {
+        expansion = cache_fetch_expansion(*state, *handle, uint64_t(offset), wanted);
+      }
+      for (;;) {
+        if (checksums) {
+          if (entry.stale()) {
+            throw std::system_error(ESTALE, std::generic_category(), "stale checksum generation");
+          }
+          if (entry.checksum_failed(uint64_t(offset), wanted)) {
+            throw std::system_error(EIO, std::generic_category(), "cached part checksum mismatch");
+          }
+          const int fd = entry.begin_checksum_wait(uint64_t(offset), wanted);
+          if (fd >= 0) {
+            wait.kind       = AsyncIoRequest::READ;
+            wait.fd         = fd;
+            wait.data       = &notification;
+            wait.length     = sizeof(notification);
+            wait.timeout_ms = 0;
+            wait.complete   = cache_available;
+            wait.context    = this;
+            if (reactor->submit(wait)) return;
+            entry.end_async_wait();
+            throw std::system_error(errno, std::generic_category(), "submit checksum wait");
+          }
+          start_cached_checksums(*checksums, uint64_t(offset), wanted);
+        }
+        if (entry.pin_clean(uint64_t(offset), wanted)) {
+          const int result = reply_pinned_cached_range(
+              request, entry, uint64_t(offset), wanted);
+          if (result != 0) {
+            fprintf(stderr, "asynchronous cache hit reply failed: %s\n",
+                    strerror(-result));
+          }
+          delete this;
+          return;
+        }
+        if (entry.range_bad(uint64_t(offset), wanted)) {
+          throw std::system_error(EIO, std::generic_category(), "poisoned cache range");
+        }
+        cache_claim = entry.claim_fetch(uint64_t(offset), wanted, expansion);
+        if (cache_claim) break;
+        const int fd = entry.begin_async_wait(uint64_t(offset), wanted);
+        if (fd < 0) continue;
+        wait.kind       = AsyncIoRequest::READ;
+        wait.fd         = fd;
+        wait.data       = &notification;
+        wait.length     = sizeof(notification);
+        wait.timeout_ms = 0;
+        wait.complete   = cache_available;
+        wait.context    = this;
+        if (reactor->submit(wait)) return;
+        entry.end_async_wait();
+        throw std::system_error(errno, std::generic_category(), "submit cache wait");
+      }
+      // Allocation/eviction can write to local storage. Only its completion
+      // comes back here; HTTP parsing and socket I/O never enter this worker.
+      continuation.task = {cache_prepared_ready, cancel, this};
+      if (!reactor->reserve_completion(&continuation.task)) {
+        throw std::system_error(errno, std::generic_category(), "reserve cache completion");
+      }
+      try {
+        state->uploads->submit(handle, [this] {
+          try {
+            IoExecutorScope local_only(nullptr, 0);
+            cache_prepared = handle->cache_entry->prepare_read(
+                cache_claim.offset, cache_claim.length);
+          } catch (...) {
+            prepare_error = std::current_exception();
+          }
+          reactor->complete(&continuation.task);
+        });
+      } catch (...) {
+        prepare_error = std::current_exception();
+        reactor->complete(&continuation.task);
+      }
+    } catch (...) {
+      if (cache_claim) handle->cache_entry->fail_fetch(cache_claim);
+      reply_callback_error(request);
+      delete this;
+    }
+  }
+
+  static void available(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncReadTask*>(context);
+    task->handle->identity_mutex.end_async_wait();
+    if (result < 0) {
+      fuse_reply_err(task->request, -int(result));
+      delete task;
+      return;
+    }
+    task->start();
+  }
+
+  static void ready(void* context) noexcept {
+    std::unique_ptr<AsyncReadTask> task(static_cast<AsyncReadTask*>(context));
+    try {
+      bool retrying;
+      {
+        std::lock_guard guard(task->prefetch->mutex);
+        retrying = task->prefetch->checksum_retrying;
+      }
+      if (retrying) {
+        task.release()->wait_prefetch();
+        return;
+      }
+      const size_t relative = size_t(uint64_t(task->offset) -
+                                     task->prefetch->offset);
+      {
+        std::lock_guard guard(task->prefetch->mutex);
+        if (task->prefetch->checksum_bad) {
+          throw std::system_error(EIO, std::generic_category(), "poisoned read checksum");
+        }
+        if (task->prefetch->produced < relative + task->wanted ||
+            !task->prefetch->range_valid) {
+          if (task->prefetch->error != nullptr) {
+            std::rethrow_exception(task->prefetch->error);
+          }
+          throw std::system_error(EIO, std::generic_category(),
+                                  "incomplete asynchronous read");
+        }
+      }
+      if (task->handle->stale.load(std::memory_order_acquire)) {
+        throw std::system_error(ESTALE, std::generic_category(),
+                                "stale asynchronous read");
+      }
+      int result;
+      if (task->wanted < 2 * task->state->page_size) {
+        result = fuse_reply_buf(
+            task->request,
+            static_cast<const char*>(task->prefetch->storage.mapping) + relative,
+            task->wanted);
+      } else {
+        fuse_bufvec buffers{};
+        buffers.count        = 1;
+        buffers.buf[0].size  = task->wanted;
+        buffers.buf[0].flags = fuse_buf_flags(
+            FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
+        buffers.buf[0].fd    = task->prefetch->storage.fd.get();
+        buffers.buf[0].pos   = off_t(relative);
+        result = fuse_reply_data(
+            task->request, &buffers, FUSE_BUF_SPLICE_MOVE);
+      }
+      if (result != 0) {
+        fprintf(stderr, "asynchronous read reply failed: %s\n", strerror(-result));
+      }
+    } catch (...) {
+      reply_callback_error(task->request);
+    }
+  }
+
+  void start() noexcept {
+    try {
+      if (!identity.try_lock()) {
+        const int fd = handle->identity_mutex.begin_async_wait();
+        if (!identity.try_lock()) {
+          wait.kind       = AsyncIoRequest::READ;
+          wait.fd         = fd;
+          wait.data       = &notification;
+          wait.length     = sizeof(notification);
+          wait.timeout_ms = 0;
+          wait.complete   = available;
+          wait.context    = this;
+          if (reactor->submit(wait)) return;
+          handle->identity_mutex.end_async_wait();
+          throw std::system_error(errno, std::generic_category(),
+                                  "submit identity wait");
+        }
+        handle->identity_mutex.end_async_wait();
+      }
+      if (offset < 0) {
+        throw std::system_error(EINVAL, std::generic_category(), "read offset");
+      }
+      if (handle->inode != inode || handle->writable) {
+        throw std::system_error(EBADF, std::generic_category(), "read handle");
+      }
+      if (handle->read_checksum_bad.load(std::memory_order_acquire)) {
+        throw std::system_error(EIO, std::generic_category(), "read checksum mismatch");
+      }
+      if (handle->stale.load(std::memory_order_acquire) ||
+          (handle->generation_epoch != 0 &&
+           (handle->item->generation_epoch.load(std::memory_order_acquire) &
+            ((1ULL << 63) - 1)) != handle->generation_epoch)) {
+        throw std::system_error(ESTALE, std::generic_category(), "read generation");
+      }
+      const uint64_t begin = uint64_t(offset);
+      if (begin >= handle->size || size == 0) {
+        fuse_reply_buf(request, nullptr, 0);
+        delete this;
+        return;
+      }
+      wanted = size_t(std::min<uint64_t>(size, handle->size - begin));
+      warn_random_read(*state, handle->object_path, handle->size, begin, size);
+      if (handle->recovery_read && handle->cache_entry) {
+        reply_cached_range(request, *handle->cache_entry, begin, wanted);
+        delete this;
+        return;
+      }
+      if (handle->cache_entry) {
+        read_cache();
+        return;
+      }
+      read_uncached();
+    } catch (...) {
+      reply_callback_error(request);
+      delete this;
+    }
+  }
+
+  void read_uncached() noexcept {
+    try {
+      const uint64_t begin = uint64_t(offset);
+      bool created;
+      if (state->local_cache) {
+        auto storage = state->read_ahead_pool->acquire(wanted);
+        prefetch = std::make_shared<UncachedPrefetch>(
+            state->read_ahead_pool, std::move(storage), begin, wanted);
+        created = true;
+      } else {
+        prefetch = static_cast<UncachedFileReader*>(handle->reader.get())->select_async(
+            *state, begin, wanted, handle->size, created);
+      }
+      if (created) {
+        start_uncached_transfer();
+        return;
+      }
+      wait_prefetch();
+    } catch (...) {
+      reply_callback_error(request);
+      delete this;
+    }
+  }
+
+  void start_uncached_transfer() noexcept {
+    try {
+      WorkerState& worker = worker_state(*state);
+      const auto range = make_range_request(
+          *state, *handle, worker, prefetch->offset, prefetch->length,
+          !state->config.directory_bucket);
+      AsyncHttpRequest args;
+      args.method.assign("GET");
+      args.path.assign(range.path().data(), range.path().size());
+      args.headers.assign(range.headers.begin(), range.headers.end());
+      args.range             = true;
+      args.offset            = prefetch->offset;
+      args.length            = prefetch->length;
+      args.measure_transport = state->config.report_metrics;
+      args.capture_headers   = state->config.verify_read_checksum;
+      auto transfer = std::make_unique<AsyncRangeTransfer>(
+          *state, *reactor, prefetch, handle->size, std::move(args));
+      if (state->config.verify_read_checksum && prefetch->offset == 0 &&
+          prefetch->length == handle->size) {
+        transfer->checksums = std::make_unique<ReadChecksumContext>(
+            *state, *reactor, *handle, active);
+      }
+      transfer.release()->start();
+      wait_prefetch();
+    } catch (const CredentialRefreshPending&) {
+      credentials_pending(false);
+    } catch (...) {
+      credential_cached = false;
+      credential_failed(std::current_exception());
+    }
+  }
+
+  void wait_prefetch() noexcept {
+    continuation.reactor = reactor;
+    continuation.task    = {ready, cancel, this};
+    continuation.wanted  = size_t(uint64_t(offset) - prefetch->offset) + wanted;
+    if (!reactor->reserve_completion(&continuation.task)) {
+      fuse_reply_err(request, errno);
+      delete this;
+      return;
+    }
+    if (!prefetch->subscribe(continuation)) reactor->complete(&continuation.task);
+  }
+};
 
 void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
                  off_t offset, fuse_file_info* file) {
@@ -7922,25 +12438,14 @@ void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
                               "missing file reader");
     }
     FuseReactor* reactor = current_fuse_reactor();
-    if (reactor != nullptr && !state.local_cache) {
+    if (reactor != nullptr) {
       auto task = std::make_unique<AsyncReadTask>(
           state, handle, request, inode, size, offset);
-      task->reactor_task = {
-          run_async_read, cancel_async_read, task.get()};
-      AsyncReadTask* submitted = task.release();
-      if (!reactor->submit_task(&submitted->reactor_task)) {
-        task.reset(submitted);
-        throw std::system_error(EAGAIN, std::generic_category(),
-                                "submit asynchronous read");
-      }
+      task->reactor = reactor;
+      task.release()->start();
       return;
     }
-    auto active = std::make_unique<OpenRequestGuard>(handle);
-    if (reactor != nullptr && state.local_cache) {
-      read_open_file(state, handle, true, nullptr,
-                     request, inode, size, offset, &active);
-      return;
-    }
+    OpenRequestGuard active(handle);
     handle.reader->read(state, handle, request, inode, size, offset);
   } catch (...) {
     reply_callback_error(request);
@@ -8000,7 +12505,7 @@ void UncachedFileWriter::write(State& state, OpenHandle& handle,
                               "write after flush");
     }
     while (handle.write_in_progress) {
-      handle.condition.wait(handle_guard);
+      wait_handle(handle, handle_guard);
     }
     if (handle.unlinked.load(std::memory_order_acquire)) {
       throw std::system_error(ESTALE, std::generic_category(),
@@ -8097,7 +12602,7 @@ void UncachedFileWriter::write(State& state, OpenHandle& handle,
     handle.stream_offset     = end;
     handle.size              = end;
     handle.write_in_progress = false;
-    handle.condition.notify_all();
+    notify_handle(handle);
     if (state.config.stats_interval_seconds != 0) {
       state.fuse_writes.fetch_add(1, std::memory_order_relaxed);
       state.fuse_write_bytes.fetch_add(length, std::memory_order_relaxed);
@@ -8114,7 +12619,7 @@ void pwrite_cache_exact(int fd, uint64_t offset,
   while (written != bytes.size()) {
     const ssize_t result = io_pwrite(
         fd, bytes.data() + written, bytes.size() - written,
-        off_t(offset + written));
+        off_t(offset + written), 0, true);
     if (result > 0) {
       written += size_t(result);
     } else if (result < 0 && errno == EINTR) {
@@ -8379,11 +12884,12 @@ void upload_cached_part_job(State& state, OpenHandle& handle,
     fail_write(handle, error);
   }
   --handle.pending_parts;
-  handle.condition.notify_all();
+  notify_handle(handle);
 }
 
 void submit_cached_part(State& state, OpenHandle& handle,
-                        uint64_t offset, size_t length) {
+                        uint64_t offset, size_t length,
+                        const OpenRequestGuard* parent = nullptr) {
   const unsigned number = handle.next_part_number;
   if (number > kMaximumMultipartParts) {
     throw std::system_error(EFBIG, std::generic_category(),
@@ -8402,10 +12908,15 @@ void submit_cached_part(State& state, OpenHandle& handle,
   handle.multipart_required = true;
   ++handle.pending_parts;
   try {
-    state.uploads->submit(
-        &handle, [&state, &handle, number, offset, length] {
-          upload_cached_part_job(state, handle, number, offset, length);
-        });
+    if (FuseReactor* reactor = current_fuse_reactor();
+        reactor != nullptr && !state.config.tls) {
+      submit_async_part(state, handle, *reactor, {}, number, offset, length, parent);
+    } else {
+      state.uploads->submit_upload(
+          &handle, [&state, &handle, number, offset, length] {
+            upload_cached_part_job(state, handle, number, offset, length);
+          });
+    }
   } catch (...) {
     --handle.pending_parts;
     handle.next_part_number = number;
@@ -8421,7 +12932,8 @@ void submit_cached_part(State& state, OpenHandle& handle,
 }
 
 void submit_ready_cached_parts(State& state, OpenHandle& handle,
-                               bool include_final) {
+                               bool include_final,
+                               const OpenRequestGuard* parent = nullptr) {
   const uint64_t part_size = state.config.part_size;
   for (;;) {
     const uint64_t offset =
@@ -8434,7 +12946,7 @@ void submit_ready_cached_parts(State& state, OpenHandle& handle,
       return;
     }
     const size_t length = size_t(std::min<uint64_t>(available, part_size));
-    submit_cached_part(state, handle, offset, length);
+    submit_cached_part(state, handle, offset, length, parent);
   }
 }
 
@@ -8475,7 +12987,7 @@ void CachedFileWriter::write(State& state, OpenHandle& handle,
 
     std::unique_lock guard(handle.mutex);
     while (handle.write_in_progress) {
-      handle.condition.wait(guard);
+      wait_handle(handle, guard);
     }
     if (handle.unlinked.load(std::memory_order_acquire)) {
       throw std::system_error(ESTALE, std::generic_category(),
@@ -8524,7 +13036,7 @@ void CachedFileWriter::write(State& state, OpenHandle& handle,
       throw;
     }
     handle.write_in_progress = false;
-    handle.condition.notify_all();
+    notify_handle(handle);
     if (state.config.stats_interval_seconds != 0) {
       state.fuse_writes.fetch_add(1, std::memory_order_relaxed);
       state.fuse_write_bytes.fetch_add(length, std::memory_order_relaxed);
@@ -8609,10 +13121,10 @@ void commit_cached_write(OpenHandle& handle) {
 void CachedFileWriter::flush(State& state, OpenHandle& handle) {
   std::unique_lock guard(handle.mutex);
   while (handle.write_in_progress) {
-    handle.condition.wait(guard);
+    wait_handle(handle, guard);
   }
   while (handle.write_state == WRITE_SEALING) {
-    handle.condition.wait(guard);
+    wait_handle(handle, guard);
   }
   if (handle.unlinked.load(std::memory_order_acquire)) {
     throw std::system_error(ESTALE, std::generic_category(),
@@ -8641,7 +13153,7 @@ void CachedFileWriter::flush(State& state, OpenHandle& handle) {
       submit_ready_cached_parts(state, handle, true);
       while (handle.pending_parts != 0 &&
              handle.write_state != WRITE_FAILED) {
-        handle.condition.wait(guard);
+        wait_handle(handle, guard);
       }
       if (handle.write_state == WRITE_FAILED) {
         throw std::system_error(handle.write_error,
@@ -8667,7 +13179,7 @@ void CachedFileWriter::flush(State& state, OpenHandle& handle) {
       guard.lock();
     }
     handle.write_state = WRITE_SEALED;
-    handle.condition.notify_all();
+    notify_handle(handle);
   } catch (const std::system_error& error) {
     if (!guard.owns_lock()) {
       guard.lock();
@@ -8693,7 +13205,7 @@ void CachedFileWriter::flush(State& state, OpenHandle& handle) {
 void CachedFileWriter::fsync(State&, OpenHandle& handle, bool) {
   std::unique_lock guard(handle.mutex);
   while (handle.write_in_progress) {
-    handle.condition.wait(guard);
+    wait_handle(handle, guard);
   }
   if (handle.unlinked.load(std::memory_order_acquire)) {
     throw std::system_error(ESTALE, std::generic_category(),
@@ -8730,7 +13242,7 @@ void UncachedFileWriter::flush(State& state, OpenHandle& handle) {
 void UncachedFileWriter::fsync(State&, OpenHandle& handle, bool) {
   std::unique_lock handle_guard(handle.mutex);
   while (handle.write_in_progress) {
-    handle.condition.wait(handle_guard);
+    wait_handle(handle, handle_guard);
   }
   if (handle.unlinked.load(std::memory_order_acquire)) {
     throw std::system_error(ESTALE, std::generic_category(),
@@ -8914,6 +13426,300 @@ void recover_cached_write(State& state,
   });
 }
 
+class AsyncPendingDelete {
+ public:
+  using Complete = void (*)(void*, std::exception_ptr) noexcept;
+  AsyncPendingDelete(State& state, FuseReactor& reactor, std::string path,
+                       Complete complete, void* context)
+      : state_(state), reactor_(reactor), path_(std::move(path)),
+        complete_(complete), context_(context) {}
+
+  bool start() noexcept {
+    completion_ = {begin, nullptr, this};
+    if (!reactor_.reserve_completion(&completion_)) return false;
+    reactor_.complete(&completion_);
+    return true;
+  }
+
+  void cancel() noexcept {
+    cancelled_ = true;
+    if (http_) http_->cancel();
+    else if (rename_) rename_->cancel();
+    else if (session_) session_->cancel();
+    else if (wait_.pending()) reactor_.cancel(wait_);
+  }
+
+ private:
+  enum Phase { HEAD_HIDDEN, HEAD_VISIBLE, DELETE_HIDDEN } phase_ = HEAD_HIDDEN;
+  State& state_;
+  FuseReactor& reactor_;
+  std::string path_;
+  std::string destination_;
+  State::PendingDelete operation_;
+  OpenHandleIdentityLocks readers_;
+  size_t locked_ = 0;
+  std::string hidden_etag_;
+  Complete complete_;
+  void* context_;
+  std::unique_ptr<AsyncS3Request> http_;
+  std::unique_ptr<AsyncNativeRename> rename_;
+  std::unique_ptr<AsyncExpressSession> session_;
+  FuseReactor::ReactorTask completion_;
+  AsyncIoRequest wait_;
+  uint64_t notification_ = 0;
+  std::exception_ptr local_error_;
+  bool owned_ = false;
+  bool cancelled_ = false;
+
+  void finish(std::exception_ptr error = {}) noexcept {
+    if (owned_) {
+      std::lock_guard guard(state_.open_files_mutex);
+      const auto pending = state_.pending_deletes.find(path_);
+      if (pending != state_.pending_deletes.end() &&
+          pending->second.key == operation_.key) {
+        if (error) pending->second.deleting = false;
+        else state_.pending_deletes.erase(pending);
+      }
+    }
+    if (error) {
+      fprintf(stderr, "error: pending S3 delete retained for recovery: path=%s\n",
+              path_.c_str());
+    }
+    readers_.identities.clear();
+    readers_.pins.clear();
+    const auto callback = complete_;
+    void* const value = context_;
+    callback(value, error);
+  }
+
+  void check_cancelled() const {
+    if (cancelled_) {
+      throw std::system_error(ECANCELED, std::generic_category(), "pending S3 delete cancelled");
+    }
+  }
+
+  static void begin(void* value) noexcept {
+    auto* self = static_cast<AsyncPendingDelete*>(value);
+    try {
+      self->check_cancelled();
+      {
+        std::lock_guard guard(self->state_.open_files_mutex);
+        const auto pending = self->state_.pending_deletes.find(self->path_);
+        if (pending != self->state_.pending_deletes.end() && !pending->second.deleting &&
+            (pending->second.rollback || !self->state_.open_files.contains(self->path_))) {
+          self->operation_ = pending->second;
+          pending->second.deleting = true;
+          self->owned_ = true;
+          if (self->operation_.rollback) {
+            const auto opened = self->state_.open_files.find(self->path_);
+            if (opened != self->state_.open_files.end()) {
+              if (opened->second.writer) {
+                throw std::logic_error("pending restore has an open writer");
+              }
+              for (OpenHandle* handle : opened->second.handles) {
+                if (handle == nullptr || handle->writable) {
+                  throw std::logic_error("invalid pending restore reader");
+                }
+                try {
+                  self->readers_.pins.push_back(std::make_unique<OpenRequestGuard>(*handle));
+                } catch (const std::system_error& error) {
+                  if (error.code().value() == EBADF) continue;
+                  throw;
+                }
+                self->readers_.handles.push_back(handle);
+              }
+            }
+          }
+        }
+      }
+      if (!self->owned_) {
+        self->finish();
+        return;
+      }
+      if (!self->operation_.rollback) {
+        self->phase_ = DELETE_HIDDEN;
+        self->send();
+        return;
+      }
+      self->destination_ = object_request_path(self->state_, self->operation_.restore_key);
+      self->readers_.identities.reserve(self->readers_.handles.size());
+      for (OpenHandle* handle : self->readers_.handles) {
+        self->readers_.identities.emplace_back(handle->identity_mutex, std::defer_lock);
+      }
+      self->lock_readers();
+    } catch (...) {
+      self->finish(std::current_exception());
+    }
+  }
+
+  static void unlocked(void* value, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncPendingDelete*>(value);
+    self->readers_.handles[self->locked_]->identity_mutex.end_async_wait();
+    if (result < 0) {
+      try {
+        throw std::system_error(-int(result), std::generic_category(), "pending restore identity wait");
+      } catch (...) { self->finish(std::current_exception()); }
+    } else self->lock_readers();
+  }
+
+  void lock_readers() noexcept {
+    try {
+      check_cancelled();
+      for (; locked_ < readers_.handles.size(); ++locked_) {
+        auto& lock = readers_.identities[locked_];
+        auto& mutex = readers_.handles[locked_]->identity_mutex;
+        if (lock.try_lock()) continue;
+        const int fd = mutex.begin_async_wait();
+        if (lock.try_lock()) {
+          mutex.end_async_wait();
+          continue;
+        }
+        wait_.kind       = AsyncIoRequest::READ;
+        wait_.fd         = fd;
+        wait_.data       = &notification_;
+        wait_.length     = sizeof(notification_);
+        wait_.timeout_ms = 0;
+        wait_.complete   = unlocked;
+        wait_.context    = this;
+        if (reactor_.submit(wait_)) return;
+        mutex.end_async_wait();
+        throw std::system_error(errno, std::generic_category(), "submit pending restore wait");
+      }
+      send();
+    } catch (...) { finish(std::current_exception()); }
+  }
+
+  static void authenticated(void* value, std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncPendingDelete*>(value);
+    self->session_.reset();
+    if (error) self->finish(error);
+    else self->send();
+  }
+
+  void send() noexcept {
+    try {
+      check_cancelled();
+      if (!AsyncExpressSession::ready(state_)) {
+        session_ = std::make_unique<AsyncExpressSession>(
+            state_, reactor_, authenticated, this);
+        if (session_->start()) return;
+        throw std::system_error(errno, std::generic_category(), "submit restore authentication");
+      }
+      AsyncHttpRequest args;
+      const std::string_view method = phase_ == DELETE_HIDDEN ? "DELETE" : "HEAD";
+      const std::string_view path = phase_ == HEAD_VISIBLE ? destination_ : path_;
+      args.method.assign(method.data(), method.size());
+      args.path.assign(path.data(), path.size());
+      if (phase_ == DELETE_HIDDEN && !hidden_etag_.empty()) {
+        args.headers.push_back({"if-match", hidden_etag_});
+      }
+      append_authorization(args.headers, state_, method, path, kEmptyPayloadSha256);
+      args.capture_headers = true;
+      http_ = std::make_unique<AsyncS3Request>(
+          state_, reactor_, std::move(args), received, this);
+      if (!http_->start()) {
+        throw std::system_error(errno, std::generic_category(), "submit pending delete request");
+      }
+    } catch (...) { finish(std::current_exception()); }
+  }
+
+  static void received(void* value, Response&& response,
+                         std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncPendingDelete*>(value);
+    try {
+      if (error) std::rethrow_exception(error);
+      self->check_cancelled();
+      self->http_.reset();
+      if (self->phase_ == DELETE_HIDDEN) {
+        if (response.status != 200 && response.status != 204 && response.status != 404) {
+          throw_s3_response(response, "pending DeleteObject");
+        }
+        self->cleanup();
+      } else if (self->phase_ == HEAD_HIDDEN) {
+        if (response.status == 404) { self->cleanup(); return; }
+        self->hidden_etag_ = decode_head_response(response).etag;
+        self->phase_ = HEAD_VISIBLE;
+        self->send();
+      } else if (response.status == 404) {
+        for (OpenHandle* handle : self->readers_.handles) {
+          handle->object_path.reserve(self->destination_.size());
+          handle->key.reserve(self->operation_.restore_key.size());
+        }
+        self->rename_ = std::make_unique<AsyncNativeRename>(
+            self->state_, self->reactor_, self->operation_.key, self->hidden_etag_,
+            self->destination_, true, restored, self);
+        if (!self->rename_->start()) {
+          throw std::system_error(errno, std::generic_category(), "submit pending rename restore");
+        }
+      } else {
+        const auto metadata = decode_head_response(response);
+        if (self->operation_.replacement_etag.empty() ||
+            metadata.etag != self->operation_.replacement_etag) {
+          throw std::system_error(EBUSY, std::generic_category(), "ambiguous pending rename target");
+        }
+        self->phase_ = DELETE_HIDDEN;
+        self->send();
+      }
+    } catch (...) { self->finish(std::current_exception()); }
+  }
+
+  static void restored(void* value, bool accepted, std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncPendingDelete*>(value);
+    try {
+      if (error) std::rethrow_exception(error);
+      if (!accepted) {
+        throw std::system_error(EOPNOTSUPP, std::generic_category(), "pending native rename restore");
+      }
+      {
+        std::lock_guard guard(self->state_.open_files_mutex);
+        const auto opened = self->state_.open_files.find(self->path_);
+        if (!reader_snapshot_matches(
+                opened == self->state_.open_files.end() ? std::span<OpenHandle* const>{}
+                                                       : opened->second.handles,
+                self->readers_.handles)) {
+          throw std::logic_error("pending restore reader registry changed");
+        }
+        if (opened != self->state_.open_files.end()) {
+          for (OpenHandle* handle : opened->second.handles) {
+            handle->object_path.assign(self->destination_);
+            handle->key.assign(self->operation_.restore_key);
+          }
+          auto node = self->state_.open_files.extract(opened);
+          node.key().assign(self->destination_);
+          self->state_.open_files.insert(std::move(node));
+        }
+      }
+      self->cleanup();
+    } catch (...) { self->finish(std::current_exception()); }
+  }
+
+  static void cleaned(void* value) noexcept {
+    auto* self = static_cast<AsyncPendingDelete*>(value);
+    self->finish(self->local_error_);
+  }
+
+  void cleanup() noexcept {
+    completion_ = {cleaned, nullptr, this};
+    if (!reactor_.reserve_completion(&completion_)) {
+      try { throw std::system_error(errno, std::generic_category(), "reserve pending delete cleanup"); }
+      catch (...) { finish(std::current_exception()); }
+      return;
+    }
+    try {
+      state_.uploads->submit(this, [this] {
+        try {
+          IoExecutorScope local_only(nullptr, 0);
+          state_.local_cache->finish_pending_delete(operation_.key);
+        } catch (...) { local_error_ = std::current_exception(); }
+        reactor_.complete(&completion_);
+      });
+    } catch (...) {
+      local_error_ = std::current_exception();
+      reactor_.complete(&completion_);
+    }
+  }
+};
+
 void finish_pending_delete(State& state, std::string_view path) noexcept {
   State::PendingDelete operation;
   {
@@ -9096,42 +13902,419 @@ void cache_recovery_loop(std::stop_token stop, State* state) noexcept {
   }
 }
 
-struct AsyncCachedWriteTask {
-  AsyncCachedWriteTask(State& state_value, OpenHandle& handle_value,
-                       fuse_req_t request_value, fuse_ino_t inode_value,
-                       const fuse_bufvec& input_value, off_t offset_value)
-      : state(&state_value), handle(&handle_value), request(request_value),
-        inode(inode_value), input(input_value), offset(offset_value),
-        active(handle_value) {}
+struct AsyncWriteRequest {
+  AsyncWriteRequest(State& s, OpenHandle& h, FuseReactor& r,
+                     fuse_req_t req, fuse_ino_t ino,
+                     const fuse_bufvec& source, off_t off)
+      : state(s), handle(h), reactor(r), request(req), inode(ino),
+        input(source), offset(off), active(h) {
+    if (source.count > 1) {
+      const size_t bytes = offsetof(fuse_bufvec, buf) + source.count * sizeof(fuse_buf);
+      descriptor = std::make_unique<std::byte[]>(bytes);
+      memcpy(descriptor.get(), &source, bytes);
+    }
+    length = fuse_buf_size(&source);
+    remaining = length;
+  }
+  virtual ~AsyncWriteRequest() = default;
+  virtual void process() noexcept = 0;
 
-  State* state;
-  OpenHandle* handle;
+  State& state;
+  OpenHandle& handle;
+  FuseReactor& reactor;
   fuse_req_t request;
   fuse_ino_t inode;
   fuse_bufvec input;
   off_t offset;
   OpenRequestGuard active;
-  FuseReactor::ReactorTask reactor_task;
-};
+  std::unique_ptr<std::byte[]> descriptor;
+  void* input_owner = nullptr;
+  size_t length = 0;
+  size_t remaining = 0;
+  uint64_t end = 0;
+  bool owns_write = false;
+  bool handle_wait = false;
+  AsyncIoRequest io;
+  uint64_t notification = 0;
 
-void run_async_cached_write(void* context) noexcept {
-  std::unique_ptr<AsyncCachedWriteTask> task(
-      static_cast<AsyncCachedWriteTask*>(context));
-  task->handle->writer->write(
-      *task->state, *task->handle, task->request,
-      task->inode, &task->input, task->offset);
-  if (task->input.idx == task->input.count) {
-    FuseReactor* reactor = current_fuse_reactor();
-    if (reactor != nullptr) {
-      reactor->mark_input_consumed();
+  fuse_bufvec& buffers() noexcept {
+    return descriptor ? *reinterpret_cast<fuse_bufvec*>(descriptor.get()) : input;
+  }
+
+  void finish(int error) noexcept {
+    std::unique_ptr<AsyncWriteRequest> self(this);
+    if (owns_write) {
+      std::lock_guard guard(handle.mutex);
+      if (error == 0 && handle.write_state == WRITE_FAILED) error = handle.write_error;
+      if (error == 0) {
+        handle.stream_offset = end;
+        handle.size = end;
+      } else {
+        fail_write(handle, error);
+      }
+      handle.write_in_progress = false;
+      notify_handle(handle);
+    }
+    if (error != 0) {
+      fuse_reply_err(request, error);
+    } else {
+      if (state.config.stats_interval_seconds != 0) {
+        state.fuse_writes.fetch_add(1, std::memory_order_relaxed);
+        state.fuse_write_bytes.fetch_add(length, std::memory_order_relaxed);
+      }
+      fuse_reply_write(request, length);
+    }
+    if (input_owner != nullptr) {
+      reactor.release_input(input_owner, remaining == 0);
+      input_owner = nullptr;
     }
   }
+
+  static void available(void* context, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncWriteRequest*>(context);
+    self->handle.reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    self->handle_wait = false;
+    if (result < 0) self->finish(-int(result));
+    else self->start();
+  }
+
+  void start() noexcept {
+    try {
+      if (offset < 0 || handle.inode != inode || !handle.writable) {
+        throw std::system_error(offset < 0 ? EINVAL : EBADF,
+                                std::generic_category(), "asynchronous write");
+      }
+      if (length == 0) { finish(0); return; }
+      if (uint64_t(offset) > UINT64_MAX - length) {
+        throw std::system_error(EFBIG, std::generic_category(), "write offset overflow");
+      }
+      end = uint64_t(offset) + length;
+      if (end > std::min(state.config.part_size * kMaximumMultipartParts,
+                         kMaximumObjectSize)) {
+        throw std::system_error(EFBIG, std::generic_category(), "multipart size limit");
+      }
+      {
+        std::lock_guard guard(handle.mutex);
+        if (handle.unlinked.load()) {
+          throw std::system_error(ESTALE, std::generic_category(), "write unlinked file");
+        }
+        if (handle.write_state != WRITE_OPEN) {
+          throw std::system_error(handle.write_state == WRITE_FAILED
+              ? handle.write_error : EIO, std::generic_category(), "write after seal");
+        }
+        if (handle.write_in_progress) {
+          handle.reactor_waiters.fetch_add(1, std::memory_order_acq_rel);
+          handle_wait = true;
+        } else {
+          if (uint64_t(offset) != handle.stream_offset) {
+            throw std::system_error(ESPIPE, std::generic_category(), "non-sequential write");
+          }
+          handle.write_in_progress = true;
+          owns_write = true;
+        }
+      }
+      if (handle_wait) {
+        io = {};
+        io.kind       = AsyncIoRequest::READ;
+        io.fd         = handle.state_event.get();
+        io.data       = &notification;
+        io.length     = sizeof(notification);
+        io.timeout_ms = 0; // Serialize local writes, not a network request.
+        io.complete   = available;
+        io.context    = this;
+        if (reactor.submit(io)) return;
+        handle.reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+        handle_wait = false;
+        throw std::system_error(errno, std::generic_category(), "submit write admission");
+      }
+      process();
+    } catch (...) { finish(AsyncPartUpload::error_code(std::current_exception())); }
+  }
+
+  void consume(size_t size) {
+    fuse_bufvec& input = buffers();
+    input.off += size;
+    remaining -= size;
+    if (input.off == input.buf[input.idx].size) {
+      ++input.idx;
+      input.off = 0;
+    }
+  }
+};
+
+struct AsyncUncachedWrite final : AsyncWriteRequest {
+  using AsyncWriteRequest::AsyncWriteRequest;
+
+  enum Stage { BUDGET, SPLICE, COPY_READ, PIPE_WRITE } stage = SPLICE;
+  std::unique_ptr<std::byte[]> copy;
+  bool budget_wait = false;
+  bool copying_fd = false;
+  bool memory_write = false;
+  size_t copied_bytes = 0;
+
+  void submit_io(AsyncIoRequest::Kind kind, int fd, void* data, size_t size,
+                 int output = -1, off_t position = -1, unsigned flags = 0) {
+    io = {};
+    io.kind         = kind;
+    io.fd           = fd;
+    io.data         = data;
+    io.length       = size;
+    io.output_fd    = output;
+    io.input_offset = position;
+    // Budget admission and local FUSE-pipe transfers have no S3 deadline.
+    // Shutdown still cancels their CQEs before retiring the input/handle.
+    io.timeout_ms   = 0;
+    io.flags        = flags;
+    io.complete     = received;
+    io.context      = this;
+    if (!reactor.submit(io)) {
+      throw std::system_error(errno, std::generic_category(), "submit retained write");
+    }
+  }
+
+  bool reserve() {
+    if (handle.current_reservation) return true;
+    if (reserve_part_budget(state, false)) {
+      handle.current_reservation = true;
+      return true;
+    }
+    {
+      std::lock_guard guard(state.budget_mutex);
+      if (!state.budget_event) {
+        state.budget_event.reset(::eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE));
+        if (!state.budget_event) {
+          throw std::system_error(errno, std::generic_category(), "write budget event");
+        }
+      }
+      state.budget_reactor_waiters.fetch_add(1, std::memory_order_acq_rel);
+      budget_wait = true;
+    }
+    if (reserve_part_budget(state, false)) {
+      state.budget_reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+      budget_wait = false;
+      handle.current_reservation = true;
+      return true;
+    }
+    stage = BUDGET;
+    try {
+      submit_io(AsyncIoRequest::READ, state.budget_event.get(), &notification,
+                 sizeof(notification));
+    } catch (...) {
+      state.budget_reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+      budget_wait = false;
+      throw;
+    }
+    return false;
+  }
+
+  void process() noexcept override {
+    try {
+      if (remaining == 0) {
+        if (copied_bytes != 0) record_memory_fallback(state, copied_bytes);
+        finish(0);
+        return;
+      }
+      {
+        std::lock_guard guard(handle.mutex);
+        if (handle.write_state == WRITE_FAILED || handle.unlinked.load()) {
+          throw std::system_error(handle.unlinked.load() ? ESTALE : handle.write_error,
+                                  std::generic_category(), "retained write failed");
+        }
+      }
+      if (!reserve()) return;
+      if (!handle.current_part) handle.current_part = std::make_unique<RetainedPart>();
+      fuse_bufvec& input = buffers();
+      while (input.idx < input.count && input.off == input.buf[input.idx].size) {
+        ++input.idx;
+        input.off = 0;
+      }
+      if (input.idx == input.count || input.off > input.buf[input.idx].size) {
+        throw std::runtime_error("short asynchronous FUSE write buffer");
+      }
+      const fuse_buf& buffer = input.buf[input.idx];
+      const bool fd = (buffer.flags & FUSE_BUF_IS_FD) != 0;
+      memory_write = !fd || copying_fd;
+      RetainedPart& part = *handle.current_part;
+      PipeSegment& segment = writable_segment(
+          part, memory_write ? PIPE_INPUT_MEMORY : PIPE_INPUT_FD);
+      const size_t count = std::min({remaining, buffer.size - input.off,
+          size_t(state.config.part_size - part.bytes),
+          segment.pipe.capacity() - segment.bytes});
+      if (count == 0) throw std::logic_error("empty retained write transfer");
+      if (!fd) {
+        if (buffer.mem == nullptr) {
+          throw std::system_error(EFAULT, std::generic_category(), "null FUSE write memory");
+        }
+        stage = PIPE_WRITE;
+        submit_io(AsyncIoRequest::WRITE, segment.pipe.write_fd(),
+                   static_cast<std::byte*>(buffer.mem) + input.off, count);
+      } else {
+        const bool seek = (buffer.flags & FUSE_BUF_FD_SEEK) != 0;
+        if (seek && (buffer.pos < 0 ||
+            uint64_t(buffer.pos) > uint64_t(INT64_MAX) - input.off)) {
+          throw std::system_error(EOVERFLOW, std::generic_category(), "FUSE buffer offset");
+        }
+        const off_t position = seek ? buffer.pos + off_t(input.off) : -1;
+        if (copying_fd) {
+          if (!copy) copy = std::make_unique<std::byte[]>(64U * 1024U);
+          stage = COPY_READ;
+          submit_io(seek ? AsyncIoRequest::PREAD : AsyncIoRequest::READ,
+                     buffer.fd, copy.get(), std::min<size_t>(count, 64U * 1024U),
+                     -1, position);
+        } else {
+          stage = SPLICE;
+          submit_io(AsyncIoRequest::SPLICE, buffer.fd, nullptr, count,
+                     segment.pipe.write_fd(), position,
+                     SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        }
+      }
+    } catch (...) { finish(AsyncPartUpload::error_code(std::current_exception())); }
+  }
+
+  static void received(void* context, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncUncachedWrite*>(context);
+    try {
+      if (self->budget_wait) {
+        self->state.budget_reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+        self->budget_wait = false;
+      }
+      if (self->stage == BUDGET) {
+        if (result < 0) self->finish(-int(result));
+        else self->process();
+        return;
+      }
+      if (self->stage == SPLICE && result == -EAGAIN &&
+          self->handle.current_part->segments.back().bytes != 0) {
+        self->handle.current_part->segments.back().pipe.close_write_end();
+        self->process();
+        return;
+      }
+      if (self->stage == SPLICE && result < 0 &&
+          (result == -EINVAL || result == -EPERM || result == -ENOSYS ||
+           result == -EOPNOTSUPP || result == -EXDEV)) {
+        self->copying_fd = true;
+        self->process();
+        return;
+      }
+      if (result <= 0) {
+        throw std::system_error(result < 0 ? -int(result) : EIO,
+                                std::generic_category(), "retained FUSE write");
+      }
+      const size_t count = size_t(result);
+      if (self->stage == COPY_READ) {
+        self->stage = PIPE_WRITE;
+        self->io = {};
+        self->io.kind = AsyncIoRequest::WRITE;
+        self->io.fd = self->handle.current_part->segments.back().pipe.write_fd();
+        self->io.data = self->copy.get();
+        self->io.length = count;
+        self->io.exact = true;
+        self->io.timeout_ms = 0;
+        self->io.complete = received;
+        self->io.context = self;
+        if (!self->reactor.submit(self->io)) {
+          throw std::system_error(errno, std::generic_category(), "copy retained FUSE write");
+        }
+        return;
+      }
+      if (self->io.exact && count != self->io.length) {
+        throw std::system_error(EIO, std::generic_category(), "short retained pipe write");
+      }
+      auto& part = *self->handle.current_part;
+      part.segments.back().bytes += count;
+      part.bytes += count;
+      if (self->memory_write) self->copied_bytes += count;
+      self->consume(count);
+      {
+        std::lock_guard guard(self->handle.mutex);
+        submit_current_part(self->state, self->handle, &self->active);
+      }
+      self->process();
+    } catch (...) { self->finish(AsyncPartUpload::error_code(std::current_exception())); }
+  }
+};
+
+struct AsyncCachedWrite final : AsyncWriteRequest {
+  using AsyncWriteRequest::AsyncWriteRequest;
+  FuseReactor::ReactorTask completion;
+  std::exception_ptr worker_error;
+
+  static void ready(void* context) noexcept {
+    auto* self = static_cast<AsyncCachedWrite*>(context);
+    if (self->worker_error) {
+      self->handle.cache_entry->isolate_write();
+      self->finish(AsyncPartUpload::error_code(self->worker_error));
+      return;
+    }
+    try {
+      {
+        std::lock_guard guard(self->handle.mutex);
+        remember_partial_write_pages(self->handle, uint64_t(self->offset),
+            self->end, self->handle.cache_entry->page_size());
+        self->handle.stream_offset = self->end;
+        self->handle.size = self->end;
+        submit_ready_cached_parts(self->state, self->handle, false, &self->active);
+      }
+      self->remaining = 0;
+      self->finish(0);
+    } catch (...) { self->finish(AsyncPartUpload::error_code(std::current_exception())); }
+  }
+
+  void process() noexcept override {
+    completion = {ready, ready, this};
+    if (!reactor.reserve_completion(&completion)) {
+      finish(ECANCELED);
+      return;
+    }
+    try {
+      state.uploads->submit(&handle, [this] {
+        try {
+          IoExecutorScope local_only(nullptr, 0);
+          handle.cache_entry->prepare_write(uint64_t(offset), length);
+          write_fuse_buffers_to_cache(state, buffers(), handle.cache_write_pipe,
+              handle.cache_entry->data_fd(), uint64_t(offset), length);
+          handle.cache_entry->publish_dirty(uint64_t(offset), length, end);
+        } catch (...) { worker_error = std::current_exception(); }
+        reactor.complete(&completion);
+      });
+    } catch (...) {
+      worker_error = std::current_exception();
+      reactor.complete(&completion);
+    }
+  }
+};
+
+template<class WriteTask>
+void start_async_write(State& state, OpenHandle& handle, FuseReactor& reactor,
+                        fuse_req_t request, fuse_ino_t inode,
+                        fuse_bufvec* input, off_t offset) {
+  if (input == nullptr || input->count == 0) {
+    throw std::system_error(EINVAL, std::generic_category(), "invalid FUSE write buffers");
+  }
+  auto task = std::make_unique<WriteTask>(state, handle, reactor,
+                                         request, inode, *input, offset);
+  task->input_owner = reactor.retain_input();
+  if (task->input_owner == nullptr) {
+    throw std::system_error(errno == 0 ? EIO : errno,
+                            std::generic_category(), "retain FUSE write input");
+  }
+  task.release()->start();
 }
 
-void cancel_async_cached_write(void* context) noexcept {
-  std::unique_ptr<AsyncCachedWriteTask> task(
-      static_cast<AsyncCachedWriteTask*>(context));
-  fuse_reply_err(task->request, EIO);
+void UncachedFileWriter::write_async(State& state, OpenHandle& handle,
+                                     fuse_req_t request, fuse_ino_t inode,
+                                     fuse_bufvec* input, off_t offset,
+                                     FuseReactor& reactor) {
+  start_async_write<AsyncUncachedWrite>(
+      state, handle, reactor, request, inode, input, offset);
+}
+
+void CachedFileWriter::write_async(State& state, OpenHandle& handle,
+                                   fuse_req_t request, fuse_ino_t inode,
+                                   fuse_bufvec* input, off_t offset,
+                                   FuseReactor& reactor) {
+  start_async_write<AsyncCachedWrite>(
+      state, handle, reactor, request, inode, input, offset);
 }
 
 void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
@@ -9145,25 +14328,9 @@ void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
                               "missing file writer");
     }
     FuseReactor* reactor = current_fuse_reactor();
-    if (reactor != nullptr && state.local_cache) {
-      if (input == nullptr || input->count != 1 || input->idx != 0 ||
-          input->off != 0 ||
-          (input->buf[0].flags & FUSE_BUF_IS_FD) == 0) {
-        throw std::system_error(EIO, std::generic_category(),
-                                "unexpected asynchronous FUSE write buffer");
-      }
-      auto task = std::make_unique<AsyncCachedWriteTask>(
-          state, handle, request, inode, *input, offset);
-      task->reactor_task = {
-          run_async_cached_write, cancel_async_cached_write, task.get()};
-      AsyncCachedWriteTask* submitted = task.release();
-      if (!reactor->submit_input_task(&submitted->reactor_task)) {
-        task.reset(submitted);
-        throw std::system_error(EAGAIN, std::generic_category(),
-                                "submit asynchronous cached write");
-      }
-      input->idx = input->count;
-      input->off = 0;
+    if (reactor != nullptr && !state.config.tls) {
+      handle.writer->write_async(state, handle, request, inode,
+                                  input, offset, *reactor);
       return;
     }
     handle.writer->write(state, handle, request, inode, input, offset);
@@ -9172,12 +14339,535 @@ void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
   }
 }
 
+struct AsyncFlushRequest {
+  AsyncFlushRequest(State& s, OpenHandle& h, FuseReactor& r, fuse_req_t req)
+      : state(s), handle(h), reactor(r), request(req), active(h) {}
+
+  State& state;
+  OpenHandle& handle;
+  FuseReactor& reactor;
+  fuse_req_t request;
+  OpenRequestGuard active;
+  std::shared_ptr<RetainedPart> part;
+  std::vector<Pipe> replay;
+  ChecksumValue checksum;
+  ssostr<248> body;
+  ssostr<64> body_etag;
+  Response committed;
+  std::optional<ObjectMetadata> metadata;
+  std::unique_ptr<AsyncSignedS3Request> http;
+  FuseReactor::ReactorTask completion;
+  AsyncIoRequest wait;
+  UniqueFd timer;
+  uint64_t notification = 0;
+  std::exception_ptr worker_error;
+  bool owns_seal = false;
+  bool parts_prepared = false;
+  bool waiting = false;
+  bool reserved = false;
+  bool admitted = false;
+  bool prepared = false;
+  bool ambiguous = false;
+  bool recovering = false;
+  unsigned attempt = 0;
+
+  void finish(int error) noexcept {
+    std::unique_ptr<AsyncFlushRequest> self(this);
+    http.reset();
+    replay.clear();
+    part.reset();
+    if (reserved) release_part_budget(state);
+    if (admitted) state.uploads->finish_upload();
+    bool unregister = false;
+    {
+      std::lock_guard guard(handle.mutex);
+      if (owns_seal) {
+        if (handle.unlinked.load()) error = ESTALE;
+        if (error == 0 && handle.write_state == WRITE_FAILED) error = handle.write_error;
+        if (error == 0) {
+          handle.write_state = WRITE_SEALED;
+          unregister = handle.registered;
+          handle.registered = false;
+        } else {
+          fail_write(handle, error);
+        }
+        notify_handle(handle);
+      }
+    }
+    if (unregister) unregister_open_handle(state, handle.object_path, handle, false);
+    fuse_reply_err(request, error);
+  }
+
+  static void awakened(void* context, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncFlushRequest*>(context);
+    self->handle.reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    self->waiting = false;
+    if (result < 0) self->finish(-int(result));
+    else self->start();
+  }
+
+  void start() noexcept {
+    try {
+      {
+        std::lock_guard guard(handle.mutex);
+        if (handle.unlinked.load()) {
+          throw std::system_error(ESTALE, std::generic_category(), "flush unlinked file");
+        }
+        if (handle.write_state == WRITE_FAILED) {
+          throw std::system_error(handle.write_error, std::generic_category(), "flush failed write");
+        }
+        if (handle.write_state == WRITE_SEALED) { finish_after_unlock = true; }
+        else {
+          if (handle.write_state == WRITE_OPEN) {
+            handle.write_state = WRITE_SEALING;
+            owns_seal = true;
+          }
+          if (!owns_seal || handle.write_in_progress) {
+            handle.reactor_waiters.fetch_add(1, std::memory_order_acq_rel);
+            waiting = true;
+          } else {
+            if (!parts_prepared) {
+              if (handle.cache_entry) {
+                if (handle.stream_offset > state.config.part_size || handle.multipart_required) {
+                  submit_ready_cached_parts(state, handle, true, &active);
+                }
+              } else if (!handle.multipart_required) {
+                part.reset(handle.current_part.release());
+                if (part && !part->segments.empty()) part->segments.back().pipe.close_write_end();
+                reserved = handle.current_reservation;
+                handle.current_reservation = false;
+              } else if (handle.current_part && handle.current_part->bytes != 0) {
+                std::shared_ptr<RetainedPart> tail(handle.current_part.release());
+                if (!tail->segments.empty()) tail->segments.back().pipe.close_write_end();
+                handle.current_reservation = false;
+                try { submit_part(state, handle, std::move(tail), &active); }
+                catch (...) { release_part_budget(state); throw; }
+              } else if (handle.current_reservation) {
+                handle.current_reservation = false;
+                release_part_budget(state);
+              }
+              parts_prepared = true;
+            }
+            if (handle.pending_parts != 0) {
+              handle.reactor_waiters.fetch_add(1, std::memory_order_acq_rel);
+              waiting = true;
+            }
+          }
+        }
+      }
+      if (finish_after_unlock) { finish(0); return; }
+      if (waiting) {
+        wait = {};
+        wait.kind = AsyncIoRequest::READ;
+        wait.fd = handle.state_event.get();
+        wait.data = &notification;
+        wait.length = sizeof(notification);
+        wait.timeout_ms = 0; // Pending uploads each own their network deadline.
+        wait.complete = awakened;
+        wait.context = this;
+        if (reactor.submit(wait)) return;
+        handle.reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+        waiting = false;
+        throw std::system_error(errno, std::generic_category(), "wait for write seal");
+      }
+      // Admission covers the final PUT/Complete until local publication finishes.
+      completion = {prepared_ready, prepared_ready, this};
+      if (!reactor.reserve_completion(&completion)) {
+        finish(ECANCELED);
+        return;
+      }
+      try {
+        state.uploads->submit_upload(&handle, [this] {
+          admitted = true;
+          prepare();
+          reactor.complete(&completion);
+        }, true);
+      } catch (...) {
+        worker_error = std::current_exception();
+        reactor.complete(&completion);
+      }
+    } catch (...) { finish(AsyncPartUpload::error_code(std::current_exception())); }
+  }
+
+  bool finish_after_unlock = false;
+
+  void prepare() noexcept {
+    try {
+      IoExecutorScope local_only(nullptr, 0);
+      if (!prepared) {
+        if (handle.cache_entry) handle.cache_entry->begin_write();
+        if (handle.multipart_required) {
+          for (const auto& etag : handle.part_etags) {
+            if (etag.empty()) throw std::runtime_error("multipart commit has a missing ETag");
+          }
+          if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
+            if (handle.part_checksums.size() != handle.part_etags.size()) {
+              throw std::runtime_error("multipart commit has missing checksums");
+            }
+            for (const auto& value : handle.part_checksums) {
+              if (value.empty()) throw std::runtime_error("multipart part has no checksum");
+            }
+          }
+          body = complete_body(handle, state.config.checksum);
+          if (state.config.checksum == CHECKSUM_CRC64NVME ||
+              state.config.checksum == CHECKSUM_CRC64XZ) {
+            checksum = combined_multipart_checksum(handle, state.config.checksum);
+          }
+        } else if (checksum_has_digest(state.config.checksum)) {
+          checksum = handle.cache_entry
+              ? checksum_file_range(state.config.checksum,
+                    handle.cache_entry->data_fd(), 0, size_t(handle.stream_offset))
+              : retained_checksum(state.config.checksum, part.get());
+        }
+        prepared = true;
+      }
+      replay.clear();
+      if (part) {
+        replay.reserve(part->segments.size());
+        for (const auto& segment : part->segments) {
+          if (segment.bytes == 0) continue;
+          Pipe clone = Pipe::create(segment.pipe.capacity());
+          if (clone.capacity() < segment.bytes) {
+            throw std::system_error(ENOBUFS, std::generic_category(), "write replay capacity");
+          }
+          tee_exact(segment.pipe.read_fd(), clone.write_fd(), segment.bytes, 0);
+          clone.close_write_end();
+          replay.push_back(std::move(clone));
+        }
+      }
+    } catch (...) { worker_error = std::current_exception(); }
+  }
+
+  static void prepared_ready(void* context) noexcept {
+    auto* self = static_cast<AsyncFlushRequest*>(context);
+    if (self->worker_error) {
+      self->finish(AsyncPartUpload::error_code(self->worker_error));
+      return;
+    }
+    self->send();
+  }
+
+  void send() noexcept {
+    try {
+      AsyncHttpRequest args;
+      args.upload = true;
+      if (handle.multipart_required) {
+        args.method = "POST";
+        args.path = query_path(handle.object_path,
+            "uploadId=" + uri_encode(handle.upload_id, false));
+        args.headers.push_back({"content-type", "application/xml"});
+        const auto* bytes = reinterpret_cast<const std::byte*>(body.data());
+        args.body.assign(bytes, bytes + body.size());
+        if (state.config.checksum == CHECKSUM_CRC64NVME) {
+          args.headers.push_back({checksum_header_name(state.config.checksum), checksum.base64});
+          args.headers.push_back({"x-amz-mp-object-size", std::to_string(handle.stream_offset)});
+        }
+      } else {
+        args.method = "PUT";
+        args.path = handle.object_path;
+        args.headers.push_back({"content-type", "application/octet-stream"});
+        if (!handle.write_id.empty()) {
+          args.headers.push_back({"x-amz-meta-ngs3fs-write-id", handle.write_id});
+        }
+        append_upload_checksum(args.headers, state.config.checksum, checksum);
+        if (handle.cache_entry) {
+          args.source_fd = handle.cache_entry->data_fd();
+          args.source_length = size_t(handle.stream_offset);
+        } else if (part) {
+          size_t i = 0;
+          args.source_segments.reserve(replay.size());
+          for (const auto& segment : part->segments) {
+            if (segment.bytes == 0) continue;
+            args.source_segments.push_back({replay[i++].read_fd(), 0, segment.bytes, false});
+          }
+        }
+      }
+      if (!handle.etag.empty()) args.headers.push_back({"if-match", handle.etag});
+      else if (handle.create_exclusive) args.headers.push_back({"if-none-match", "*"});
+      http = std::make_unique<AsyncSignedS3Request>(
+          state, reactor, std::move(args), received, this, 1,
+          !handle.multipart_required && handle.stream_offset == 0
+              ? kEmptyPayloadSha256 : kUnsignedPayload);
+      if (!http->start()) throw std::system_error(errno, std::generic_category(), "submit write commit");
+    } catch (...) { received(this, Response{}, std::current_exception()); }
+  }
+
+  static void retry_ready(void* context, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncFlushRequest*>(context);
+    if (result < 0) { self->finish(-int(result)); return; }
+    self->completion = {prepared_ready, prepared_ready, self};
+    if (!self->reactor.reserve_completion(&self->completion)) {
+      self->finish(ECANCELED);
+      return;
+    }
+    try {
+      self->state.uploads->submit(&self->handle, [self] {
+        self->prepare();
+        self->reactor.complete(&self->completion);
+      });
+    } catch (...) {
+      self->worker_error = std::current_exception();
+      self->reactor.complete(&self->completion);
+    }
+  }
+
+  void retry(const Response& response) {
+    const uint64_t ms = async_retry_milliseconds(response, attempt++);
+    timer.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC));
+    if (!timer) throw std::system_error(errno, std::generic_category(), "write retry timer");
+    itimerspec spec{};
+    spec.it_value.tv_sec = time_t(ms / 1000);
+    spec.it_value.tv_nsec = long((ms % 1000) * 1'000'000);
+    if (::timerfd_settime(timer.get(), 0, &spec, nullptr) != 0) {
+      throw std::system_error(errno, std::generic_category(), "arm write retry");
+    }
+    wait = {};
+    wait.kind = AsyncIoRequest::READ;
+    wait.fd = timer.get();
+    wait.data = &notification;
+    wait.length = sizeof(notification);
+    wait.complete = retry_ready;
+    wait.context = this;
+    if (!reactor.submit(wait)) throw std::system_error(errno, std::generic_category(), "submit write retry");
+  }
+
+  static void received(void* context, Response&& response, std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncFlushRequest*>(context);
+    self->http.reset();
+    try {
+      if (!error && self->state.config.directory_bucket &&
+          (response.status == 401 || response.status == 403) && self->attempt < 3) {
+        invalidate_express_session(self->state);
+        self->retry(response);
+        return;
+      }
+      if (AsyncPartUpload::error_code(error) == ECANCELED) {
+        self->finish(ECANCELED);
+        return;
+      }
+      if (error || retryable_response(response)) {
+        self->ambiguous = true;
+        if (self->attempt < 3) { self->retry(response); return; }
+        self->head(true);
+        return;
+      }
+      if (self->ambiguous) {
+        S3ErrorInfo embedded;
+        if (response.status < 200 || response.status >= 300 ||
+            (!response.body.empty() && parse_s3_error(response_xml(response), embedded))) {
+          self->head(true);
+          return;
+        }
+      }
+      if (response.status == 412 && self->handle.create_exclusive) {
+        throw std::system_error(EEXIST, std::generic_category(), "write destination exists");
+      }
+      if (response.status == 409 && self->handle.multipart_required) {
+        throw std::system_error(ESTALE, std::generic_category(), "multipart commit conflict");
+      }
+      require_s3_success(response, self->handle.multipart_required
+          ? "CompleteMultipartUpload" : "PutObject");
+      if (self->handle.multipart_required) {
+        S3Xml xml(response_xml(response), "CompleteMultipartUpload");
+        const auto& root = xml.result_root("CompleteMultipartUploadResult");
+        self->body_etag = xml.optional_text(root, "ETag");
+        if (self->state.config.checksum == CHECKSUM_CRC64NVME) {
+          if (xml.required_text(root, checksum_xml_name(self->state.config.checksum)) !=
+              sso_view(self->checksum.base64)) {
+            throw std::runtime_error("multipart commit checksum mismatch");
+          }
+        } else if (self->state.config.checksum == CHECKSUM_CRC64XZ) {
+          verify_upload_checksum(response, self->state.config.checksum,
+                                 self->checksum, "CompleteMultipartUpload");
+        }
+      } else {
+        verify_upload_checksum(response, self->state.config.checksum,
+                               self->checksum, "PutObject");
+      }
+      self->committed = std::move(response);
+      if (self->committed.headers.find("last-modified") == self->committed.headers.end()) {
+        self->head(false);
+      } else {
+        self->commit_local();
+      }
+    } catch (...) { self->finish(AsyncPartUpload::error_code(std::current_exception())); }
+  }
+
+  void head(bool recover) noexcept {
+    recovering = recover;
+    try {
+      AsyncHttpRequest args;
+      args.method = "HEAD";
+      args.path = handle.object_path;
+      http = std::make_unique<AsyncSignedS3Request>(state, reactor, std::move(args), headed, this);
+      if (!http->start()) throw std::system_error(errno, std::generic_category(), "submit write metadata");
+    } catch (...) { headed(this, Response{}, std::current_exception()); }
+  }
+
+  static void headed(void* context, Response&& response, std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncFlushRequest*>(context);
+    self->http.reset();
+    try {
+      if (error) std::rethrow_exception(error);
+      self->metadata = decode_head_response(response);
+      const auto& metadata = *self->metadata;
+      if (metadata.size != self->handle.stream_offset ||
+          (self->recovering &&
+           ((!self->handle.write_id.empty() && metadata.write_id != self->handle.write_id) ||
+            (self->handle.write_id.empty() && !self->handle.etag.empty() &&
+             metadata.etag == self->handle.etag)))) {
+        throw std::system_error(EIO, std::generic_category(), "write commit outcome unknown");
+      }
+      if (self->recovering) {
+        self->committed = std::move(response);
+        fprintf(stderr, "warning: recovered ambiguous S3 write commit: %s\n",
+                self->handle.object_path.c_str());
+      }
+      self->commit_local();
+    } catch (...) {
+      if (self->recovering) {
+        fprintf(stderr, "error: S3 write commit outcome unknown: %s\n",
+                self->handle.object_path.c_str());
+      }
+      self->finish(AsyncPartUpload::error_code(std::current_exception()));
+    }
+  }
+
+  static void committed_local(void* context) noexcept {
+    auto* self = static_cast<AsyncFlushRequest*>(context);
+    if (!self->worker_error) {
+      std::lock_guard guard(self->handle.mutex);
+      self->handle.upload_id.clear();
+      self->handle.part_etags.clear();
+      self->handle.part_checksums.clear();
+      self->handle.part_checksum_values.clear();
+      self->handle.part_sizes.clear();
+    }
+    self->finish(AsyncPartUpload::error_code(self->worker_error));
+  }
+
+  void commit_local() noexcept {
+    completion = {committed_local, committed_local, this};
+    if (!reactor.reserve_completion(&completion)) { finish(ECANCELED); return; }
+    try {
+      state.uploads->submit(&handle, [this] {
+        try {
+          IoExecutorScope local_only(nullptr, 0);
+          if (handle.cache_entry) {
+            handle.page_cache_store_failed |= !store_cached_partial_pages(state, handle);
+          } else if (part) {
+            handle.page_cache_store_failed |= !store_page_cache(state, handle, *part, 0);
+          }
+          publish_written_metadata(handle, committed, metadata ? &*metadata : nullptr,
+                                    sso_view(body_etag));
+          if (handle.cache_entry) commit_cached_write(handle);
+        } catch (...) { worker_error = std::current_exception(); }
+        reactor.complete(&completion);
+      });
+    } catch (...) {
+      worker_error = std::current_exception();
+      reactor.complete(&completion);
+    }
+  }
+};
+
+struct AsyncFsyncRequest {
+  AsyncFsyncRequest(State& s, OpenHandle& h, FuseReactor& r, fuse_req_t req)
+      : state(s), handle(h), reactor(r), request(req), active(h) {}
+  State& state;
+  OpenHandle& handle;
+  FuseReactor& reactor;
+  fuse_req_t request;
+  OpenRequestGuard active;
+  AsyncIoRequest wait;
+  FuseReactor::ReactorTask completion;
+  uint64_t notification = 0;
+  std::exception_ptr error;
+
+  void finish(int value) noexcept {
+    std::unique_ptr<AsyncFsyncRequest> self(this);
+    fuse_reply_err(request, value);
+  }
+
+  static void awakened(void* context, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncFsyncRequest*>(context);
+    self->handle.reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    if (result < 0) self->finish(-int(result));
+    else self->start();
+  }
+
+  static void ready(void* context) noexcept {
+    auto* self = static_cast<AsyncFsyncRequest*>(context);
+    int value = AsyncPartUpload::error_code(self->error);
+    {
+      std::lock_guard guard(self->handle.mutex);
+      if (self->handle.unlinked.load()) value = ESTALE;
+      else if (self->handle.write_state == WRITE_FAILED) value = self->handle.write_error;
+    }
+    self->finish(value);
+  }
+
+  void start() noexcept {
+    try {
+      bool waiting = false;
+      {
+        std::lock_guard guard(handle.mutex);
+        if (handle.unlinked.load()) {
+          throw std::system_error(ESTALE, std::generic_category(), "fsync unlinked file");
+        }
+        if (handle.write_state == WRITE_FAILED) {
+          throw std::system_error(handle.write_error, std::generic_category(), "fsync failed write");
+        }
+        if (handle.write_in_progress) {
+          waiting = true;
+          handle.reactor_waiters.fetch_add(1, std::memory_order_acq_rel);
+        }
+      }
+      if (waiting) {
+        wait = {};
+        wait.kind = AsyncIoRequest::READ;
+        wait.fd = handle.state_event.get();
+        wait.data = &notification;
+        wait.length = sizeof(notification);
+        wait.timeout_ms = 0; // Wait for local writes without a network timeout.
+        wait.complete = awakened;
+        wait.context = this;
+        if (reactor.submit(wait)) return;
+        handle.reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+        throw std::system_error(errno, std::generic_category(), "wait for fsync");
+      }
+      if (!handle.cache_entry) { finish(0); return; }
+      completion = {ready, ready, this};
+      if (!reactor.reserve_completion(&completion)) { finish(ECANCELED); return; }
+      try {
+        state.uploads->submit(&handle, [this] {
+          try {
+            IoExecutorScope local_only(nullptr, 0);
+            handle.cache_entry->sync_write();
+          } catch (...) { error = std::current_exception(); }
+          reactor.complete(&completion);
+        });
+      } catch (...) {
+        error = std::current_exception();
+        reactor.complete(&completion);
+      }
+    } catch (...) { finish(AsyncPartUpload::error_code(std::current_exception())); }
+  }
+};
+
 void ngs3fs_flush(fuse_req_t request, fuse_ino_t,
                   fuse_file_info* file) {
   try {
     OpenHandle& handle = handle_required(file);
     if (handle.writer) {
-      handle.writer->flush(state_from(request), handle);
+      State& state = state_from(request);
+      if (FuseReactor* reactor = current_fuse_reactor();
+          reactor != nullptr && !state.config.tls) {
+        auto task = std::make_unique<AsyncFlushRequest>(state, handle, *reactor, request);
+        task.release()->start();
+        return;
+      }
+      handle.writer->flush(state, handle);
     }
     fuse_reply_err(request, 0);
   } catch (...) {
@@ -9190,7 +14880,14 @@ void ngs3fs_fsync(fuse_req_t request, fuse_ino_t, int data_only,
   try {
     OpenHandle& handle = handle_required(file);
     if (handle.writer) {
-      handle.writer->fsync(state_from(request), handle, data_only != 0);
+      State& state = state_from(request);
+      if (FuseReactor* reactor = current_fuse_reactor();
+          reactor != nullptr && !state.config.tls) {
+        auto task = std::make_unique<AsyncFsyncRequest>(state, handle, *reactor, request);
+        task.release()->start();
+        return;
+      }
+      handle.writer->fsync(state, handle, data_only != 0);
     }
     fuse_reply_err(request, 0);
   } catch (...) {
@@ -9216,156 +14913,327 @@ void discard_pending_inode(State& state, OpenHandle& handle) noexcept {
   }
 }
 
+void release_write_local_no_network(State& state, OpenHandle& handle) noexcept;
+
 void UncachedFileWriter::release(State& state,
                                  OpenHandle& handle) noexcept {
-  bool release_budget = false;
-  bool discard_pending = false;
-  bool registered      = false;
   try {
-    std::unique_lock handle_guard(handle.mutex);
-    while (handle.write_in_progress ||
-           handle.write_state == WRITE_SEALING) {
-      handle.condition.wait(handle_guard);
+    std::unique_lock guard(handle.mutex);
+    while (handle.write_in_progress || handle.write_state == WRITE_SEALING) {
+      wait_handle(handle, guard);
     }
-    if (handle.write_state == WRITE_OPEN) {
-      fail_write(handle, EIO);
-    }
-    while (handle.pending_parts != 0) {
-      handle.condition.wait(handle_guard);
-    }
-    release_budget = handle.current_reservation;
-    handle.current_reservation = false;
-    handle.current_part.reset();
+    if (handle.write_state == WRITE_OPEN) fail_write(handle, EIO);
+    while (handle.pending_parts != 0) wait_handle(handle, guard);
+    // Only the legacy engine calls this blocking wrapper.
     abort_multipart(state, handle);
-    discard_pending = handle.write_state != WRITE_SEALED;
   } catch (...) {
+    fprintf(stderr, "warning: legacy write release failed: path=%s\n",
+            handle.object_path.c_str());
   }
-  {
-    std::lock_guard guard(handle.mutex);
-    registered        = handle.registered;
-    handle.registered = false;
-  }
-  if (discard_pending) {
-    discard_pending_inode(state, handle);
-  }
-  if (registered) {
-    unregister_open_handle(state, handle.object_path, handle);
-  } else {
-    release_open_inode(state, handle);
-  }
-  if (release_budget) {
-    release_part_budget(state);
-  }
+  release_write_local_no_network(state, handle);
 }
 
 void CachedFileWriter::release(State& state,
                                OpenHandle& handle) noexcept {
   try {
     std::unique_lock guard(handle.mutex);
-    while (handle.write_in_progress ||
-           handle.write_state == WRITE_SEALING) {
-      handle.condition.wait(guard);
+    while (handle.write_in_progress || handle.write_state == WRITE_SEALING) {
+      wait_handle(handle, guard);
     }
-    while (handle.pending_parts != 0) {
-      handle.condition.wait(guard);
-    }
-    if (handle.unlinked.load(std::memory_order_acquire)) {
-      const bool registered = handle.registered;
-      handle.registered = false;
-      guard.unlock();
-      abort_multipart(state, handle);
-      if (handle.cache_entry) {
-        handle.cache_entry->discard_write();
-      }
-      if (registered) {
-        unregister_open_handle(state, handle.object_path, handle);
-      } else {
-        release_open_inode(state, handle);
-      }
-      return;
-    }
-    const bool dirty = handle.cache_entry && handle.cache_entry->dirty();
-    if (dirty && handle.write_state != WRITE_SEALED) {
-      fprintf(stderr,
-              "warning: cached write preserved for recovery: path=%s "
-              "bytes=%" PRIu64 "\n",
-              handle.object_path.c_str(), handle.stream_offset);
-      const bool registered = handle.registered;
-      handle.registered = false;
-      guard.unlock();
-      {
-        std::lock_guard open_guard(state.open_files_mutex);
-        state.recovery_paths.insert(handle.object_path);
-      }
-      if (registered) {
-        unregister_open_handle(state, handle.object_path, handle);
-      } else {
-        release_open_inode(state, handle);
-      }
-      return;
-    }
-    const bool registered = handle.registered;
-    handle.registered = false;
+    while (handle.pending_parts != 0) wait_handle(handle, guard);
+    const bool unlinked = handle.unlinked.load(std::memory_order_acquire);
     guard.unlock();
-    if (registered) {
-      unregister_open_handle(state, handle.object_path, handle);
-    } else {
-      release_open_inode(state, handle);
-    }
-    if (handle.write_state != WRITE_SEALED) {
-      discard_pending_inode(state, handle);
-    }
+    if (unlinked) abort_multipart(state, handle);
   } catch (...) {
-    bool registered = false;
-    {
-      std::lock_guard guard(handle.mutex);
-      registered        = handle.registered;
-      handle.registered = false;
+    fprintf(stderr, "warning: legacy cached write release failed: path=%s\n",
+            handle.object_path.c_str());
+  }
+  release_write_local_no_network(state, handle);
+}
+
+// Last-reference retirement only. Never waits for an admitted write and never
+// performs S3 I/O, including the allocation/shutdown fallback of async release.
+void release_write_local_no_network(State& state, OpenHandle& handle) noexcept {
+  bool registered = false;
+  bool release_budget = false;
+  bool preserve = false;
+  bool discard_pending = false;
+  const bool unlinked = handle.unlinked.load(std::memory_order_acquire);
+  {
+    std::lock_guard guard(handle.mutex);
+    registered = handle.registered;
+    handle.registered = false;
+    release_budget = handle.current_reservation;
+    handle.current_reservation = false;
+    handle.current_part.reset();
+    preserve = handle.cache_entry && !unlinked &&
+        handle.cache_entry->dirty() && handle.write_state != WRITE_SEALED;
+    discard_pending = handle.write_state != WRITE_SEALED && !preserve;
+    if (handle.write_state == WRITE_OPEN || handle.write_state == WRITE_SEALING) {
+      fail_write(handle, EIO);
     }
-    if (registered) {
-      unregister_open_handle(state, handle.object_path, handle);
-    } else {
-      release_open_inode(state, handle);
+    if (!preserve && !handle.upload_id.empty()) {
+      fprintf(stderr, "warning: multipart upload not aborted during local-only "
+                      "release; lifecycle cleanup may be required: path=%s "
+                      "upload_id=%s\n", handle.object_path.c_str(),
+              handle.upload_id.c_str());
+      handle.upload_id.clear();
     }
+  }
+  if (preserve) {
+    fprintf(stderr, "warning: cached write preserved for recovery: path=%s "
+                    "bytes=%" PRIu64 "\n",
+            handle.object_path.c_str(), handle.stream_offset);
+    try {
+      std::lock_guard guard(state.open_files_mutex);
+      state.recovery_paths.insert(handle.object_path);
+    } catch (...) {
+      fprintf(stderr, "warning: recovery registry allocation failed; cached "
+                      "write remains on disk: path=%s\n",
+              handle.object_path.c_str());
+    }
+  } else if (unlinked && handle.cache_entry) {
+    try { handle.cache_entry->discard_write(); }
+    catch (...) {
+      fprintf(stderr, "warning: local cache cleanup failed for unlinked "
+                      "write handle: path=%s\n", handle.object_path.c_str());
+    }
+  }
+  // Removing a pending dentry must precede dropping the last inode open count.
+  if (discard_pending) discard_pending_inode(state, handle);
+  if (registered) unregister_open_handle(state, handle.object_path, handle);
+  else release_open_inode(state, handle);
+  if (release_budget) release_part_budget(state);
+}
+
+struct AsyncWriteRelease {
+  using Complete = void (*)(void*, int) noexcept;
+  State& state;
+  OpenHandle& handle;
+  FuseReactor& reactor;
+  Complete complete;
+  void* context;
+  FuseReactor::ReactorTask ticket;
+  std::unique_ptr<AsyncSignedS3Request> http;
+  int error = 0;
+
+  static void done(void* context) noexcept {
+    auto* self = static_cast<AsyncWriteRelease*>(context);
+    const auto callback = self->complete;
+    void* target = self->context;
+    const int error = self->error;
+    delete self;
+    callback(target, error);
+  }
+
+  void cleanup() noexcept {
+    try {
+      state.uploads->submit(&handle, [this] {
+        {
+          IoExecutorScope local_only(nullptr, 0);
+          release_write_local_no_network(state, handle);
+        }
+        reactor.complete(&ticket);
+      });
+    } catch (...) {
+      fprintf(stderr, "warning: local release worker unavailable; completing "
+                      "local-only handle cleanup inline: path=%s\n",
+              handle.object_path.c_str());
+      {
+        IoExecutorScope local_only(nullptr, 0);
+        release_write_local_no_network(state, handle);
+      }
+      reactor.complete(&ticket);
+    }
+  }
+
+  static void aborted(void* context, Response&& response,
+                       std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncWriteRelease*>(context);
+    self->http.reset();
+    if (error || (response.status != 204 && response.status != 200 &&
+                  response.status != 404)) {
+      fprintf(stderr, "warning: failed to abort multipart upload on release; "
+                      "lifecycle cleanup may be required: path=%s status=%d\n",
+              self->handle.object_path.c_str(), response.status);
+    }
+    self->handle.upload_id.clear();
+    self->cleanup();
+  }
+
+  void start() noexcept {
+    const bool preserve = handle.cache_entry && !handle.unlinked.load() &&
+        handle.cache_entry->dirty() && handle.write_state != WRITE_SEALED;
+    if (handle.upload_id.empty() || preserve) {
+      cleanup();
+      return;
+    }
+    try {
+      AsyncHttpRequest args;
+      args.method = "DELETE";
+      args.path = query_path(handle.object_path,
+          "uploadId=" + uri_encode(handle.upload_id, false));
+      http = std::make_unique<AsyncSignedS3Request>(state, reactor,
+          std::move(args), aborted, this);
+      if (!http->start()) throw std::system_error(errno, std::generic_category(), "abort multipart");
+    } catch (...) { aborted(this, Response{}, std::current_exception()); }
+  }
+};
+
+// The caller owns the retiring handle through completion. False means no work
+// was admitted and no callback runs. Completion is terminal: local registry and
+// inode cleanup is finished even if worker admission needs a rare inline fallback.
+bool start_async_write_release(State& state, OpenHandle& handle,
+                                FuseReactor& reactor,
+                                AsyncWriteRelease::Complete complete,
+                                void* context) noexcept {
+  {
+    std::lock_guard guard(handle.mutex);
+    if (handle.pending_parts != 0 || handle.write_in_progress ||
+        handle.write_state == WRITE_SEALING) {
+      fprintf(stderr, "error: non-idle write handle at last-reference retirement: "
+                      "path=%s pending_parts=%zu write_in_progress=%d state=%d\n",
+              handle.object_path.c_str(), size_t(handle.pending_parts),
+              int(handle.write_in_progress), int(handle.write_state));
+      assert(handle.pending_parts == 0 && !handle.write_in_progress &&
+             handle.write_state != WRITE_SEALING);
+      errno = EIO;
+      return false;
+    }
+  }
+  try {
+    auto task = std::make_unique<AsyncWriteRelease>(
+        AsyncWriteRelease{state, handle, reactor, complete, context, {}, {}});
+    task->ticket = {AsyncWriteRelease::done, AsyncWriteRelease::done, task.get()};
+    if (!reactor.reserve_completion(&task->ticket)) return false;
+    task.release()->start();
+    return true;
+  } catch (...) {
+    errno = ENOMEM;
+    return false;
   }
 }
 
+struct ReleaseTask {
+  State* state;
+  OpenHandle* handle;
+  fuse_req_t request;
+  FuseReactor* reactor;
+  FuseReactor::ReactorTask task;
+  std::unique_ptr<AsyncPendingDelete> pending;
+  int result = 0;
+
+  static void completed(void* context, std::exception_ptr = {}) noexcept {
+    std::unique_ptr<ReleaseTask> task(static_cast<ReleaseTask*>(context));
+    std::unique_ptr<OpenHandle> handle(task->handle);
+    fuse_reply_err(task->request, task->result);
+  }
+
+  void finish_pending() noexcept {
+    try {
+      bool found;
+      {
+        std::lock_guard guard(state->open_files_mutex);
+        found = state->pending_deletes.contains(handle->object_path);
+      }
+      if (found) {
+        pending = std::make_unique<AsyncPendingDelete>(
+            *state, *reactor, handle->object_path, completed, this);
+        if (pending->start()) return;
+        fprintf(stderr, "warning: pending delete cleanup not admitted: path=%s\n",
+                handle->object_path.c_str());
+      }
+    } catch (...) {
+      fprintf(stderr, "warning: pending delete retained after handle close: path=%s\n",
+              handle->object_path.c_str());
+    }
+    completed(this);
+  }
+
+  static void write_released(void* context, int error) noexcept {
+    auto* task = static_cast<ReleaseTask*>(context);
+    if (error != 0) {
+      task->result = error;
+      fprintf(stderr, "warning: write release cleanup: path=%s: %s\n",
+              task->handle->object_path.c_str(), strerror(error));
+    }
+    task->finish_pending();
+  }
+
+  static void finish(void* context) noexcept {
+    auto* release = static_cast<ReleaseTask*>(context);
+    if (release->reactor != nullptr) {
+      if (release->handle->writer) {
+        if (start_async_write_release(*release->state, *release->handle,
+                *release->reactor, write_released, release)) return;
+        // Last-reference retirement cannot race an admitted writer. Failure
+        // here is an internal invariant failure, not a successful close.
+        fprintf(stderr, "error: cannot retire admitted write handle: path=%s: %s\n",
+                release->handle->object_path.c_str(), strerror(errno));
+        release->result = EIO;
+        release_write_local_no_network(*release->state, *release->handle);
+        release->finish_pending();
+        return;
+      }
+      release_open_inode(*release->state, *release->handle);
+      release->finish_pending();
+      return;
+    }
+    std::unique_ptr<ReleaseTask> task(static_cast<ReleaseTask*>(context));
+    std::unique_ptr<OpenHandle> handle(task->handle);
+    try {
+      if (handle->writer) {
+        handle->writer->release(*task->state, *handle);
+      } else {
+        release_open_inode(*task->state, *handle);
+      }
+      finish_pending_delete(*task->state, handle->object_path);
+      fuse_reply_err(task->request, 0);
+    } catch (...) {
+      reply_callback_error(task->request);
+    }
+  }
+
+  static void ready(void* context) noexcept {
+    auto* task = static_cast<ReleaseTask*>(context);
+    if (task->reactor != nullptr) {
+      task->reactor->complete(&task->task);
+      return;
+    }
+    finish(task);
+  }
+};
+
 void ngs3fs_release(fuse_req_t request, fuse_ino_t,
                     fuse_file_info* file) {
-  State& state = state_from(request);
-  std::unique_ptr<OpenHandle> handle;
   try {
-    handle.reset(&handle_required(file));
+    State& state = state_from(request);
+    OpenHandle& handle = handle_required(file);
+    auto task = std::make_unique<ReleaseTask>();
+    task->state   = &state;
+    task->handle  = &handle;
+    task->request = request;
+    task->reactor = current_fuse_reactor();
+    task->task    = {ReleaseTask::finish, ReleaseTask::finish, task.get()};
+    if (task->reactor != nullptr && !task->reactor->reserve_completion(&task->task)) {
+      throw std::system_error(errno, std::generic_category(), "reserve release completion");
+    }
+    handle.release_ready   = ReleaseTask::ready;
+    handle.release_context = task.get();
+    constexpr uint64_t closing = 1ULL << 63;
+    handle.request_state.fetch_or(closing, std::memory_order_acq_rel);
+    file->fh = 0;
+    if (!handle.writable && handle.registered) {
+      // The application has closed the handle. Internal read/checksum tasks
+      // retain its lifetime, but must not prohibit a new application writer.
+      handle.registered = false;
+      unregister_open_handle(state, {}, handle, false);
+    }
+    task.release();
+    drop_open_request(handle);
   } catch (...) {
     reply_callback_error(request);
-    return;
   }
-  file->fh = 0;
-  constexpr uint64_t closing    = 1ULL << 63;
-  constexpr uint64_t active_mask = closing - 1;
-  uint64_t requests =
-      handle->request_state.fetch_or(closing, std::memory_order_acq_rel);
-  while ((requests & active_mask) != 0) {
-    handle->request_state.wait(requests, std::memory_order_acquire);
-    requests = handle->request_state.load(std::memory_order_acquire);
-  }
-  if (handle->writer) {
-    const std::string path = handle->object_path;
-    handle->writer->release(state, *handle);
-    finish_pending_delete(state, path);
-  } else if (handle->registered) {
-    std::string path;
-    {
-      std::shared_lock identity_guard(handle->identity_mutex);
-      path = handle->object_path;
-    }
-    handle->registered = false;
-    unregister_open_handle(state, path, *handle);
-    finish_pending_delete(state, path);
-  } else {
-    release_open_inode(state, *handle);
-  }
-  fuse_reply_err(request, 0);
 }
 
 void ngs3fs_opendir(fuse_req_t request, fuse_ino_t inode,
@@ -9383,13 +15251,12 @@ void ngs3fs_opendir(fuse_req_t request, fuse_ino_t inode,
     }
     auto handle = std::make_unique<DirHandle>();
     handle->item = static_cast<InodeDir*>(&item);
-    {
-      std::lock_guard guard(item.dir_children().mutation_mutex);
-      if (item.detached()) {
-        throw std::system_error(ESTALE, std::generic_category(), "opendir");
-      }
-      retain_inode_count(item.open_count, "directory open count");
+    // The kernel's lookup reference already pins item. An overlapping rmdir
+    // may detach it after this check, just as for a native open directory.
+    if (item.detached()) {
+      throw std::system_error(ESTALE, std::generic_category(), "opendir");
     }
+    retain_inode_count(item.open_count, "directory open count");
     cache_touch(*handle->item);
     file->fh = reinterpret_cast<uint64_t>(handle.release());
     if (fuse_reply_open(request, file) != 0) {
@@ -9404,51 +15271,11 @@ void ngs3fs_opendir(fuse_req_t request, fuse_ino_t inode,
   }
 }
 
-void ngs3fs_readdir(fuse_req_t request, fuse_ino_t inode, size_t size,
-                    off_t offset, fuse_file_info* file) {
-  if (offset < 0) {
-    fuse_reply_err(request, EINVAL);
-    return;
-  }
+void reply_directory_entries(fuse_req_t request, fuse_ino_t inode, size_t size,
+                               off_t offset, DirHandle& handle) {
   try {
     State& state = state_from(request);
-    if (file == nullptr || file->fh == 0) {
-      throw std::system_error(EBADF, std::generic_category(), "readdir");
-    }
-    DirHandle* handle = reinterpret_cast<DirHandle*>(uintptr_t(file->fh));
-    InodeDir* directory = handle->item;
-    InodeBase* item = inode == FUSE_ROOT_ID
-                          ? static_cast<InodeBase*>(state.root_item.get())
-                          : reinterpret_cast<InodeBase*>(uintptr_t(inode));
-    if (item == nullptr || !item->directory() || directory != item) {
-      throw std::system_error(ENOTDIR, std::generic_category(), "readdir");
-    }
-    uint8_t initialized = handle->initialized.load(std::memory_order_acquire);
-    while (initialized != 2) {
-      if (initialized == 0 && handle->initialized.compare_exchange_weak(
-              initialized, 1, std::memory_order_acquire,
-              std::memory_order_acquire)) {
-        try {
-          if (!directory->detached() &&
-              directory->expire.load(std::memory_order_relaxed) <=
-                  fuse_monotonic_ns()) {
-            refresh_directory(state, inode);
-          }
-          handle->initialized.store(2, std::memory_order_release);
-          handle->initialized.notify_all();
-          initialized = 2;
-          break;
-        } catch (...) {
-          handle->initialized.store(0, std::memory_order_release);
-          handle->initialized.notify_all();
-          throw;
-        }
-      }
-      if (initialized == 1) {
-        handle->initialized.wait(1, std::memory_order_acquire);
-      }
-      initialized = handle->initialized.load(std::memory_order_acquire);
-    }
+    InodeDir* directory = handle.item;
     cache_touch(*directory);
 
     thread_local std::vector<char> output;
@@ -9508,6 +15335,97 @@ void ngs3fs_readdir(fuse_req_t request, fuse_ino_t inode, size_t size,
       }
     }
     fuse_reply_buf(request, output.data(), used);
+  } catch (...) {
+    reply_callback_error(request);
+  }
+}
+
+struct AsyncReaddir {
+  State& state;
+  FuseReactor& reactor;
+  fuse_req_t request;
+  fuse_ino_t inode;
+  size_t size;
+  off_t offset;
+  DirHandle& handle;
+  InodePin pin;
+  DirectoryContinuation waiter;
+
+  AsyncReaddir(State& s, FuseReactor& r, fuse_req_t req, fuse_ino_t ino,
+                 size_t bytes, off_t off, DirHandle& dir)
+      : state(s), reactor(r), request(req), inode(ino), size(bytes),
+        offset(off), handle(dir) {
+    retain_inode_count(handle.item->open_count, "readdir pin");
+    pin = InodePin(state, *handle.item);
+    waiter.complete = completed;
+    waiter.context = this;
+  }
+
+  static void completed(void* context, std::exception_ptr error) noexcept {
+    std::unique_ptr<AsyncReaddir> task(static_cast<AsyncReaddir*>(context));
+    task->handle.initialized.store(error ? 0 : 2, std::memory_order_release);
+    notify_dir_handle(task->handle);
+    try {
+      if (error) std::rethrow_exception(error);
+      reply_directory_entries(task->request, task->inode, task->size,
+                                task->offset, task->handle);
+    } catch (...) {
+      reply_callback_error(task->request);
+    }
+  }
+
+  void start() noexcept {
+    try {
+      handle.initialized.store(1, std::memory_order_release);
+      if (!await_directory_refresh(state, reactor, inode, waiter)) completed(this, {});
+    } catch (...) {
+      completed(this, std::current_exception());
+    }
+  }
+};
+
+void ngs3fs_readdir(fuse_req_t request, fuse_ino_t inode, size_t size,
+                    off_t offset, fuse_file_info* file) {
+  if (offset < 0) {
+    fuse_reply_err(request, EINVAL);
+    return;
+  }
+  try {
+    State& state = state_from(request);
+    if (file == nullptr || file->fh == 0) {
+      throw std::system_error(EBADF, std::generic_category(), "readdir");
+    }
+    auto& handle = *reinterpret_cast<DirHandle*>(uintptr_t(file->fh));
+    InodeBase& item = inode_reference(state, inode);
+    if (!item.directory() || handle.item != &item) {
+      throw std::system_error(ENOTDIR, std::generic_category(), "readdir");
+    }
+    if (FuseReactor* reactor = current_fuse_reactor()) {
+      if (handle.initialized.load(std::memory_order_acquire) != 2 && !item.detached()) {
+        (new AsyncReaddir(state, *reactor, request, inode, size, offset, handle))->start();
+        return;
+      }
+    } else {
+      uint8_t initialized = handle.initialized.load(std::memory_order_acquire);
+      while (initialized != 2) {
+        if (initialized == 0 && handle.initialized.compare_exchange_weak(
+                initialized, 1, std::memory_order_acquire, std::memory_order_acquire)) {
+          try {
+            if (!item.detached()) refresh_directory(state, inode);
+            handle.initialized.store(2, std::memory_order_release);
+            notify_dir_handle(handle);
+            break;
+          } catch (...) {
+            handle.initialized.store(0, std::memory_order_release);
+            notify_dir_handle(handle);
+            throw;
+          }
+        }
+        if (initialized == 1) wait_dir_handle(handle);
+        initialized = handle.initialized.load(std::memory_order_acquire);
+      }
+    }
+    reply_directory_entries(request, inode, size, offset, handle);
   } catch (...) {
     reply_callback_error(request);
   }
@@ -9616,12 +15534,14 @@ bool hide_open_readers(State& state, std::string_view key,
     if (!readers_gone) {
       std::lock_guard guard(state.open_files_mutex);
       const auto opened = state.open_files.find(path);
-      if (opened == state.open_files.end() ||
-          opened->second.handles != reader_locks.handles) {
+      readers_gone = opened == state.open_files.end();
+      if (!reader_snapshot_matches(
+              readers_gone ? std::span<OpenHandle* const>{} : opened->second.handles,
+              reader_locks.handles)) {
         throw std::logic_error(
             "reader registry changed during native unlink");
       }
-      const bool inserted = state.pending_deletes.try_emplace(
+      const bool inserted = readers_gone || state.pending_deletes.try_emplace(
           hidden_path, State::PendingDelete{
               .key = hidden_key,
               .restore_key = std::string(restore_key),
@@ -9686,17 +15606,21 @@ bool hide_open_readers(State& state, std::string_view key,
   {
     std::lock_guard guard(state.open_files_mutex);
     const auto opened = state.open_files.find(path);
-    if (opened == state.open_files.end() ||
-        opened->second.handles != reader_locks.handles) {
+    readers_gone = opened == state.open_files.end();
+    if (!reader_snapshot_matches(
+            readers_gone ? std::span<OpenHandle* const>{} : opened->second.handles,
+            reader_locks.handles)) {
       throw std::logic_error("reader registry changed during native rename");
     }
-    for (OpenHandle* handle : opened->second.handles) {
-      handle->object_path.assign(hidden_path);
-      handle->key.assign(hidden_key);
+    if (!readers_gone) {
+      for (OpenHandle* handle : opened->second.handles) {
+        handle->object_path.assign(hidden_path);
+        handle->key.assign(hidden_key);
+      }
+      auto node = state.open_files.extract(opened);
+      node.key().assign(hidden_path);
+      state.open_files.insert(std::move(node));
     }
-    auto node = state.open_files.extract(opened);
-    node.key().assign(hidden_path);
-    state.open_files.insert(std::move(node));
     if (restore_key.empty()) {
       const auto pending = state.pending_deletes.find(hidden_path);
       if (pending != state.pending_deletes.end()) {
@@ -9717,14 +15641,725 @@ bool hide_open_readers(State& state, std::string_view key,
   if (hidden_path_result != nullptr) {
     *hidden_path_result = hidden_path;
   }
+  if (readers_gone && restore_key.empty()) {
+    reader_locks.identities.clear();
+    finish_pending_delete(state, hidden_path);
+  }
   return true;
 }
+
+struct AsyncReaderLocks {
+  OpenHandleIdentityLocks locks;
+  FuseReactor* reactor = nullptr;
+  AsyncIoRequest wait;
+  uint64_t notification = 0;
+  size_t index = 0;
+  void (*complete)(void*, std::exception_ptr) noexcept = nullptr;
+  void* context = nullptr;
+
+  void snapshot(State& state, FuseReactor& owner, std::string_view path) {
+    reactor = &owner;
+    std::lock_guard guard(state.open_files_mutex);
+    const auto opened = state.open_files.find(path);
+    if (opened == state.open_files.end()) return;
+    if (opened->second.writer || opened->second.handles.size() != opened->second.readers) {
+      throw std::logic_error("invalid reader registry during namespace mutation");
+    }
+    locks.handles.reserve(opened->second.handles.size());
+    locks.pins.reserve(opened->second.handles.size());
+    for (OpenHandle* handle : opened->second.handles) {
+      if (handle == nullptr || handle->writable) throw std::logic_error("invalid mutation reader");
+      try {
+        locks.pins.push_back(std::make_unique<OpenRequestGuard>(*handle));
+        locks.handles.push_back(handle);
+      } catch (const std::system_error& error) {
+        if (error.code().value() != EBADF) throw;
+      }
+    }
+    locks.identities.reserve(locks.handles.size());
+    for (OpenHandle* handle : locks.handles) {
+      locks.identities.emplace_back(handle->identity_mutex, std::defer_lock);
+    }
+  }
+
+  bool acquire() {
+    for (; index < locks.identities.size(); ++index) {
+      auto& lock = locks.identities[index];
+      if (lock.try_lock()) continue;
+      ReactorSharedMutex& mutex = *lock.mutex();
+      const int fd = mutex.begin_async_wait();
+      if (lock.try_lock()) {
+        mutex.end_async_wait();
+        continue;
+      }
+      wait = {};
+      wait.kind = AsyncIoRequest::READ;
+      wait.fd = fd;
+      wait.data = &notification;
+      wait.length = sizeof(notification);
+      wait.timeout_ms = 0;
+      wait.complete = available;
+      wait.context = this;
+      if (reactor->submit(wait)) return false;
+      const int error = errno;
+      mutex.end_async_wait();
+      throw std::system_error(error, std::generic_category(), "submit mutation identity wait");
+    }
+    return true;
+  }
+
+  static void available(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncReaderLocks*>(context);
+    task->locks.identities[task->index].mutex()->end_async_wait();
+    try {
+      if (result < 0) throw std::system_error(-int(result), std::generic_category(), "mutation identity wait");
+      if (!task->acquire()) return;
+    } catch (...) {
+      task->complete(task->context, std::current_exception());
+      return;
+    }
+    task->complete(task->context, {});
+  }
+};
+
+class AsyncHideReaders {
+ public:
+  using Complete = void (*)(void*, bool, std::exception_ptr) noexcept;
+  AsyncHideReaders(State& state, FuseReactor& reactor, std::string key, std::string path,
+                     std::string restore, std::string replacement, Complete complete, void* context)
+      : state_(state), reactor_(reactor), key_(std::move(key)), path_(std::move(path)),
+        restore_(std::move(restore)), replacement_(std::move(replacement)),
+        complete_(complete), context_(context) {}
+
+  bool start() noexcept {
+    task_ = {begin, nullptr, this};
+    return reactor_.post(&task_);
+  }
+
+  std::string take_hidden_key() noexcept { return std::move(hidden_key_); }
+  std::string take_hidden_path() noexcept { return std::move(hidden_path_); }
+
+ private:
+  State& state_;
+  FuseReactor& reactor_;
+  std::string key_, path_, restore_, replacement_, hidden_key_, hidden_path_;
+  ObjectMetadata metadata_;
+  AsyncReaderLocks readers_;
+  std::unique_ptr<AsyncSignedS3Request> head_;
+  std::unique_ptr<AsyncNativeRename> rename_;
+  std::unique_ptr<AsyncPendingDelete> cleanup_;
+  AsyncCacheRetirement retirement_;
+  AsyncLocalCacheWork local_;
+  FuseReactor::ReactorTask task_;
+  Complete complete_;
+  void* context_;
+  std::exception_ptr failure_;
+  bool recovering_ = false;
+  bool marker_ = false;
+  bool pending_ = false;
+  bool hidden_ = false;
+  bool readers_gone_ = false;
+  bool cache_retry_ = false;
+  bool cache_removed_ = false;
+
+  void finish(bool hidden, std::exception_ptr error = {}) noexcept {
+    readers_.locks.identities.clear();
+    readers_.locks.pins.clear();
+    complete_(context_, hidden, std::move(error));
+  }
+
+  void finish_discard_marker() noexcept {
+    if (pending_) {
+      std::lock_guard guard(state_.open_files_mutex);
+      state_.pending_deletes.erase(hidden_path_);
+      pending_ = false;
+    }
+    finish(false, failure_);
+  }
+
+  static void remove_marker(void* value) {
+    auto* task = static_cast<AsyncHideReaders*>(value);
+    task->state_.local_cache->finish_pending_delete(task->hidden_key_);
+  }
+
+  static void marker_removed(void* value, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncHideReaders*>(value);
+    if (error) {
+      fprintf(stderr, "warning: native unlink marker cleanup could not run: path=%s\n",
+              task->hidden_path_.c_str());
+      if (!task->failure_) task->failure_ = std::move(error);
+    }
+    task->marker_ = false;
+    task->finish_discard_marker();
+  }
+
+  void discard_marker(std::exception_ptr error = {}) noexcept {
+    failure_ = std::move(error);
+    if (!marker_) { finish_discard_marker(); return; }
+    try {
+      local_.start(state_, reactor_, remove_marker, marker_removed, this);
+    } catch (...) {
+      // Keep the marker for mount-time recovery if local cleanup cannot be
+      // admitted; no filesystem operation is allowed in this owner fallback.
+      marker_removed(this, std::current_exception());
+    }
+  }
+
+  static void begin(void* context) noexcept {
+    auto* task = static_cast<AsyncHideReaders*>(context);
+    try {
+      bool any = false;
+      {
+        std::lock_guard guard(task->state_.open_files_mutex);
+        const auto opened = task->state_.open_files.find(task->path_);
+        any = opened != task->state_.open_files.end() && opened->second.readers != 0;
+      }
+      if (!any) { task->finish(false); return; }
+      task->head(task->path_);
+    } catch (...) { task->finish(false, std::current_exception()); }
+  }
+
+  void head(std::string_view path) {
+    AsyncHttpRequest args;
+    args.method = "HEAD";
+    args.path.assign(path.data(), path.size());
+    head_ = std::make_unique<AsyncSignedS3Request>(state_, reactor_, std::move(args), received, this);
+    if (!head_->start()) throw std::system_error(errno, std::generic_category(), "submit native unlink HEAD");
+  }
+
+  static void received(void* context, Response&& response, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncHideReaders*>(context);
+    task->head_.reset();
+    try {
+      if (task->recovering_) {
+        if (!error && response.status == 404) {
+          task->discard_marker(task->failure_);
+          return;
+        }
+        if (!error) {
+          const ObjectMetadata metadata = decode_head_response(response);
+          if (metadata.size == task->metadata_.size &&
+              (task->metadata_.etag.empty() || metadata.etag == task->metadata_.etag)) {
+            task->publish();
+            return;
+          }
+        }
+        task->recover_pending();
+        return;
+      }
+      if (error) std::rethrow_exception(error);
+      task->metadata_ = decode_head_response(response);
+      task->hidden_key_ = pending_delete_key(task->state_);
+      if (task->hidden_key_.size() > 1024) { task->finish(false); return; }
+      task->hidden_path_ = object_request_path(task->state_, task->hidden_key_);
+      task->readers_.complete = locked;
+      task->readers_.context = task;
+      task->readers_.snapshot(task->state_, task->reactor_, task->path_);
+      if (task->readers_.acquire()) task->rename();
+    } catch (...) { task->finish(false, std::current_exception()); }
+  }
+
+  static void locked(void* context, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncHideReaders*>(context);
+    try {
+      if (error) std::rethrow_exception(error);
+      task->rename();
+    } catch (...) { task->finish(false, std::current_exception()); }
+  }
+
+  void rename() {
+    if (readers_.locks.handles.empty()) { finish(false); return; }
+    for (OpenHandle* handle : readers_.locks.handles) {
+      handle->object_path.reserve(hidden_path_.size());
+      handle->key.reserve(hidden_key_.size());
+    }
+    local_.start(state_, reactor_, create_marker, marker_created, this);
+  }
+
+  static void create_marker(void* value) {
+    auto* task = static_cast<AsyncHideReaders*>(value);
+    task->state_.local_cache->create_pending_delete(
+        task->hidden_key_, task->restore_, task->replacement_);
+  }
+
+  static void marker_created(void* value, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncHideReaders*>(value);
+    if (error) { task->finish(false, std::move(error)); return; }
+    task->marker_ = true;
+    task->rename_marked();
+  }
+
+  void rename_marked() noexcept {
+    try {
+      bool any;
+      {
+        std::lock_guard guard(state_.open_files_mutex);
+        const auto opened = state_.open_files.find(path_);
+        any = opened != state_.open_files.end();
+        if (!reader_snapshot_matches(any ? std::span<OpenHandle* const>(opened->second.handles) :
+                                           std::span<OpenHandle* const>{}, readers_.locks.handles)) {
+          throw std::logic_error("reader registry changed during native unlink");
+        }
+        if (any) {
+          pending_ = state_.pending_deletes.try_emplace(hidden_path_, State::PendingDelete{
+              .key = hidden_key_, .restore_key = restore_, .replacement_etag = replacement_,
+              .rollback = !restore_.empty(), .deleting = true}).second;
+          if (!pending_) throw std::logic_error("pending-delete key collision");
+        }
+      }
+      if (!any) { discard_marker(); return; }
+      rename_ = std::make_unique<AsyncNativeRename>(
+          state_, reactor_, key_, metadata_.etag, hidden_path_, true, renamed, this);
+      if (!rename_->start()) throw std::system_error(errno, std::generic_category(), "submit native unlink");
+    } catch (...) {
+      discard_marker(std::current_exception());
+    }
+  }
+
+  static void renamed(void* context, bool renamed, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncHideReaders*>(context);
+    task->rename_.reset();
+    try {
+      if (error) {
+        task->failure_ = error;
+        task->recovering_ = true;
+        try { task->head(task->hidden_path_); }
+        catch (...) { task->recover_pending(); }
+      } else if (!renamed) {
+        task->discard_marker();
+      } else task->publish();
+    } catch (...) { task->finish(false, std::current_exception()); }
+  }
+
+  void recover_pending() {
+    readers_.locks.identities.clear();
+    {
+      std::lock_guard guard(state_.open_files_mutex);
+      const auto pending = state_.pending_deletes.find(hidden_path_);
+      if (pending != state_.pending_deletes.end()) pending->second.deleting = false;
+    }
+    cleanup_ = std::make_unique<AsyncPendingDelete>(state_, reactor_, hidden_path_, cleaned, this);
+    if (!cleanup_->start()) finish(hidden_, failure_ ? failure_ : std::make_exception_ptr(
+        std::system_error(errno, std::generic_category(), "submit pending unlink cleanup")));
+  }
+
+  static void cleaned(void* context, std::exception_ptr) noexcept {
+    auto* task = static_cast<AsyncHideReaders*>(context);
+    task->cleanup_.reset();
+    // Pending-delete failures retain the marker for explicit recovery; the
+    // original namespace operation keeps its established best-effort result.
+    task->finish(task->hidden_, task->failure_);
+  }
+
+  static void cache_retired(void* context, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncHideReaders*>(context);
+    try {
+      if (error) std::rethrow_exception(error);
+      task->finish_cache();
+    } catch (...) { task->finish(task->hidden_, std::current_exception()); }
+  }
+
+  void finish_cache() {
+    retirement_.complete = cache_retired;
+    retirement_.context = this;
+    if (cache_retry_ && !retirement_.ready(state_, reactor_, key_, nullptr, true)) return;
+    cache_retry_ = false;
+    local_.start(state_, reactor_, remove_cache, cache_removed, this);
+  }
+
+  static void remove_cache(void* value) {
+    auto* task = static_cast<AsyncHideReaders*>(value);
+    task->cache_removed_ = task->state_.local_cache->remove(
+        task->key_, true, &task->cache_retry_, false);
+  }
+
+  static void cache_removed(void* value, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncHideReaders*>(value);
+    try {
+      if (error) std::rethrow_exception(error);
+      if (task->cache_retry_) { task->finish_cache(); return; }
+      if (!task->cache_removed_) {
+        fprintf(stderr, "warning: native unlink could not detach local cache generation: path=%s\n",
+                task->path_.c_str());
+      }
+      if (task->readers_gone_ && task->restore_.empty()) task->recover_pending();
+      else task->finish(true);
+    } catch (...) {
+      task->finish(task->hidden_, std::current_exception());
+    }
+  }
+
+  void publish() {
+    bool gone;
+    {
+      std::lock_guard guard(state_.open_files_mutex);
+      const auto opened = state_.open_files.find(path_);
+      gone = opened == state_.open_files.end();
+      if (!reader_snapshot_matches(gone ? std::span<OpenHandle* const>{} :
+                                         std::span<OpenHandle* const>(opened->second.handles), readers_.locks.handles)) {
+        throw std::logic_error("reader registry changed during native rename");
+      }
+      if (!gone) {
+        for (OpenHandle* handle : opened->second.handles) {
+          if (std::find(readers_.locks.handles.begin(), readers_.locks.handles.end(), handle) ==
+              readers_.locks.handles.end()) continue;
+          handle->object_path.assign(hidden_path_);
+          handle->key.assign(hidden_key_);
+        }
+        auto node = state_.open_files.extract(opened);
+        node.key().assign(hidden_path_);
+        state_.open_files.insert(std::move(node));
+      }
+      if (restore_.empty()) {
+        const auto pending = state_.pending_deletes.find(hidden_path_);
+        if (pending != state_.pending_deletes.end()) pending->second.deleting = false;
+      }
+    }
+    hidden_ = true;
+    readers_gone_ = gone;
+    failure_ = {};
+    finish_cache();
+  }
+};
 
 void remove_item(State& state, InodeBase& item) {
   if (detach_cached_item(state, item)) {
     sweep_retired_items(state);
   }
 }
+
+struct AsyncUnlink {
+  State& state;
+  FuseReactor& reactor;
+  fuse_req_t request;
+  fuse_ino_t parent;
+  std::string name, key, path;
+  InodePin directory, item;
+  std::unique_lock<IoMutex> directory_lock;
+  std::unique_ptr<PathMutationGuard> mutation;
+  std::unique_ptr<AsyncHideReaders> hide;
+  std::unique_ptr<AsyncSignedS3Request> remote;
+  DirectoryContinuation listing;
+  AsyncCacheRetirement retirement;
+  AsyncLocalCacheWork local;
+  AsyncIoRequest wait;
+  uint64_t notification = 0;
+  OpenHandle* writer = nullptr;
+  std::unique_ptr<OpenRequestGuard> writer_pin;
+  unsigned phase = 0;
+  bool waiting_writer = false;
+  bool hidden = false;
+  bool preserve_readers = false;
+  bool writer_marker = false;
+  bool marker_created = false;
+  bool writer_reserved = false;
+  bool delete_committed = false;
+  bool cache_retry = false;
+  bool cache_preserved = false;
+  bool cache_qualified = false;
+  std::vector<std::shared_ptr<CacheEntry>> reader_entries;
+  std::exception_ptr failure;
+
+  AsyncUnlink(State& s, FuseReactor& r, fuse_req_t req, fuse_ino_t p, const char* n)
+      : state(s), reactor(r), request(req), parent(p), name(n) {
+    InodeBase& base = inode_item(state, parent);
+    if (!base.directory()) throw std::system_error(ENOTDIR, std::generic_category(), "unlink");
+    retain_inode_count(base.open_count, "unlink parent pin");
+    directory = InodePin(state, base);
+    directory_lock = std::unique_lock<IoMutex>(base.dir_children().mutation_mutex, std::defer_lock);
+    listing.complete = resumed;
+    listing.context = this;
+    retirement.complete = resumed;
+    retirement.context = this;
+  }
+
+  ~AsyncUnlink() {
+    if (writer_reserved) {
+      { std::lock_guard guard(writer->mutex); writer->write_in_progress = false; }
+      notify_handle(*writer);
+    }
+  }
+
+  void finish_failure() noexcept {
+    std::unique_ptr<AsyncUnlink> owner(this);
+    if (writer_marker && !delete_committed) {
+      std::lock_guard guard(state.open_files_mutex);
+      state.pending_deletes.erase(path);
+    } else if (writer_marker) {
+      std::lock_guard guard(state.open_files_mutex);
+      const auto pending = state.pending_deletes.find(path);
+      if (pending != state.pending_deletes.end()) pending->second.deleting = false;
+    }
+    invalidate_directory(state, parent);
+    try { std::rethrow_exception(failure); }
+    catch (...) { reply_callback_error(request); }
+  }
+
+  static void remove_marker(void* value) {
+    auto* task = static_cast<AsyncUnlink*>(value);
+    if (task->marker_created && !task->delete_committed) {
+      task->state.local_cache->finish_pending_delete(task->key);
+    }
+    task->reader_entries.clear();
+  }
+
+  static void failed_marker_removed(void* value, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncUnlink*>(value);
+    if (error) {
+      fprintf(stderr, "warning: failed unlink marker retained for recovery: path=%s\n",
+              task->path.c_str());
+    }
+    task->marker_created = false;
+    task->finish_failure();
+  }
+
+  void fail(std::exception_ptr error) noexcept {
+    failure = std::move(error);
+    if ((marker_created && !delete_committed) || !reader_entries.empty()) {
+      try {
+        local.start(state, reactor, remove_marker, failed_marker_removed, this);
+      } catch (...) { failed_marker_removed(this, std::current_exception()); }
+      return;
+    }
+    finish_failure();
+  }
+
+  static void create_marker(void* value) {
+    auto* task = static_cast<AsyncUnlink*>(value);
+    if (task->writer->cache_entry->dirty()) {
+      task->state.local_cache->create_pending_delete(task->key);
+      task->marker_created = true;
+    }
+  }
+
+  static void discard_write(void* value) {
+    auto* task = static_cast<AsyncUnlink*>(value);
+    task->writer->cache_entry->discard_write();
+  }
+
+  static void remove_cache(void* value) {
+    auto* task = static_cast<AsyncUnlink*>(value);
+    if (!task->cache_qualified) {
+      task->preserve_readers = cached_readers_fully_clean(std::move(task->reader_entries));
+      task->cache_qualified = true;
+    }
+    task->cache_preserved = task->state.local_cache->remove(
+        task->key, task->preserve_readers, &task->cache_retry, false);
+  }
+
+  static void resumed(void* context, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncUnlink*>(context);
+    if (error) task->fail(std::move(error));
+    else task->advance();
+  }
+
+  static void unlocked(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncUnlink*>(context);
+    if (task->waiting_writer) task->writer->reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    else task->directory_lock.mutex()->end_async_wait();
+    if (result < 0) task->fail(std::make_exception_ptr(
+        std::system_error(-int(result), std::generic_category(), "unlink state wait")));
+    else task->advance();
+  }
+
+  void wait_on(int fd) {
+    wait = {};
+    wait.kind = AsyncIoRequest::READ;
+    wait.fd = fd;
+    wait.data = &notification;
+    wait.length = sizeof(notification);
+    wait.timeout_ms = 0;
+    wait.complete = unlocked;
+    wait.context = this;
+    if (!reactor.submit(wait)) {
+      const int error = errno;
+      if (waiting_writer) writer->reactor_waiters.fetch_sub(1, std::memory_order_acq_rel);
+      else directory_lock.mutex()->end_async_wait();
+      throw std::system_error(error, std::generic_category(), "submit unlink state wait");
+    }
+  }
+
+  static void hidden_readers(void* context, bool hidden, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncUnlink*>(context);
+    task->hidden = hidden;
+    task->hide.reset();
+    resumed(context, std::move(error));
+  }
+
+  static void received(void* context, Response&& response, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncUnlink*>(context);
+    task->remote.reset();
+    try {
+      if (error) std::rethrow_exception(error);
+      if (response.status != 200 && response.status != 204 && response.status != 404) {
+        throw_s3_response(response, "DeleteObject");
+      }
+      task->delete_committed = true;
+    } catch (...) { task->fail(std::current_exception()); return; }
+    task->advance();
+  }
+
+  void advance() noexcept {
+    std::unique_ptr<AsyncUnlink> owner(this);
+    try {
+      for (;;) switch (phase) {
+        case 0: {
+          if (!directory_lock.try_lock()) {
+            const int fd = directory_lock.mutex()->begin_async_wait();
+            if (!directory_lock.try_lock()) {
+              wait_on(fd);
+              owner.release();
+              return;
+            }
+            directory_lock.mutex()->end_async_wait();
+          }
+          phase = 1;
+          if (await_directory_refresh(state, reactor, parent, listing)) {
+            owner.release(); return;
+          }
+          break;
+        }
+        case 1:
+          item = pin_cached_child(state, *directory, name);
+          if (!item) throw std::system_error(ENOENT, std::generic_category(), "unlink");
+          if (item->directory()) throw std::system_error(EISDIR, std::generic_category(), "unlink");
+          key = item_key(state, *item);
+          path = object_request_path(state, key);
+          mutation = std::make_unique<PathMutationGuard>(state, path, false,
+              std::string_view{}, false, "unlink", true, true);
+          phase = 2;
+          if (state.local_cache) {
+            hide = std::make_unique<AsyncHideReaders>(state, reactor, key, path,
+                std::string{}, std::string{}, hidden_readers, this);
+            if (!hide->start()) throw std::system_error(errno, std::generic_category(), "submit unlink reader preservation");
+            owner.release(); return;
+          }
+          break;
+        case 2: {
+          if (hidden) { phase = 5; break; }
+          {
+            std::lock_guard guard(state.open_files_mutex);
+            const auto opened = state.open_files.find(path);
+            if (opened != state.open_files.end()) {
+              if (state.local_cache && opened->second.readers != 0) {
+                reader_entries = cached_reader_entries(opened->second.handles);
+              }
+              if (opened->second.writer) {
+                for (OpenHandle* handle : opened->second.handles) {
+                  if (handle == nullptr || !handle->writable) continue;
+                  try { writer_pin = std::make_unique<OpenRequestGuard>(*handle); writer = handle; }
+                  catch (const std::system_error& error) { if (error.code().value() != EBADF) throw; }
+                  break;
+                }
+              }
+            }
+          }
+          phase = 3;
+          break;
+        }
+        case 3:
+          if (writer != nullptr) {
+            std::unique_lock guard(writer->mutex);
+            if (writer->write_in_progress || writer->write_state == WRITE_SEALING) {
+              writer->reactor_waiters.fetch_add(1, std::memory_order_acq_rel);
+              waiting_writer = true;
+              guard.unlock();
+              wait_on(writer->state_event.get());
+              owner.release(); return;
+            }
+            writer->write_in_progress = true;
+            writer_reserved = true;
+            guard.unlock();
+            if (state.local_cache && writer->cache_entry) {
+              phase = 30;
+              local.start(state, reactor, create_marker, resumed, this);
+              owner.release(); return;
+            }
+          }
+          phase = 31;
+          break;
+        case 30: {
+          if (marker_created) {
+            std::lock_guard open_guard(state.open_files_mutex);
+            writer_marker = state.pending_deletes.try_emplace(path, State::PendingDelete{
+                .key = key, .restore_key = {}, .replacement_etag = {}, .rollback = false, .deleting = true}).second;
+            if (!writer_marker) throw std::logic_error("pending writer unlink collision");
+          }
+          phase = 31;
+          break;
+        }
+        case 31:
+          {
+            AsyncHttpRequest args;
+            args.method = "DELETE";
+            args.path = path;
+            remote = std::make_unique<AsyncSignedS3Request>(state, reactor, std::move(args), received, this);
+            phase = 4;
+            if (!remote->start()) throw std::system_error(errno, std::generic_category(), "submit unlink DeleteObject");
+            owner.release(); return;
+          }
+        case 4:
+          if (writer != nullptr) {
+            {
+              std::lock_guard guard(writer->mutex);
+              writer->unlinked.store(true, std::memory_order_release);
+              writer->stale.store(true, std::memory_order_release);
+              if (writer->write_state != WRITE_SEALED) fail_write(*writer, ESTALE);
+            }
+            if (writer->cache_entry) {
+              phase = 40;
+              local.start(state, reactor, discard_write, resumed, this);
+              owner.release(); return;
+            }
+          }
+          phase = 40;
+          break;
+        case 40:
+          if (writer_marker) {
+            std::lock_guard guard(state.open_files_mutex);
+            const auto pending = state.pending_deletes.find(path);
+            if (pending != state.pending_deletes.end()) pending->second.deleting = false;
+            writer_marker = false;
+          }
+          phase = 5;
+          break;
+        case 5: {
+          cache_preserved = hidden;
+          if (!hidden && state.local_cache) {
+            if (cache_retry && !retirement.ready(state, reactor, key, nullptr, preserve_readers)) {
+              owner.release(); return;
+            }
+            cache_retry = false;
+            phase = 50;
+            local.start(state, reactor, remove_cache, resumed, this);
+            owner.release(); return;
+          }
+          phase = 50;
+          break;
+        }
+        case 50: {
+          if (cache_retry) { phase = 5; break; }
+          if (!cache_preserved) {
+            std::lock_guard guard(state.open_files_mutex);
+            const auto opened = state.open_files.find(path);
+            if (opened != state.open_files.end()) {
+              for (OpenHandle* handle : opened->second.handles) {
+                if (handle != nullptr && !handle->writable) handle->stale.store(true, std::memory_order_release);
+              }
+            }
+          }
+          if (!item->detached()) remove_item(state, *item);
+          fuse_reply_err(request, 0);
+          return;
+        }
+        default: abort();
+      }
+    } catch (...) {
+      owner.release();
+      fail(std::current_exception());
+    }
+  }
+};
 
 void ngs3fs_unlink(fuse_req_t request, fuse_ino_t parent,
                    const char* name) {
@@ -9734,6 +16369,11 @@ void ngs3fs_unlink(fuse_req_t request, fuse_ino_t parent,
   }
   State& state = state_from(request);
   try {
+    if (FuseReactor* reactor = current_fuse_reactor()) {
+      auto task = std::make_unique<AsyncUnlink>(state, *reactor, request, parent, name);
+      task.release()->advance();
+      return;
+    }
     InodeBase& directory = inode_item(state, parent);
     if (!directory.directory()) {
       throw std::system_error(ENOTDIR, std::generic_category(), "unlink");
@@ -9814,7 +16454,7 @@ void ngs3fs_unlink(fuse_req_t request, fuse_ino_t parent,
         std::unique_lock writer_guard(writer->mutex);
         while (writer->write_in_progress ||
                writer->write_state == WRITE_SEALING) {
-          writer->condition.wait(writer_guard);
+          wait_handle(*writer, writer_guard);
         }
         delete_object(state, key, {});
         writer->unlinked.store(true, std::memory_order_release);
@@ -9895,10 +16535,257 @@ void put_empty_object(State& state, std::string_view path,
   require_s3_success(response, "PutObject directory marker");
 }
 
+struct AsyncDirectoryAction {
+  enum Kind { CREATE, MKDIR, RMDIR };
+  State& state;
+  FuseReactor& reactor;
+  fuse_req_t request;
+  fuse_ino_t parent;
+  std::string name;
+  fuse_file_info file{};
+  Kind kind;
+  unsigned phase = 0;
+  InodePin directory;
+  InodePin item;
+  DirectoryGuards locks;
+  size_t lock_index = 0;
+  IoMutex* waiting = nullptr;
+  uint64_t notification = 0;
+  AsyncIoRequest wait;
+  DirectoryContinuation listing;
+  AsyncCacheRetirement retirement;
+  std::unique_ptr<AsyncSignedS3Request> remote;
+  Response response;
+
+  AsyncDirectoryAction(State& s, FuseReactor& r, fuse_req_t req,
+                          fuse_ino_t p, const char* n, fuse_file_info* info, Kind k)
+      : state(s), reactor(r), request(req), parent(p), name(n), kind(k) {
+    InodeBase& base = inode_item(state, parent);
+    if (!base.directory()) {
+      throw std::system_error(ENOTDIR, std::generic_category(), "directory operation");
+    }
+    retain_inode_count(base.open_count, "directory mutation pin");
+    directory = InodePin(state, base);
+    if (info != nullptr) file = *info;
+    listing.complete = listed;
+    listing.context = this;
+    retirement.complete = listed;
+    retirement.context = this;
+  }
+
+  void fail(std::exception_ptr error) noexcept {
+    std::unique_ptr<AsyncDirectoryAction> owner(this);
+    invalidate_directory(state, parent);
+    try {
+      std::rethrow_exception(error);
+    } catch (...) {
+      reply_callback_error(request);
+    }
+  }
+
+  static void listed(void* context, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncDirectoryAction*>(context);
+    if (error) task->fail(std::move(error));
+    else task->advance();
+  }
+
+  static void unlocked(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncDirectoryAction*>(context);
+    task->waiting->end_async_wait();
+    task->waiting = nullptr;
+    try {
+      if (result < 0) {
+        throw std::system_error(-int(result), std::generic_category(), "wait for directory mutation");
+      }
+      task->advance();
+    } catch (...) {
+      task->fail(std::current_exception());
+    }
+  }
+
+  static void received(void* context, Response&& response, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncDirectoryAction*>(context);
+    task->response = std::move(response);
+    task->remote.reset();
+    if (error) task->fail(std::move(error));
+    else task->advance();
+  }
+
+  void prepare_locks() {
+    locks.directories.push_back(&directory->dir_children());
+    if (kind == RMDIR) {
+      item = pin_cached_child(state, *directory, name);
+      if (!item) throw std::system_error(ENOENT, std::generic_category(), "rmdir");
+      if (!item->directory()) throw std::system_error(ENOTDIR, std::generic_category(), "rmdir");
+      locks.directories.push_back(&item->dir_children());
+    }
+    std::sort(locks.directories.begin(), locks.directories.end(), std::less<Directory*>());
+    locks.guards.reserve(locks.directories.size());
+    for (Directory* children : locks.directories) {
+      locks.guards.emplace_back(children->mutation_mutex, std::defer_lock);
+    }
+  }
+
+  bool acquire_locks() {
+    for (; lock_index < locks.guards.size(); ++lock_index) {
+      auto& lock = locks.guards[lock_index];
+      if (lock.try_lock()) continue;
+      IoMutex& mutex = *lock.mutex();
+      const int fd = mutex.begin_async_wait();
+      if (lock.try_lock()) {
+        mutex.end_async_wait();
+        continue;
+      }
+      waiting = &mutex;
+      wait = {};
+      wait.kind = AsyncIoRequest::READ;
+      wait.fd = fd;
+      wait.data = &notification;
+      wait.length = sizeof(notification);
+      wait.complete = unlocked;
+      wait.context = this;
+      wait.timeout_ms = 0;
+      if (!reactor.submit(wait)) {
+        const int error = errno;
+        mutex.end_async_wait();
+        waiting = nullptr;
+        throw std::system_error(error, std::generic_category(), "submit directory lock wait");
+      }
+      return false;
+    }
+    return true;
+  }
+
+  void advance() noexcept {
+    std::unique_ptr<AsyncDirectoryAction> owner(this);
+    try {
+      for (;;) {
+        switch (phase) {
+          case 0:
+            phase = 1;
+            if (await_directory_refresh(state, reactor, parent, listing)) {
+              owner.release();
+              return;
+            }
+            break;
+          case 1:
+            prepare_locks();
+            phase = 2;
+            break;
+          case 2:
+            if (!acquire_locks()) {
+              owner.release();
+              return;
+            }
+            phase = 3;
+            if (await_directory_refresh(state, reactor, parent, listing)) {
+              owner.release();
+              return;
+            }
+            break;
+          case 3:
+            if (directory->detached()) {
+              throw std::system_error(ESTALE, std::generic_category(), "directory mutation");
+            }
+            if (kind == CREATE) {
+              if (pin_cached_child(state, *directory, name)) {
+                throw std::system_error(EEXIST, std::generic_category(), "create");
+              }
+              bool retry = false;
+              create_cached_file(request, parent, name.c_str(), &file, &locks.guards.front(), &retry);
+              if (retry) { phase = 2; lock_index = 0; break; }
+              return;
+            }
+            phase = 4;
+            if (kind == RMDIR) {
+              InodePin current = pin_cached_child(state, *directory, name);
+              if (current.get() != item.get()) {
+                throw std::system_error(ENOENT, std::generic_category(), "rmdir changed entry");
+              }
+              if (await_directory_refresh(state, reactor, item_inode(item.get()), listing, true)) {
+                owner.release();
+                return;
+              }
+            }
+            break;
+          case 4: {
+            AsyncHttpRequest args;
+            if (kind == RMDIR) {
+              std::shared_lock guard(item->dir_children().mutex);
+              if (!item->dir_children().empty()) {
+                throw std::system_error(ENOTEMPTY, std::generic_category(), "rmdir");
+              }
+              args.method = "DELETE";
+              args.path = object_request_path(state, item_key(state, *item));
+            } else {
+              args.method = "PUT";
+              args.path = object_request_path(state, item_key(state, *directory) + name + '/');
+              args.headers.push_back(Header{"if-none-match", "*"});
+            }
+            remote = std::make_unique<AsyncSignedS3Request>(
+                state, reactor, std::move(args), received, this, kind == MKDIR ? 1 : 4);
+            phase = 5;
+            if (!remote->start()) {
+              throw std::system_error(errno, std::generic_category(), "submit directory mutation");
+            }
+            owner.release();
+            return;
+          }
+          case 5:
+            if (kind == RMDIR) {
+              if (response.status != 200 && response.status != 204 && response.status != 404) {
+                throw_s3_response(response, "DeleteObject");
+              }
+              if (!item->detached()) remove_item(state, *item);
+              fuse_reply_err(request, 0);
+            } else {
+              if (response.status == 412) {
+                throw std::system_error(EEXIST, std::generic_category(), "directory marker already exists");
+              }
+              require_s3_success(response, "PutObject directory marker");
+              ListedChild child;
+              child.name = name;
+              child.directory = true;
+              const fuse_ino_t inode = install_item(state, parent, std::move(child), 0, true, false, true);
+              fuse_entry_param entry{};
+              entry.ino = inode;
+              entry.generation = 1;
+              entry.attr_timeout = entry.entry_timeout = remaining_directory_timeout(*directory);
+              fill_inode_stat(state, inode, inode_item(state, inode), entry.attr);
+              if (fuse_reply_entry(request, &entry) != 0) {
+                forget_inode(inode, 1);
+                sweep_retired_items(state);
+              }
+            }
+            return;
+          default: abort();
+        }
+      }
+    } catch (...) {
+      invalidate_directory(state, parent);
+      reply_callback_error(request);
+    }
+  }
+};
+
+void start_directory_action(fuse_req_t request, fuse_ino_t parent,
+                              const char* name, fuse_file_info* file, int kind) {
+  try {
+    (new AsyncDirectoryAction(state_from(request), *current_fuse_reactor(),
+        request, parent, name, file, AsyncDirectoryAction::Kind(kind)))->advance();
+  } catch (...) {
+    reply_callback_error(request);
+  }
+}
+
 void ngs3fs_mkdir(fuse_req_t request, fuse_ino_t parent, const char* name,
                   mode_t) {
   if (name == nullptr || !valid_fuse_component(name)) {
     fuse_reply_err(request, EINVAL);
+    return;
+  }
+  if (current_fuse_reactor() != nullptr) {
+    start_directory_action(request, parent, name, nullptr, AsyncDirectoryAction::MKDIR);
     return;
   }
   State& state = state_from(request);
@@ -9945,6 +16832,10 @@ void ngs3fs_rmdir(fuse_req_t request, fuse_ino_t parent,
     fuse_reply_err(request, EINVAL);
     return;
   }
+  if (current_fuse_reactor() != nullptr) {
+    start_directory_action(request, parent, name, nullptr, AsyncDirectoryAction::RMDIR);
+    return;
+  }
   State& state = state_from(request);
   try {
     refresh_directory(state, parent);
@@ -9985,6 +16876,410 @@ void ngs3fs_rmdir(fuse_req_t request, fuse_ino_t parent,
   }
 }
 
+struct AsyncRename {
+  State& state;
+  FuseReactor& reactor;
+  fuse_req_t request;
+  fuse_ino_t parent, new_parent;
+  std::string name, new_name, source_key, destination_key, source_path, destination_path;
+  std::string hidden_key, hidden_path;
+  unsigned flags;
+  unsigned phase = 0;
+  InodePin source_parent, destination_parent, source, destination;
+  DirectoryGuards locks;
+  size_t lock_index = 0;
+  DirectoryContinuation listing;
+  AsyncCacheRetirement retirement;
+  AsyncLocalCacheWork local;
+  AsyncIoRequest wait;
+  uint64_t notification = 0;
+  std::unique_ptr<PathMutationGuard> mutation;
+  AsyncReaderLocks readers;
+  bool readers_initialized = false;
+  bool destination_hidden = false;
+  bool destination_preserved = false;
+  bool cache_destination_processed = false;
+  bool cache_renamed = false;
+  bool cache_retry = false;
+  bool destination_snapshot = false;
+  bool destination_qualified = false;
+  bool preserve_destination = false;
+  std::vector<std::shared_ptr<CacheEntry>> destination_entries;
+  ObjectMetadata metadata;
+  std::unique_ptr<AsyncSignedS3Request> head;
+  std::unique_ptr<AsyncHideReaders> hide;
+  std::unique_ptr<AsyncRemoteRename> remote;
+  std::unique_ptr<AsyncPendingDelete> cleanup;
+  std::exception_ptr failure;
+
+  AsyncRename(State& s, FuseReactor& r, fuse_req_t req, fuse_ino_t p, const char* n,
+                 fuse_ino_t np, const char* nn, unsigned f)
+      : state(s), reactor(r), request(req), parent(p), new_parent(np), name(n), new_name(nn), flags(f) {
+    InodeBase& first = inode_item(state, parent);
+    InodeBase& second = inode_item(state, new_parent);
+    if (!first.directory() || !second.directory()) throw std::system_error(ENOTDIR, std::generic_category(), "rename");
+    retain_inode_count(first.open_count, "rename parent pin");
+    source_parent = InodePin(state, first);
+    retain_inode_count(second.open_count, "rename destination pin");
+    destination_parent = InodePin(state, second);
+    listing.complete = resumed;
+    listing.context = this;
+    readers.complete = resumed;
+    readers.context = this;
+    retirement.complete = resumed;
+    retirement.context = this;
+  }
+
+  void fail(std::exception_ptr error) noexcept {
+    if (destination_hidden && !failure && phase <= 11) {
+      failure = error;
+      try { cleanup_hidden(); return; }
+      catch (...) {}
+    }
+    std::unique_ptr<AsyncRename> owner(this);
+    invalidate_directory(state, parent);
+    if (new_parent != parent) invalidate_directory(state, new_parent);
+    try { std::rethrow_exception(error); }
+    catch (...) { reply_callback_error(request); }
+  }
+
+  static void resumed(void* context, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncRename*>(context);
+    if (error) task->fail(std::move(error));
+    else task->advance();
+  }
+
+  static void unlocked(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncRename*>(context);
+    task->locks.guards[task->lock_index].mutex()->end_async_wait();
+    if (result < 0) task->fail(std::make_exception_ptr(
+        std::system_error(-int(result), std::generic_category(), "rename directory wait")));
+    else task->advance();
+  }
+
+  void prepare_locks() {
+    source = pin_cached_child(state, *source_parent, name);
+    if (!source) throw std::system_error(ENOENT, std::generic_category(), "rename");
+    destination = pin_cached_child(state, *destination_parent, new_name);
+    locks.directories = {&source_parent->dir_children(), &destination_parent->dir_children()};
+    if (source->directory()) locks.directories.push_back(&source->dir_children());
+    if (destination && destination->directory()) locks.directories.push_back(&destination->dir_children());
+    std::sort(locks.directories.begin(), locks.directories.end(), std::less<Directory*>());
+    locks.directories.erase(std::unique(locks.directories.begin(), locks.directories.end()), locks.directories.end());
+    locks.guards.reserve(locks.directories.size());
+    for (Directory* directory : locks.directories) {
+      locks.guards.emplace_back(directory->mutation_mutex, std::defer_lock);
+    }
+  }
+
+  bool acquire_locks() {
+    for (; lock_index < locks.guards.size(); ++lock_index) {
+      auto& lock = locks.guards[lock_index];
+      if (lock.try_lock()) continue;
+      const int fd = lock.mutex()->begin_async_wait();
+      if (lock.try_lock()) { lock.mutex()->end_async_wait(); continue; }
+      wait = {};
+      wait.kind = AsyncIoRequest::READ;
+      wait.fd = fd;
+      wait.data = &notification;
+      wait.length = sizeof(notification);
+      wait.timeout_ms = 0;
+      wait.complete = unlocked;
+      wait.context = this;
+      if (reactor.submit(wait)) return false;
+      const int error = errno;
+      lock.mutex()->end_async_wait();
+      throw std::system_error(error, std::generic_category(), "submit rename directory wait");
+    }
+    return true;
+  }
+
+  void validate() {
+    InodePin first = pin_cached_child(state, *source_parent, name);
+    InodePin second = pin_cached_child(state, *destination_parent, new_name);
+    if (first.get() != source.get() || second.get() != destination.get()) {
+      throw std::system_error(EAGAIN, std::generic_category(), "rename entry changed while locking");
+    }
+    if (source_parent->detached() || destination_parent->detached()) {
+      throw std::system_error(ESTALE, std::generic_category(), "rename parent detached");
+    }
+    if (destination && (flags & RENAME_NOREPLACE)) throw std::system_error(EEXIST, std::generic_category(), "rename");
+    source_key = item_key(state, *source);
+    destination_key = item_key(state, *destination_parent) + new_name;
+    if (source->directory()) destination_key += '/';
+    source_path = object_request_path(state, source_key);
+    destination_path = object_request_path(state, destination_key);
+    mutation = std::make_unique<PathMutationGuard>(state, source_path, source->directory(),
+        destination_path, source->directory(), "rename", state.local_cache && !source->directory());
+    if (source->directory()) {
+      if (destination && !destination->directory()) throw std::system_error(ENOTDIR, std::generic_category(), "rename");
+      if (destination_key.starts_with(source_key)) throw std::system_error(EINVAL, std::generic_category(), "move directory into itself");
+    } else if (destination && destination->directory()) {
+      throw std::system_error(EISDIR, std::generic_category(), "rename");
+    }
+  }
+
+  static void headed(void* context, Response&& response, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncRename*>(context);
+    task->head.reset();
+    try {
+      if (error) std::rethrow_exception(error);
+      task->metadata = decode_head_response(response);
+    } catch (...) { task->fail(std::current_exception()); return; }
+    task->advance();
+  }
+
+  static void hidden_readers(void* context, bool hidden, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncRename*>(context);
+    try {
+      if (hidden) {
+        task->hidden_key = task->hide->take_hidden_key();
+        task->hidden_path = task->hide->take_hidden_path();
+      }
+      task->destination_hidden = hidden;
+      task->hide.reset();
+      if (error) std::rethrow_exception(error);
+    } catch (...) { task->fail(std::current_exception()); return; }
+    task->advance();
+  }
+
+  void cleanup_hidden() {
+    {
+      std::lock_guard guard(state.open_files_mutex);
+      const auto pending = state.pending_deletes.find(hidden_path);
+      if (pending != state.pending_deletes.end()) {
+        if (!failure) pending->second.rollback = false;
+        pending->second.deleting = false;
+      }
+    }
+    cleanup = std::make_unique<AsyncPendingDelete>(state, reactor, hidden_path, cleaned, this);
+    if (!cleanup->start()) {
+      if (failure) std::rethrow_exception(failure);
+      throw std::system_error(errno, std::generic_category(), "submit rename cleanup");
+    }
+  }
+
+  static void renamed(void* context, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncRename*>(context);
+    task->remote.reset();
+    if (error) {
+      task->failure = error;
+      if (!task->destination_hidden) { task->fail(error); return; }
+      try { task->cleanup_hidden(); }
+      catch (...) { task->fail(error); }
+    } else task->advance();
+  }
+
+  static void cleaned(void* context, std::exception_ptr) noexcept {
+    auto* task = static_cast<AsyncRename*>(context);
+    task->cleanup.reset();
+    if (task->failure) task->fail(task->failure);
+    else task->advance();
+  }
+
+  static void remove_destination(void* value) {
+    auto* task = static_cast<AsyncRename*>(value);
+    if (!task->destination_qualified) {
+      task->preserve_destination = cached_readers_fully_clean(std::move(task->destination_entries));
+      task->destination_qualified = true;
+    }
+    task->destination_preserved = task->state.local_cache->remove(
+        task->destination_key, task->preserve_destination, &task->cache_retry, false);
+  }
+
+  static void destination_removed(void* value, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncRename*>(value);
+    if (error) { task->fail(std::move(error)); return; }
+    task->cache_destination_processed = !task->cache_retry;
+    task->advance();
+  }
+
+  static void rename_cache(void* value) {
+    auto* task = static_cast<AsyncRename*>(value);
+    task->state.local_cache->rename(
+        task->source_key, task->destination_key, &task->cache_retry, false);
+  }
+
+  static void cache_rename_done(void* value, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncRename*>(value);
+    if (error) { task->fail(std::move(error)); return; }
+    task->cache_renamed = !task->cache_retry;
+    task->advance();
+  }
+
+  static void commit_marker(void* value) {
+    auto* task = static_cast<AsyncRename*>(value);
+    task->state.local_cache->commit_pending_delete(task->hidden_key);
+  }
+
+  static void marker_committed(void* value, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncRename*>(value);
+    if (error) {
+      try { std::rethrow_exception(error); }
+      catch (const std::exception& failure) {
+        fprintf(stderr, "warning: remote rename committed before pending-delete metadata: path=%s: %s\n",
+                task->hidden_path.c_str(), failure.what());
+      } catch (...) {
+        fprintf(stderr, "warning: remote rename committed before pending-delete metadata: path=%s\n",
+                task->hidden_path.c_str());
+      }
+    }
+    task->advance();
+  }
+
+  bool publish() {
+    if (!source->directory()) {
+      if (!cache_destination_processed) {
+        destination_preserved = destination_hidden;
+        if (!destination_hidden && destination && state.local_cache) {
+          if (!destination_snapshot) {
+            std::lock_guard guard(state.open_files_mutex);
+            const auto opened = state.open_files.find(destination_path);
+            if (opened != state.open_files.end() && opened->second.readers != 0) {
+              destination_entries = cached_reader_entries(opened->second.handles);
+            }
+            destination_snapshot = true;
+          }
+          if (cache_retry && !retirement.ready(state, reactor, destination_key,
+                                                 nullptr, preserve_destination)) return false;
+          cache_retry = false;
+          local.start(state, reactor, remove_destination, destination_removed, this);
+          return false;
+        }
+        cache_destination_processed = true;
+      }
+      if (!cache_renamed && state.local_cache) {
+        if (cache_retry && !retirement.ready(state, reactor, destination_key)) return false;
+        cache_retry = false;
+        local.start(state, reactor, rename_cache, cache_rename_done, this);
+        return false;
+      }
+      finish_open_file_rename(state, source_path, destination_path, destination_key,
+                               destination_preserved, readers.locks.handles);
+      readers.locks.identities.clear();
+      readers.locks.pins.clear();
+    }
+    if (destination && !destination->detached()) remove_item(state, *destination);
+    if (!source->detached() && !destination_parent->detached() &&
+        move_cached_item(*source, *destination_parent, new_name)) {
+      if (!source->directory()) source->set_fsize(metadata.size);
+    } else {
+      invalidate_directory(state, parent);
+      invalidate_directory(state, new_parent);
+    }
+    fuse_reply_err(request, 0);
+    return true;
+  }
+
+  void advance() noexcept {
+    std::unique_ptr<AsyncRename> owner(this);
+    try {
+      for (;;) switch (phase) {
+        case 0:
+          phase = 1;
+          if (await_directory_refresh(state, reactor, parent, listing)) { owner.release(); return; }
+          break;
+        case 1:
+          phase = 2;
+          if (new_parent != parent && await_directory_refresh(state, reactor, new_parent, listing)) { owner.release(); return; }
+          break;
+        case 2:
+          prepare_locks();
+          if (parent == new_parent && name == new_name) { fuse_reply_err(request, 0); return; }
+          phase = 3;
+          break;
+        case 3:
+          if (!acquire_locks()) { owner.release(); return; }
+          phase = 4;
+          if (await_directory_refresh(state, reactor, parent, listing)) { owner.release(); return; }
+          break;
+        case 4:
+          phase = 5;
+          if (new_parent != parent && await_directory_refresh(state, reactor, new_parent, listing)) { owner.release(); return; }
+          break;
+        case 5:
+          validate();
+          phase = 6;
+          if (source->directory() && await_directory_refresh(state, reactor, item_inode(source.get()), listing, true)) { owner.release(); return; }
+          break;
+        case 6:
+          if (source->directory()) {
+            std::shared_lock guard(source->dir_children().mutex);
+            if (!source->dir_children().empty()) throw std::system_error(EXDEV, std::generic_category(), "non-empty S3 directory rename is not atomic");
+          }
+          phase = 7;
+          if (source->directory() && destination && await_directory_refresh(state, reactor, item_inode(destination.get()), listing, true)) { owner.release(); return; }
+          break;
+        case 7:
+          if (source->directory() && destination) {
+            std::shared_lock guard(destination->dir_children().mutex);
+            if (!destination->dir_children().empty()) throw std::system_error(ENOTEMPTY, std::generic_category(), "rename destination directory");
+          }
+          phase = 8;
+          break;
+        case 8:
+          if (state.local_cache && !source->directory()) {
+            if (!readers_initialized) {
+              readers.snapshot(state, reactor, source_path);
+              readers_initialized = true;
+            }
+            if (!readers.acquire()) { owner.release(); return; }
+            for (OpenHandle* handle : readers.locks.handles) {
+              handle->object_path.reserve(destination_path.size());
+              handle->key.reserve(destination_key.size());
+            }
+          }
+          {
+            AsyncHttpRequest args;
+            args.method = "HEAD";
+            args.path = source_path;
+            head = std::make_unique<AsyncSignedS3Request>(state, reactor, std::move(args), headed, this);
+            phase = 9;
+            if (!head->start()) throw std::system_error(errno, std::generic_category(), "submit rename HeadObject");
+            owner.release(); return;
+          }
+        case 9:
+          phase = 10;
+          if (!source->directory() && destination && state.local_cache) {
+            hide = std::make_unique<AsyncHideReaders>(state, reactor, destination_key, destination_path,
+                destination_key, metadata.etag, hidden_readers, this);
+            if (!hide->start()) throw std::system_error(errno, std::generic_category(), "submit rename destination preservation");
+            owner.release(); return;
+          }
+          break;
+        case 10:
+          remote = std::make_unique<AsyncRemoteRename>(state, reactor, source_key, metadata.size,
+              metadata.etag, metadata.version_id, destination_path,
+              !source->directory() && (flags & RENAME_NOREPLACE), renamed, this);
+          phase = 11;
+          if (!remote->start()) {
+            const auto error = std::make_exception_ptr(std::system_error(errno, std::generic_category(), "submit remote rename"));
+            owner.release();
+            renamed(this, error);
+            return;
+          }
+          owner.release(); return;
+        case 11:
+          if (destination_hidden) {
+            phase = 111;
+            local.start(state, reactor, commit_marker, marker_committed, this);
+            owner.release(); return;
+          }
+          phase = 12;
+          break;
+        case 111:
+          phase = 12;
+          cleanup_hidden();
+          owner.release(); return;
+        case 12:
+          if (!publish()) owner.release();
+          return;
+        default: abort();
+      }
+    } catch (...) { owner.release(); fail(std::current_exception()); }
+  }
+};
+
 void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
                    fuse_ino_t new_parent, const char* new_name,
                    unsigned int flags) {
@@ -10003,6 +17298,11 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
 
   State& state = state_from(request);
   try {
+    if (FuseReactor* reactor = current_fuse_reactor()) {
+      auto task = std::make_unique<AsyncRename>(state, *reactor, request, parent, name, new_parent, new_name, flags);
+      task.release()->advance();
+      return;
+    }
     InodePin source;
     InodePin destination;
     {
@@ -10487,13 +17787,16 @@ int run(int argc, char** argv) {
         std::lock_guard guard(state.session_mutex);
         state.session = session;
       }
-      bool run_legacy = state.config.io_engine == IO_ENGINE_LEGACY;
+      bool run_legacy = state.config.io_engine == IO_ENGINE_LEGACY || state.config.tls;
+      if (state.config.tls && state.config.io_engine != IO_ENGINE_LEGACY) {
+        fprintf(stderr, "warning: TLS uses the legacy engine; io_uring is "
+                        "enabled only for plaintext connections\n");
+      }
       if (!run_legacy) {
         reactors = std::make_unique<FuseReactorGroup>();
         std::string reactor_error;
         if (reactors->initialize(session, state.config.reactor_count,
                                  kFuseReactorQueueDepth,
-                                 state.config.max_connections,
                                  state.config.request_timeout_ms,
                                  reactor_error)) {
           result = reactors->run();

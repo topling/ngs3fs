@@ -13,8 +13,9 @@ max_connections=${MAX_CONNECTIONS:-8}
 io_engine=${NGS3FS_IO_ENGINE:-}
 reactors=${NGS3FS_REACTORS:-}
 bytes=${BYTES:-1048576}
-perf_event=${PERF_EVENT:-cycles:u}
+perf_event=${PERF_EVENT:-cpu-clock}
 perf_frequency=${PERF_FREQUENCY:-4000}
+perf_mmap_size=${PERF_MMAP_SIZE:-4M}
 io_args=()
 if [[ -n "$io_engine" ]]; then
   io_args+=(--io-engine "$io_engine")
@@ -200,6 +201,14 @@ for binary in "${required_binaries[@]}" \
 done
 
 mkdir -p "$backend/$bucket" "$mount_dir"
+{
+  printf 'ngs3fs_path=%s\n' "$(realpath "$ngs3fs")"
+  printf 'ngs3fs_sha256=%s\n' "$(sha256sum "$ngs3fs" | cut -d' ' -f1)"
+  printf 'git_commit=%s\n' "$(git -C "$project_dir" rev-parse HEAD)"
+  printf 'git_dirty=%s\n' "$(git -C "$project_dir" status --porcelain | tr '\n' ' ')"
+  printf 'perf_event=%s\nperf_frequency=%s\n' "$perf_event" "$perf_frequency"
+  printf 'perf_mmap_size=%s\n' "$perf_mmap_size"
+} >"$run_dir/system.txt"
 if [[ "$workload" = mmap ]]; then
   dd if=/dev/urandom of="$backend/$bucket/$object" \
     bs=1M count=256 status=none
@@ -277,7 +286,7 @@ fi
 profile_first_line=$(wc -l <"$run_dir/versity-access.log")
 
 LD_LIBRARY_PATH=$perf_lib "$perf" record -F "$perf_frequency" \
-  -e "$perf_event" \
+  -e "$perf_event" -m "$perf_mmap_size" \
   --call-graph dwarf,16384 -p "$ngs3fs_pid" \
   -o "$run_dir/perf.data" -- sleep 3600 &
 perf_pid=$!
@@ -354,7 +363,7 @@ if [[ ! -s "$run_dir/perf.folded" ]]; then
   rm -f "$run_dir/perf.data" "$run_dir/perf.script" \
     "$run_dir/perf.folded"
   LD_LIBRARY_PATH=$perf_lib "$perf" record -F "$perf_frequency" \
-    -e "$perf_event" \
+    -e "$perf_event" -m "$perf_mmap_size" \
     --call-graph dwarf,16384 -p "$ngs3fs_pid" \
     -o "$run_dir/perf.data" -- sleep 3600 &
   perf_pid=$!

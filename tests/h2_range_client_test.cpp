@@ -1,4 +1,5 @@
 #include "http.hpp"
+#include "async_io_executor.hpp"
 #include "io.hpp"
 
 #include <nghttp2/nghttp2.h>
@@ -173,16 +174,19 @@ class TestFileSink final : public RangeFileSink {
   TestFileSink(int fd, uint64_t offset) noexcept
       : RangeFileSink(fd, offset) {}
 
-  void progress(const Response&, bool complete) override {
+  void progress(const Response& response, bool complete) override {
     ++calls;
+    produced = response.body_bytes;
     completed |= complete;
   }
 
   size_t calls = 0;
+  size_t produced = 0;
   bool completed = false;
 };
 
-int main() {
+int main(int argc, char** argv) {
+  const bool asynchronous = argc == 2 && std::string_view(argv[1]) == "--async";
   UniqueFd listener(
       ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP));
   assert(listener);
@@ -208,13 +212,49 @@ int main() {
   UniqueFd file(::memfd_create("h2-range-file", MFD_CLOEXEC));
   assert(file);
   TestFileSink sink(file.get(), 0);
-  auto download = client->begin_range_to_fd(
-      "/bucket/key", 0, expected.size(), sink, {}, false, true);
-  const size_t first_received = download->receive_at_least(64U * 1024U);
-  assert(first_received >= 64U * 1024U);
-  assert(first_received < expected.size());
-  assert(!sink.completed);
-  const auto response = download->finish();
+  Response response;
+  if (asynchronous) {
+    TestAsyncIoExecutor executor(4093);
+    AsyncHttpRequest request;
+    request.path = "/bucket/key";
+    request.range = true;
+    request.length = expected.size();
+    request.destination = &sink;
+    request.capture_headers = false;
+    request.measure_transport = true;
+    struct Completion {
+      Response* response;
+      std::exception_ptr error;
+      bool done = false;
+    } completion{&response, {}};
+    auto operation = client->make_async_request(executor, std::move(request),
+        [](void* context, Response&& result, std::exception_ptr error) noexcept {
+          auto& completion = *static_cast<Completion*>(context);
+          *completion.response = std::move(result);
+          completion.error = std::move(error);
+          completion.done = true;
+        }, &completion);
+    operation->start();
+    while (sink.produced < 64U * 1024U && !completion.done) {
+      assert(executor.run_one());
+    }
+    assert(sink.produced >= 64U * 1024U);
+    assert(sink.produced < expected.size());
+    assert(!sink.completed);
+    executor.run();
+    assert(completion.done);
+    if (completion.error) std::rethrow_exception(completion.error);
+    assert(executor.parameters_preserved());
+    assert(executor.saw_background_file_write());
+  } else {
+    auto download = client->begin_range_to_fd(
+        "/bucket/key", 0, expected.size(), sink, {}, false, true);
+    const size_t first_received = download->receive_at_least(64U * 1024U);
+    assert(first_received >= 64U * 1024U);
+    assert(first_received < expected.size());
+    assert(!sink.completed);
+    response = download->finish();
+  }
   assert(response.status == 206);
   assert(response.body_bytes == expected.size());
   assert(response.externally_spliced_bytes == expected.size());

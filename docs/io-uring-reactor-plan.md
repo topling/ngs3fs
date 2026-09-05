@@ -5,6 +5,151 @@ use libfuse for protocol semantics while preserving fd-backed splice replies;
 FUSE-over-io-uring remains excluded until its payload UAPI avoids the extra
 copy.
 
+## Approved revision: explicit continuations, no fibers (2026-09-05)
+
+This revision supersedes the fiber-based implementation described in the
+historical implementation sections below. It does not change filesystem,
+checksum, caching, protocol-selection, or close-to-open semantics.
+
+### Goal and boundaries
+
+Replace stackful fibers with small operation-specific state machines. An I/O
+completion advances its operation on the owning reactor without a synchronous
+worker rendezvous or a stack switch. Preserve legacy as the startup-time
+fallback, TLS as the existing compatibility boundary, and bounded background
+execution for local filesystem writes and checksum computation. Do not add
+coroutines, another scheduler framework, a giant filesystem-wide switch, new
+mount options, or provider/kernel changes to implement this revision.
+
+This is active development: old source interfaces and on-disk cache formats
+are not compatibility commitments. Refactor or remove old APIs directly; do
+not add data migrations, legacy-format readers, or permanent adapter layers.
+The separately requested legacy I/O engine remains a supported runtime mode,
+not a requirement to preserve its previous internal implementation.
+
+The allowed changes remain the source/build/test/documentation and benchmark
+scope above. Transitional synchronous interfaces may remain while callers are
+migrated, but an intermediate implementation using them for the cleartext hot
+path is not completion of this contract.
+
+### Request and I/O ownership
+
+- `AsyncIoRequest` owns stable operation parameters and a completion callback.
+  Submitting it is nonblocking. Rejection returns immediately without invoking
+  the callback; acceptance produces exactly one terminal callback on its owner
+  reactor, never inline in the submit call.
+- Short transfers continue from the recorded offset. Header parsing runs in
+  the reactor's receive completion. Local-file writes retain `IOSQE_ASYNC` so
+  filesystem work cannot unexpectedly run inside ring submission.
+- Deadlines use the existing monotonic nearest-deadline loop. Cancellation is
+  only a request to stop: the original I/O CQE must be retired before releasing
+  its buffers, fd ownership, or request storage. The cancel CQE alone is not
+  proof that the original I/O no longer references memory.
+- Fixed-size internal I/O/control objects use reactor-local free lists. A
+  one-reactor request does not need atomic refcounts or queues solely because
+  the implementation supports multiple reactors; genuinely cross-thread
+  ownership still requires synchronization.
+- FUSE operation objects copy callback-scoped names and file-info values,
+  retain fd-backed input ownership when needed, and own inode/handle/cache
+  references until their final dependent operation completes.
+- A satisfied read replies once and separates its FUSE lifetime from an
+  ongoing prefetch/checksum lifetime. Later failure affects only operations
+  that have not already succeeded, following existing checksum policy.
+- Connection, pending-page, metadata refresh, and handle-completion waits
+  register continuations and return to the event loop. No reactor blocks on a
+  condition variable, an eventfd read, or a contended filesystem lock.
+- Release closes admission, then retires the handle after its final request;
+  it cannot delete a handle merely because an observed count became zero
+  while another completion still accesses that handle.
+
+### Ordered implementation tasks
+
+1. Add the callback-driven asynchronous I/O interface and tests of short I/O,
+   timeout, rejection, cancellation, and exactly-once completion. Keep the
+   synchronous interface available only for legacy/transitional callers.
+2. Add HTTP/1 and HTTP/2 continuation state machines sharing existing parsers
+   and protocol validation. Cover send, receive headers, body progress, body
+   completion, connection reuse, and failed/canceled connection disposal.
+3. Migrate FUSE data paths and their retained input/reply lifetimes. Preserve
+   early read replies, in-flight prefetch reuse, asynchronous checksum policy,
+   sequential writes, first-flush seal, and background local-file writes.
+4. Migrate remaining metadata/pool/cache/handle waiting points; remove fiber
+   stacks, context assembly, fiber-local state, and their build dependencies.
+5. Review/fix/test all modes, then collect repeated A/B and kernel-inclusive
+   flamegraphs. Record executable identity, cache-drop outcome, CPU, wall time,
+   latency, S3 request counts, syscall/context-switch evidence, and io-wq load.
+   Commit/push and run the approved CI matrix only after local correctness
+   gates; retain readable evidence artifacts, not raw perf.data.
+
+### Verification and stop conditions
+
+| Requirement | Required evidence | Missing evidence |
+|---|---|---|
+| No fibers or hidden synchronous hot-path handoff | Source audit plus reactor/worker call stacks | Incomplete |
+| Stable asynchronous ownership | Focused short-I/O/timeout/cancel/shutdown tests and sanitizer where supported | Block completion |
+| Preserved behavior | Existing full CTest plus legacy/one/multi-reactor cache and uncached integrations | Block completion |
+| Early reply and background progress | Prefetch, overlapping reads, close while I/O is pending tests | Block completion |
+| No CPU/latency regression | Repeated comparable A/B samples and kernel-inclusive flamegraphs | Continue analysis/fix |
+| Reproducible evidence | Actual executable paths/hashes, event/frequency, workload and cache state | Discard unsupported comparison |
+
+Stop and seek a scope decision if this requires an extra payload copy, changes
+approved filesystem behavior, or needs a new external dependency/kernel patch.
+Do not present temporary fallback workers, unconverted waits, or unmeasured
+performance as a completed fiber removal. A failed test is investigated and
+fixed without weakening its assertion.
+
+### Revision execution evidence
+
+| Task | Evidence | Result |
+|---|---|---|
+| Existing-lifetime repair before migration | Build and existing uring, legacy, multi-reactor and multi-reactor cached integrations | 4/4 pass |
+| Explicit asynchronous I/O | Reactor-local request pools, original/cancel CQE retirement, short-I/O/deadline tests, shutdown continuation overflow tests | Focused tests pass; final suite pending |
+| HTTP and FUSE migration | H1/H2 continuation parsers, asynchronous read/write/metadata operations; fiber stacks/context switching removed | Implemented; final integration gate pending |
+| First full correctness run | 49/55 passed; a serial rerun passed four of the six failures, leaving the two cached integrations failing page-cache retention | Not a passing full-suite result |
+| Follow-up fixes | Actual background NOTIFY_STORE completion before flush; nonblocking cache retirement; background cache initialization; credential-refresh and eviction-lock fixes; checksum/rename regression cases | Full 55/55 pass on the final 2026-09-05 local rebuild (53.03 seconds) |
+| Notification and owner-thread regression | Real custom-I/O notification completion, blocked notification versus unrelated READ, reentrant notifications, initialize/run on different threads, disabled-destination exclusion, callback/CQE fairness | Focused test passed 30 consecutive runs |
+| Local-cache metadata stages | Marker creation/cleanup, discard, remove, rename and eligibility queries run in background continuations; retirement busy exits the worker instead of waiting there; normal cache open needs one worker round-trip | Included in the final 55/55 passing build |
+| Shutdown review | Early owner failure wakes peers; every owner waits for cross-ring admission to close; rejected dispatch consumes neither destination admission nor source SQE | Focused test passed 30 consecutive runs; full suite passes |
+| ASan + UBSan | Reactor I/O, cache, asynchronous HTTP, credential provider | 4/4 pass; fixed missing helper-target build dependency, without changing test timeouts |
+| Preliminary performance evidence | Local normal-advice legacy/one/four-reactor previews and kernel-inclusive four-reactor flamegraph | Diagnostic only; not the performance gate |
+
+The first cached-retention failure exposed a notification completion bug:
+`fuse_lowlevel_notify_store` returned after queuing a deferred notification,
+so flush could overtake the actual STORE. Notifications issued from existing
+background threads now complete their local fusefd write there before returning;
+this adds no worker handoff and does not make reactor callbacks block. Ordinary
+FUSE request transport, HTTP parsing and socket I/O remain reactor-driven.
+
+Local profiling evidence is under
+`build/profiles/states-preview-uring4-20260905`. Its 4000 Hz `cpu-clock` stacks
+include kernel and io-wq execution and show substantial splice/scheduling costs;
+the capture reported lost events, so its percentages are diagnostic estimates.
+The preliminary four-reactor wall times varied markedly. Old blocked FUSE tasks
+also caused a global `drop_caches` attempt to stall before the repeated benchmark
+could run. Do not claim a successful cache drop, a completed A/B comparison, or
+a no-regression result from these previews. Repeat the final matrix on the
+GitHub runner and retain readable stacks, counters, identities and tables.
+
+The next scheduling experiment enables each pre-created ring on its actual
+owner using `R_DISABLED | SINGLE_ISSUER | DEFER_TASKRUN | COOP_TASKRUN`.
+Multi-reactor mounts therefore use the same single-owner kernel optimization
+as one-reactor mounts. Startup does not dispatch to disabled rings. Busy
+callback iterations explicitly reap deferred work without sleeping, and
+cross-owner dispatch admission is synchronized with shutdown draining.
+This is not a claimed performance improvement until repeated measurements
+complete. The setup/enable contract follows the
+[liburing setup documentation](https://github.com/axboe/liburing/blob/master/man/io_uring_setup.2).
+
+The local three-repetition screening run
+`build/benchmarks/states-owner-normal-20260905` explicitly skipped global cache
+dropping (each sample still used a new mount). Its median wall time / daemon
+CPU per operation was legacy 1377.9 ms / 1.265 ms, one-reactor 1935.9 ms /
+1.348 ms, and four-reactor 1660.9 ms / 1.973 ms. Samples varied substantially,
+and the first repetition overlapped a build-system dependency check. These are
+diagnostic results, not an accepted no-regression result. Performance remains
+unfinished. Runner evidence now includes five repetitions of both random and
+normal advice plus uncached legacy/one/four-reactor kernel-inclusive profiles.
+
 ## Goal
 
 Add an io_uring I/O engine that supports one or multiple reactors while preserving the current threaded implementation as a startup-time fallback. `reactor_count == 1` is the ordinary one-element `ReactorGroup`, not a separate implementation. The hot I/O path must not acquire locks merely because it uses the group abstraction.

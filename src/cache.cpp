@@ -1,4 +1,5 @@
 #include "cache.hpp"
+#include "io.hpp"
 
 #include <openssl/sha.h>
 #include <openssl/rand.h>
@@ -6,6 +7,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/file.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -753,6 +755,9 @@ CacheEntry::CacheEntry(LocalCache& owner, std::string key, int data_fd,
 }
 
 CacheEntry::~CacheEntry() {
+  if (wait_fd_ >= 0) {
+    ::close(wait_fd_);
+  }
   uint64_t unlinked_bytes = 0;
   struct stat status{};
   if (unlinked_data_ && data_fd_ >= 0 && ::fstat(data_fd_, &status) == 0) {
@@ -807,6 +812,22 @@ std::string CacheEntry::version_id() const {
     throw std::runtime_error("invalid cached Version ID");
   }
   return std::string(header.version_id.data(), header.version_length);
+}
+
+CacheIdentitySnapshot CacheEntry::identity_snapshot() const {
+  std::lock_guard guard(mutex_);
+  const auto& header = *static_cast<const CacheMetaHeader*>(mapping_);
+  if (header.etag_length > header.etag.size() ||
+      header.version_length > header.version_id.size()) {
+    throw std::runtime_error("invalid cached identity");
+  }
+  return CacheIdentitySnapshot{
+      .key = key_,
+      .etag = std::string(header.etag.data(), header.etag_length),
+      .version_id = std::string(header.version_id.data(), header.version_length),
+      .size = size_,
+      .epoch = epoch_,
+  };
 }
 
 std::string CacheEntry::write_id() const {
@@ -1202,7 +1223,8 @@ bool CacheEntry::pin_clean(uint64_t offset, size_t length) {
   if (length == 0) {
     return true;
   }
-  if (!range_all_state(offset, length, CACHE_PAGE_CLEAN)) {
+  if (!range_all_state(offset, length, CACHE_PAGE_CLEAN) ||
+      checksum_blocked_locked(offset, length) != 0) {
     return false;
   }
   const size_t region_size = std::max<size_t>(1024U * 1024U, page_size_);
@@ -1264,7 +1286,7 @@ void CacheEntry::unpin(uint64_t offset, size_t length) noexcept {
     }
   }
   if (stale_ && pinned_regions_ == 0) {
-    condition_.notify_all();
+    notify_waiters_locked();
   }
 }
 
@@ -1292,6 +1314,9 @@ bool CacheEntry::range_ready_locked(uint64_t offset,
   if (stale_ || length == 0) {
     return true;
   }
+  const uint8_t checksum = checksum_blocked_locked(offset, length);
+  if (checksum == kPartBad) return true;
+  if (checksum == kPartRetrying) return false;
   const size_t first = size_t(offset / page_size_);
   const size_t last = size_t((offset + length - 1) / page_size_);
   bool pending = false;
@@ -1305,6 +1330,41 @@ bool CacheEntry::range_ready_locked(uint64_t offset,
     }
   }
   return !pending;
+}
+
+void CacheEntry::wait_locked(std::unique_lock<std::mutex>& guard) {
+  if (wait_fd_ < 0) {
+    wait_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
+    if (wait_fd_ < 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "create cache wait event");
+    }
+  }
+  ++waiters_;
+  guard.unlock();
+  uint64_t wake = 0;
+  ssize_t result;
+  do {
+    result = io_read(wait_fd_, &wake, sizeof(wake));
+  } while (result < 0 && errno == EINTR);
+  guard.lock();
+  --waiters_;
+  if (result != ssize_t(sizeof(wake))) {
+    throw std::system_error(result < 0 ? errno : EIO,
+                            std::generic_category(),
+                            "wait for cache state");
+  }
+}
+
+void CacheEntry::notify_waiters_locked() noexcept {
+  if (wait_fd_ < 0 || waiters_ == 0) {
+    return;
+  }
+  const uint64_t wake = waiters_;
+  ssize_t result;
+  do {
+    result = ::write(wait_fd_, &wake, sizeof(wake));
+  } while (result < 0 && errno == EINTR);
 }
 
 CacheFetchClaim CacheEntry::claim_fetch(uint64_t wanted_offset,
@@ -1369,13 +1429,65 @@ CacheFetchClaim CacheEntry::claim_fetch(uint64_t wanted_offset,
 
 void CacheEntry::wait_for_range(uint64_t offset, size_t length) {
   std::unique_lock guard(mutex_);
-  condition_.wait(guard, [&] {
-    return range_ready_locked(offset, length);
-  });
+  while (!range_ready_locked(offset, length)) {
+    wait_locked(guard);
+  }
   if (stale_) {
     throw std::system_error(ESTALE, std::generic_category(),
                             "stale cache generation");
   }
+}
+
+int CacheEntry::begin_async_wait(uint64_t offset, size_t length) {
+  std::lock_guard guard(mutex_);
+  if (range_ready_locked(offset, length)) return -1;
+  if (wait_fd_ < 0) {
+    wait_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
+    if (wait_fd_ < 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "create cache wait event");
+    }
+  }
+  ++waiters_;
+  return wait_fd_;
+}
+
+void CacheEntry::end_async_wait() noexcept {
+  std::lock_guard guard(mutex_);
+  if (waiters_ == 0) abort();
+  --waiters_;
+}
+
+uint8_t CacheEntry::checksum_blocked_locked(uint64_t offset, size_t length) const noexcept {
+  if (stale_ || offset >= size_ || length == 0) return 0;
+  const uint64_t end = offset + std::min<uint64_t>(length, size_ - offset);
+  auto part = std::lower_bound(checksum_parts_.begin(), checksum_parts_.end(), offset,
+      [](const CacheChecksumPart& item, uint64_t begin) { return item.offset + item.size <= begin; });
+  uint8_t blocked = 0;
+  for (; part != checksum_parts_.end() && part->offset < end; ++part) {
+    const uint8_t state = checksum_states_[size_t(part - checksum_parts_.begin())];
+    if (state == kPartBad) return kPartBad;
+    if (state == kPartRetrying) blocked = state;
+  }
+  return blocked;
+}
+
+bool CacheEntry::checksum_failed(uint64_t offset, size_t length) const {
+  std::lock_guard guard(mutex_);
+  return checksum_blocked_locked(offset, length) == kPartBad;
+}
+
+int CacheEntry::begin_checksum_wait(uint64_t offset, size_t length) {
+  std::lock_guard guard(mutex_);
+  if (checksum_blocked_locked(offset, length) != kPartRetrying) return -1;
+  if (wait_fd_ < 0) {
+    wait_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
+    if (wait_fd_ < 0) {
+      throw std::system_error(errno, std::generic_category(), "create checksum wait event");
+    }
+  }
+  ++waiters_;
+  return wait_fd_;
 }
 
 void CacheEntry::publish_clean(const CacheFetchClaim& claim,
@@ -1399,13 +1511,12 @@ void CacheEntry::publish_clean(const CacheFetchClaim& claim,
     }
   }
   if (first != page_end) {
-    condition_.notify_all();
+    notify_waiters_locked();
   }
 }
 
 bool CacheEntry::end_fetch_locked(const CacheFetchClaim& claim) noexcept {
-  const auto i = std::find(active_claims_.begin(), active_claims_.end(),
-                           claim.id);
+  const auto i = std::find(active_claims_.begin(), active_claims_.end(), claim.id);
   if (i == active_claims_.end()) {
     return false;
   }
@@ -1440,7 +1551,7 @@ void CacheEntry::finish_fetch(const CacheFetchClaim& claim) noexcept {
     }
   }
   end_fetch_locked(claim);
-  condition_.notify_all();
+  notify_waiters_locked();
 }
 
 void CacheEntry::fail_fetch(const CacheFetchClaim& claim) noexcept {
@@ -1470,7 +1581,7 @@ void CacheEntry::fail_fetch(const CacheFetchClaim& claim) noexcept {
     }
   }
   end_fetch_locked(claim);
-  condition_.notify_all();
+  notify_waiters_locked();
 }
 
 void CacheEntry::mark_bad(const CacheFetchClaim& claim) noexcept {
@@ -1483,7 +1594,7 @@ void CacheEntry::mark_bad(const CacheFetchClaim& claim) noexcept {
       set_page_state(page, CACHE_PAGE_BAD);
     }
   }
-  condition_.notify_all();
+  notify_waiters_locked();
 }
 
 void CacheEntry::begin_retry(const CacheFetchClaim& claim) {
@@ -1497,7 +1608,7 @@ void CacheEntry::begin_retry(const CacheFetchClaim& claim) {
   for (size_t page = first; page < last; ++page) {
     set_page_state(page, CACHE_PAGE_READ_PENDING);
   }
-  condition_.notify_all();
+  notify_waiters_locked();
 }
 
 void CacheEntry::finish_retry(const CacheFetchClaim& claim,
@@ -1510,11 +1621,12 @@ void CacheEntry::finish_retry(const CacheFetchClaim& claim,
   finish_fetch(claim);
 }
 
-bool CacheEntry::begin_checksum_manifest() {
+bool CacheEntry::begin_checksum_manifest(bool wait) {
   std::unique_lock guard(mutex_);
-  condition_.wait(guard, [&] {
-    return stale_ || checksum_manifest_ != kChecksumLoading;
-  });
+  while (!stale_ && checksum_manifest_ == kChecksumLoading) {
+    if (!wait) return false;
+    wait_locked(guard);
+  }
   if (stale_) {
     throw std::system_error(ESTALE, std::generic_category(),
                             "stale cache generation");
@@ -1525,6 +1637,19 @@ bool CacheEntry::begin_checksum_manifest() {
   checksum_manifest_ = kChecksumLoading;
   ++checksum_ops_;
   return true;
+}
+
+int CacheEntry::begin_manifest_wait() {
+  std::lock_guard guard(mutex_);
+  if (stale_ || checksum_manifest_ != kChecksumLoading) return -1;
+  if (wait_fd_ < 0) {
+    wait_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
+    if (wait_fd_ < 0) {
+      throw std::system_error(errno, std::generic_category(), "create manifest wait event");
+    }
+  }
+  ++waiters_;
+  return wait_fd_;
 }
 
 void CacheEntry::finish_checksum_manifest(
@@ -1555,7 +1680,7 @@ void CacheEntry::finish_checksum_manifest(
   if (checksum_ops_ != 0) {
     --checksum_ops_;
   }
-  condition_.notify_all();
+  notify_waiters_locked();
 }
 
 void CacheEntry::checksum_manifest_unavailable() noexcept {
@@ -1566,7 +1691,7 @@ void CacheEntry::checksum_manifest_unavailable() noexcept {
   if (checksum_ops_ != 0) {
     --checksum_ops_;
   }
-  condition_.notify_all();
+  notify_waiters_locked();
 }
 
 bool CacheEntry::checksum_manifest_available() const noexcept {
@@ -1575,7 +1700,8 @@ bool CacheEntry::checksum_manifest_available() const noexcept {
 }
 
 CacheChecksumClaim CacheEntry::claim_checksum(uint64_t offset,
-                                               size_t length) {
+                                               size_t length,
+                                               bool skip_in_progress) {
   std::lock_guard guard(mutex_);
   if (stale_) {
     throw std::system_error(ESTALE, std::generic_category(),
@@ -1601,6 +1727,7 @@ CacheChecksumClaim CacheEntry::claim_checksum(uint64_t offset,
       return claim;
     }
     if (state == kPartVerifying || state == kPartRetrying) {
+      if (skip_in_progress) continue;
       CacheChecksumClaim claim;
       claim.action = CACHE_CHECKSUM_WAIT;
       return claim;
@@ -1646,7 +1773,7 @@ CacheChecksumClaim CacheEntry::claim_checksum(uint64_t offset,
 
 void CacheEntry::wait_for_checksum(uint64_t offset, size_t length) {
   std::unique_lock guard(mutex_);
-  condition_.wait(guard, [&] {
+  const auto ready = [&] {
     if (stale_ || checksum_manifest_ != kChecksumAvailable || length == 0 ||
         offset >= size_) {
       return true;
@@ -1661,7 +1788,10 @@ void CacheEntry::wait_for_checksum(uint64_t offset, size_t length) {
       }
     }
     return true;
-  });
+  };
+  while (!ready()) {
+    wait_locked(guard);
+  }
   if (stale_) {
     throw std::system_error(ESTALE, std::generic_category(),
                             "stale cache generation");
@@ -1676,7 +1806,7 @@ void CacheEntry::checksum_mismatch(
       checksum_states_[claim.part] == kPartVerifying) {
     checksum_states_[claim.part] = kPartRetrying;
   }
-  condition_.notify_all();
+  notify_waiters_locked();
 }
 
 void CacheEntry::finish_checksum(const CacheChecksumClaim& claim,
@@ -1705,17 +1835,70 @@ void CacheEntry::finish_checksum(const CacheChecksumClaim& claim,
   if (checksum_ops_ != 0) {
     --checksum_ops_;
   }
-  condition_.notify_all();
+  notify_waiters_locked();
 }
 
-void CacheEntry::retire_generation() {
+void CacheEntry::abandon_checksum(const CacheChecksumClaim& claim) noexcept {
+  std::lock_guard guard(mutex_);
+  if (claim.part >= checksum_states_.size() || claim.epoch != epoch_) {
+    return;
+  }
+  const uint8_t state = checksum_states_[claim.part];
+  if (state != kPartVerifying && state != kPartRetrying) {
+    return;
+  }
+  checksum_states_[claim.part] = kPartUnverified;
+  const uint64_t end = std::min<uint64_t>(size_, claim.offset + claim.size);
+  const size_t first_page = size_t(claim.offset / page_size_);
+  const size_t last_page = std::min(
+      page_count_, size_t((end - 1) / page_size_) + 1);
+  for (size_t page = first_page; page < last_page; ++page) {
+    if (page_state(page) == CACHE_PAGE_CLEAN) {
+      set_page_state(page, CACHE_PAGE_MISSING);
+    }
+  }
+  const size_t region_size = std::max<size_t>(1024U * 1024U, page_size_);
+  const size_t first_region = size_t(claim.offset / region_size);
+  const size_t last_region = std::min(
+      region_pins_.size(), size_t((end - 1) / region_size) + 1);
+  for (size_t region = first_region; region < last_region; ++region) {
+    if (region_pins_[region] != 0) {
+      --region_pins_[region];
+      --pinned_regions_;
+    }
+  }
+  if (checksum_ops_ != 0) --checksum_ops_;
+  notify_waiters_locked();
+}
+
+CacheRetirementPending::CacheRetirementPending()
+    : std::system_error(EAGAIN, std::generic_category(), "cache generation retirement pending") {}
+
+void CacheEntry::retire_generation(bool wait) {
   std::unique_lock guard(mutex_);
-  stale_ = true;
-  condition_.notify_all();
-  condition_.wait(guard, [&] {
-    return active_claims_.empty() && checksum_ops_ == 0 &&
-        pinned_regions_ == 0;
-  });
+  if (!stale_) {
+    stale_ = true;
+    notify_waiters_locked();
+  }
+  while (!active_claims_.empty() || checksum_ops_ != 0 ||
+         pinned_regions_ != 0) {
+    if (!wait || io_executor() != nullptr) {
+      throw CacheRetirementPending();
+    }
+    wait_locked(guard);
+  }
+}
+
+int CacheEntry::begin_retire_wait() {
+  std::lock_guard guard(mutex_);
+  if (!stale_) throw std::logic_error("cache retirement wait without retirement");
+  if (active_claims_.empty() && checksum_ops_ == 0 && pinned_regions_ == 0) return -1;
+  if (wait_fd_ < 0) {
+    wait_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
+    if (wait_fd_ < 0) cache_throw_errno("create cache retirement event");
+  }
+  ++waiters_;
+  return wait_fd_;
 }
 
 uint64_t CacheEntry::evict_one_region() noexcept {
@@ -1774,7 +1957,7 @@ uint64_t CacheEntry::evict_one_region() noexcept {
       if (::fstat(data_fd_, &after) != 0) {
         return 0;
       }
-      condition_.notify_all();
+      notify_waiters_locked();
       const uint64_t old_bytes = uint64_t(before.st_blocks) * 512;
       const uint64_t new_bytes = uint64_t(after.st_blocks) * 512;
       return old_bytes > new_bytes ? old_bytes - new_bytes : 0;
@@ -1895,7 +2078,8 @@ std::recursive_mutex& LocalCache::key_mutex(std::string_view key) noexcept {
 bool LocalCache::reclaim_closed_clean(
     const std::shared_ptr<CacheEntry>& entry) noexcept {
   try {
-    std::lock_guard key_guard(key_mutex(entry->key_));
+    std::unique_lock key_guard(key_mutex(entry->key_), std::try_to_lock);
+    if (!key_guard.owns_lock()) return false;
     std::unique_lock guard(mutex_);
     auto found = entries_.end();
     for (auto i = entries_.begin(); i != entries_.end();) {
@@ -1998,6 +2182,19 @@ bool LocalCache::evict_cold() {
         objects_root_fd_, data_root_fd_, config_, name_max,
         [this](CacheCleanRecord&& record) {
           try {
+            // A caller reserving space can already own another key lock.
+            // Cold eviction must never wait for a second key in that order.
+            std::unique_lock key_guard(key_mutex(record.key), std::try_to_lock);
+            if (!key_guard.owns_lock()) return false;
+            {
+              std::lock_guard guard(mutex_);
+              for (const auto& weak : entries_) {
+                const auto entry = weak.lock();
+                // Live entries were already examined by evict_one(). Do not
+                // reopen/retire a generation from a stale on-disk scan record.
+                if (entry && entry->key_ == record.key) return false;
+              }
+            }
             CacheIdentity identity{
                 .key        = record.key,
                 .etag       = record.etag,
@@ -2817,8 +3014,31 @@ void LocalCache::finish_pending_delete(std::string_view key) noexcept {
   }
 }
 
+std::shared_ptr<CacheEntry> LocalCache::retiring_entry(
+    std::string_view key, const CacheIdentity* reuse, bool preserve_generation) {
+  std::lock_guard key_guard(key_mutex(key));
+  std::lock_guard guard(mutex_);
+  for (auto i = entries_.begin(); i != entries_.end();) {
+    const auto entry = i->lock();
+    if (!entry) { i = entries_.erase(i); continue; }
+    ++i;
+    if (entry->key_ != key) continue;
+    std::lock_guard entry_guard(entry->mutex_);
+    const auto& header = *static_cast<const CacheMetaHeader*>(entry->mapping_);
+    if (!entry->stale_ &&
+        ((reuse != nullptr && !entry->detached_ && cache_identity_matches(header, *reuse, config_.page_size)) ||
+         (preserve_generation && (header.flags & kCacheMetaDirty) == 0))) continue;
+    if (!entry->stale_) {
+      entry->stale_ = true;
+      entry->notify_waiters_locked();
+    }
+    if (!entry->active_claims_.empty() || entry->checksum_ops_ != 0 || entry->pinned_regions_ != 0) return entry;
+  }
+  return {};
+}
+
 std::shared_ptr<CacheEntry> LocalCache::create_writer(
-    const CacheIdentity& base, uint64_t maximum_size) {
+    const CacheIdentity& base, uint64_t maximum_size, bool wait) {
   const std::string_view key = base.key;
   if (key.size() > kCacheKeyCapacity ||
       base.etag.size() > kCacheEtagCapacity ||
@@ -2835,10 +3055,13 @@ std::shared_ptr<CacheEntry> LocalCache::create_writer(
       continue;
     }
     if (entry->key_ == key) {
-      i = entries_.erase(i);
       guard.unlock();
-      entry->retire_generation();
+      entry->retire_generation(wait);
       guard.lock();
+      std::erase_if(entries_, [&](const auto& weak) {
+        const auto current = weak.lock();
+        return !current || current.get() == entry.get();
+      });
       i = entries_.begin();
       continue;
     }
@@ -2950,7 +3173,9 @@ std::shared_ptr<CacheEntry> LocalCache::create_writer(
 }
 
 bool LocalCache::remove(std::string_view key,
-                        bool preserve_generation) noexcept {
+                        bool preserve_generation, bool* retry,
+                        bool wait) noexcept {
+  if (retry != nullptr) *retry = false;
   try {
     std::lock_guard key_guard(key_mutex(key));
     std::shared_ptr<CacheEntry> target;
@@ -2964,8 +3189,6 @@ bool LocalCache::remove(std::string_view key,
       }
       if (entry->key_ == key) {
         target = std::move(entry);
-        i = entries_.erase(i);
-        continue;
       }
       ++i;
     }
@@ -2985,10 +3208,20 @@ bool LocalCache::remove(std::string_view key,
       if (preserved) {
         target->disable_eviction();
       } else {
-        target->retire_generation();
+        target->retire_generation(wait);
       }
     } else {
       guard.unlock();
+    }
+
+    // Do not lose a busy generation from the registry if retirement raises
+    // EAGAIN. A later retry must still find and wait for its live file users.
+    {
+      std::lock_guard entries_guard(mutex_);
+      std::erase_if(entries_, [&](const auto& weak) {
+        const auto current = weak.lock();
+        return !current || current->key_ == key;
+      });
     }
 
     struct statvfs fs{};
@@ -3032,6 +3265,9 @@ bool LocalCache::remove(std::string_view key,
     unlink_file(objects_root_fd_, target ? target->meta_fd_ : -1,
                 &CacheEntry::unlinked_meta_);
     return preserved;
+  } catch (const CacheRetirementPending&) {
+    if (retry != nullptr) *retry = true;
+    return false;
   } catch (const std::exception& error) {
     fprintf(stderr, "warning: local cache removal failed: key=%.*s: %s\n",
             int(key.size()), key.data(), error.what());
@@ -3043,7 +3279,9 @@ bool LocalCache::remove(std::string_view key,
 }
 
 bool LocalCache::rename(std::string_view old_key,
-                        std::string_view new_key) noexcept {
+                        std::string_view new_key, bool* retry,
+                        bool wait) noexcept {
+  if (retry != nullptr) *retry = false;
   if (old_key == new_key) {
     return true;
   }
@@ -3060,7 +3298,12 @@ bool LocalCache::rename(std::string_view old_key,
   if (second != first) {
     second_guard.emplace(*second);
   }
-  remove(new_key, false);
+  bool busy = false;
+  remove(new_key, false, &busy, wait);
+  if (busy) {
+    if (retry != nullptr) *retry = true;
+    return false;
+  }
   try {
     std::unique_lock guard(mutex_);
     std::shared_ptr<CacheEntry> target;
@@ -3158,13 +3401,13 @@ bool LocalCache::rename(std::string_view old_key,
             int(old_key.size()), old_key.data(),
             int(new_key.size()), new_key.data());
   }
-  remove(old_key, false);
-  remove(new_key, false);
+  remove(old_key, false, nullptr, wait);
+  remove(new_key, false, nullptr, wait);
   return false;
 }
 
 std::shared_ptr<CacheEntry> LocalCache::open(
-    const CacheIdentity& identity) {
+    const CacheIdentity& identity, bool wait) {
   if (identity.key.size() > kCacheKeyCapacity ||
       identity.etag.size() > kCacheEtagCapacity ||
       identity.version_id.size() > kCacheVersionCapacity) {
@@ -3191,10 +3434,13 @@ std::shared_ptr<CacheEntry> LocalCache::open(
       if (matches) {
         return entry;
       }
-      i = entries_.erase(i);
       guard.unlock();
-      entry->retire_generation();
+      entry->retire_generation(wait);
       guard.lock();
+      std::erase_if(entries_, [&](const auto& weak) {
+        const auto current = weak.lock();
+        return !current || current.get() == entry.get();
+      });
       i = entries_.begin();
       continue;
     }

@@ -10,15 +10,12 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
-#include <ucontext.h>
 #include <vector>
-
 class FuseReactorGroup;
 class FuseReactor;
 
@@ -27,15 +24,17 @@ class FuseReactorReplyScope {
   explicit FuseReactorReplyScope(
       FuseReactor* reactor,
       int timeout_ms = kRequestIoTimeoutMs,
-      int receive_fd = -1) noexcept;
+      int receive_fd = -1, bool detached = false) noexcept;
   ~FuseReactorReplyScope();
 
   FuseReactorReplyScope(const FuseReactorReplyScope&) = delete;
   FuseReactorReplyScope& operator=(const FuseReactorReplyScope&) = delete;
 
  private:
+  FuseReactor* continuation_owner_ = nullptr;
   FuseReactor* previous_ = nullptr;
   int previous_receive_fd_ = -1;
+  void* previous_dispatch_ = nullptr;
   IoExecutorScope io_scope_;
 };
 
@@ -51,44 +50,21 @@ class FuseReactor : public IoExecutor {
 
   bool initialize(FuseReactorGroup* group, fuse_session* session,
                   int fuse_fd, bool owns_fuse_fd,
-                  bool initialization_owner, bool single_reactor,
-                  unsigned depth,
+                  bool initialization_owner,
+                  unsigned depth, unsigned receive_concurrency,
                   std::string& error);
   int run() noexcept;
 
-  ssize_t receive(int fd, void* data, size_t length,
-                  int flags, int timeout_ms) noexcept override;
-  ssize_t read(int fd, void* data, size_t length,
-               int timeout_ms) noexcept override;
-  ssize_t pread(int fd, void* data, size_t length, off_t offset,
-                int timeout_ms) noexcept override;
-  ssize_t receive_exact(int fd, void* data, size_t length,
-                        int flags, int timeout_ms) noexcept override;
-  ssize_t receive_exact_then(
-      int fd, void* data, size_t length, int flags, int timeout_ms,
-      ReceiveProcessor processor, void* context) noexcept override;
-  ssize_t receive_until(int fd, void* data, size_t length,
-                        int flags, int timeout_ms,
-                        ReceiveProcessor processor,
-                        void* context) noexcept override;
-  ssize_t send(int fd, const void* data, size_t length,
-               int flags, int timeout_ms) noexcept override;
-  ssize_t send_exact(int fd, const void* data, size_t length,
-                     int flags, int timeout_ms) noexcept override;
-  ssize_t pwrite(int fd, const void* data, size_t length,
-                 off_t offset, int timeout_ms) noexcept override;
-  ssize_t splice(int input_fd, off_t* input_offset,
-                 int output_fd, off_t* output_offset,
-                 size_t length, unsigned flags,
-                 int timeout_ms) noexcept override;
-  ssize_t splice_exact(int input_fd, off_t* input_offset,
-                       int output_fd, off_t* output_offset,
-                       size_t length, unsigned flags,
-                       int timeout_ms,
-                       size_t* calls) noexcept override;
-  int connect(int fd, const sockaddr* address,
-              socklen_t address_length,
-              int timeout_ms) noexcept override;
+  bool submit(AsyncIoRequest& request) noexcept override;
+  bool cancel(AsyncIoRequest& request) noexcept override;
+
+  using NotifyFunction = void (*)(void*, int) noexcept;
+  // Owner-only. Accepted notifications complete once, never inline, after the
+  // real local write (or shutdown cancellation); rejected calls do not callback.
+  // Completion receives zero on success or a negative errno on failure.
+  // The callback may destroy its context or submit another notification.
+  bool notify_inval_inode(fuse_ino_t inode, off_t offset, off_t length,
+                           NotifyFunction done, void* context) noexcept;
 
   using TaskFunction = void (*)(void*) noexcept;
   struct ReactorTask {
@@ -96,20 +72,29 @@ class FuseReactor : public IoExecutor {
     TaskFunction cancel = nullptr;
     void* context       = nullptr;
     void* input_owner   = nullptr;
+    // Reserved completion bookkeeping; callers leave these fields untouched.
+    FuseReactor* completion_owner = nullptr;
+    ReactorTask* completion_next  = nullptr;
+    bool completion_queued       = false;
   };
 
-  bool submit_task(ReactorTask* task) noexcept;
-  bool submit_input_task(ReactorTask* task) noexcept;
-  [[nodiscard]] bool in_current_task() const noexcept {
-    return current_ == this && active_fiber_ != nullptr;
-  }
-  using TaskLocalDestructor = void (*)(void*) noexcept;
-  [[nodiscard]] void* task_local_data() const noexcept;
-  void set_task_local_data(
-      void* data, TaskLocalDestructor destructor) noexcept;
-  void mark_input_consumed() noexcept;
+  // Caller-owned continuation, executed once on this reactor.
+  // Accepted tasks never execute inline and may delete themselves in run.
+  bool post(ReactorTask* task) noexcept;
+  // Reserve on the owner before handing work to another thread. A successful
+  // reservation keeps the reactor alive until complete(task), even at shutdown.
+  // An admitted owner callback may reserve its next cleanup stage at shutdown;
+  // ordinary post/submit admission remains closed.
+  // complete is thread-safe, cannot fail, and never invokes run inline.
+  bool reserve_completion(ReactorTask* task) noexcept;
+  void complete(ReactorTask* task) noexcept;
+  // Retain FD-backed FUSE input beyond the initial callback. Release on the
+  // same reactor after consuming it, or with consumed=false on failure.
+  void* retain_input() noexcept;
+  void release_input(void* token, bool consumed) noexcept;
 
  private:
+  friend struct ReactorIoTest;
   friend class FuseReactorGroup;
   friend class FuseReactorReplyScope;
   friend FuseReactor* current_fuse_reactor() noexcept;
@@ -127,9 +112,12 @@ class FuseReactor : public IoExecutor {
     std::vector<u_char> overflow_data;
     size_t length  = 0;
     int input_fd   = -1;
+    int output_fd  = -1;
     unsigned flags = 0;
     bool pooled    = false;
     bool external  = false;
+    NotifyFunction notify_done = nullptr;
+    void* notify_context = nullptr;
 
     u_char* data() noexcept {
       return length <= sizeof(inline_data) ? inline_data :
@@ -142,17 +130,13 @@ class FuseReactor : public IoExecutor {
     IO_READ,
     IO_PREAD,
     IO_SEND,
+    IO_WRITE,
     IO_PWRITE,
     IO_SPLICE,
     IO_CONNECT,
   };
 
-  struct Fiber;
-
   struct alignas(8) IoRequest {
-    // CQEs can complete before an exact receive or its processor is done.
-    // Publish finished only after all reactor-side continuation work ends.
-    std::atomic<bool> finished{false};
     IoKind kind               = IO_RECEIVE;
     int fd                    = -1;
     int output_fd             = -1;
@@ -174,34 +158,31 @@ class FuseReactor : public IoExecutor {
     bool cancel_submitted      = false;
     ReceiveProcessor receive_processor = nullptr;
     void* receive_context      = nullptr;
-    int operation_result      = -ECANCELED;
     uint64_t deadline_ns       = 0;
-    Fiber* fiber              = nullptr;
+    size_t active_index        = SIZE_MAX;
+    IoRequest* next_free      = nullptr;
+    AsyncIoRequest* async     = nullptr;
+    ssize_t async_result      = -ECANCELED;
+    bool cancelled            = false;
+    bool cancel_pending       = false;
+    bool original_completed   = false;
   };
 
   struct Dispatch {
     fuse_buf buffer = {};
+    alignas(8) ReactorTask task = {};
+    FuseReactor* owner = nullptr;
+    FuseReactor* target = nullptr;
     int pipe[2]     = {-1, -1};
+    int output_fd   = -1;
     size_t capacity = 0;
+    unsigned receive_index = 0;
     Reply* reply    = nullptr;
     std::atomic<bool> reply_submitted{false};
     std::atomic<unsigned> input_tasks{0};
     bool processing_complete = false;
+    bool input_drain_needed  = false;
     bool reply_claimed       = false;
-  };
-
-  struct Fiber {
-    ucontext_t context                     = {};
-    ReactorTask* task                      = nullptr;
-    void* stack_mapping                    = nullptr;
-    size_t stack_mapping_size              = 0;
-    void* sanitizer_fake_stack             = nullptr;
-    void* local_data                       = nullptr;
-    TaskLocalDestructor local_destructor     = nullptr;
-    Dispatch* input_dispatch               = nullptr;
-    bool input_consumed                    = false;
-    bool queued                            = false;
-    bool finished                          = false;
   };
 
   static ssize_t sync_writev(int fd, iovec* iov, int count,
@@ -217,17 +198,16 @@ class FuseReactor : public IoExecutor {
   static void clear_receive(void* userdata) noexcept;
 
   bool submit_receive() noexcept;
+  bool initialize_receive_clones() noexcept;
+  bool complete_receive(Dispatch* dispatch, int result) noexcept;
   bool submit_wakeup() noexcept;
   bool submit_external_receive() noexcept;
-  bool submit_io_receive() noexcept;
   bool submit_dispatch_receive() noexcept;
   bool submit_task_receive() noexcept;
   bool submit_external_reply(Reply* reply) noexcept;
   bool submit_io_request(IoRequest* request) noexcept;
-  bool resize_receive_pipe() noexcept;
   static bool drain_receive_pipe(int fd) noexcept;
   bool drain_external_pipe() noexcept;
-  bool drain_io_pipe() noexcept;
   bool drain_dispatch_pipe() noexcept;
   bool drain_task_pipe() noexcept;
   bool resume_receive() noexcept;
@@ -240,91 +220,107 @@ class FuseReactor : public IoExecutor {
   void fail_replies(int result) noexcept;
   void fail_external_replies(int result) noexcept;
   void complete_io(IoRequest* request, int result) noexcept;
+  void complete_async_io(IoRequest* request, int result) noexcept;
+  void complete_async_cancel(IoRequest* request, int result) noexcept;
+  void finish_async_io(IoRequest* request, ssize_t result) noexcept;
+  void retire_async_io(IoRequest* request) noexcept;
   bool cancel_expired_io(uint64_t now) noexcept;
-  uint64_t next_io_deadline() const noexcept;
-  void fail_io_requests(int result) noexcept;
+  void refresh_io_deadline() noexcept;
+  void drain_shutdown() noexcept;
+  void fail_remote_dispatch(Dispatch* dispatch, int result) noexcept;
   void fail_dispatches() noexcept;
-  int execute_io(IoRequest& request) noexcept;
   Dispatch* acquire_dispatch() noexcept;
   void finish_dispatch(Dispatch* dispatch) noexcept;
   void recycle_dispatch(Dispatch* dispatch) noexcept;
   void dispatch_complete(Dispatch* dispatch) noexcept;
+  bool enqueue_task(ReactorTask* task) noexcept;
   bool start_task(ReactorTask* task) noexcept;
-  bool initialize_fiber(Fiber* fiber) noexcept;
-  bool run_ready_fibers() noexcept;
-  void resume_fiber(Fiber* fiber) noexcept;
-  void yield_fiber() noexcept;
-  void queue_fiber(Fiber* fiber) noexcept;
-  void release_fiber(Fiber* fiber) noexcept;
+  bool start_dispatch(Dispatch* dispatch) noexcept;
+  bool start_remote_dispatch(
+      Dispatch* dispatch, FuseReactor* target) noexcept;
+  bool run_ready_callbacks() noexcept;
   void release_input_dispatch(Dispatch* dispatch,
                               bool drain_input = true) noexcept;
-  static void fiber_entry() noexcept;
+  static void dispatch_entry(void* context) noexcept;
 
   FuseReactorGroup* group_         = nullptr;
   fuse_session* session_           = nullptr;
   io_uring ring_                   = {};
   Reply* reply_head_               = nullptr;
   Reply* reply_tail_               = nullptr;
+  NotifyFunction pending_notify_  = nullptr;
+  void* pending_notify_context_    = nullptr;
+  bool notify_accepted_            = false;
   int external_pipe_[2]            = {-1, -1};
-  int io_pipe_[2]                  = {-1, -1};
   int dispatch_pipe_[2]            = {-1, -1};
   int task_pipe_[2]                = {-1, -1};
-  Dispatch* active_receive_        = nullptr;
   std::vector<Dispatch*> free_dispatches_;
-  std::vector<Fiber*> fibers_;
-  std::vector<Fiber*> free_fibers_;
-  std::vector<Fiber*> ready_fibers_;
+  std::vector<Dispatch*> receiving_;
+  std::vector<ReactorTask*> ready_callbacks_;
+  size_t callback_head_ = 0;
+  size_t callback_count_ = 0;
+  unsigned continuation_depth_ = 0;
+  std::mutex completion_mutex_;
+  std::atomic<bool> completion_pending_{false};
+  ReactorTask* completion_head_ = nullptr;
+  ReactorTask* completion_tail_ = nullptr;
   std::unique_ptr<Reply[]> reply_pool_;
   Reply* reply_free_                = nullptr;
   std::atomic<uint64_t> external_submitted_{0};
-  std::atomic<uint64_t> external_completed_{0};
   std::atomic<size_t> task_count_{0};
   std::vector<IoRequest*> io_requests_;
+  std::unique_ptr<IoRequest[]> async_pool_;
+  IoRequest* async_free_ = nullptr;
+  size_t async_pending_ = 0;
+  uint64_t next_io_deadline_          = UINT64_MAX;
   uint64_t external_consumed_      = 0;
   uint64_t wake_value_             = 0;
   uint64_t monotonic_now_ns_       = 0;
   int fuse_fd_                     = -1;
+  std::vector<int> receive_fds_;
+  std::vector<int> owned_receive_fds_;
+  std::vector<bool> receive_pending_fds_;
   int wake_fd_                     = -1;
   int error_                       = 0;
   size_t reply_count_              = 0;
   size_t max_reply_count_          = 0;
-  size_t fiber_stack_guard_size_   = 4096;
+  unsigned receive_concurrency_    = 1;
+  size_t reactor_index_            = 0;
   uint64_t received_requests_      = 0;
   uint64_t completed_replies_      = 0;
   uint64_t external_replies_       = 0;
   uint64_t io_operations_          = 0;
-  uint64_t task_io_operations_     = 0;
-  uint64_t external_io_operations_ = 0;
   uint64_t background_file_writes_ = 0;
+  uint64_t wait_calls_             = 0;
+  uint64_t completion_batches_     = 0;
+  uint64_t completions_            = 0;
+  size_t completion_batch_high_water_ = 0;
   std::atomic<uint64_t> receive_drains_{0};
   size_t dispatch_count_           = 0;
+  size_t receive_count_            = 0;
   size_t max_dispatch_count_       = 0;
   size_t max_task_count_           = 0;
   size_t reply_pool_size_          = 0;
   size_t reply_high_water_         = 0;
-  ucontext_t scheduler_context_    = {};
-  Fiber* active_fiber_             = nullptr;
-  void* scheduler_sanitizer_fake_stack_ = nullptr;
   unsigned setup_flags_            = 0;
   bool ring_ready_                 = false;
   bool owns_fuse_fd_               = false;
   bool initialization_owner_       = false;
   bool initialization_complete_    = false;
-  bool receive_pending_            = false;
   bool external_pending_           = false;
-  bool io_pending_                 = false;
   bool dispatch_pending_           = false;
   bool task_pending_               = false;
   bool reply_pending_              = false;
   bool wake_pending_               = false;
   bool first_receive_              = true;
-  u_char receive_token_            = 0;
-  u_char external_token_           = 0;
-  u_char io_token_                 = 0;
-  u_char dispatch_token_           = 0;
-  u_char task_token_               = 0;
-  u_char cancel_token_             = 0;
-  u_char wake_token_               = 0;
+  bool receive_active_             = false;
+  alignas(8) u_char external_token_ = 0;
+  alignas(8) u_char dispatch_token_ = 0;
+  alignas(8) u_char task_token_     = 0;
+  alignas(8) u_char cancel_token_   = 0;
+  alignas(8) u_char wake_token_     = 0;
+  alignas(8) u_char receive_handoff_token_ = 0;
+  alignas(8) u_char shutdown_token_ = 0;
 
   static thread_local FuseReactor* current_;
   static thread_local FuseReactor* reply_target_;
@@ -341,24 +337,21 @@ class FuseReactorGroup {
   FuseReactorGroup& operator=(const FuseReactorGroup&) = delete;
 
   bool initialize(fuse_session* session, unsigned count, unsigned depth,
-                  unsigned worker_count, int io_timeout_ms,
+                  int io_timeout_ms,
                   std::string& error);
   int run();
   void report_stats() const noexcept;
   void shutdown() noexcept;
 
  private:
+  friend struct ReactorIoTest;
   friend class FuseReactor;
 
   FuseReactor* callback_reactor() noexcept;
+  FuseReactor* next_dispatch_reactor() noexcept;
   void begin_shutdown() noexcept;
-  bool synchronize_external(FuseReactor* reactor) noexcept;
   void reactor_initialized() noexcept;
   void wake() noexcept;
-  bool submit_dispatch(FuseReactor* reactor,
-                       FuseReactor::Dispatch* dispatch) noexcept;
-  void dispatch_worker() noexcept;
-  void stop_dispatch_workers() noexcept;
   static int clone_fuse_fd(fuse_session* session, std::string& error);
 
   fuse_session* session_ = nullptr;
@@ -366,14 +359,12 @@ class FuseReactorGroup {
   std::mutex initialization_mutex_;
   std::condition_variable initialization_condition_;
   std::shared_mutex external_mutex_;
-  std::mutex dispatch_mutex_;
-  std::condition_variable dispatch_condition_;
-  std::deque<std::pair<FuseReactor*, FuseReactor::Dispatch*>>
-      dispatch_queue_;
-  std::vector<std::thread> dispatch_threads_;
   std::atomic<bool> shutting_down_{false};
   int io_timeout_ms_ = kRequestIoTimeoutMs;
-  bool dispatch_stopping_ = false;
   bool initialized_     = false;
   bool primary_stopped_ = false;
+  std::atomic<unsigned> running_reactors_{0};
+  bool dispatch_ready_ = false;
+  size_t next_reactor_ = 0;
+  unsigned reactor_dispatches_ = 0;
 };

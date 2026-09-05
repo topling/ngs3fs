@@ -12,6 +12,13 @@
 #include <future>
 #include <string.h>
 
+struct CacheTestAccess {
+  static std::recursive_mutex& key_mutex(LocalCache& cache, std::string_view key) {
+    return cache.key_mutex(key);
+  }
+  static bool evict_cold(LocalCache& cache) { return cache.evict_cold(); }
+};
+
 struct TemporaryDirectory {
   TemporaryDirectory() {
     std::array<char, 64> pattern{};
@@ -75,6 +82,38 @@ int main() {
       .reserve_is_percent = true,
   };
   std::string recovery_write_id;
+
+  {
+    TemporaryDirectory cold_directory;
+    CacheConfig cold = config;
+    cold.root = cold_directory.path;
+    LocalCache cache(cold);
+    {
+      auto entry = cache.open(test_identity("cold-lock-b", "etag", 4096));
+      const auto claim = entry->claim_fetch(0, 4096, 4096);
+      assert(entry->prepare_read(0, 4096));
+      write_test_bytes(entry->data_fd(), 0, 4096);
+      entry->publish_clean(claim, 0, 4096, true);
+      entry->finish_fetch(claim);
+    }
+    auto& first = CacheTestAccess::key_mutex(cache, "reserve-lock-a");
+    auto& second = CacheTestAccess::key_mutex(cache, "cold-lock-b");
+    assert(&first != &second);
+    std::unique_lock held(second);
+    std::promise<void> started;
+    auto entered = started.get_future();
+    auto eviction = std::async(std::launch::async, [&] {
+      std::lock_guard reserve_key(first);
+      started.set_value();
+      return CacheTestAccess::evict_cold(cache);
+    });
+    entered.get();
+    const bool ready = eviction.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    held.unlock();
+    const bool evicted = eviction.get();
+    assert(ready && !evicted);
+    assert(CacheTestAccess::evict_cold(cache));
+  }
 
   {
     LocalCache cache(config);
@@ -253,6 +292,195 @@ int main() {
     assert(old->stale());
     assert(!old->range_clean(0, 4096));
     assert(!current->range_clean(0, 4096));
+
+    {
+      const auto namespace_status = [&](std::string_view key) {
+        std::array<struct stat, 2> status{};
+        const std::string data = config.root + "/data/" + std::string(key);
+        const std::string meta =
+            config.root + "/meta/objects/" + std::string(key);
+        assert(::stat(data.c_str(), &status[0]) == 0);
+        assert(::stat(meta.c_str(), &status[1]) == 0);
+        return status;
+      };
+      const auto assert_namespace_unchanged = [](const auto& before,
+                                                 const auto& after) {
+        for (size_t i = 0; i != before.size(); ++i) {
+          assert(after[i].st_dev == before[i].st_dev);
+          assert(after[i].st_ino == before[i].st_ino);
+          assert(after[i].st_size == before[i].st_size);
+          assert(after[i].st_nlink == before[i].st_nlink);
+        }
+      };
+      const CacheIdentity async_old_identity =
+          test_identity("async-generation", "etag-old", 8192);
+      const CacheIdentity async_new_identity =
+          test_identity("async-generation", "etag-new", 8192);
+      std::shared_ptr<CacheEntry> async_old = cache.open(async_old_identity);
+      const CacheFetchClaim async_claim =
+          async_old->claim_fetch(0, 8192, 8192);
+      assert(async_claim.offset == 0 && async_claim.length == 8192);
+      const bool prepared =
+          async_old->prepare_read(async_claim.offset, async_claim.length);
+      assert(prepared);
+      write_test_bytes(async_old->data_fd(), 0, 8192);
+      async_old->publish_clean(async_claim, 0, 4096, false);
+      const bool pinned = async_old->pin_clean(0, 4096);
+      assert(pinned);
+      struct stat async_before{};
+      const int before_status =
+          ::fstat(async_old->data_fd(), &async_before);
+      assert(before_status == 0);
+      const auto async_namespace = namespace_status(async_old_identity.key);
+
+      IoExecutor reactor_marker;
+      IoExecutorScope reactor_scope(&reactor_marker, 0);
+      std::shared_ptr<CacheEntry> pending = cache.retiring_entry(
+          async_old_identity.key, &async_new_identity);
+      assert(pending.get() == async_old.get());
+      assert(async_old->stale());
+      const int first_retire_fd = async_old->begin_retire_wait();
+      assert(first_retire_fd >= 0);
+
+      bool open_retry = false;
+      try {
+        (void)cache.open(async_new_identity);
+      } catch (const std::system_error& error) {
+        open_retry = error.code().value() == EAGAIN;
+      }
+      assert(open_retry);
+      pending = cache.retiring_entry(async_old_identity.key);
+      assert(pending.get() == async_old.get());
+
+      bool writer_retry = false;
+      try {
+        (void)cache.create_writer(async_new_identity, 16384);
+      } catch (const std::system_error& error) {
+        writer_retry = error.code().value() == EAGAIN;
+      }
+      assert(writer_retry);
+      {
+        // Background local I/O has no executor, but must still hand a busy
+        // generation back to its reactor rather than park the worker pool.
+        IoExecutorScope worker_scope(nullptr, 0);
+        bool worker_open_retry = false;
+        bool worker_write_retry = false;
+        try { (void)cache.open(async_new_identity, false); }
+        catch (const CacheRetirementPending&) { worker_open_retry = true; }
+        try { (void)cache.create_writer(async_new_identity, 16384, false); }
+        catch (const CacheRetirementPending&) { worker_write_retry = true; }
+        assert(worker_open_retry && worker_write_retry);
+        bool worker_remove_retry = false;
+        const bool worker_removed = cache.remove(
+            async_old_identity.key, false, &worker_remove_retry, false);
+        assert(!worker_removed && worker_remove_retry);
+        assert(cache.retiring_entry(async_old_identity.key).get() ==
+               async_old.get());
+        assert_namespace_unchanged(
+            async_namespace, namespace_status(async_old_identity.key));
+      }
+      struct stat async_after{};
+      const int after_status = ::fstat(async_old->data_fd(), &async_after);
+      assert(after_status == 0);
+      assert(async_after.st_dev == async_before.st_dev &&
+             async_after.st_ino == async_before.st_ino &&
+             async_after.st_size == async_before.st_size);
+
+      bool remove_retry = false;
+      const bool removed = cache.remove(
+          async_old_identity.key, false, &remove_retry);
+      assert(!removed && remove_retry);
+      pending = cache.retiring_entry(async_old_identity.key);
+      assert(pending.get() == async_old.get());
+
+      async_old->finish_fetch(async_claim);
+      uint64_t notification = 0;
+      const ssize_t first_wake = ::read(
+          first_retire_fd, &notification, sizeof(notification));
+      assert(first_wake == ssize_t(sizeof(notification)));
+      async_old->end_async_wait();
+      const int pinned_retire_fd = async_old->begin_retire_wait();
+      assert(pinned_retire_fd >= 0);
+      async_old->unpin(0, 4096);
+      notification = 0;
+      const ssize_t pinned_wake = ::read(
+          pinned_retire_fd, &notification, sizeof(notification));
+      assert(pinned_wake == ssize_t(sizeof(notification)));
+      async_old->end_async_wait();
+      const int retired = async_old->begin_retire_wait();
+      assert(retired == -1);
+      std::shared_ptr<CacheEntry> async_current =
+          cache.open(async_new_identity);
+      assert(async_current->etag() == "etag-new");
+      assert(async_current.get() != async_old.get());
+      {
+        IoExecutorScope worker_scope(nullptr, 0);
+        remove_retry = true;
+        (void)cache.remove(async_new_identity.key, false, &remove_retry, false);
+        assert(!remove_retry);
+        assert(!std::filesystem::exists(
+            config.root + "/data/async-generation"));
+        assert(!std::filesystem::exists(
+            config.root + "/meta/objects/async-generation"));
+      }
+
+      const CacheIdentity rename_source_identity =
+          test_identity("async-rename-source", "source-etag", 4096);
+      const CacheIdentity rename_destination_identity =
+          test_identity("async-rename-destination", "destination-etag", 8192);
+      std::shared_ptr<CacheEntry> rename_source =
+          cache.open(rename_source_identity);
+      std::shared_ptr<CacheEntry> rename_destination =
+          cache.open(rename_destination_identity);
+      const CacheFetchClaim rename_claim =
+          rename_destination->claim_fetch(0, 8192, 8192);
+      const bool rename_prepared = rename_destination->prepare_read(
+          rename_claim.offset, rename_claim.length);
+      assert(rename_prepared);
+      write_test_bytes(rename_destination->data_fd(), 0, 8192);
+      rename_destination->publish_clean(rename_claim, 0, 4096, false);
+      const bool rename_pinned = rename_destination->pin_clean(0, 4096);
+      assert(rename_pinned);
+      const auto source_namespace = namespace_status(rename_source_identity.key);
+      const auto destination_namespace =
+          namespace_status(rename_destination_identity.key);
+      bool rename_retry = false;
+      const bool renamed_busy = cache.rename(
+          rename_source_identity.key, rename_destination_identity.key,
+          &rename_retry);
+      assert(!renamed_busy && rename_retry);
+      {
+        IoExecutorScope worker_scope(nullptr, 0);
+        bool worker_rename_retry = false;
+        const bool worker_renamed = cache.rename(
+            rename_source_identity.key, rename_destination_identity.key,
+            &worker_rename_retry, false);
+        assert(!worker_renamed && worker_rename_retry);
+        assert_namespace_unchanged(
+            source_namespace, namespace_status(rename_source_identity.key));
+        assert_namespace_unchanged(destination_namespace,
+            namespace_status(rename_destination_identity.key));
+      }
+      std::shared_ptr<CacheEntry> source_still_present =
+          cache.open(rename_source_identity);
+      assert(source_still_present.get() == rename_source.get());
+      pending = cache.retiring_entry(rename_destination_identity.key);
+      assert(pending.get() == rename_destination.get());
+      rename_destination->finish_fetch(rename_claim);
+      rename_destination->unpin(0, 4096);
+      rename_retry = true;
+      {
+        IoExecutorScope worker_scope(nullptr, 0);
+        const bool renamed = cache.rename(
+            rename_source_identity.key, rename_destination_identity.key,
+            &rename_retry, false);
+        assert(renamed && !rename_retry);
+      }
+      const CacheIdentity renamed_identity = test_identity(
+          rename_destination_identity.key, "source-etag", 4096);
+      std::shared_ptr<CacheEntry> renamed_entry = cache.open(renamed_identity);
+      assert(renamed_entry.get() == rename_source.get());
+    }
 
     std::shared_ptr<CacheEntry> writer = cache.create_writer(
         test_identity("written/file", "old-etag", 17),

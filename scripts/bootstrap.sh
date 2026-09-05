@@ -68,7 +68,9 @@ if [[ ! -d "${libfuse_source_dir}/.git" ]]; then
   git clone --no-checkout https://github.com/libfuse/libfuse.git \
     "${libfuse_source_dir}"
 fi
-git -C "${libfuse_source_dir}" fetch --quiet origin "${libfuse_commit}"
+if ! git -C "${libfuse_source_dir}" cat-file -e "${libfuse_commit}^{commit}"; then
+  git -C "${libfuse_source_dir}" fetch --quiet origin "${libfuse_commit}"
+fi
 git -C "${libfuse_source_dir}" checkout --detach --quiet "${libfuse_commit}"
 if [[ ! -f "${libfuse_stamp}" ]] ||
     ! cmp --silent "${libfuse_patch}" "${libfuse_stamp}" ||

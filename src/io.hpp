@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <sys/socket.h>
 #include <span>
+#include <atomic>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -48,7 +49,76 @@ class UniqueFd {
   int fd_ = -1;
 };
 
+// Short native waits for legacy workers, or try/recheck/eventfd waits for
+// explicit I/O continuations. No descriptor is allocated until contention.
+class IoMutex {
+ public:
+  IoMutex() = default;
+  ~IoMutex();
+  IoMutex(const IoMutex&) = delete;
+  IoMutex& operator=(const IoMutex&) = delete;
+
+  bool try_lock() noexcept {
+    bool expected = false;
+    return locked_.compare_exchange_strong(expected, true,
+        std::memory_order_acquire, std::memory_order_relaxed);
+  }
+  void lock() noexcept {
+    while (!try_lock()) locked_.wait(true, std::memory_order_acquire);
+  }
+  void unlock() noexcept;
+  int begin_async_wait();
+  void end_async_wait() noexcept {
+    waiters_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+ private:
+  std::atomic<bool> locked_{false};
+  std::atomic<unsigned> waiters_{0};
+  std::atomic<int> event_{-1};
+};
+
 inline constexpr size_t kPreferredIoSize = 256U * 1024U;
+
+class IoExecutor;
+class FuseReactor;
+
+// The caller owns this request, its descriptors, buffers, and callback context
+// until complete(context, result). A result is bytes transferred or -errno.
+// Submit/cancel and completion all run on the executor's owner reactor.
+struct AsyncIoRequest {
+  enum Kind { RECEIVE, READ, PREAD, SEND, WRITE, PWRITE, SPLICE, CONNECT };
+  using Complete = void (*)(void*, ssize_t) noexcept;
+  using Processor = int (*)(void*, size_t) noexcept;
+
+  Kind kind                    = RECEIVE;
+  int fd                       = -1;
+  int output_fd                = -1;
+  void* data                   = nullptr;
+  size_t length                = 0;
+  off_t input_offset           = -1;
+  off_t output_offset          = -1;
+  const sockaddr* address      = nullptr;
+  socklen_t address_length     = 0;
+  unsigned flags               = 0;
+  int timeout_ms               = 0;
+  bool exact                   = false;
+  bool force_async             = false;
+  Processor processor          = nullptr;
+  void* processor_context      = nullptr;
+  Complete complete            = nullptr;
+  void* context                = nullptr;
+  // Written before completion, including partial progress on failure.
+  size_t transferred           = 0;
+  size_t operations            = 0;
+
+  [[nodiscard]] bool pending() const noexcept { return implementation_ != nullptr; }
+
+ private:
+  friend class FuseReactor;
+  void* implementation_        = nullptr;
+  IoExecutor* owner_            = nullptr;
+};
 
 class IoExecutor {
  public:
@@ -56,40 +126,17 @@ class IoExecutor {
 
   virtual ~IoExecutor() = default;
 
-  virtual ssize_t receive(int fd, void* data, size_t length,
-                          int flags, int timeout_ms) noexcept = 0;
-  virtual ssize_t read(int fd, void* data, size_t length,
-                       int timeout_ms) noexcept = 0;
-  virtual ssize_t pread(int fd, void* data, size_t length, off_t offset,
-                        int timeout_ms) noexcept = 0;
-  virtual ssize_t receive_exact(int fd, void* data, size_t length,
-                                int flags, int timeout_ms) noexcept = 0;
-  virtual ssize_t receive_exact_then(
-      int fd, void* data, size_t length, int flags, int timeout_ms,
-      ReceiveProcessor processor, void* context) noexcept = 0;
-  virtual ssize_t receive_until(int fd, void* data, size_t length,
-                                int flags, int timeout_ms,
-                                ReceiveProcessor processor,
-                                void* context) noexcept = 0;
-  virtual ssize_t send(int fd, const void* data, size_t length,
-                       int flags, int timeout_ms) noexcept = 0;
-  virtual ssize_t send_exact(int fd, const void* data, size_t length,
-                             int flags, int timeout_ms) noexcept = 0;
-  virtual ssize_t pwrite(int fd, const void* data, size_t length,
-                         off_t offset, int timeout_ms) noexcept = 0;
-  virtual ssize_t splice(int input_fd, off_t* input_offset,
-                         int output_fd, off_t* output_offset,
-                         size_t length, unsigned flags,
-                         int timeout_ms) noexcept = 0;
-  virtual ssize_t splice_exact(int input_fd, off_t* input_offset,
-                               int output_fd, off_t* output_offset,
-                               size_t length, unsigned flags,
-                               int timeout_ms,
-                               size_t* calls) noexcept = 0;
-  virtual int connect(int fd, const sockaddr* address,
-                      socklen_t address_length,
-                      int timeout_ms) noexcept = 0;
+  // false: not accepted, errno explains why, and no completion will run.
+  // true: exactly one non-inline completion, after the original kernel I/O
+  // has retired. The callback may destroy or resubmit the same request.
+  virtual bool submit(AsyncIoRequest& request) noexcept;
+  // true means cancellation was requested; completion still owns retirement.
+  virtual bool cancel(AsyncIoRequest& request) noexcept;
+
+
 };
+
+IoExecutor* io_executor() noexcept;
 
 class IoExecutorScope {
  public:
@@ -125,16 +172,19 @@ ssize_t io_send(int fd, const void* data, size_t length, int flags,
 ssize_t io_send_exact(int fd, const void* data, size_t length, int flags,
                       int timeout_ms = 0) noexcept;
 ssize_t io_pwrite(int fd, const void* data, size_t length,
-                  off_t offset, int timeout_ms = 0) noexcept;
+                  off_t offset, int timeout_ms = 0,
+                  bool force_async = false) noexcept;
 ssize_t io_splice(int input_fd, off_t* input_offset,
                   int output_fd, off_t* output_offset,
                   size_t length, unsigned flags,
-                  int timeout_ms = 0) noexcept;
+                  int timeout_ms = 0,
+                  bool force_async = false) noexcept;
 ssize_t io_splice_exact(int input_fd, off_t* input_offset,
                         int output_fd, off_t* output_offset,
                         size_t length, unsigned flags,
                         int timeout_ms = 0,
-                        size_t* calls = nullptr) noexcept;
+                        size_t* calls = nullptr,
+                        bool force_async = false) noexcept;
 int io_connect(int fd, const sockaddr* address,
                socklen_t address_length, int timeout_ms) noexcept;
 
@@ -195,3 +245,5 @@ UniqueFd connect_tcp(std::string_view host, uint16_t port,
                      size_t receive_buffer_size = 0);
 
 void set_socket_receive_timeout(int fd, int timeout_ms);
+void configure_blocking_socket(int fd, int io_timeout_ms);
+bool configure_socket_receive_buffer(int fd, size_t requested) noexcept;
