@@ -15,8 +15,9 @@
 #include <vector>
 
 // Page-rounded transient storage, shared by all handles of an inode. Demand
-// has a separate allowance INSIDE the caps so blocked publication cannot use
+// has a protected minimum INSIDE the caps so blocked publication cannot use
 // the memory needed to complete a READ that holds its destination folios.
+// Demand may also use idle capacity outside that minimum.
 class PrefetchBudget {
   struct State;
 

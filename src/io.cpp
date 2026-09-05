@@ -226,14 +226,19 @@ PrefetchBudget::Reservation PrefetchBudget::try_reserve(
   const auto found = s.files.find(file);
   const State::Usage used = found == s.files.end() ? State::Usage{} : found->second;
   const size_t file_reserve = std::min(limit, s.demand_reserve);
-  const size_t cap = demand ? s.demand_reserve : s.capacity - s.demand_reserve;
-  const size_t file_cap = demand ? file_reserve : limit - file_reserve;
-  const size_t taken = demand ? s.used.demand : s.used.speculative;
-  const size_t file_taken = demand ? used.demand : used.speculative;
+  const size_t global = s.used.demand + s.used.speculative;
   const size_t total = used.demand + used.speculative;
-  if (taken > cap || file_taken > file_cap || total > limit) return {};
-  const size_t bytes = std::min({preferred, cap - taken, file_cap - file_taken,
-                                  limit - total});
+  if (global > s.capacity || total > limit) return {};
+  size_t bytes = std::min({preferred, s.capacity - global, limit - total});
+  if (!demand) {
+    // Keep the reserve free of speculation. Demand can borrow any other idle
+    // capacity; capping it at the reserve would serialize unrelated READs.
+    const size_t cap = s.capacity - s.demand_reserve;
+    const size_t file_cap = limit - file_reserve;
+    if (s.used.speculative > cap || used.speculative > file_cap) return {};
+    bytes = std::min({bytes, cap - s.used.speculative,
+                           file_cap - used.speculative});
+  }
   if (bytes < minimum) return {};
   // Insertion can throw: do it before changing any counters.
   auto& entry = s.files.try_emplace(file).first->second;

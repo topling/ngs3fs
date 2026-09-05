@@ -66,6 +66,8 @@ memfd cache; the remote object remains the source for a later cache miss.
   Budget exhaustion prints a rate-limited stderr warning using `fprintf`.
 - Reserve one maximum-demand-sized allowance inside each applicable limit for
   demand-only progress. Speculative/STORE-retained windows cannot consume it.
+  This is a floor protected from speculation, not a ceiling on demand. Demand
+  may also use all otherwise idle capacity, under the same global/per-file caps.
   A demand-only window replies and retires without STORE. This also lets a READ
   crossing existing window boundaries finish while STORE waits on its folios.
   Explicit limits must accommodate the negotiated maximum READ and page
@@ -229,6 +231,19 @@ with these gates; re-review implementation ordering before enabling publication.
   final ASan suite passed 76/76 (81.35 s). Final TSan admission/budget pressure
   passed all four tests three times each (61.44 s). The performance runner
   remains pending. No CPU win is claimed yet.
+- Runner `33972853791` passed every job, but admission alone is not sufficient:
+  normal advice legacy/uring-1 CPU per operation 1.074/1.074 ms and wall
+  1437.936/1686.323 ms; random advice 1.191/1.450 ms and 1512.045/2222.225 ms.
+  Further inspection found demand staging incorrectly capped at the protected
+  reserve even when the rest of the budget was idle. Demand now borrows idle
+  capacity while speculation still cannot consume the protected minimum.
+  A new deterministic test fails on the old code and passes after the fix;
+  mixed demand/speculation stress checks both total and per-inode caps.
+  Normal/TSan/ASan full suites pass 76/76 (82.10/129.54/90.35 s). Local normal
+  advice medians before/after are uring-1 CPU/op 1.138/1.045 ms, wall
+  1404.563/1390.237 ms; uring-4 1.973/1.470 ms, wall 1144.694/1020.419 ms.
+  These local measurements do not establish runner parity: legacy still has
+  lower wall time. Continue the runner comparison and hotspot analysis.
 
 - Mount and per-file budget admission now cover every production prefetch
   allocation. Limits are exposed and validated; explicit per-file limits are

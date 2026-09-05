@@ -966,6 +966,32 @@ void test_prefetch_budget() {
   survivor.reset();
 }
 
+void test_prefetch_budget_demand_capacity() {
+  constexpr size_t p = 4096;
+  PrefetchBudget budget(8 * p, p, p);
+  auto first = budget.try_reserve(1, 4 * p, 2 * p, 2 * p, true);
+  assert(first.bytes() == 2 * p); // The protected floor is not a demand ceiling.
+  auto same = budget.try_reserve(1, 4 * p, 4 * p, p, true);
+  assert(same.bytes() == 2 * p);
+  assert(!budget.try_reserve(1, 4 * p, p, p, true));
+  auto second = budget.try_reserve(2, 8 * p, 3 * p, 3 * p, true);
+  assert(second.bytes() == 3 * p);
+  auto speculative = budget.try_reserve(3, 8 * p, 8 * p, p, false);
+  assert(speculative.bytes() == p); // Demand borrowing still counts globally.
+  assert(!budget.try_reserve(4, 8 * p, p, p, false));
+  assert(!budget.try_reserve(4, 8 * p, p, p, true));
+  second.reset();
+  auto more = budget.try_reserve(3, 8 * p, 3 * p, 3 * p, false);
+  assert(more.bytes() == 3 * p);
+  first.reset();
+  same.reset();
+  auto fill = budget.try_reserve(4, 8 * p, 8 * p, p, false);
+  assert(fill.bytes() == 3 * p); // All speculation together still leaves p.
+  auto protected_demand = budget.try_reserve(4, 8 * p, p, p, true);
+  assert(protected_demand.bytes() == p);
+  assert(budget.snapshot().used == 8 * p);
+}
+
 void test_prefetch_budget_concurrent() {
   constexpr size_t p = 4096;
   PrefetchBudget budget(5 * p, p, p);
@@ -978,7 +1004,7 @@ void test_prefetch_budget_concurrent() {
       for (unsigned n = 0; n < 1000; ++n) {
         for (;;) {
           const auto before = budget.snapshot();
-          auto lease = budget.try_reserve(i % 2, 3 * p, p, p, false);
+          auto lease = budget.try_reserve(i % 2, 3 * p, p, p, n % 2 != 0);
           if (lease) {
             assert(budget.snapshot().used <= 5 * p);
             assert(budget.file_used(i % 2) <= 3 * p);
@@ -993,7 +1019,7 @@ void test_prefetch_budget_concurrent() {
   for (auto& thread : threads) thread.join();
   assert(completed == 8000);
   assert(budget.snapshot().used == 0 && budget.snapshot().files == 0);
-  assert(budget.snapshot().peak <= 4 * p);
+  assert(budget.snapshot().peak <= 5 * p);
 
   const auto revision = budget.snapshot().revision;
   std::barrier stopping(2);
@@ -1015,6 +1041,7 @@ int main() {
   test_prefetch_budget_async_wait();
   test_prefetch_storage_budget_event_stress();
   test_prefetch_budget_concurrent();
+  test_prefetch_budget_demand_capacity();
   test_s3_xml();
   test_ssostr_header_names();
   test_inode_dentry_slots();
