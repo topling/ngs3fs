@@ -345,7 +345,9 @@ class QueueExecutor final : public IoExecutor {
   size_t syscall_count_ = 0;
 };
 
-enum class ServerCase { RANGE, HEAD, EARLY_EOF, RECONNECT, CANCEL };
+enum class ServerCase {
+  RANGE, HEAD, BODYLESS_KEEP_ALIVE, EARLY_EOF, RECONNECT, CANCEL
+};
 
 struct ServerInput {
   int listener = -1;
@@ -370,6 +372,31 @@ void run_server(ServerInput input) {
   }
 
   const std::string request = read_request_head(socket.get());
+  if (input.scenario == ServerCase::BODYLESS_KEEP_ALIVE) {
+    check(request.starts_with("DELETE /no-content HTTP/1.1\r\n"),
+          "unexpected 204 request line");
+    send_text(socket.get(), "HTTP/1.1 204 No Content\r\n\r\n");
+
+    const std::string not_modified = read_request_head(socket.get());
+    check(not_modified.starts_with(
+              "GET /not-modified HTTP/1.1\r\n"),
+          "unexpected 304 request line");
+    send_text(socket.get(),
+              "HTTP/1.1 304 Not Modified\r\netag: old\r\n\r\n");
+
+    const std::string head = read_request_head(socket.get());
+    check(head.starts_with("HEAD /head-no-length HTTP/1.1\r\n"),
+          "unexpected bodyless HEAD request line");
+    send_text(socket.get(),
+              "HTTP/1.1 200 OK\r\nx-head: no-length\r\n\r\n");
+
+    const std::string reused = read_request_head(socket.get());
+    check(reused.starts_with("HEAD /after-bodyless HTTP/1.1\r\n"),
+          "bodyless responses did not preserve the connection");
+    send_text(socket.get(),
+              "HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n");
+    return;
+  }
   if (input.scenario == ServerCase::RANGE) {
     check(request.starts_with("GET /range HTTP/1.1\r\n"),
           "unexpected range request line");
@@ -612,6 +639,44 @@ void test_early_eof() {
   check(executor.parameters_preserved(), "executor changed EOF parameters");
 }
 
+void test_bodyless_keep_alive() {
+  TestServer server(ServerCase::BODYLESS_KEEP_ALIVE);
+  auto client = connect_client(server.port());
+  QueueExecutor executor;
+  struct RequestCase {
+    const char* method;
+    const char* path;
+    int status;
+  };
+  constexpr std::array cases{
+      RequestCase{"DELETE", "/no-content", 204},
+      RequestCase{"GET", "/not-modified", 304},
+      RequestCase{"HEAD", "/head-no-length", 200},
+      RequestCase{"HEAD", "/after-bodyless", 204},
+  };
+  for (const RequestCase& current : cases) {
+    AsyncHttpRequest request;
+    request.method = current.method;
+    request.path = current.path;
+    CompletionState completion;
+    completion.operation = client->make_async_request(
+        executor, std::move(request), complete_http, &completion);
+    completion.operation->start();
+    check(completion.calls == 0, "bodyless request completed inline");
+    executor.run();
+    print_error(completion.error);
+    check(completion.calls == 1 && !completion.error &&
+              completion.response.status == current.status,
+          "bodyless response failed");
+    check(completion.response.body_bytes == 0,
+          "bodyless response consumed a body");
+    check(completion.destroyed_in_callback,
+          "bodyless operation was not destroyed in its callback");
+  }
+  check(executor.parameters_preserved(),
+        "executor changed bodyless request parameters");
+}
+
 void test_reconnect_after_close() {
   TestServer server(ServerCase::RECONNECT);
   auto client = connect_client(server.port());
@@ -688,6 +753,7 @@ void test_queued_cancel() {
 int main() {
   test_range_to_fd();
   test_head_without_destination();
+  test_bodyless_keep_alive();
   test_early_eof();
   test_reconnect_after_close();
   test_queued_cancel();

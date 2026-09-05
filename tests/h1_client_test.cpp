@@ -232,8 +232,7 @@ void run_server(ServerInput input) {
   read_all(socket.get(), fixed_body);
   assert(fixed_body == input.upload);
   send_text(socket.get(),
-            "HTTP/1.1 204 No Content\r\n"
-            "content-length: 0\r\n\r\n");
+            "HTTP/1.1 204 No Content\r\n\r\n");
 
   const std::string large = read_request_head(socket.get(), "large GET");
   assert(large.starts_with("GET /bucket/list HTTP/1.1\r\n"));
@@ -241,6 +240,19 @@ void run_server(ServerInput input) {
             "HTTP/1.1 200 OK\r\ncontent-length: " +
                 std::to_string(input.control.size()) + "\r\n\r\n");
   write_all(socket.get(), input.control);
+
+  const std::string not_modified = read_request_head(
+      socket.get(), "not-modified GET");
+  assert(not_modified.starts_with(
+      "GET /bucket/not-modified HTTP/1.1\r\n"));
+  send_text(socket.get(), "HTTP/1.1 304 Not Modified\r\netag: old\r\n\r\n");
+
+  const std::string head_without_length = read_request_head(
+      socket.get(), "bodyless HEAD");
+  assert(head_without_length.starts_with(
+      "HEAD /bucket/no-length HTTP/1.1\r\n"));
+  send_text(socket.get(),
+            "HTTP/1.1 200 OK\r\nx-head: no-length\r\n\r\n");
 
   const std::string head = read_request_head(socket.get(), "HEAD");
   assert(head.starts_with("HEAD /bucket/key HTTP/1.1\r\n"));
@@ -362,6 +374,18 @@ int main() {
       "GET", "/bucket/list", {}, expected_control.size());
   assert(control.status == 200);
   assert(control.body == expected_control);
+
+  const Response not_modified = client->request_no_body(
+      "GET", "/bucket/not-modified");
+  assert(not_modified.status == 304);
+  assert(not_modified.body_bytes == 0);
+  assert(not_modified.headers.at("etag") == "old");
+
+  const Response head_without_length = client->request_no_body(
+      "HEAD", "/bucket/no-length");
+  assert(head_without_length.status == 200);
+  assert(head_without_length.body_bytes == 0);
+  assert(head_without_length.headers.at("x-head") == "no-length");
 
   const auto metadata = client->request_no_body("HEAD", "/bucket/key");
   assert(metadata.status == 200);

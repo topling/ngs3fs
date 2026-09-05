@@ -11,6 +11,221 @@ This revision supersedes the fiber-based implementation described in the
 historical implementation sections below. It does not change filesystem,
 checksum, caching, protocol-selection, or close-to-open semantics.
 
+### Approved follow-up: bounded transient prefetch storage (2026-09-05)
+
+Execution clarification (budget integration): explicit per-file limits are caps,
+not clamped to object length; the automatic default alone uses min(file size,
+two windows). Speculative windows shrink under pressure.
+
+**Latest user correction:** when read verification is enabled, proactively
+STORE only a checksum unit that has passed verification. Do not STORE an
+unverified unit early. Normal READ replies may still complete early as already
+approved. An unpublished checksum unit can reuse its memfd for the one retry
+after active source replies drain; pending READs wait on retry state. This
+supersedes the previous dual-generation staging/reservation design and the
+previous instruction that checksum work must not delay proactive STORE.
+Invalidation of already returned READ pages remains asynchronous, and retry
+does not wait for that invalidation. Publication after retry waits for both
+successful verification and invalidation. A partial range without a verifiable
+checksum unit is not proactively STOREd; do not misrepresent the existing
+uncached full-object check as multipart-manifest verification.
+
+Published prefixes can be punched while the download continues. Admission
+pins conservatively protect a whole source window; any active READ delays a
+prefix punch. Checksum source ownership also delays punching. STORE completion
+advances the reclaimable prefix; a source-generation swap resets that prefix.
+Legacy publication runs on a separate bounded worker queue, never on the
+download/checksum workers. Tests must distinguish a server-send barrier from
+client checksum/publication completion. These are implementation tactics within
+the approved memory/early-reply requirements; review: approved with focused
+low-budget, retry, prefix-retirement, and shutdown gates still required.
+
+This follow-up supersedes the retained-memfd prefetch cache and the earlier
+"no new mount options" restriction only for the two limits below. memfd is
+download/transfer staging, not a second completed-data cache. Already requested
+bytes still reply as soon as available. Without read verification, progressively
+publish complete prefetched pages during download. With verification, publish
+only completed, verified checksum units. Retire each published
+staging interval only once dependent reads, checksum work, and actual
+notification I/O have finished.
+"Publish" is a logical handoff, not a guarantee of physical page stealing.
+Failed publication must be reported and must not leave an unbounded retained
+memfd cache; the remote object remains the source for a later cache miss.
+
+- `--max-prefetch-memory SIZE` limits the entire mount. Default: 10% of physical
+  RAM, not 10% of currently free RAM. All allocated staging, including windows
+  waiting for a connection and completed windows awaiting publication or last
+  consumers, remains charged. Idle pool entries must not retain payload pages.
+- `--max-file-prefetch-memory SIZE` adds a per-file limit, shared across that
+  inode's open handles. Default: `min(file_size, 2 * maximum_prefetch_window)`.
+  Both limits apply simultaneously. Page-granularity allocation and final-page
+  rounding must not create an unaccounted allocation loophole.
+- Admit memory before allocation. Shrink speculative windows to available
+  allowance; if even demand cannot fit, await budget without blocking a reactor.
+  Do not discard useful in-flight data solely because access is out of order.
+  Budget exhaustion prints a rate-limited stderr warning using `fprintf`.
+- Reserve one maximum-demand-sized allowance inside each applicable limit for
+  demand-only progress. Speculative/STORE-retained windows cannot consume it.
+  A demand-only window replies and retires without STORE. This also lets a READ
+  crossing existing window boundaries finish while STORE waits on its folios.
+  Explicit limits must accommodate the negotiated maximum READ and page
+  rounding; smaller files use their rounded file size. The reservation is not
+  extra memory beyond the configured cap.
+- Publish outside the reactor's blocking path, preserving stable inode/handle
+  identity. Pending READ replies must be able to run while STORE waits on their
+  locked pages. Never wait for STORE while withholding such a READ reply.
+- Batch currently available whole pages, targeting 256 KiB per STORE without
+  waiting for further network input to reach that target. Keep at most one
+  STORE in flight per download; its completion advances the next batch from
+  the then-current receive progress. EOF may publish the exact final partial
+  page, never bytes beyond the object's published size.
+- Overlapping in-flight READs pin their source interval atomically with range
+  selection. Keep STORE-pending intervals selectable by READ, including READs
+  from other handles of the same inode/generation. Never make READ completion
+  depend on STORE. Removing an interval from selection precedes hole punching;
+  existing READ and checksum pins delay physical reclamation. A post-retirement
+  kernel cache miss may fetch again, but cannot read a sparse zero-filled hole.
+- Already delivered READ data and STORE data must belong to the same immutable
+  generation. A checksum retry invalidates earlier READ data, drains only active
+  READ source replies, and reuses its unpublished staging. Retry must not wait
+  for invalidation: it can be needed to complete the READ blocking invalidation.
+  Verified retry data can satisfy waiting READs; STORE waits for both retry
+  verification and invalidation. Successful READs are not retroactively failed.
+  Checksum work delays proactive STORE and reclamation, not an available READ.
+- Preserve asynchronous checksum verification/retry and generation isolation.
+  Do not publish stale or poisoned bytes after an invalidation or replace newer
+  data with an older generation. Cancellation retires original I/O ownership
+  before freeing storage. Shutdown wakes budget waiters and drains publishers.
+- STORE must neither hold session/inode locks needed by READ callbacks nor
+  occupy every worker needed by READ/checksum prerequisites. Generation changes
+  close old-generation publication admission, asynchronously drain its STOREs,
+  then invalidate, rather than checking an epoch only before a blocking STORE.
+- Keep memfd plus splice. The mmap/vmsplice comparison and mapped-RECV experiment
+  are deferred at the user's request. Implement and test budget accounting as
+  an isolated first gate before integrating memory admission and publication;
+  do not advertise mount options as effective before that integration passes.
+
+| Finding / decision | Contract change | Re-review |
+|---|---|---|
+| Idle-only pool cap misses live windows | Account mount-wide before allocation through final release | Required |
+| Completed memfds duplicate retained data | Publish into kernel cache and retire transient staging | Required |
+| User requires per-file budget | Shared per-inode accounting with min(size, 2 * max window) default | Required |
+| STORE waited for the complete download | Accepted: publish available pages incrementally, bound in-flight STOREs | Required |
+| STORE overlaps locked in-flight READ pages | Accepted: independent READ replies, atomic source pins and interval retirement, demand progress reserve | Required |
+| Waiting for invalidation before starting checksum retry creates a READ/INVAL cycle | Latest user correction: no unverified STORE, drain active source replies, reuse staging, and a two-condition fence before publication | Required |
+
+Verification must cover CLI defaults/validation; aggregate and per-file peak
+charges including multiple handles; early demand replies and prefetched-tail
+cache hits after memfd retirement; overlap and disjoint concurrent reads; tiny
+files/final pages; low-budget contention without reactor starvation; checksum
+retry; rename/forget/close/unmount while publication is pending. Then run the
+existing full suite and compare CPU/latency plus memory evidence. Do not claim
+implementation or completion until these gates pass.
+
+The incremental-publication review additionally requires a paused-tail test
+that observes STORE before GET completion; a blocked STORE plus overlapping
+READ test that completes the READ first; cross-handle and cross-batch-boundary
+READs; a READ racing with source reclamation; checksum retry while early READs
+are in flight (with STORE withheld); and old-generation STORE completion
+preceding invalidation. These are
+correctness gates, not benchmark-only scenarios. Review decision: executable
+with these gates; re-review implementation ordering before enabling publication.
+
+#### Current follow-up execution evidence
+
+- Mount and per-file budget admission now cover every production prefetch
+  allocation. Limits are exposed and validated; explicit per-file limits are
+  not clamped to object size. Exhaustion shrinks speculation or waits on an
+  eventfd through the reactor, with a rate-limited stderr warning.
+- Successful STORE completion permits page-aligned prefix hole punching while
+  the rest of the download continues. READ pins and checksum ownership prevent
+  premature reclamation. Legacy publication uses a dedicated worker.
+- Verification-enabled publication waits for verification. Partial ranges
+  without a checksum unit and responses without a usable checksum are not
+  proactively published. Retry drains active READ source replies and reuses
+  the original staging; no second staging reservation is required.
+- Focused verification after the checksum-policy correction:
+  `ctest --test-dir build -R prefetch --output-on-failure -j1`: 17/17 passed
+  (19.19 seconds), including legacy/uring low-budget contention, progressive
+  publication, checksum-gated retry, and option validation.
+- Review found legacy overwrite OPEN lacked the existing uring publication
+  fence. It now advances the generation and drains old STORE before exposing
+  truncation. Full suite after that repair: 70/70 passed (77.31 seconds).
+- Three added gates passed: legacy/uring shutdown during a paused download
+  after prefix publication, and successful first-pass checksum publication.
+  Eight publication/retry/shutdown variants repeated ten times: 80/80 passed
+  (67.59 seconds). This tests graceful unmount with active download; it does
+  not prove every forced kernel-folio/rename/forget interleaving.
+- ASan/UBSan rebuilt from the current sources: 25/25 focused tests passed
+  (37.07 seconds), covering budget contention, shutdown, retry, publication,
+  reactor ownership, cached integration, and HTTP/1 bodyless connection reuse.
+- Verdict: partial. Performance/runner evidence and precise forced
+  old-STORE/rename/forget ordering evidence remain pending. Continue execution;
+  none of the historical performance comparisons is a new improvement claim.
+
+#### Historical follow-up evidence (superseded intermediate implementation)
+
+The following records earlier increments, not current behavior or remaining
+implementation work. In particular, dual retry staging and completed-window-only
+reclamation have been superseded above; historical passing counts do not verify
+the latest checksum policy.
+
+| Gate | Evidence | Status |
+|---|---|---|
+| Budget accounting core | `PrefetchBudget` RAII reservations, per-inode counters, separately reserved demand allowance within both caps, page-aligned admission, peak counters | Implemented; storage can own a reservation, production allocation admission remains pending |
+| Storage charge lifetime | Charged pool allocation rejects undersized reservations; moves preserve charges; final destruction unmaps/closes before returning capacity; pooling truncates before returning capacity, with callbacks outside the pool lock | Core suite repeated 20 times successfully; tests retain separate READ/STORE owners and reenter the pool from a budget wakeup |
+| Retry capacity transfer | Page-aligned reservation splitting transfers already admitted capacity without release, wakeup, or competition with other allocators | Unit-tested with two live storage generations under a fully occupied speculative allowance; not yet used by production retry admission |
+| Budget defaults | Physical-memory 10% rounded down to pages; per-file min(size, 2 * window), final page rounded up, explicit limits required page aligned | Unit-tested; mount options not yet exposed |
+| Concurrency / lifecycle | Shared inode charges, global exhaustion, smaller windows, moved/destroyed leases, cancellation, release-before-subscribe, shutdown wake, 8 threads x 1000 reservations | Core suite repeated 20 times before final default/shutdown additions; final full suite passes |
+| Actual STORE completion | Owner-only fd-backed `notify_store`; terminal callback captured for both WRITE and SPLICE, best-effort STORE failure distinct from fatal transport replies | Connected to uring prefetch progress; one in-flight batch per window |
+| Notification content | Nonzero source and destination offsets, full header/payload validation, non-inline and reentrant completion | Reactor suite repeated 30 times |
+| Incremental publication | Pause the S3 body halfway; `mincore` observes a never-read page resident while GET is still pending and kernel read-ahead is disabled | Single- and two-reactor mounted tests pass |
+| Overlapping READ | Eight concurrent reads cross the received/pending boundary through two handles; one GET supplies all requests | Shared reader per inode/generation; no READ waits for STORE completion |
+| Repeated interleavings | `ctest --test-dir build -R prefetch_store --repeat until-fail:10 --output-on-failure --timeout 30` | Four mounted variants x 10 runs: all 40 pass, 54.55 seconds |
+| Source retirement | Range matching acquires a READ pin under the same mutex as withdrawal. On completed handoff, `/proc/PID/fd` shows memfd length and blocks both zero; a later read gets correct kernel-cached bytes without another GET | Mounted tests pass, including successful checksum retry |
+| Descriptor-only reuse | Idle pool truncates/unmaps retired storage and keeps at most 16 empty descriptors; pipe references preserve old data across fd reuse | Unit test and eight-thread pool stress pass |
+| Checksum retry ordering | Corrupt a proactively stored page. Retry downloads into separately owned staging while old STORE/invalidation drains. Republish only after both successful verification and invalidation | Single- and two-reactor retry tests pass; fixed mock GET checksum to describe original rather than corrupted data |
+| Generation / overwrite fence | Epoch checks close old publication admission. Invalidation waits asynchronously for admitted STORE. Overwrite OPEN drains old STORE before exposing O_TRUNC; ordinary READ replies bypass this fence | Existing generation and write-after-read regressions pass; precise forced old-STORE/rename/forget timing still needs dedicated injection |
+| Regression found and repaired | An extra write-open INVAL expired attributes and broke write-then-read cache retention. The write-open fence now only drains STORE; kernel O_TRUNC performs cache removal | Both uncached and cached retention restored, with unchanged test assertions |
+| Existing correctness | `cmake --build build -j 4`; `ctest --test-dir build --output-on-failure -j 1` | Final 59/59 pass, 62.70 seconds |
+| Sanitizers | `ctest --test-dir build/asan -R 'prefetch_store\|ngs3fs_core_tests\|reactor_io_test\|fuse_multi_reactor_cached_integration_test' --output-on-failure --timeout 60` | Final ASan/UBSan 7/7 pass, 14.53 seconds |
+| Remaining integration | Mount parameters and admission (including retry staging), low-budget progress tests, legacy/TLS progressive publication, reclamation of completed subregions while the rest of a window is still downloading, profiling and runner evidence | Pending; the mount does not yet enforce the new memory budgets |
+
+The current reclamation granularity is a completed window: no payload remains
+after download/checksum/publication completion and the last READ source pin.
+Publication itself is incremental. Reclaiming prefixes of a still-downloading
+window remains a separate gate, not an implemented claim. The publication fence
+currently excludes other publications mount-wide during invalidation, but does
+not lock READ dispatch/replies or add a mutex to InodeFile. Measure this boundary
+before deciding whether narrower fencing is worthwhile.
+
+The charge-lifetime increment does not enable mount limits by itself. Reserving
+both checksum generations in advance is possible through reservation splitting,
+but is not a complete small-limit admission policy: a per-file cap equal to its
+rounded size cannot accommodate two full-file copies. Do not silently exceed
+that cap or wait for a STORE whose blocked READ needs the retry. Demand-only
+and small-file retry progress still require integration and mounted tests.
+
+Verification verdict for the whole bounded-prefetch follow-up: **partial**.
+
+Charge-lifetime increment verification: build succeeds; the core suite passes
+20 consecutive runs; the final full suite passes 59/59 (63.87 seconds); the
+seven focused ASan/UBSan tests pass 7/7 (16.81 seconds). Final mounted
+STORE/overlap/retry repetitions pass 40/40 (60.00 seconds). An earlier full run
+failed the random-extent GET-count assertion in the two-reactor retry test.
+Inspection found its barrier waited only for server sends, not asynchronous
+client checksum/publication completion. The exact-count test now also waits
+for uring staging retirement, leaving early READ and overlap assertions intact.
+The old test passed 40 isolated repetitions, so that failure's precise schedule
+was not reproduced; retain range diagnostics rather than claim conclusive
+fault attribution. Mount admission, tiny-budget retry progress, incremental
+reclamation, legacy publication, and performance/runner gates remain pending.
+
+Continue execution for the remaining integration and evidence gates. No
+mmap/vmsplice comparison, new performance claim, commit, push, or runner run was
+performed for this increment. Existing unrelated pending CI/HTTP changes remain
+in the working tree; this evidence concerns the current combined local build.
+
 ### Goal and boundaries
 
 Replace stackful fibers with small operation-specific state machines. An I/O
@@ -149,6 +364,29 @@ and the first repetition overlapped a build-system dependency check. These are
 diagnostic results, not an accepted no-regression result. Performance remains
 unfinished. Runner evidence now includes five repetitions of both random and
 normal advice plus uncached legacy/one/four-reactor kernel-inclusive profiles.
+
+### Measured follow-up: receive directly into the existing memfd mapping
+
+Status: proposal paused; the experimental writable mapping and sink hook have
+been withdrawn. FUSE page stealing is conditional, and populated shared mappings
+prevent stealing those pages. This proposal does not establish a single physical
+page cache. The pool's capacity currently bounds idle retained storage, not all
+active windows across the mount. Establish an aggregate memory bound and safe
+release of consumed storage before proceeding with the receive experiment.
+
+The uncached prefetch pool already owns a shared memfd mapping. Its current
+socket-to-pipe-to-memfd path incurs a copy in `iter_file_splice_write` and two
+asynchronous splice stages. The next bounded change makes that same mapping
+writable and lets asynchronous HTTP receive directly into its unfilled span.
+It adds no user-space staging buffer and no additional payload copy. Publish
+only bytes actually received, never use `MSG_WAITALL`, respect H2 DATA-frame
+boundaries, and keep the mapping alive until the original I/O CQE retires.
+Existing retries/checksums/prefetch ownership and early FUSE replies remain
+unchanged. Persistent-cache sinks continue using background file writes;
+they must not expose disk-backed mappings to reactor receives. Measure cold
+mapping page-fault costs as well as steady-state pool reuse before claiming
+an improvement. Cover short reads, tail boundaries, cancellation and FD-visible
+data in both H1/H2, then rerun the full suite and A/B profiles.
 
 ## Goal
 

@@ -4,7 +4,9 @@
 
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #include <array>
 #ifdef NDEBUG
@@ -16,6 +18,8 @@
 #include <iostream>
 #include <span>
 #include <vector>
+#include <thread>
+#include <barrier>
 
 static_assert(sizeof(ssostr<32>) == 32);
 
@@ -598,7 +602,419 @@ void test_s3_mtime() {
   assert(parse_http_mtime("Tue, 19 Jan 2038 03:14:07 GMT") == 2147483647);
 }
 
+void test_prefetch_storage() {
+  const size_t p = size_t(::sysconf(_SC_PAGESIZE));
+  ReadAheadStoragePool pool(1);
+  auto storage = pool.acquire(2 * p);
+  const int fd = storage.fd.get();
+  std::vector<char> data(p, 'x');
+  assert(::pwrite(fd, data.data(), data.size(), 0) == ssize_t(data.size()));
+  struct stat st {};
+  assert(::fstat(fd, &st) == 0 && st.st_blocks > 0);
+  assert(static_cast<const char*>(storage.mapping)[0] == 'x');
+
+  Pipe pipe = Pipe::create(p);
+  off_t offset = 0;
+  assert(::splice(fd, &offset, pipe.write_fd(), nullptr, p, 0) == ssize_t(p));
+  pool.release(std::move(storage));
+  assert(::fstat(fd, &st) == 0 && st.st_size == 0 && st.st_blocks == 0);
+
+  auto reused = pool.acquire(3 * p);
+  assert(reused.fd.get() == fd && reused.size == 3 * p);
+  assert(::fstat(fd, &st) == 0 && st.st_blocks == 0);
+  // Reusing the emptied fd must not modify pages already handed to a pipe.
+  std::vector<char> replacement(p, 'y');
+  assert(::pwrite(fd, replacement.data(), p, 0) == ssize_t(p));
+  std::vector<char> received(p);
+  assert(::read(pipe.read_fd(), received.data(), p) == ssize_t(p));
+  assert(received == data);
+  assert(static_cast<const char*>(reused.mapping)[p] == 0);
+
+  auto extra = pool.acquire(p);
+  const int extra_fd = extra.fd.get();
+  pool.release(std::move(reused));
+  pool.release(std::move(extra));
+  assert(::fcntl(extra_fd, F_GETFD) == -1 && errno == EBADF);
+  assert(::fstat(fd, &st) == 0 && st.st_size == 0 && st.st_blocks == 0);
+
+  auto first = pool.acquire(p);
+  auto second = pool.acquire(2 * p);
+  const int first_fd = first.fd.get();
+  first = std::move(second);
+  assert(!second.fd && second.mapping == nullptr && second.size == 0);
+  assert(first.size == 2 * p && first.mapping != nullptr);
+  assert(::fcntl(first_fd, F_GETFD) == -1 && errno == EBADF);
+  pool.release(std::move(first));
+
+  ReadAheadStoragePool no_reuse(0);
+  auto ephemeral = no_reuse.acquire(p);
+  const int ephemeral_fd = ephemeral.fd.get();
+  no_reuse.release(std::move(ephemeral));
+  assert(::fcntl(ephemeral_fd, F_GETFD) == -1 && errno == EBADF);
+  bool rejected = false;
+  try { (void)pool.acquire(0); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  assert(rejected);
+}
+
+void test_prefetch_storage_budget() {
+  const size_t p = size_t(::sysconf(_SC_PAGESIZE));
+  PrefetchBudget budget(8 * p, 2 * p, p);
+  ReadAheadStoragePool pool(1);
+  auto reservation = budget.try_reserve(1, 8 * p, 6 * p, 6 * p, false);
+  assert(reservation.bytes() == 6 * p);
+  assert_throws([&] { reservation.split(0); });
+  assert_throws([&] { reservation.split(p + 1); });
+  assert_throws([&] { reservation.split(7 * p); });
+  const auto revision = budget.snapshot().revision;
+  auto retry = reservation.split(3 * p);
+  assert(reservation.bytes() == 3 * p && retry.bytes() == 3 * p);
+  assert(budget.snapshot().used == 6 * p);
+  assert(budget.snapshot().revision == revision);
+  assert(!budget.try_reserve(2, 8 * p, p, p, false));
+
+  // Reserving both generations before STORE admission makes retry independent
+  // of an old STORE that may itself be waiting for the retry's READ reply.
+  auto storage = std::shared_ptr<ReadAheadStoragePool::Storage>(
+      new ReadAheadStoragePool::Storage(pool.acquire(3 * p - 7, std::move(reservation))),
+      [&](auto* value) { pool.release(std::move(*value)); delete value; });
+  auto read = storage;
+  auto store = storage;
+  const int fd = storage->fd.get();
+  const char byte = 'x';
+  assert(::pwrite(fd, &byte, 1, 0) == 1);
+  storage.reset();
+  read.reset();
+  assert(budget.snapshot().used == 6 * p); // STORE still owns the old pages.
+  auto replacement = pool.acquire(3 * p, std::move(retry));
+  assert(budget.snapshot().used == 6 * p);
+
+  struct Wake {
+    ReadAheadStoragePool* pool;
+    PrefetchBudget* budget;
+    int fd;
+    bool called = false;
+  } wake{&pool, &budget, fd};
+  PrefetchBudget::Waiter waiter;
+  waiter.context = &wake;
+  waiter.ready = [](void* context) noexcept {
+    auto& w = *static_cast<Wake*>(context);
+    const size_t p = size_t(::sysconf(_SC_PAGESIZE));
+    struct stat st {};
+    assert(::fstat(w.fd, &st) == 0 && st.st_size == 0 && st.st_blocks == 0);
+    auto charge = w.budget->try_reserve(2, 8 * p, p, p, false);
+    assert(charge);
+    auto next = w.pool->acquire(p, std::move(charge));
+    w.pool->release(std::move(next)); // No pool lock is held across the callback.
+    w.called = true;
+  };
+  assert(budget.subscribe(waiter, budget.snapshot().revision));
+  store.reset();
+  assert(wake.called && budget.snapshot().used == 3 * p);
+  pool.release(std::move(replacement));
+  assert(budget.snapshot().used == 0 && budget.snapshot().peak == 6 * p);
+
+  // Allocation rejection returns all admitted capacity without creating data.
+  auto small = budget.try_reserve(1, 8 * p, p, p, true);
+  assert_throws([&] { pool.acquire(p + 1, std::move(small)); });
+  assert(budget.snapshot().used == 0);
+  auto invalid = budget.try_reserve(1, 8 * p, p, p, true);
+  assert_throws([&] { pool.acquire(0, std::move(invalid)); });
+  assert(budget.snapshot().used == 0);
+
+  // Move assignment closes the replaced memfd before dropping its charge.
+  auto first = pool.acquire(p, budget.try_reserve(1, 8 * p, p, p, false));
+  auto second = pool.acquire(p, budget.try_reserve(1, 8 * p, p, p, false));
+  first = std::move(second);
+  assert(budget.snapshot().used == p && !second.charge);
+  pool.release(std::move(first));
+  assert(budget.snapshot().used == 0);
+
+  auto whole = budget.try_reserve(1, 8 * p, p, p, true);
+  auto moved = whole.split(p);
+  assert(!whole && moved.bytes() == p && budget.snapshot().used == p);
+  int closed;
+  {
+    auto last = pool.acquire(p, std::move(moved));
+    closed = last.fd.get();
+  }
+  assert(::fcntl(closed, F_GETFD) == -1 && errno == EBADF);
+  assert(budget.snapshot().used == 0);
+  ReadAheadStoragePool no_reuse(0);
+  auto last = no_reuse.acquire(p, budget.try_reserve(1, 8 * p, p, p, true));
+  closed = last.fd.get();
+  no_reuse.release(std::move(last));
+  assert(::fcntl(closed, F_GETFD) == -1 && errno == EBADF);
+  assert(budget.snapshot().used == 0);
+}
+
+void test_prefetch_storage_discard() {
+  const size_t p = size_t(::sysconf(_SC_PAGESIZE));
+  PrefetchBudget budget(8 * p, p, p);
+  ReadAheadStoragePool pool(1);
+  auto charge = budget.try_reserve(7, 8 * p, 4 * p, p, false);
+  assert(charge.bytes() == 4 * p);
+  auto storage = pool.acquire(4 * p, std::move(charge));
+  std::vector<char> page(p);
+  for (size_t i = 0; i != 4; ++i) {
+    std::fill(page.begin(), page.end(), char('a' + i));
+    assert(::pwrite(storage.fd.get(), page.data(), p, off_t(i * p)) ==
+           ssize_t(p));
+  }
+  assert(budget.file_used(7) == 4 * p);
+  assert(!storage.discard(1, p));
+  assert(!storage.discard(0, p + 1));
+  assert(!storage.discard(3 * p, 2 * p));
+  assert(!storage.discard(0, 5 * p));
+  assert(storage.charge.bytes() == 4 * p);
+  assert(storage.discard(0, 2 * p));
+  assert(storage.charge.bytes() == 2 * p);
+  assert(budget.file_used(7) == 2 * p);
+  std::vector<char> suffix(2 * p);
+  assert(::pread(storage.fd.get(), suffix.data(), suffix.size(), off_t(2 * p)) ==
+         ssize_t(suffix.size()));
+  assert(suffix[0] == 'c' && suffix[p] == 'd');
+  std::vector<char> hole(2 * p, 'x');
+  assert(::pread(storage.fd.get(), hole.data(), hole.size(), 0) ==
+         ssize_t(hole.size()));
+  assert(std::all_of(hole.begin(), hole.end(), [](char value) {
+    return value == 0;
+  }));
+  pool.release(std::move(storage));
+  assert(budget.file_used(7) == 0);
+  auto reused = pool.acquire(4 * p);
+  struct stat status {};
+  assert(::fstat(reused.fd.get(), &status) == 0);
+  assert(status.st_size == off_t(4 * p) && status.st_blocks == 0);
+  pool.release(std::move(reused));
+}
+
+void test_prefetch_budget_async_wait() {
+  constexpr size_t p = 4096;
+  PrefetchBudget budget(4 * p, p, p);
+  auto lease = budget.try_reserve(1, 4 * p, 3 * p, p, false);
+  assert(lease);
+  const uint64_t revision = budget.snapshot().revision;
+  const int fd = budget.begin_async_wait(revision);
+  assert(fd >= 0);
+  lease.reset();
+  pollfd ready{fd, POLLIN, 0};
+  assert(::poll(&ready, 1, 1000) == 1 && (ready.revents & POLLIN));
+  uint64_t wake_count = 0;
+  assert(::read(fd, &wake_count, sizeof(wake_count)) ==
+         ssize_t(sizeof(wake_count)) && wake_count == 1);
+  budget.end_async_wait();
+
+  auto held = budget.try_reserve(2, 4 * p, 3 * p, p, false);
+  assert(held);
+  const uint64_t stopping_revision = budget.snapshot().revision;
+  const int stopping_fd = budget.begin_async_wait(stopping_revision);
+  assert(stopping_fd == fd);
+  budget.stop();
+  ready = {stopping_fd, POLLIN, 0};
+  assert(::poll(&ready, 1, 1000) == 1 && (ready.revents & POLLIN));
+  assert(::read(stopping_fd, &wake_count, sizeof(wake_count)) ==
+         ssize_t(sizeof(wake_count)) && wake_count == 1);
+  budget.end_async_wait();
+  assert(budget.snapshot().stopped);
+  assert(budget.begin_async_wait(budget.snapshot().revision) == -1);
+}
+
+void test_prefetch_storage_budget_event_stress() {
+  constexpr size_t p = 4096;
+  PrefetchBudget budget(4 * p, p, p);
+  ReadAheadStoragePool pool(0);
+  std::barrier start(8);
+  std::atomic<unsigned> completed{0};
+  std::vector<std::thread> threads;
+  for (unsigned i = 0; i != 8; ++i) {
+    threads.emplace_back([&, i] {
+      start.arrive_and_wait();
+      for (unsigned n = 0; n != 100; ++n) {
+        for (;;) {
+          const auto before = budget.snapshot();
+          auto charge = budget.try_reserve(i, 8 * p, p, p, false);
+          if (charge) {
+            auto storage = pool.acquire(p, std::move(charge));
+            assert(budget.snapshot().used <= 4 * p);
+            std::this_thread::yield();
+            ++completed;
+            break;
+          }
+          const int fd = budget.begin_async_wait(before.revision);
+          if (fd < 0) continue;
+          uint64_t wake_count = 0;
+          for (;;) {
+            pollfd ready{fd, POLLIN, 0};
+            int polled;
+            do {
+              polled = ::poll(&ready, 1, 5000);
+            } while (polled < 0 && errno == EINTR);
+            assert(polled == 1 && (ready.revents & POLLIN));
+            const ssize_t read_bytes =
+                ::read(fd, &wake_count, sizeof(wake_count));
+            if (read_bytes == ssize_t(sizeof(wake_count))) break;
+            assert(read_bytes < 0 && (errno == EINTR || errno == EAGAIN));
+          }
+          budget.end_async_wait();
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  assert(completed == 800);
+  assert(budget.snapshot().used == 0);
+}
+
+void test_prefetch_storage_concurrent() {
+  const size_t p = size_t(::sysconf(_SC_PAGESIZE));
+  ReadAheadStoragePool pool(2);
+  std::vector<std::thread> threads;
+  for (unsigned n = 0; n < 8; ++n) {
+    threads.emplace_back([&, n] {
+      const char value = char('a' + n);
+      for (unsigned i = 0; i < 100; ++i) {
+        auto storage = pool.acquire((1 + i % 3) * p);
+        struct stat st {};
+        assert(::fstat(storage.fd.get(), &st) == 0 && st.st_blocks == 0);
+        assert(::pwrite(storage.fd.get(), &value, 1, 0) == 1);
+        assert(static_cast<const char*>(storage.mapping)[0] == value);
+        pool.release(std::move(storage));
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+}
+
+void test_prefetch_budget() {
+  constexpr size_t p = 4096;
+  assert(PrefetchBudget::default_capacity(100 * p + 9, p) == 10 * p);
+  assert(PrefetchBudget::default_capacity(SIZE_MAX, p) % p == 0);
+  assert(PrefetchBudget::file_limit(0, 8 * p, 0, p) == 0);
+  assert(PrefetchBudget::file_limit(1, 8 * p, 0, p) == p);
+  assert(PrefetchBudget::file_limit(32 * p, 8 * p, 0, p) == 16 * p);
+  assert(PrefetchBudget::file_limit(32 * p, 8 * p, 4 * p, p) == 4 * p);
+  assert(PrefetchBudget::file_limit(2 * p, 8 * p, 4 * p, p) == 4 * p);
+  assert_throws([&] { PrefetchBudget::file_limit(UINT64_MAX, p, SIZE_MAX, p); });
+  assert_throws([&] { PrefetchBudget::file_limit(8 * p, p, p + 1, p); });
+  PrefetchBudget budget(8 * p, p, p);
+  assert_throws([&] { PrefetchBudget bad(p, 2 * p, p); });
+  assert_throws([&] { PrefetchBudget bad(8 * p + 1, p, p); });
+  assert_throws([&] { budget.try_reserve(1, 4 * p, p + 1, p, false); });
+  auto first = budget.try_reserve(1, 4 * p, 8 * p, p, false);
+  assert(first.bytes() == 3 * p); // Shrink to file cap minus demand reserve.
+  assert(!budget.try_reserve(1, 4 * p, p, p, false)); // Another handle, same inode.
+  auto second = budget.try_reserve(2, 8 * p, 8 * p, p, false);
+  assert(second.bytes() == 4 * p); // Global speculative allowance exhausted.
+  assert(!budget.try_reserve(3, 8 * p, p, p, false));
+  auto demand = budget.try_reserve(1, 4 * p, p, p, true);
+  assert(demand && budget.file_used(1) == 4 * p);
+  assert(budget.snapshot().used == 8 * p);
+  assert(!budget.try_reserve(2, 8 * p, p, p, true));
+  assert(budget.snapshot().files == 2);
+  auto moved = std::move(demand);
+  assert(!demand && moved.bytes() == p);
+  moved.reset();
+  moved.reset();
+  assert(budget.snapshot().used == 7 * p);
+
+  struct Wake {
+    PrefetchBudget* budget;
+    unsigned calls = 0;
+  } wake{&budget};
+  PrefetchBudget::Waiter waiter;
+  waiter.context = &wake;
+  waiter.ready = [](void* value) noexcept {
+    auto& w = *static_cast<Wake*>(value);
+    (void)w.budget->snapshot(); // Must run outside the budget mutex.
+    ++w.calls;
+  };
+  auto revision = budget.snapshot().revision;
+  assert(budget.subscribe(waiter, revision));
+  assert_throws([&] { budget.subscribe(waiter, revision); });
+  first.reset();
+  assert(wake.calls == 1);
+  assert(!budget.unsubscribe(waiter));
+  assert(!budget.subscribe(waiter, revision)); // Release before subscription.
+  revision = budget.snapshot().revision;
+  assert(budget.subscribe(waiter, revision));
+  assert(budget.unsubscribe(waiter));
+  second.reset();
+  assert(wake.calls == 1);
+  assert(budget.snapshot().used == 0 && budget.snapshot().files == 0);
+  assert(budget.snapshot().peak == 8 * p);
+
+  auto tiny = budget.try_reserve(4, p, p, p, false);
+  assert(!tiny); // A tiny file uses demand, not a speculative reservation.
+  tiny = budget.try_reserve(4, p, p, p, true);
+  assert(tiny.bytes() == p);
+  assert(budget.subscribe(waiter, budget.snapshot().revision));
+  budget.stop();
+  budget.stop();
+  assert(wake.calls == 2 && budget.snapshot().stopped);
+  assert(!budget.try_reserve(5, p, p, p, true));
+  assert(!budget.wait(budget.snapshot().revision));
+  tiny.reset();
+  assert(budget.snapshot().used == 0);
+
+  // A lease can outlive its facade without losing the accounting owner.
+  PrefetchBudget::Reservation survivor;
+  {
+    PrefetchBudget temporary(p, p, p);
+    survivor = temporary.try_reserve(1, p, p, p, true);
+  }
+  survivor.reset();
+}
+
+void test_prefetch_budget_concurrent() {
+  constexpr size_t p = 4096;
+  PrefetchBudget budget(5 * p, p, p);
+  std::barrier start(8);
+  std::atomic<unsigned> completed{0};
+  std::vector<std::thread> threads;
+  for (unsigned i = 0; i < 8; ++i) {
+    threads.emplace_back([&, i] {
+      start.arrive_and_wait();
+      for (unsigned n = 0; n < 1000; ++n) {
+        for (;;) {
+          const auto before = budget.snapshot();
+          auto lease = budget.try_reserve(i % 2, 3 * p, p, p, false);
+          if (lease) {
+            assert(budget.snapshot().used <= 5 * p);
+            assert(budget.file_used(i % 2) <= 3 * p);
+            completed.fetch_add(1, std::memory_order_relaxed);
+            break;
+          }
+          assert(budget.wait(before.revision));
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  assert(completed == 8000);
+  assert(budget.snapshot().used == 0 && budget.snapshot().files == 0);
+  assert(budget.snapshot().peak <= 4 * p);
+
+  const auto revision = budget.snapshot().revision;
+  std::barrier stopping(2);
+  std::thread waiter([&] {
+    stopping.arrive_and_wait();
+    assert(!budget.wait(revision));
+  });
+  stopping.arrive_and_wait();
+  budget.stop();
+  waiter.join();
+}
+
 int main() {
+  test_prefetch_storage();
+  test_prefetch_storage_concurrent();
+  test_prefetch_storage_discard();
+  test_prefetch_budget();
+  test_prefetch_storage_budget();
+  test_prefetch_budget_async_wait();
+  test_prefetch_storage_budget_event_stress();
+  test_prefetch_budget_concurrent();
   test_s3_xml();
   test_ssostr_header_names();
   test_inode_dentry_slots();

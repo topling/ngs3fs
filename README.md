@@ -76,7 +76,8 @@ multi-file namespace. It remains experimental rather than production-ready.
   as failures, as required by S3.
 - Read verification is off by default. `--verify-read-checksum` enables
   background best-effort verification when a complete independently
-  verifiable object or multipart unit is available. The first read or mmap
+  verifiable object is available (or a multipart unit on the cached path).
+  Uncached reads currently verify full objects only. The first read or mmap
   fault may complete before verification. Arbitrary Range GETs are not treated
   as whole-object checksums. With local caching, multipart ObjectParts
   checksums are loaded lazily with GetObjectAttributes; a missing, unsupported,
@@ -85,6 +86,11 @@ multi-file namespace. It remains experimental rather than production-ready.
   ngs3fs fail with `EIO`. After the active FUSE reply completes, a background
   worker invalidates the affected inode range so later mmap faults also reach
   the BAD state without racing the request's locked folio.
+  Verification-enabled uncached reads never proactively issue `FUSE_NOTIFY_STORE` for a
+  unit before it passes verification. Partial ranges without a verifiable unit
+  remain best effort and are not proactively STOREd. An unpublished whole-file
+  retry reuses staging after active replies drain; STORE waits for successful
+  verification and completion of the earlier READ invalidation.
 - FUSE remains in cached mode; `direct_io` is never enabled.
 - The FUSE transport can be selected with `--io-engine auto|legacy|uring`.
   `legacy` remains the default while the uring engine is experimental and its
@@ -441,6 +447,17 @@ making room for a new window evicts the oldest completed region. After three
 such misses, that handle stops opening new prefetch windows. This path is
 disabled by `--verify-read-checksum`, which retains exact complete-unit
 verification semantics.
+The experimental `--max-prefetch-memory SIZE` and
+`--max-file-prefetch-memory SIZE` controls are documented here ahead of full
+runtime rollout and remain gated by focused tests: explicit values must be
+page-aligned and at least 256 KiB. Both default to 0 (automatic); the process
+budget resolves to 10% of physical RAM, rounded down to a page, while the
+per-file budget defaults to the smaller of file size and twice the maximum
+prefetch window. An explicit per-file value is a cap and is not clamped to
+file size. Under pressure, speculative windows shrink to fit the available
+budget; a rate-limited stderr warning reports budget pressure. These limits
+bound speculative prefetch memory and do not change an individual READ's
+negotiated maximum.
 `-L/--cache-dir` enables the persistent sparse local cache. Each S3 key maps to
 a sparse data file plus mmap-backed metadata with a two-bit state per host
 page. Clean hits are returned from the cache FD; misses fetch adaptively from

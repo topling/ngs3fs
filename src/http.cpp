@@ -2718,7 +2718,9 @@ class Http1Client final : public HttpClient {
       const size_t body_limit = error_response
           ? kMaximumErrorResponseSize : max_body_bytes;
 
-      bool response_complete = parser.message_complete();
+      bool response_complete = parser.message_complete() ||
+          method == "HEAD" || response.status == 204 ||
+          response.status == 304;
       if (!response_complete) {
         const std::optional<size_t> fixed_remaining =
             parser.fixed_body_remaining();

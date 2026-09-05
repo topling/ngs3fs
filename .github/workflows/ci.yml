@@ -120,9 +120,14 @@ jobs:
           NGS3FS_STRESS_JOBS: 8
           NGS3FS_STRESS_ITERATIONS: 20
         run: |
-          ./scripts/test_libfuse_cases.sh \
-            "$GITHUB_WORKSPACE/upstream/libfuse" \
-            "$GITHUB_WORKSPACE/build/libfuse-cases"
+          for configuration in legacy:1 uring:1 uring:4; do
+            engine=${configuration%%:*}
+            reactors=${configuration##*:}
+            NGS3FS_IO_ENGINE="$engine" NGS3FS_REACTORS="$reactors" \
+              ./scripts/test_libfuse_cases.sh \
+              "$GITHUB_WORKSPACE/upstream/libfuse" \
+              "$GITHUB_WORKSPACE/build/libfuse-cases-$engine-$reactors"
+          done
 
       - name: Run filtered xfstests correctness and stress cases
         env:
@@ -152,6 +157,18 @@ jobs:
         run: |
           ./scripts/test_multi_mount.sh \
             "$GITHUB_WORKSPACE/build/multi-mount"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ctest-and-filesystem-test-logs
+          if-no-files-found: ignore
+          path: |
+            build/**/Testing/Temporary/LastTest*.log
+            build/libfuse-cases-*/*.log
+            build/xfstests/*.log
+            build/multi-mount/*.log
 
   hardening:
     name: hardening (${{ matrix.name }})

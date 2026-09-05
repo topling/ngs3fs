@@ -181,6 +181,9 @@ struct SpecialObject {
   size_t checksum_part_size  = 0;
   bool attributes_unsupported = false;
   bool invalid_content_range = false;
+  size_t pause_after = 0;
+  std::atomic<bool> tail_paused{false};
+  std::atomic<bool> resume_tail{false};
   std::vector<RequestRange> get_ranges;
   std::vector<std::string> get_paths;
 };
@@ -405,8 +408,20 @@ ssize_t read_body(nghttp2_session*, int32_t, uint8_t* buffer,
     response.delayed = true;
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
-  const size_t count =
+  if (response.keepalive && response.keepalive->pause_after != 0 &&
+      response.cursor >= response.keepalive->pause_after) {
+    response.keepalive->tail_paused.store(true, std::memory_order_release);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!response.keepalive->resume_tail.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  size_t count =
       std::min(length, response.end - response.cursor);
+  if (response.keepalive && response.cursor < response.keepalive->pause_after) {
+    count = std::min(count, response.keepalive->pause_after - response.cursor);
+  }
   if (count != 0) {
     memcpy(buffer, response.object->data() + response.cursor, count);
   }
@@ -1304,13 +1319,15 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     require(request.checksum_mode == "ENABLED" && complete_object,
             "checksum mode was used for a partial object range");
     ++state.checksum_mode_requests;
-    checksum = encoded_checksum(state.checksum, *object);
+    // Corruption injection changes the transport bytes, not the object's
+    // authoritative checksum. Otherwise a corrupt GET incorrectly verifies.
+    checksum = encoded_checksum(state.checksum, source->keepalive->bytes);
     response_headers.push_back(
         header(checksum_header_name(state.checksum), checksum));
     response_headers.push_back(
         header("x-amz-checksum-type", "FULL_OBJECT"));
   } else if (state.checksum == CHECKSUM_CRC64XZ) {
-    checksum = response_checksum(state.checksum, *object);
+    checksum = response_checksum(state.checksum, source->keepalive->bytes);
     response_headers.push_back(
         header(checksum_header_name(state.checksum), checksum));
   }
@@ -1538,6 +1555,7 @@ class MountedProcess {
   }
 
   void restart(pid_t process) noexcept { process_ = process; }
+  bool stopped_cleanly() const noexcept { return clean_exit_; }
 
   void stop() noexcept {
     if (process_ <= 0) {
@@ -1549,6 +1567,7 @@ class MountedProcess {
       int status = 0;
       const pid_t result = ::waitpid(process_, &status, WNOHANG);
       if (result == process_) {
+        clean_exit_ = WIFEXITED(status) && WEXITSTATUS(status) == 0;
         process_ = -1;
         return;
       }
@@ -1578,6 +1597,7 @@ class MountedProcess {
   }
   std::string mountpoint_;
   pid_t process_ = -1;
+  bool clean_exit_ = false;
 };
 
 std::string make_mountpoint() {
@@ -1595,7 +1615,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
                    std::string_view cache_dir,
                    std::string_view engine = "auto",
                    std::string_view reactors = "1",
-                   bool verify_reads = true) {
+                   bool verify_reads = true, bool whole_retry = false,
+                   bool low_budget = false) {
   const std::string port_text = std::to_string(port);
   const std::string uid_text  = std::to_string(::getuid());
   const std::string gid_text  = std::to_string(::getgid());
@@ -1615,6 +1636,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               "0750", "-I", "1", "--checksum", checksum.data(),
               "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "--io-engine", engine.data(),
+              "--max-prefetch-memory", low_budget ? "256KiB" : "0",
+              "--max-file-prefetch-memory", low_budget ? "256KiB" : "0",
               "--reactors", reactors.data(), "-f", mountpoint.data(),
               static_cast<char*>(nullptr));
     } else if (cache_dir.empty()) {
@@ -1624,6 +1647,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
               "0750", "-I", "1",
               "--checksum", checksum.data(), "--verify-read-checksum",
+              "--max-file-prefetch-memory", low_budget ? "256KiB" : (whole_retry ? "8MiB" : "0"),
+              "--max-prefetch-memory", low_budget ? "256KiB" : "0",
               "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "--io-engine", engine.data(),
               "--reactors", reactors.data(), "-f", mountpoint.data(),
@@ -1661,10 +1686,46 @@ void wait_until_mounted(std::string_view file_path, pid_t process) {
   throw std::runtime_error("timed out waiting for FUSE mount");
 }
 
+bool prefetch_storage_empty(pid_t process, size_t* resident = nullptr) {
+  if (resident) *resident = 0;
+  char path[128];
+  snprintf(path, sizeof(path), "/proc/%ld/fd", long(process));
+  DIR* directory = ::opendir(path);
+  if (!directory) fail_errno("opendir daemon fds");
+  struct CloseDir {
+    DIR* directory;
+    ~CloseDir() { ::closedir(directory); }
+  } close{directory};
+  bool found = false;
+  bool empty = true;
+  while (dirent* entry = ::readdir(directory)) {
+    if (entry->d_name[0] == '.') continue;
+    char fd_path[512];
+    snprintf(fd_path, sizeof(fd_path), "%s/%s", path, entry->d_name);
+    char target[512];
+    const ssize_t n = ::readlink(fd_path, target, sizeof(target) - 1);
+    if (n < 0) {
+      if (errno == ENOENT) continue;
+      fail_errno("readlink daemon fd");
+    }
+    target[n] = 0;
+    if (strstr(target, "memfd:ngs3fs-read-ahead") == nullptr) continue;
+    struct stat st {};
+    if (::stat(fd_path, &st) != 0) {
+      if (errno == ENOENT) continue;
+      fail_errno("stat daemon prefetch fd");
+    }
+    found = true;
+    if (resident) *resident += size_t(st.st_blocks) * 512;
+    empty &= st.st_size == 0 && st.st_blocks == 0;
+  }
+  return found && empty;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2 || argc > 6) {
     std::cerr << "usage: fuse_mmap_integration_test NGS3FS "
-                 "[CHECKSUM [plain|cache|prefetch "
+                 "[CHECKSUM [plain|cache|prefetch|prefetch-verified "
                  "[auto|legacy|uring [REACTORS]]]]\n";
     return 2;
   }
@@ -1693,8 +1754,13 @@ int main(int argc, char** argv) {
     if (reactors != "1" && reactors != "2") {
       throw std::invalid_argument("integration-test reactors must be 1 or 2");
     }
-    const bool prefetch_mode = argc >= 4 &&
-        std::string_view(argv[3]) == "prefetch";
+    const bool verified_clean = argc >= 4 && std::string_view(argv[3]) == "prefetch-verified-clean";
+    const bool shutdown_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-shutdown";
+    const bool verified_prefetch = verified_clean || (argc >= 4 &&
+        std::string_view(argv[3]) == "prefetch-verified");
+    const bool budget_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-budget";
+    const bool prefetch_mode = verified_prefetch || budget_prefetch || shutdown_prefetch || (argc >= 4 &&
+        std::string_view(argv[3]) == "prefetch");
     std::vector<std::byte> expected(512U * 1024U + 37U);
     for (size_t i = 0; i < expected.size(); ++i) {
       expected[i] = static_cast<std::byte>((i * 29U + 7U) & 0xffU);
@@ -1745,6 +1811,15 @@ int main(int argc, char** argv) {
                          "\"read-ahead-sequential\"");
     add_overwrite_object("read-ahead-random.bin", read_ahead,
                          "\"read-ahead-random\"");
+    add_overwrite_object("read-ahead-store.bin", read_ahead,
+                         "\"read-ahead-store\"");
+    if (verified_prefetch) {
+      auto& object = *shared.special_objects.at("read-ahead-store.bin");
+      object.bytes.resize(768U * 1024U + 37U);
+      object.corrupted_bytes = object.bytes;
+      object.corrupted_bytes[384U * 1024U + 17U] ^= std::byte{0x80};
+      object.corrupt_gets_remaining = verified_clean ? 0 : 1;
+    }
     std::vector<std::byte> checksum_test(256U * 1024U + 37U);
     for (size_t i = 0; i < checksum_test.size(); ++i) {
       checksum_test[i] = static_cast<std::byte>((i * 13U + 41U) & 0xffU);
@@ -1770,6 +1845,9 @@ int main(int argc, char** argv) {
     add_checksum_object("checksum-rename.bin", 1, 128U * 1024U);
     add_checksum_object("checksum-fail.bin", 2);
     add_checksum_object("checksum-unsupported.bin", 0, 0, true);
+    add_checksum_object("budget-retry.bin", 1);
+    shared.special_objects.at("budget-retry.bin")->bytes.resize(32U * 1024U + 37U);
+    shared.special_objects.at("budget-retry.bin")->corrupted_bytes.resize(32U * 1024U + 37U);
     add_checksum_object("invalid-content-range.bin", 0);
     shared.special_objects.at(
         "invalid-content-range.bin")->invalid_content_range = true;
@@ -1788,19 +1866,78 @@ int main(int argc, char** argv) {
     const std::string checksum_option(checksum_option_name(checksum));
     const pid_t process = start_daemon(
         argv[1], mountpoint, listener.port, checksum_option, cache_dir,
-        engine, reactors, !prefetch_mode);
+        engine, reactors, !prefetch_mode || verified_prefetch || budget_prefetch,
+        verified_prefetch, budget_prefetch);
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
 
+    if (budget_prefetch) {
+      constexpr std::array<const char*, 3> names{
+          "read-ahead.bin", "read-ahead-sequential.bin", "read-ahead-random.bin"};
+      std::array<std::exception_ptr, 8> errors;
+      std::atomic<bool> start{false};
+      std::vector<std::jthread> readers;
+      for (unsigned n = 0; n < errors.size(); ++n) {
+        readers.emplace_back([&, n] {
+          try {
+            UniqueFd fd(::open((mountpoint + "/" + names[n % names.size()]).c_str(), O_RDONLY | O_CLOEXEC));
+            if (!fd) fail_errno("open budget concurrent reader");
+            require(::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_RANDOM) == 0, "budget random advice");
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            std::array<std::byte, 16 * 1024> bytes;
+            for (unsigned i = 0; i < 64; ++i) {
+              const size_t offset = ((i * 71 + n * 23) % 240) * 16U * 1024U;
+              pread_all(fd.get(), bytes, offset);
+              require(std::equal(bytes.begin(), bytes.end(), read_ahead.begin() + offset),
+                      "low-budget concurrent read differs");
+            }
+          } catch (...) { errors[n] = std::current_exception(); }
+        });
+      }
+      start.store(true, std::memory_order_release);
+      for (auto& reader : readers) reader.join();
+      for (const auto& error : errors) if (error) std::rethrow_exception(error);
+      UniqueFd retry(::open((mountpoint + "/budget-retry.bin").c_str(), O_RDONLY | O_CLOEXEC));
+      if (!retry) fail_errno("open demand-only checksum retry");
+      std::vector<std::byte> bytes(32U * 1024U + 37U);
+      pread_all(retry.get(), bytes, 0);
+      bool corrected = false;
+      for (unsigned i = 0; i < 2000; ++i) {
+        int gets;
+        { std::lock_guard guard(shared.mutex); gets = shared.special_objects.at("budget-retry.bin")->get_requests; }
+        pread_all(retry.get(), bytes, 0);
+        if (gets == 2 && std::equal(bytes.begin(), bytes.end(), checksum_test.begin())) {
+          corrected = true;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(corrected, "demand-only retry did not progress within the memory limit");
+      retry.reset();
+      mounted.stop();
+      shared.stop.store(true);
+      server.request_stop();
+      server.join();
+      if (::rmdir(mountpoint.c_str()) != 0) fail_errno("rmdir budget mountpoint");
+      fprintf(stderr, "256 KiB mount/file limits: 8 readers, 3 files, 512 random reads and demand-only checksum retry passed\n");
+      return 0;
+    }
+
     if (prefetch_mode) {
       const auto wait_for_gets = [&] {
-        for (unsigned attempt = 0; attempt != 1000; ++attempt) {
+        for (unsigned attempt = 0; attempt != 2000; ++attempt) {
+          bool sent;
           {
             std::lock_guard state_guard(shared.mutex);
-            if (shared.active_gets == 0) {
-              return;
-            }
+            sent = shared.active_gets == 0;
+          }
+          // A sent response is not a completed client window: asynchronous
+          // checksum and STORE can still be pending. The next disjoint READ
+          // legitimately uses demand-only I/O until that window completes.
+          // The exact-window assertions below require a quiescent client too.
+          if (sent && prefetch_storage_empty(process)) {
+            return;
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -1819,7 +1956,167 @@ int main(int argc, char** argv) {
         }
         throw std::runtime_error("timed out waiting for read-ahead GET");
       };
+      if (engine == "uring" || (engine == "legacy" && !verified_prefetch)) {
+        std::shared_ptr<SpecialObject> object;
+        {
+          std::lock_guard guard(shared.mutex);
+          object = shared.special_objects.at("read-ahead-store.bin");
+          object->pause_after = 512U * 1024U;
+        }
+        std::vector<std::jthread> readers;
+        struct ResumeTail {
+          SpecialObject& object;
+          ~ResumeTail() { object.resume_tail.store(true, std::memory_order_release); }
+        } resume{*object};
+        const std::string path = mountpoint + "/read-ahead-store.bin";
+        UniqueFd first(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+        UniqueFd second(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+        require(first && second, "open progressive STORE object");
+        require(::posix_fadvise(first.get(), 0, 0, POSIX_FADV_RANDOM) == 0 &&
+                    ::posix_fadvise(second.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+                "disable kernel read-ahead for STORE evidence");
+        const size_t page = size_t(::sysconf(_SC_PAGESIZE));
+        constexpr size_t probe = 384U * 1024U;
+        void* mapping = ::mmap(nullptr, page, PROT_READ, MAP_SHARED, first.get(), off_t(probe));
+        require(mapping != MAP_FAILED, "map unfaulted STORE probe page");
+        struct Unmap {
+          void* mapping;
+          size_t length;
+          ~Unmap() { if (mapping != MAP_FAILED) ::munmap(mapping, length); }
+        } unmap{mapping, page};
+        unsigned char resident = 0;
+        require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
+                "STORE probe page was already resident before any READ");
+        std::array<std::byte, 64U * 1024U> first_bytes{};
+        pread_all(first.get(), first_bytes, 0);
+        require(std::equal(first_bytes.begin(), first_bytes.end(), read_ahead.begin()),
+                "progressive STORE initial READ differs");
+        bool published = false;
+        for (unsigned i = 0; i < 2000; ++i) {
+          require(::mincore(mapping, page, &resident) == 0, "mincore STORE probe");
+          if (((resident & 1) || verified_prefetch) && object->tail_paused.load(std::memory_order_acquire)) {
+            published = true;
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(published && !object->resume_tail.load(std::memory_order_acquire),
+                "prefetch did not reach the paused-tail observation point");
+        if (verified_prefetch) {
+          for (unsigned i = 0; i < 20; ++i) {
+            require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
+                    "unverified prefetched data was proactively STOREd");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+        }
+        if (!verified_prefetch) {
+          bool reclaimed = false;
+          for (unsigned i = 0; i < 2000; ++i) {
+            size_t bytes;
+            prefetch_storage_empty(process, &bytes);
+            if (bytes <= 256U * 1024U) { reclaimed = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+          require(reclaimed, "published prefix still occupies memfd pages while GET is paused");
+        }
+        {
+          std::lock_guard guard(shared.mutex);
+          require(shared.active_gets > 0, "paused GET already completed before STORE evidence");
+        }
+        if (shutdown_prefetch) {
+          // Exit with a live download and a published prefix, not after the
+          // staging has already retired. Let the server resume independently.
+          require(::munmap(mapping, page) == 0, "unmap shutdown probe");
+          unmap.mapping = MAP_FAILED;
+          first.reset();
+          second.reset();
+          std::jthread resume_download([object] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            object->resume_tail.store(true, std::memory_order_release);
+          });
+          mounted.stop();
+          require(mounted.stopped_cleanly(), "prefetch shutdown did not exit cleanly");
+          shared.stop.store(true);
+          server.request_stop();
+          server.join();
+          require(::rmdir(mountpoint.c_str()) == 0, "remove prefetch shutdown mountpoint");
+          fprintf(stderr, "shutdown with active prefetch and published prefix: passed\n");
+          return 0;
+        }
+        std::array<std::exception_ptr, 8> errors{};
+        std::atomic<unsigned> entered{0};
+        struct FinishReaders {
+          SpecialObject& object;
+          std::vector<std::jthread>& readers;
+          ~FinishReaders() {
+            object.resume_tail.store(true, std::memory_order_release);
+            for (auto& reader : readers) if (reader.joinable()) reader.join();
+          }
+        } finish_readers{*object, readers};
+        for (size_t n = 0; n < errors.size(); ++n) {
+          readers.emplace_back([&, n] {
+            entered.fetch_add(1, std::memory_order_release);
+            try {
+              // Cross the received/pending boundary and alternate handles.
+              const size_t offset = 448U * 1024U + n * page;
+              std::vector<std::byte> bytes(256U * 1024U);
+              pread_all(n % 2 ? first.get() : second.get(), bytes, offset);
+              require(std::equal(bytes.begin(), bytes.end(), read_ahead.begin() + offset),
+                      "overlapping STORE/READ bytes differ");
+            } catch (...) { errors[n] = std::current_exception(); }
+          });
+        }
+        while (entered.load(std::memory_order_acquire) != errors.size()) {
+          std::this_thread::yield();
+        }
+        // Leave concurrent READs pending while another satisfied READ completes.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        pread_all(first.get(), first_bytes, 0);
+        object->resume_tail.store(true, std::memory_order_release);
+        for (auto& thread : readers) thread.join();
+        for (auto& error : errors) if (error) std::rethrow_exception(error);
+        if (verified_prefetch) {
+          bool corrected = false;
+          for (unsigned i = 0; i < 2000; ++i) {
+            pread_all(second.get(), first_bytes, probe);
+            if (std::equal(first_bytes.begin(), first_bytes.end(), read_ahead.begin() + probe)) {
+              corrected = true;
+              break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+          require(corrected, "checksum retry did not replace corrupt early READ data");
+        }
+        wait_for_gets();
+        bool retired = false;
+        for (unsigned i = 0; i < 2000; ++i) {
+          if (prefetch_storage_empty(process)) {
+            retired = true;
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(retired, "completed prefetch memfd still retains payload pages");
+        pread_all(second.get(), first_bytes, probe);
+        require(std::equal(first_bytes.begin(), first_bytes.end(), read_ahead.begin() + probe),
+                "kernel cache bytes differ after memfd retirement");
+        {
+          std::lock_guard guard(shared.mutex);
+          require(object->get_requests == (verified_prefetch && !verified_clean ? 2 : 1),
+                  "overlapping cross-handle READ did not share its in-flight prefetch");
+        }
+        fprintf(stderr, "%s and overlapping cross-handle READ: passed\n",
+                verified_prefetch ? "STORE withheld until checksum retry succeeds" : "progressive STORE before EOF");
+      }
       const std::string path = mountpoint + "/read-ahead.bin";
+      if (verified_prefetch) {
+        mounted.stop();
+        shared.stop.store(true);
+        server.request_stop();
+        server.join();
+        if (::rmdir(mountpoint.c_str()) != 0) fail_errno("rmdir verified prefetch mountpoint");
+        return 0;
+      }
       UniqueFd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
       if (!fd) {
         fail_errno("open read-ahead object");
@@ -1929,6 +2226,12 @@ int main(int argc, char** argv) {
         std::lock_guard state_guard(shared.mutex);
         const auto& ranges = shared.special_objects.at(
             "read-ahead-random.bin")->get_ranges;
+        if (ranges.size() != random_offsets.size()) {
+          for (const auto& range : ranges) {
+            fprintf(stderr, "random-extent GET: first=%llu last=%llu\n",
+                    (unsigned long long)range.first, (unsigned long long)range.last);
+          }
+        }
         require(ranges.size() == random_offsets.size(),
                 "random extents did not each use one GET");
         for (size_t i = 0; i != ranges.size(); ++i) {

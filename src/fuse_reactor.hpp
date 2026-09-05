@@ -65,6 +65,10 @@ class FuseReactor : public IoExecutor {
   // The callback may destroy its context or submit another notification.
   bool notify_inval_inode(fuse_ino_t inode, off_t offset, off_t length,
                            NotifyFunction done, void* context) noexcept;
+  // fd-backed STORE. Keep source storage alive until done; queued admission
+  // is not publication. STORE failures are reported to done, not mount-fatal.
+  bool notify_store(fuse_ino_t inode, off_t offset, int fd, off_t source_offset,
+                    size_t length, NotifyFunction done, void* context) noexcept;
 
   using TaskFunction = void (*)(void*) noexcept;
   struct ReactorTask {
@@ -118,6 +122,7 @@ class FuseReactor : public IoExecutor {
     bool external  = false;
     NotifyFunction notify_done = nullptr;
     void* notify_context = nullptr;
+    bool notify_best_effort = false;
 
     u_char* data() noexcept {
       return length <= sizeof(inline_data) ? inline_data :
@@ -250,6 +255,7 @@ class FuseReactor : public IoExecutor {
   Reply* reply_tail_               = nullptr;
   NotifyFunction pending_notify_  = nullptr;
   void* pending_notify_context_    = nullptr;
+  bool pending_notify_best_effort_ = false;
   bool notify_accepted_            = false;
   int external_pipe_[2]            = {-1, -1};
   int dispatch_pipe_[2]            = {-1, -1};

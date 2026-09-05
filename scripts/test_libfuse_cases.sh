@@ -19,6 +19,13 @@ versitygw=${VERSITYGW_BIN:-$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Lin
 ngs3fs=${NGS3FS_BIN:-$project_dir/build/dev/ngs3fs}
 goofys=${GOOFYS_BIN:-}
 client=${NGS3FS_TEST_CLIENT:-ngs3fs}
+io_args=()
+if [[ -n "${NGS3FS_IO_ENGINE:-}" ]]; then
+  io_args+=(--io-engine "$NGS3FS_IO_ENGINE")
+fi
+if [[ -n "${NGS3FS_REACTORS:-}" ]]; then
+  io_args+=(--reactors "$NGS3FS_REACTORS")
+fi
 skip_cases=${NGS3FS_LIBFUSE_SKIP:-}
 if [[ -z "$goofys" ]]; then
   goofys=$(command -v goofys || true)
@@ -142,7 +149,7 @@ if [[ $client == ngs3fs ]]; then
     echo "ngs3fs local cache: $cache_dir"
   fi
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
-    "$ngs3fs" "${ngs3fs_mount_args[@]}" "$mount_dir" \
+    "$ngs3fs" "${ngs3fs_mount_args[@]}" "${io_args[@]}" "$mount_dir" \
       >"$client_log" 2>&1 &
 else
   AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \

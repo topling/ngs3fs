@@ -10,6 +10,81 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <memory>
+#include <mutex>
+#include <vector>
+
+// Page-rounded transient storage, shared by all handles of an inode. Demand
+// has a separate allowance INSIDE the caps so blocked publication cannot use
+// the memory needed to complete a READ that holds its destination folios.
+class PrefetchBudget {
+  struct State;
+
+ public:
+  struct Snapshot {
+    size_t used;
+    size_t peak;
+    size_t files;
+    uint64_t revision;
+    bool stopped;
+    size_t file_peak;
+  };
+
+  struct Waiter {
+    void (*ready)(void*) noexcept = nullptr;
+    void* context = nullptr;
+    Waiter* next = nullptr;
+    bool linked = false;
+  };
+
+  class Reservation {
+   public:
+    Reservation() = default;
+    ~Reservation() { reset(); }
+    Reservation(const Reservation&) = delete;
+    Reservation& operator=(const Reservation&) = delete;
+    Reservation(Reservation&& other) noexcept;
+    Reservation& operator=(Reservation&& other) noexcept;
+    explicit operator bool() const noexcept { return bytes_ != 0; }
+    size_t bytes() const noexcept { return bytes_; }
+    size_t page_size() const noexcept;
+    // Transfer already admitted bytes without releasing/reacquiring capacity.
+    // Used to release a reclaimed prefix while retaining the remaining charge.
+    Reservation split(size_t bytes);
+    void reset() noexcept;
+
+   private:
+    friend class PrefetchBudget;
+    Reservation(std::shared_ptr<State> state, uintptr_t file, size_t bytes,
+                bool demand) noexcept
+        : state_(std::move(state)), file_(file), bytes_(bytes), demand_(demand) {}
+    std::shared_ptr<State> state_;
+    uintptr_t file_ = 0;
+    size_t bytes_   = 0;
+    bool demand_    = false;
+  };
+
+  PrefetchBudget(size_t capacity, size_t demand_reserve, size_t page_size);
+  static size_t default_capacity(uint64_t physical_bytes, size_t page_size);
+  static size_t file_limit(uint64_t file_size, size_t max_window,
+                          size_t explicit_limit, size_t page_size);
+  Reservation try_reserve(uintptr_t file, size_t file_limit,
+                          size_t preferred, size_t minimum, bool demand);
+  Snapshot snapshot() const noexcept;
+  size_t file_used(uintptr_t file) const noexcept;
+  // Observe revision BEFORE try_reserve; subscribe rechecks it under the same
+  // mutex as release. A false result means retry, not a lost wakeup. ready()
+  // must enqueue a continuation, not execute filesystem work on this thread.
+  bool subscribe(Waiter& waiter, uint64_t revision);
+  bool unsubscribe(Waiter& waiter) noexcept;
+  bool wait(uint64_t revision);
+  int begin_async_wait(uint64_t revision);
+  void end_async_wait() noexcept;
+  void stop() noexcept;
+
+ private:
+  std::shared_ptr<State> state_;
+};
 
 // File descriptors, pipes, splice helpers, and sockets.
 class UniqueFd {
@@ -47,6 +122,37 @@ class UniqueFd {
 
  private:
   int fd_ = -1;
+};
+
+// Reuse descriptors, never retired download data. Active Storage owns its
+// mapping and pages; release drops both before admitting an fd to the pool.
+class ReadAheadStoragePool {
+ public:
+  struct Storage {
+    UniqueFd fd;
+    void* mapping = nullptr;
+    size_t size   = 0;
+    PrefetchBudget::Reservation charge;
+
+    Storage() = default;
+    Storage(const Storage&) = delete;
+    Storage& operator=(const Storage&) = delete;
+    Storage(Storage&& other) noexcept;
+    Storage& operator=(Storage&& other) noexcept;
+    ~Storage();
+    void unmap() noexcept;
+    bool discard(size_t offset, size_t length) noexcept;
+  };
+
+  explicit ReadAheadStoragePool(size_t max_idle_fds = 16);
+  Storage acquire(size_t size);
+  Storage acquire(size_t size, PrefetchBudget::Reservation charge);
+  void release(Storage storage) noexcept;
+
+ private:
+  std::mutex mutex_;
+  std::vector<UniqueFd> entries_;
+  size_t max_idle_fds_;
 };
 
 // Short native waits for legacy workers, or try/recheck/eventfd waits for

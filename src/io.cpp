@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
@@ -22,6 +23,354 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <assert.h>
+#include <condition_variable>
+#include <mutex>
+#include <unordered_map>
+
+ReadAheadStoragePool::Storage::Storage(Storage&& other) noexcept
+    : fd(std::move(other.fd)),
+      mapping(std::exchange(other.mapping, nullptr)),
+      size(std::exchange(other.size, 0)), charge(std::move(other.charge)) {}
+
+ReadAheadStoragePool::Storage& ReadAheadStoragePool::Storage::operator=(
+    Storage&& other) noexcept {
+  if (this != &other) {
+    unmap();
+    fd      = std::move(other.fd);
+    // The old fd is closed before its reservation wakes another allocator.
+    charge  = std::move(other.charge);
+    mapping = std::exchange(other.mapping, nullptr);
+    size    = std::exchange(other.size, 0);
+  }
+  return *this;
+}
+
+ReadAheadStoragePool::Storage::~Storage() {
+  unmap();
+  fd.reset();
+  charge.reset();
+}
+
+void ReadAheadStoragePool::Storage::unmap() noexcept {
+  if (mapping != nullptr) {
+    ::munmap(mapping, size);
+    mapping = nullptr;
+  }
+}
+
+bool ReadAheadStoragePool::Storage::discard(size_t offset, size_t length) noexcept {
+  static const size_t page = size_t(::sysconf(_SC_PAGESIZE));
+  if (!fd || length == 0 || offset % page || length % page ||
+      offset > size || length > size - offset ||
+      (charge && (length > charge.bytes() || length % charge.page_size()))) {
+    errno = EINVAL;
+    return false;
+  }
+  if (::fallocate(fd.get(), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                  off_t(offset), off_t(length)) != 0) return false;
+  if (charge) charge.split(length).reset();
+  return true;
+}
+
+ReadAheadStoragePool::ReadAheadStoragePool(size_t max_idle_fds)
+    : max_idle_fds_(max_idle_fds) {
+  entries_.reserve(max_idle_fds);
+}
+
+ReadAheadStoragePool::Storage ReadAheadStoragePool::acquire(size_t size) {
+  return acquire(size, {});
+}
+
+ReadAheadStoragePool::Storage ReadAheadStoragePool::acquire(
+    size_t size, PrefetchBudget::Reservation charge) {
+  if (size == 0 || size > uint64_t(INT64_MAX)) {
+    throw std::invalid_argument("invalid read-ahead storage size");
+  }
+  if (charge && size > charge.bytes()) {
+    throw std::invalid_argument("read-ahead storage exceeds reservation");
+  }
+  Storage storage;
+  storage.charge = std::move(charge);
+  {
+    std::lock_guard guard(mutex_);
+    if (!entries_.empty()) {
+      storage.fd = std::move(entries_.back());
+      entries_.pop_back();
+    }
+  }
+  if (!storage.fd) {
+    storage.fd.reset(::memfd_create("ngs3fs-read-ahead", MFD_CLOEXEC));
+    if (!storage.fd) {
+      throw std::system_error(errno, std::generic_category(),
+                              "memfd_create(read-ahead)");
+    }
+  }
+  if (::ftruncate(storage.fd.get(), off_t(size)) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "ftruncate(read-ahead)");
+  }
+  storage.size = size;
+  storage.mapping = ::mmap(nullptr, size, PROT_READ, MAP_SHARED,
+                           storage.fd.get(), 0);
+  if (storage.mapping == MAP_FAILED) {
+    storage.mapping = nullptr;
+    throw std::system_error(errno, std::generic_category(), "mmap(read-ahead)");
+  }
+  return storage;
+}
+
+void ReadAheadStoragePool::release(Storage storage) noexcept {
+  if (!storage.fd || max_idle_fds_ == 0) return;
+  storage.unmap();
+  // Truncate outside the pool lock. Other owners must have retired before
+  // release; pipe references already handed off retain their own page refs.
+  if (::ftruncate(storage.fd.get(), 0) != 0) return;
+  {
+    std::lock_guard guard(mutex_);
+    if (entries_.size() < max_idle_fds_) {
+      entries_.push_back(std::move(storage.fd)); // Capacity reserved at construction.
+    }
+  }
+  // Storage's destructor releases its charge outside the pool lock, after
+  // truncation (or close). Budget callbacks may immediately reuse this pool.
+}
+
+struct PrefetchBudget::State {
+  struct Usage {
+    size_t speculative = 0;
+    size_t demand      = 0;
+  };
+  State(size_t cap, size_t reserve, size_t page)
+      : capacity(cap), demand_reserve(reserve), page_size(page) {
+    files.reserve(16);
+  }
+  ~State() { if (event >= 0) ::close(event); }
+  int event = -1;
+  unsigned event_waiters = 0;
+
+  void wake_event() noexcept {
+    std::lock_guard guard(mutex);
+    if (event < 0 || event_waiters == 0) return;
+    const uint64_t n = event_waiters;
+    ssize_t rc;
+    do { rc = ::write(event, &n, sizeof(n)); } while (rc < 0 && errno == EINTR);
+  }
+
+  std::mutex mutex;
+  std::condition_variable condition;
+  std::unordered_map<uintptr_t, Usage> files;
+  size_t capacity;
+  size_t demand_reserve;
+  size_t page_size;
+  Usage used;
+  size_t peak = 0;
+  size_t file_peak = 0;
+  uint64_t revision = 0;
+  bool stopped = false;
+  Waiter* waiters = nullptr;
+
+  Waiter* detach_waiters() noexcept {
+    Waiter* list = std::exchange(waiters, nullptr);
+    for (Waiter* p = list; p != nullptr; p = p->next) p->linked = false;
+    return list;
+  }
+  static void wake(Waiter* list) noexcept {
+    while (list != nullptr) {
+      Waiter* p = list;
+      list = p->next;
+      p->next = nullptr;
+      p->ready(p->context);
+    }
+  }
+};
+
+PrefetchBudget::PrefetchBudget(size_t capacity, size_t reserve, size_t page) {
+  if (page == 0 || reserve == 0 || capacity < reserve ||
+      capacity % page != 0 || reserve % page != 0) {
+    throw std::invalid_argument("invalid prefetch memory budget");
+  }
+  state_ = std::make_shared<State>(capacity, reserve, page);
+}
+
+size_t PrefetchBudget::default_capacity(uint64_t physical_bytes, size_t page) {
+  if (page == 0) throw std::invalid_argument("invalid page size");
+  const uint64_t limit = physical_bytes / 10;
+  if (limit > SIZE_MAX) throw std::overflow_error("prefetch budget exceeds SIZE_MAX");
+  return size_t(limit - limit % page);
+}
+
+size_t PrefetchBudget::file_limit(uint64_t size, size_t window,
+                                 size_t configured, size_t page) {
+  if (page == 0 || window == 0 || window % page != 0 || configured % page != 0) {
+    throw std::invalid_argument("prefetch limits must be page aligned");
+  }
+  const size_t maximum = SIZE_MAX - SIZE_MAX % page;
+  const size_t adaptive = window > maximum / 2 ? maximum : window * 2;
+  const uint64_t limit = configured ? configured : std::min<uint64_t>(size, adaptive);
+  if (limit > maximum) throw std::overflow_error("file prefetch budget exceeds SIZE_MAX");
+  const size_t remainder = size_t(limit % page);
+  return size_t(limit) + (remainder == 0 ? 0 : page - remainder);
+}
+
+PrefetchBudget::Reservation PrefetchBudget::try_reserve(
+    uintptr_t file, size_t limit, size_t preferred, size_t minimum, bool demand) {
+  State& s = *state_;
+  if (minimum == 0 || minimum > preferred || limit == 0 ||
+      limit % s.page_size != 0 || preferred % s.page_size != 0 ||
+      minimum % s.page_size != 0) {
+    throw std::invalid_argument("prefetch reservation must be page aligned");
+  }
+  std::lock_guard guard(s.mutex);
+  if (s.stopped) return {};
+  const auto found = s.files.find(file);
+  const State::Usage used = found == s.files.end() ? State::Usage{} : found->second;
+  const size_t file_reserve = std::min(limit, s.demand_reserve);
+  const size_t cap = demand ? s.demand_reserve : s.capacity - s.demand_reserve;
+  const size_t file_cap = demand ? file_reserve : limit - file_reserve;
+  const size_t taken = demand ? s.used.demand : s.used.speculative;
+  const size_t file_taken = demand ? used.demand : used.speculative;
+  const size_t total = used.demand + used.speculative;
+  if (taken > cap || file_taken > file_cap || total > limit) return {};
+  const size_t bytes = std::min({preferred, cap - taken, file_cap - file_taken,
+                                  limit - total});
+  if (bytes < minimum) return {};
+  // Insertion can throw: do it before changing any counters.
+  auto& entry = s.files.try_emplace(file).first->second;
+  (demand ? entry.demand : entry.speculative) += bytes;
+  (demand ? s.used.demand : s.used.speculative) += bytes;
+  s.peak = std::max(s.peak, s.used.demand + s.used.speculative);
+  s.file_peak = std::max(s.file_peak, entry.demand + entry.speculative);
+  assert(s.used.demand + s.used.speculative <= s.capacity);
+  return Reservation(state_, file, bytes, demand);
+}
+
+PrefetchBudget::Reservation::Reservation(Reservation&& other) noexcept
+    : state_(std::move(other.state_)), file_(other.file_),
+      bytes_(std::exchange(other.bytes_, 0)), demand_(other.demand_) {}
+
+PrefetchBudget::Reservation PrefetchBudget::Reservation::split(size_t bytes) {
+  if (!state_ || bytes == 0 || bytes > bytes_ || bytes % state_->page_size != 0) {
+    throw std::invalid_argument("invalid prefetch reservation split");
+  }
+  bytes_ -= bytes;
+  return Reservation(state_, file_, bytes, demand_);
+}
+
+size_t PrefetchBudget::Reservation::page_size() const noexcept {
+  return state_ ? state_->page_size : 0;
+}
+
+PrefetchBudget::Reservation& PrefetchBudget::Reservation::operator=(
+    Reservation&& other) noexcept {
+  if (this != &other) {
+    reset();
+    state_  = std::move(other.state_);
+    file_   = other.file_;
+    bytes_  = std::exchange(other.bytes_, 0);
+    demand_ = other.demand_;
+  }
+  return *this;
+}
+
+void PrefetchBudget::Reservation::reset() noexcept {
+  auto state = std::move(state_);
+  const size_t bytes = std::exchange(bytes_, 0);
+  if (bytes == 0) return;
+  Waiter* ready;
+  {
+    std::lock_guard guard(state->mutex);
+    auto found = state->files.find(file_);
+    assert(found != state->files.end());
+    auto& entry = found->second;
+    size_t& file_bytes = demand_ ? entry.demand : entry.speculative;
+    size_t& all_bytes = demand_ ? state->used.demand : state->used.speculative;
+    assert(file_bytes >= bytes && all_bytes >= bytes);
+    file_bytes -= bytes;
+    all_bytes -= bytes;
+    if (entry.demand == 0 && entry.speculative == 0) state->files.erase(found);
+    ++state->revision;
+    ready = state->detach_waiters();
+  }
+  state->condition.notify_all();
+  state->wake_event();
+  State::wake(ready);
+}
+
+int PrefetchBudget::begin_async_wait(uint64_t revision) {
+  std::lock_guard guard(state_->mutex);
+  if (state_->stopped || state_->revision != revision) return -1;
+  if (state_->event < 0) {
+    state_->event = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE);
+    if (state_->event < 0) throw std::system_error(errno, std::generic_category(), "prefetch budget eventfd");
+  }
+  ++state_->event_waiters;
+  return state_->event;
+}
+
+void PrefetchBudget::end_async_wait() noexcept {
+  std::lock_guard guard(state_->mutex);
+  assert(state_->event_waiters != 0);
+  --state_->event_waiters;
+}
+
+PrefetchBudget::Snapshot PrefetchBudget::snapshot() const noexcept {
+  std::lock_guard guard(state_->mutex);
+  return {state_->used.demand + state_->used.speculative, state_->peak,
+          state_->files.size(), state_->revision, state_->stopped, state_->file_peak};
+}
+
+size_t PrefetchBudget::file_used(uintptr_t file) const noexcept {
+  std::lock_guard guard(state_->mutex);
+  const auto found = state_->files.find(file);
+  return found == state_->files.end() ? 0
+      : found->second.demand + found->second.speculative;
+}
+
+bool PrefetchBudget::subscribe(Waiter& waiter, uint64_t revision) {
+  std::lock_guard guard(state_->mutex);
+  if (waiter.ready == nullptr || waiter.linked) {
+    throw std::invalid_argument("invalid prefetch budget waiter");
+  }
+  if (state_->stopped || state_->revision != revision) return false;
+  waiter.next = state_->waiters;
+  waiter.linked = true;
+  state_->waiters = &waiter;
+  return true;
+}
+
+bool PrefetchBudget::unsubscribe(Waiter& waiter) noexcept {
+  std::lock_guard guard(state_->mutex);
+  Waiter** p = &state_->waiters;
+  while (*p != nullptr && *p != &waiter) p = &(*p)->next;
+  if (*p == nullptr) return false; // A detached waiter still owns its callback.
+  *p = waiter.next;
+  waiter.next = nullptr;
+  waiter.linked = false;
+  return true;
+}
+
+bool PrefetchBudget::wait(uint64_t revision) {
+  std::unique_lock guard(state_->mutex);
+  state_->condition.wait(guard, [&] {
+    return state_->stopped || state_->revision != revision;
+  });
+  return !state_->stopped;
+}
+
+void PrefetchBudget::stop() noexcept {
+  Waiter* ready;
+  {
+    std::lock_guard guard(state_->mutex);
+    if (state_->stopped) return;
+    state_->stopped = true;
+    ++state_->revision;
+    ready = state_->detach_waiters();
+  }
+  state_->condition.notify_all();
+  state_->wake_event();
+  State::wake(ready);
+}
 
 IoMutex::~IoMutex() {
   const int fd = event_.load(std::memory_order_relaxed);

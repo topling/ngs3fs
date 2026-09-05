@@ -58,6 +58,15 @@ ngs3fs neither detects kernel support nor makes mount correctness depend on it.
   default is 128 MiB. An override is an integer byte count of at least 1 MiB
   and must be page aligned; invalid values warn and retain the default. A
   larger FUSE demand is never truncated to this speculative limit.
+- `--max-prefetch-memory SIZE` and `--max-file-prefetch-memory SIZE` are
+  experimental CLI budget fields, with implementation gated by focused tests.
+  An explicit nonzero value must be page aligned and at least 256 KiB. Both
+  default to `0` (automatic): 10% of physical RAM rounded down to a page for
+  the process budget, and the smaller of file size and twice the maximum
+  prefetch window for the per-file default. An explicit per-file value is a
+  cap and is not clamped to file size. Speculative windows shrink under the
+  available budget; pressure emits a rate-limited stderr warning. The
+  negotiated maximum for an individual READ is independent of these bounds.
 
 The existing multipart upload size is also the cache write-reservation unit.
 It defaults to 8 MiB and is not duplicated as a cache-specific option.
@@ -244,6 +253,11 @@ double the per-handle window up to 128 MiB by default, capped by
 - stops before another READ_PENDING or BAD range;
 - never crosses the object generation or EOF.
 
+The process and per-file prefetch budgets further reduce speculative claims
+when capacity is tight; they never reduce the demand bytes needed to satisfy
+the current READ. A rate-limited warning is emitted when pressure changes the
+speculative window.
+
 Overlapping fetches coalesce through READ_PENDING. Readers that need a pending
 page wait for its state to become CLEAN, MISSING, or BAD; they never issue a
 duplicate GET for that page. Disjoint misses may fetch concurrently. Once
@@ -290,6 +304,14 @@ configured upload part size.
 After the unit is fully present, the request worker reads the local file and
 computes the checksum without delaying a FUSE request that was already
 answered from the completed prefix.
+
+For uncached prefetch, verification-enabled reads never proactively issue
+`FUSE_NOTIFY_STORE` for a unit before it passes verification. This path currently
+verifies full objects only; unverifiable partial ranges are not proactively
+STOREd. Under a tight budget, ngs3fs avoids speculative full-object windows.
+An unpublished whole-file retry reuses staging after active replies drain;
+STORE waits for successful verification and completion of the earlier READ
+invalidation. Cached multipart verification above remains unchanged.
 
 On mismatch:
 

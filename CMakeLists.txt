@@ -238,6 +238,23 @@ if(NGS3FS_BUILD_TESTS)
   add_executable(fuse_mmap_integration_test
     tests/fuse_mmap_integration_test.cpp)
   target_link_libraries(fuse_mmap_integration_test PRIVATE ngs3fs_core)
+  foreach(engine legacy uring)
+    add_test(NAME fuse_${engine}_prefetch_shutdown_test
+      COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+              xxhash128 prefetch-shutdown ${engine} 2)
+    set_tests_properties(fuse_${engine}_prefetch_shutdown_test PROPERTIES
+      TIMEOUT 60 RESOURCE_LOCK fuse_mounts)
+    add_test(NAME fuse_${engine}_prefetch_budget_test
+      COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+              xxhash128 prefetch-budget ${engine} 2)
+    set_tests_properties(fuse_${engine}_prefetch_budget_test PROPERTIES
+      TIMEOUT 60 RESOURCE_LOCK fuse_mounts)
+  endforeach()
+  add_test(NAME fuse_legacy_prefetch_store_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 prefetch legacy)
+  set_tests_properties(fuse_legacy_prefetch_store_test PROPERTIES
+    TIMEOUT 60 RESOURCE_LOCK fuse_mounts)
   add_test(NAME fuse_mmap_integration_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>)
   set_tests_properties(fuse_mmap_integration_test PROPERTIES TIMEOUT 60)
@@ -273,6 +290,27 @@ if(NGS3FS_BUILD_TESTS)
             xxhash128 prefetch)
   set_tests_properties(fuse_uncached_read_ahead_integration_test
     PROPERTIES TIMEOUT 60)
+  add_test(NAME fuse_uring_prefetch_store_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 prefetch uring)
+  add_test(NAME fuse_uring_prefetch_verified_clean_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 prefetch-verified-clean uring 2)
+  set_tests_properties(fuse_uring_prefetch_verified_clean_test PROPERTIES
+    TIMEOUT 60 RESOURCE_LOCK fuse_mounts)
+  add_test(NAME fuse_multi_reactor_prefetch_store_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 prefetch uring 2)
+  add_test(NAME fuse_uring_prefetch_store_retry_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 prefetch-verified uring 1)
+  add_test(NAME fuse_multi_reactor_prefetch_store_retry_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 prefetch-verified uring 2)
+  set_tests_properties(fuse_uring_prefetch_store_test
+    fuse_multi_reactor_prefetch_store_test
+    fuse_uring_prefetch_store_retry_test
+    fuse_multi_reactor_prefetch_store_retry_test PROPERTIES TIMEOUT 60)
 
   # Each mounted test already exercises concurrent operations. Do not run
   # independent mounts against the same per-user kernel pipe budget at once.
@@ -286,6 +324,10 @@ if(NGS3FS_BUILD_TESTS)
     fuse_oss_crc64_integration_test
     fuse_cached_mmap_integration_test
     fuse_uncached_read_ahead_integration_test
+    fuse_uring_prefetch_store_test
+    fuse_multi_reactor_prefetch_store_test
+    fuse_uring_prefetch_store_retry_test
+    fuse_multi_reactor_prefetch_store_retry_test
     PROPERTIES RESOURCE_LOCK fuse_mounts)
 
   add_test(NAME prefetch_window_environment_test
@@ -296,6 +338,32 @@ if(NGS3FS_BUILD_TESTS)
     COMMAND ngs3fs --help)
   set_tests_properties(invalid_prefetch_window_environment_test PROPERTIES
     ENVIRONMENT "UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE=1048577")
+  # CLI/config plumbing for bounded prefetch budgets. Runtime consumption is
+  # provisional until the budget fields are wired into the readers.
+  add_test(NAME max_prefetch_memory_option_test
+    COMMAND ngs3fs --max-prefetch-memory 256MiB --help)
+  add_test(NAME max_prefetch_memory_zero_option_test
+    COMMAND ngs3fs --max-prefetch-memory 0 --help)
+  add_test(NAME max_prefetch_memory_unaligned_test
+    COMMAND ngs3fs --max-prefetch-memory 262145 --help)
+  set_tests_properties(max_prefetch_memory_unaligned_test PROPERTIES
+    WILL_FAIL TRUE)
+  add_test(NAME max_prefetch_memory_too_small_test
+    COMMAND ngs3fs --max-prefetch-memory 128KiB --help)
+  set_tests_properties(max_prefetch_memory_too_small_test PROPERTIES
+    WILL_FAIL TRUE)
+  add_test(NAME max_file_prefetch_memory_option_test
+    COMMAND ngs3fs --max-file-prefetch-memory 512MiB --help)
+  add_test(NAME max_file_prefetch_memory_zero_option_test
+    COMMAND ngs3fs --max-file-prefetch-memory 0 --help)
+  add_test(NAME max_file_prefetch_memory_unaligned_test
+    COMMAND ngs3fs --max-file-prefetch-memory 262145 --help)
+  set_tests_properties(max_file_prefetch_memory_unaligned_test PROPERTIES
+    WILL_FAIL TRUE)
+  add_test(NAME max_file_prefetch_memory_too_small_test
+    COMMAND ngs3fs --max-file-prefetch-memory 128KiB --help)
+  set_tests_properties(max_file_prefetch_memory_too_small_test PROPERTIES
+    WILL_FAIL TRUE)
   add_test(NAME removed_read_ahead_option_test
     COMMAND ngs3fs --read-ahead 1MiB --help)
   set_tests_properties(removed_read_ahead_option_test PROPERTIES WILL_FAIL TRUE)

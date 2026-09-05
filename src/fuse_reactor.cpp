@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <linux/fuse.h>
 #include <new>
 #include <poll.h>
 #include <stdio.h>
@@ -698,6 +699,49 @@ bool FuseReactor::notify_inval_inode(fuse_ino_t inode, off_t offset,
   return false;
 }
 
+bool FuseReactor::notify_store(fuse_ino_t inode, off_t offset, int fd,
+                               off_t source_offset, size_t length,
+                               NotifyFunction done, void* context) noexcept {
+  if (current_ != this) {
+    errno = EPERM;
+    return false;
+  }
+  if (done == nullptr || pending_notify_ != nullptr || fd < 0 ||
+      offset < 0 || source_offset < 0 || length == 0 ||
+      length > UINT_MAX - sizeof(fuse_out_header) - sizeof(fuse_notify_store_out) ||
+      uint64_t(length) > uint64_t(INT64_MAX) - uint64_t(offset) ||
+      uint64_t(length) > uint64_t(INT64_MAX) - uint64_t(source_offset)) {
+    errno = EINVAL;
+    return false;
+  }
+  if (!ring_ready_ || error_ != 0 ||
+      group_->shutting_down_.load(std::memory_order_acquire)) {
+    errno = ENOTCONN;
+    return false;
+  }
+  fuse_bufvec buffers{};
+  buffers.count = 1;
+  buffers.buf[0].size = length;
+  buffers.buf[0].flags = fuse_buf_flags(
+      FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
+  buffers.buf[0].fd = fd;
+  buffers.buf[0].pos = source_offset;
+  pending_notify_ = done;
+  pending_notify_context_ = context;
+  pending_notify_best_effort_ = true;
+  notify_accepted_ = false;
+  const int result = fuse_lowlevel_notify_store(
+      session_, inode, offset, &buffers, FUSE_BUF_SPLICE_MOVE);
+  const bool accepted = notify_accepted_;
+  pending_notify_ = nullptr;
+  pending_notify_context_ = nullptr;
+  pending_notify_best_effort_ = false;
+  notify_accepted_ = false;
+  if (accepted) return true;
+  errno = result < 0 ? -result : EIO;
+  return false;
+}
+
 ssize_t FuseReactor::async_writev(int fd, const iovec* iov, int count,
                                   fuse_req_t req, void* userdata) noexcept {
   // Notifications have no request completion callback. A storage worker must
@@ -804,6 +848,7 @@ ssize_t FuseReactor::async_writev(int fd, const iovec* iov, int count,
   if (local && req == nullptr && reactor->pending_notify_ != nullptr) {
     reply->notify_done = reactor->pending_notify_;
     reply->notify_context = reactor->pending_notify_context_;
+    reply->notify_best_effort = reactor->pending_notify_best_effort_;
     reactor->pending_notify_ = nullptr;
     reactor->pending_notify_context_ = nullptr;
   }
@@ -892,6 +937,13 @@ ssize_t FuseReactor::async_splice(int input_fd, int output_fd, size_t length,
   reply->input_fd  = input_fd;
   reply->output_fd = output_fd;
   reply->flags     = flags;
+  if (local && req == nullptr && reactor->pending_notify_ != nullptr) {
+    reply->notify_done = reactor->pending_notify_;
+    reply->notify_context = reactor->pending_notify_context_;
+    reply->notify_best_effort = reactor->pending_notify_best_effort_;
+    reactor->pending_notify_ = nullptr;
+    reactor->pending_notify_context_ = nullptr;
+  }
   if (reserved) {
     dispatch->reply_claimed = true;
   }
@@ -906,6 +958,7 @@ ssize_t FuseReactor::async_splice(int input_fd, int output_fd, size_t length,
   if (reserved) {
     dispatch->reply_submitted.store(true, std::memory_order_release);
   }
+  if (reply->notify_done != nullptr) reactor->notify_accepted_ = true;
   return FUSE_CUSTOM_IO_DEFERRED;
 }
 
@@ -1322,6 +1375,7 @@ void FuseReactor::release_reply(Reply* reply) noexcept {
   reply->external           = false;
   reply->notify_done        = nullptr;
   reply->notify_context     = nullptr;
+  reply->notify_best_effort = false;
   reply->next               = reply_free_;
   reply_free_               = reply;
 }
@@ -1905,7 +1959,7 @@ void FuseReactor::complete_reply(Reply* reply, int result) noexcept {
   int terminal_result = 0;
   if (result < 0 || size_t(result) != reply->length) {
     terminal_result = result < 0 ? result : -EIO;
-    if (terminal_result != -ENOENT) {
+    if (terminal_result != -ENOENT && !reply->notify_best_effort) {
       error_ = terminal_result;
     }
   }

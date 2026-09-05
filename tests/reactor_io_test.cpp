@@ -42,6 +42,7 @@ struct ReactorIoTest {
   std::atomic<bool> notification_drain_failed{false};
   bool worker_completed = false;
   std::array<char, 8> data{};
+  std::array<char, 8192> store_data{};
   char fairness_data = 0;
   std::array<char, 8> shutdown_data{};
   std::thread::id owner;
@@ -105,6 +106,9 @@ struct ReactorIoTest {
     fairness_peer.reset(fairness_sockets[1]);
     file.reset(memfd_create("reactor_io_test", MFD_CLOEXEC));
     if (!fake_fuse || !file) return false;
+    for (size_t i = 0; i < store_data.size(); ++i) store_data[i] = char(i % 113);
+    if (::pwrite(file.get(), store_data.data(), store_data.size(), 4096) !=
+        ssize_t(store_data.size())) return false;
     pipe = Pipe::create(4096);
     group.session_ = session;
     auto value = std::make_unique<FuseReactor>();
@@ -349,6 +353,37 @@ struct ReactorIoTest {
       test.check(accepted && test.notification_callbacks == 1,
                  "reentrant notification was rejected or inline");
     } else if (test.notification_callbacks == 2) {
+      std::array<char, 4096> discarded{};
+      while (::recv(test.fake_fuse_peer.get(), discarded.data(), discarded.size(),
+                    MSG_DONTWAIT) > 0) {}
+      test.submitting_notification = true;
+      const bool accepted = test.reactor().notify_store(
+          FUSE_ROOT_ID, 16384, test.file.get(), 4096,
+          test.store_data.size(), notification_done, &test);
+      test.submitting_notification = false;
+      test.check(accepted && test.notification_callbacks == 2,
+                 "fd-backed STORE was rejected or completed inline");
+    } else if (test.notification_callbacks == 3) {
+      std::array<char, sizeof(fuse_out_header) + sizeof(fuse_notify_store_out) + 8192> packet{};
+      size_t received = 0;
+      while (received < packet.size()) {
+        const ssize_t count = ::recv(test.fake_fuse_peer.get(), packet.data() + received,
+                                     packet.size() - received, MSG_DONTWAIT);
+        if (count < 0 && errno == EINTR) continue;
+        if (!test.check(count > 0, "STORE callback preceded complete payload")) return;
+        received += size_t(count);
+      }
+      fuse_out_header header{};
+      fuse_notify_store_out body{};
+      memcpy(&header, packet.data(), sizeof(header));
+      memcpy(&body, packet.data() + sizeof(header), sizeof(body));
+      if (!test.check(header.len == packet.size() && header.unique == 0 &&
+                      header.error == FUSE_NOTIFY_STORE &&
+                      body.nodeid == FUSE_ROOT_ID && body.offset == 16384 &&
+                      body.size == test.store_data.size(), "invalid STORE header") ||
+          !test.check(memcmp(packet.data() + sizeof(header) + sizeof(body),
+                             test.store_data.data(), test.store_data.size()) == 0,
+                       "invalid STORE fd offset or payload")) return;
       test.begin_shutdown_case();
     } else {
       test.check(false, "notification callback ran more than once");
@@ -590,7 +625,7 @@ struct ReactorIoTest {
            "shutdown skipped accepted I/O or callbacks");
     check(cleanup_count == cleanup_stages.size() + 1,
            "shutdown skipped overflow cleanup continuations");
-    check(notification_callbacks == 2,
+    check(notification_callbacks == 3,
           "accepted notifications did not each complete exactly once");
     check(fairness_completion_iteration >= 64 &&
           fairness_completion_iteration < 1024,

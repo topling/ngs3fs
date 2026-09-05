@@ -93,6 +93,8 @@ struct MountConfig {
   size_t max_cached_inodes          = 1'000'000;
   uint32_t stats_interval_seconds   = 0;
   size_t max_prefetch_window_size   = kDefaultMaxPrefetchWindowSize;
+  size_t max_prefetch_memory        = 0;
+  size_t max_file_prefetch_memory   = 0;
   unsigned max_uploads              = 4;
   unsigned max_connections          = 8;
   int connect_timeout_ms            = kConnectTimeoutMs;
@@ -207,7 +209,7 @@ class FileWriter {
   virtual void release(State& state, OpenHandle& handle) noexcept = 0;
 };
 
-std::unique_ptr<FileReader> make_file_reader(State& state,
+std::shared_ptr<FileReader> make_file_reader(State& state,
                                               OpenHandle& handle);
 std::unique_ptr<FileWriter> make_file_writer(State& state,
                                               OpenHandle& handle);
@@ -598,13 +600,18 @@ class ReactorSharedMutex {
     }
   }
 
-  int begin_async_wait() noexcept {
+  int begin_async_wait(bool writer = false) noexcept {
+    if (writer) waiting_writers_.fetch_add(1, std::memory_order_acq_rel);
     reactor_waiters_.fetch_add(1, std::memory_order_acq_rel);
     return event_.get();
   }
 
-  void end_async_wait() noexcept {
+  void end_async_wait(bool writer = false) noexcept {
     reactor_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+    if (writer) {
+      waiting_writers_.fetch_sub(1, std::memory_order_release);
+      notify();
+    }
   }
 
  private:
@@ -659,7 +666,7 @@ struct OpenHandle {
   std::string upload_id;
   std::string write_id;
   std::shared_ptr<CacheEntry> cache_entry;
-  std::unique_ptr<FileReader> reader;
+  std::shared_ptr<FileReader> reader;
   std::unique_ptr<FileWriter> writer;
   std::vector<std::string> part_etags;
   std::vector<ssostr<96>> part_checksums;
@@ -877,110 +884,15 @@ void cache_reclaim_loop(std::stop_token stop, State* state) noexcept;
 void cache_recovery_loop(std::stop_token stop, State* state) noexcept;
 void stats_report_loop(std::stop_token stop, State* state) noexcept;
 
-class ReadAheadStoragePool {
- public:
-  struct Storage {
-    UniqueFd fd;
-    void* mapping = nullptr;
-    size_t size = 0;
-
-    Storage() = default;
-    Storage(const Storage&) = delete;
-    Storage& operator=(const Storage&) = delete;
-    Storage(Storage&& other) noexcept
-        : fd(std::move(other.fd)),
-          mapping(std::exchange(other.mapping, nullptr)),
-          size(std::exchange(other.size, 0)) {}
-    Storage& operator=(Storage&& other) noexcept {
-      if (this != &other) {
-        unmap();
-        fd      = std::move(other.fd);
-        mapping = std::exchange(other.mapping, nullptr);
-        size    = std::exchange(other.size, 0);
-      }
-      return *this;
-    }
-    ~Storage() { unmap(); }
-
-    void unmap() noexcept {
-      if (mapping != nullptr) {
-        ::munmap(mapping, size);
-        mapping = nullptr;
-      }
-    }
-  };
-
-  explicit ReadAheadStoragePool(size_t capacity) : capacity_(capacity) {
-    entries_.reserve(16);
+size_t prefetch_capacity(const MountConfig& config, size_t page) {
+  if (config.max_prefetch_memory) return config.max_prefetch_memory;
+  const long pages = ::sysconf(_SC_PHYS_PAGES);
+  if (pages <= 0 || uint64_t(pages) > UINT64_MAX / page) {
+    throw std::runtime_error("cannot determine physical RAM for prefetch budget");
   }
-
-  Storage acquire(size_t size) {
-    Storage storage;
-    {
-      std::lock_guard guard(mutex_);
-      auto found = std::find_if(
-          entries_.begin(), entries_.end(),
-          [&](const Storage& entry) { return entry.size == size; });
-      if (found == entries_.end() && !entries_.empty()) {
-        found = entries_.end() - 1;
-      }
-      if (found != entries_.end()) {
-        storage = std::move(*found);
-        retained_ -= storage.size;
-        *found = std::move(entries_.back());
-        entries_.pop_back();
-      }
-    }
-    if (!storage.fd) {
-      storage.fd.reset(::memfd_create("ngs3fs-read-ahead", MFD_CLOEXEC));
-      if (!storage.fd) {
-        throw std::system_error(errno, std::generic_category(),
-                                "memfd_create(read-ahead)");
-      }
-    }
-    if (storage.size != size) {
-      storage.unmap();
-      if (::ftruncate(storage.fd.get(), off_t(size)) != 0) {
-        throw std::system_error(errno, std::generic_category(),
-                                "ftruncate(read-ahead)");
-      }
-      storage.size = size;
-    }
-    if (storage.mapping == nullptr) {
-      storage.mapping = ::mmap(
-          nullptr, size, PROT_READ, MAP_SHARED, storage.fd.get(), 0);
-      if (storage.mapping == MAP_FAILED) {
-        storage.mapping = nullptr;
-        throw std::system_error(errno, std::generic_category(),
-                                "mmap(read-ahead)");
-      }
-    }
-    return storage;
-  }
-
-  void release(Storage storage) noexcept {
-    if (!storage.fd || storage.size > capacity_) {
-      return;
-    }
-    std::lock_guard guard(mutex_);
-    if (retained_ > capacity_ - storage.size) {
-      return;
-    }
-    try {
-      const size_t size = storage.size;
-      entries_.push_back(std::move(storage));
-      retained_ += size;
-    } catch (...) {
-      // Storage retains ownership if growing the pool fails.
-    }
-  }
-
- private:
-  std::mutex mutex_;
-  std::vector<Storage> entries_;
-  size_t retained_ = 0;
-  size_t capacity_;
-};
+  return std::max(config.maximum_read_size,
+      PrefetchBudget::default_capacity(uint64_t(pages) * page, page));
+}
 
 struct State {
   explicit State(MountConfig value)
@@ -995,16 +907,18 @@ struct State {
         }),
         directory_mtime(wall_time_seconds()),
         page_size(size_t(::sysconf(_SC_PAGESIZE))),
+        prefetch_budget(prefetch_capacity(config, page_size),
+                        config.maximum_read_size, page_size),
         root_item(std::make_unique<InodeDir>()),
-        read_ahead_pool(std::make_shared<ReadAheadStoragePool>(
-            std::min<size_t>(64U * 1024U * 1024U,
-                             config.max_connections * 1024U * 1024U))),
+        read_ahead_pool(std::make_shared<ReadAheadStoragePool>()),
         http(std::make_unique<HttpPool>(config)),
         uploads(std::make_unique<UploadScheduler>(
             config.max_uploads, config.request_timeout_ms)),
+        publications(std::make_unique<UploadScheduler>(1, config.request_timeout_ms)),
         cache_reclaimer([this](std::stop_token stop) {
           cache_reclaim_loop(stop, this);
         }) {
+    config.max_prefetch_memory = prefetch_capacity(config, page_size);
     root_item->set_parent(root_item.get());
     if (config.stats_interval_seconds != 0) {
       stats_reporter = std::jthread([this](std::stop_token stop) {
@@ -1014,6 +928,7 @@ struct State {
   }
 
   void stop_background_tasks() noexcept {
+    prefetch_budget.stop();
     cache_recovery.request_stop();
     if (cache_recovery.joinable()) {
       cache_recovery.join();
@@ -1034,6 +949,12 @@ struct State {
     if (cache_reclaimer.joinable()) {
       cache_reclaimer.join();
     }
+    std::unique_ptr<UploadScheduler> stopped_publications;
+    {
+      std::lock_guard guard(legacy_publication_mutex);
+      stopped_publications = std::move(publications);
+    }
+    stopped_publications.reset();
     uploads.reset();
   }
 
@@ -1049,6 +970,9 @@ struct State {
 
   struct OpenFileState {
     std::vector<OpenHandle*> handles;
+    std::weak_ptr<FileReader> uncached_reader;
+    fuse_ino_t reader_inode = 0;
+    uint64_t reader_epoch   = 0;
     size_t readers = 0;
     bool writer     = false;
   };
@@ -1084,6 +1008,8 @@ struct State {
   CredentialProvider credentials;
   time_t directory_mtime;
   size_t page_size;
+  PrefetchBudget prefetch_budget;
+  std::atomic<time_t> prefetch_warning_time{0};
   std::unique_ptr<InodeDir> root_item;
   std::shared_ptr<ReadAheadStoragePool> read_ahead_pool;
   std::unique_ptr<LocalCache> local_cache;
@@ -1093,6 +1019,9 @@ struct State {
   std::condition_variable open_files_condition;
   std::mutex cache_mutex;
   std::mutex session_mutex;
+  // Only speculative STORE and invalidation participate. Ordinary READ
+  // replies must bypass this fence: STORE may be waiting on their folios.
+  ReactorSharedMutex prefetch_publication_mutex;
   std::mutex metrics_mutex;
   std::mutex credentials_mutex;
   std::mutex rename_probe_mutex;
@@ -1114,6 +1043,8 @@ struct State {
   std::vector<std::shared_ptr<CacheEntry>> recovery_entries;
   std::unique_ptr<HttpPool> http;
   std::unique_ptr<UploadScheduler> uploads;
+  std::unique_ptr<UploadScheduler> publications;
+  std::mutex legacy_publication_mutex;
   fuse_session* session = nullptr;
   Credentials express_credentials;
   AsyncExpressSession* express_async_waiters = nullptr;
@@ -1180,6 +1111,8 @@ void emit_runtime_stats(State& state, const char* event) noexcept {
           ",\"cached_inodes\":%zu,\"open_handles\":%zu"
           ",\"pinned_bytes\":%" PRIu64
           ",\"copied_write_bytes\":%" PRIu64
+          ",\"prefetch_bytes\":%zu,\"prefetch_peak_bytes\":%zu"
+          ",\"prefetch_file_peak_bytes\":%zu"
           ",\"credential_source\":\"%s\"}\n",
           event,
           state.remote_reads.load(std::memory_order_relaxed),
@@ -1188,7 +1121,9 @@ void emit_runtime_stats(State& state, const char* event) noexcept {
           state.fuse_write_bytes.load(std::memory_order_relaxed),
           state.request_errors.load(std::memory_order_relaxed),
           state.cached_inodes.load(std::memory_order_relaxed), open_handles,
-          pinned_bytes, fallback_bytes, state.credentials.source_name());
+          pinned_bytes, fallback_bytes, state.prefetch_budget.snapshot().used,
+          state.prefetch_budget.snapshot().peak, state.prefetch_budget.snapshot().file_peak,
+          state.credentials.source_name());
 }
 
 void stats_report_loop(std::stop_token stop, State* state) noexcept {
@@ -1208,10 +1143,117 @@ void stats_report_loop(std::stop_token stop, State* state) noexcept {
   emit_runtime_stats(*state, "shutdown_stats");
 }
 
+struct AsyncPageCacheFence {
+  State& state;
+  FuseReactor& reactor;
+  fuse_ino_t inode;
+  off_t offset;
+  off_t length;
+  FuseReactor::NotifyFunction done;
+  void* context;
+  std::unique_lock<ReactorSharedMutex> fence;
+  FuseReactor::ReactorTask task;
+  AsyncIoRequest wait;
+  uint64_t notification = 0;
+  bool waiting = false;
+  bool invalidate;
+
+  AsyncPageCacheFence(State& s, FuseReactor& r, fuse_ino_t ino,
+                        off_t off, off_t len,
+                        FuseReactor::NotifyFunction fn, void* ctx, bool notify)
+      : state(s), reactor(r), inode(ino), offset(off), length(len),
+        done(fn), context(ctx),
+        fence(s.prefetch_publication_mutex, std::defer_lock), invalidate(notify) {
+    task = {start, cancel, this};
+  }
+  ~AsyncPageCacheFence() {
+    if (waiting) state.prefetch_publication_mutex.end_async_wait(true);
+  }
+  static void finish(void* context, int result) noexcept {
+    std::unique_ptr<AsyncPageCacheFence> self(
+        static_cast<AsyncPageCacheFence*>(context));
+    auto done = self->done;
+    void* value = self->context;
+    self.reset(); // Reopen publication before a reentrant completion.
+    if (done) done(value, result);
+  }
+  static void cancel(void* context) noexcept { finish(context, -ECANCELED); }
+  static void available(void* context, ssize_t result) noexcept {
+    if (result < 0) finish(context, int(result));
+    else start(context);
+  }
+  static void start(void* context) noexcept {
+    auto* self = static_cast<AsyncPageCacheFence*>(context);
+    try {
+      if (!self->fence.try_lock()) {
+        if (!self->waiting) {
+          self->wait.fd = self->state.prefetch_publication_mutex.begin_async_wait(true);
+          self->waiting = true;
+        }
+        if (!self->fence.try_lock()) {
+          self->wait.kind     = AsyncIoRequest::READ;
+          self->wait.data     = &self->notification;
+          self->wait.length   = sizeof(self->notification);
+          self->wait.complete = available;
+          self->wait.context  = self;
+          if (self->reactor.submit(self->wait)) return;
+          finish(self, -errno);
+          return;
+        }
+      }
+      if (self->waiting) {
+        self->state.prefetch_publication_mutex.end_async_wait(true);
+        self->waiting = false;
+      }
+      if (!self->invalidate) {
+        finish(self, 0);
+        return;
+      }
+      if (!self->reactor.notify_inval_inode(
+              self->inode, self->offset, self->length, finish, self)) {
+        finish(self, -errno);
+      }
+    } catch (...) { finish(self, -EIO); }
+  }
+};
+
+bool async_page_cache_fence(State& state, FuseReactor& reactor,
+                                 fuse_ino_t inode, off_t offset, off_t length,
+                                 FuseReactor::NotifyFunction done,
+                                 void* context, bool invalidate = true) noexcept {
+  try {
+    auto task = std::make_unique<AsyncPageCacheFence>(
+        state, reactor, inode, offset, length, done, context, invalidate);
+    if (!reactor.post(&task->task)) return false;
+    task.release();
+    return true;
+  } catch (...) {
+    errno = ENOMEM;
+    return false;
+  }
+}
+
+void invalidated_page_cache(void* context, int result) noexcept {
+  auto& state = *static_cast<State*>(context);
+  if (result != 0 && result != -ENOENT &&
+      !state.page_cache_invalidate_warned.exchange(true, std::memory_order_relaxed)) {
+    fprintf(stderr, "warning: unable to invalidate stale page cache: %s\n",
+            strerror(-result));
+  }
+}
+
 void invalidate_page_cache(State& state, fuse_ino_t inode,
                            off_t offset = 0, off_t length = 0) noexcept {
+  if (auto* reactor = current_fuse_reactor()) {
+    if (!async_page_cache_fence(state, *reactor, inode, offset, length,
+                                     invalidated_page_cache, &state)) {
+      invalidated_page_cache(&state, -errno);
+    }
+    return;
+  }
   int error = 0;
   {
+    std::unique_lock fence(state.prefetch_publication_mutex);
     std::lock_guard guard(state.session_mutex);
     if (state.session == nullptr) {
       return;
@@ -1862,6 +1904,8 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   constexpr int requester_pays_option              = 268;
   constexpr int io_engine_option                   = 269;
   constexpr int reactors_option                    = 270;
+  constexpr int max_prefetch_memory_option         = 271;
+  constexpr int max_file_prefetch_memory_option    = 272;
   constexpr option long_options[] = {
       {"endpoint-host", required_argument, nullptr, 'e'},
       {"endpoint-port", required_argument, nullptr, 'p'},
@@ -1893,6 +1937,10 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       {"requester-pays", no_argument, nullptr, requester_pays_option},
       {"io-engine", required_argument, nullptr, io_engine_option},
       {"reactors", required_argument, nullptr, reactors_option},
+      {"max-prefetch-memory", required_argument, nullptr,
+       max_prefetch_memory_option},
+      {"max-file-prefetch-memory", required_argument, nullptr,
+       max_file_prefetch_memory_option},
       {"dir-cache-timeout", required_argument, nullptr, 'T'},
       {"max-cached-inodes", required_argument, nullptr, 'I'},
       {"part-size", required_argument, nullptr, 'P'},
@@ -1929,6 +1977,13 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       throw std::invalid_argument("invalid " + std::string(name));
     }
     return value;
+  };
+  auto parse_prefetch_memory = [&](std::string_view name) {
+    const uint64_t value = parse_required_size(name);
+    if (value > std::numeric_limits<size_t>::max()) {
+      throw std::invalid_argument(std::string(name) + " exceeds SIZE_MAX");
+    }
+    return size_t(value);
   };
 
   opterr = 0;
@@ -2094,6 +2149,14 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
         config.reactor_count = unsigned(value);
         break;
       }
+      case max_prefetch_memory_option:
+        config.max_prefetch_memory =
+            parse_prefetch_memory("--max-prefetch-memory");
+        break;
+      case max_file_prefetch_memory_option:
+        config.max_file_prefetch_memory =
+            parse_prefetch_memory("--max-file-prefetch-memory");
+        break;
       case 'T': {
         const uint64_t milliseconds =
             parse_required_unsigned("--dir-cache-timeout");
@@ -2255,6 +2318,20 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   if (config.max_prefetch_window_size % size_t(page_size) != 0) {
     throw std::logic_error("prefetch window is not page aligned");
   }
+  constexpr size_t minimum_prefetch_memory = 256U * 1024U;
+  const auto validate_prefetch_memory = [&](size_t value,
+                                            std::string_view name) {
+    if (value != 0 &&
+        (value < minimum_prefetch_memory || value % size_t(page_size) != 0)) {
+      throw std::invalid_argument(std::string(name) +
+                                  " must be 0 or a page-aligned size of at "
+                                  "least 256 KiB");
+    }
+  };
+  validate_prefetch_memory(config.max_prefetch_memory,
+                           "--max-prefetch-memory");
+  validate_prefetch_memory(config.max_file_prefetch_memory,
+                           "--max-file-prefetch-memory");
   return true;
 }
 
@@ -3953,9 +4030,11 @@ bool recover_write_commit(State& state, const OpenHandle& handle,
 }
 
 struct OpenGenerationConflict : std::system_error {
-  OpenGenerationConflict()
+  explicit OpenGenerationConflict(bool conflict = true)
       : std::system_error(EBUSY, std::generic_category(),
-                            "old object generation still has open readers") {}
+                            "object generation requires cache invalidation"),
+        old_readers(conflict) {}
+  bool old_readers;
 };
 
 bool publish_open_metadata(State& state, OpenHandle& handle, ObjectMetadata metadata) {
@@ -4000,9 +4079,8 @@ bool publish_open_metadata(State& state, OpenHandle& handle, ObjectMetadata meta
     // replying EBUSY, otherwise the old descriptor can still hit stale pages.
     // Ordinary reads must remain free to reply while invalidation waits for
     // any locked folios; serializing all FUSE output would deadlock them.
-    if (!old_readers || current_fuse_reactor() == nullptr) {
-      invalidate_page_cache(state, handle.inode);
-    }
+    if (current_fuse_reactor() != nullptr) throw OpenGenerationConflict(old_readers);
+    invalidate_page_cache(state, handle.inode);
   }
   if (old_readers) {
     throw OpenGenerationConflict();
@@ -9246,6 +9324,8 @@ struct AsyncOpen {
   bool registered = false;
   bool truncate_pending = false;
   bool keep_cache = false;
+  bool generation_conflict = false;
+  bool write_prefetch_drained = false;
   bool cache_initialized = false;
   bool cache_retry = false;
   fuse_ino_t created_parent = 0;
@@ -9394,8 +9474,9 @@ struct AsyncOpen {
       task->keep_cache = publish_open_metadata(
           task->state, *task->handle, decode_head_response(response));
       if (!task->finish()) task.release();
-    } catch (const OpenGenerationConflict&) {
+    } catch (const OpenGenerationConflict& conflict) {
       try {
+        task->generation_conflict = conflict.old_readers;
         task->invalidate_conflict();
         task.release();
       } catch (...) { reply_callback_error(task->request); }
@@ -9410,16 +9491,36 @@ struct AsyncOpen {
       fprintf(stderr, "warning: stale page-cache invalidation failed: path=%s: %s\n",
               task->handle->object_path.c_str(), strerror(-result));
     }
-    fuse_reply_err(task->request, result != 0 && result != -ENOENT ? -result : EBUSY);
+    if (result != 0 && result != -ENOENT) {
+      fuse_reply_err(task->request, -result);
+    } else if (task->generation_conflict) {
+      fuse_reply_err(task->request, EBUSY);
+    } else {
+      try {
+        task->write_prefetch_drained = task->handle->writable;
+        if (!task->finish()) task.release();
+      } catch (...) { reply_callback_error(task->request); }
+    }
   }
 
   void invalidate_conflict() {
     // A local notification can wait for locked folios whose READ still needs
     // a storage worker. Await its io-wq completion without occupying that pool.
-    if (!reactor.notify_inval_inode(inode, 0, 0, invalidated, this)) {
+    if (!async_page_cache_fence(state, reactor, inode, 0, 0, invalidated, this)) {
       throw std::system_error(errno, std::generic_category(),
                               "submit open generation invalidation");
     }
+  }
+
+  static void write_drained(void* context, int result) noexcept {
+    std::unique_ptr<AsyncOpen> task(static_cast<AsyncOpen*>(context));
+    try {
+      if (result != 0 && result != -ENOENT) {
+        throw std::system_error(-result, std::generic_category(), "drain prefetch before write open");
+      }
+      task->write_prefetch_drained = true;
+      if (!task->finish()) task.release();
+    } catch (...) { reply_callback_error(task->request); }
   }
 
   static void retired(void* context, std::exception_ptr error) noexcept {
@@ -9483,6 +9584,26 @@ struct AsyncOpen {
         (file.flags & O_TRUNC) == 0 && !truncate_pending) {
       throw std::system_error(EOPNOTSUPP, std::generic_category(),
                               "existing non-empty write open requires O_TRUNC");
+    }
+    if (writable && handle->size != 0 && !write_prefetch_drained) {
+      {
+        // A closed reader's STORE can outlive its handle. Close admission by
+        // advancing the epoch, then drain old STORE before exposing O_TRUNC.
+        InodeMetadataGuard guard(*handle->item);
+        constexpr uint64_t refreshing = 1ULL << 63;
+        constexpr uint64_t mask = refreshing - 1;
+        uint64_t epoch = handle->item->generation_epoch.load(std::memory_order_relaxed) & mask;
+        epoch = epoch == mask ? 1 : epoch + 1;
+        handle->item->generation_epoch.store(epoch | refreshing, std::memory_order_release);
+        handle->generation_epoch = epoch;
+        handle->item->set_page_cache_valid(false);
+      }
+      // O_TRUNC itself discards the old cache. Do not expire attributes with
+      // an extra INVAL notification here; only drain pre-truncation STORE.
+      if (!async_page_cache_fence(state, reactor, inode, 0, 0, write_drained, this, false)) {
+        throw std::system_error(errno, std::generic_category(), "submit write-open fence");
+      }
+      return false;
     }
     if (!cache_initialized && state.local_cache && (writable || !handle->recovery_read)) {
       const CacheIdentity cache_identity{
@@ -9597,6 +9718,22 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
       throw std::system_error(
           EOPNOTSUPP, std::generic_category(),
           "existing non-empty write open requires O_TRUNC");
+    }
+
+    if (writable && handle->size != 0) {
+      {
+        InodeMetadataGuard guard(*handle->item);
+        constexpr uint64_t refreshing = 1ULL << 63;
+        constexpr uint64_t mask = refreshing - 1;
+        uint64_t epoch = handle->item->generation_epoch.load(std::memory_order_relaxed) & mask;
+        epoch = epoch == mask ? 1 : epoch + 1;
+        handle->item->generation_epoch.store(epoch | refreshing, std::memory_order_release);
+        handle->generation_epoch = epoch;
+        handle->item->set_page_cache_valid(false);
+      }
+      // Close old publication admission, then drain admitted STOREs before
+      // exposing O_TRUNC. The kernel truncation already removes old pages.
+      std::unique_lock fence(state.prefetch_publication_mutex);
     }
 
     if (!writable && state.local_cache && !handle->recovery_read) {
@@ -9970,20 +10107,29 @@ struct PrefetchContinuation {
   size_t wanted = 0;
 };
 
+std::shared_ptr<ReadAheadStoragePool::Storage> retain_prefetch_storage(
+    std::shared_ptr<ReadAheadStoragePool> pool,
+    ReadAheadStoragePool::Storage storage) {
+  return std::shared_ptr<ReadAheadStoragePool::Storage>(
+      new ReadAheadStoragePool::Storage(std::move(storage)),
+      [pool = std::move(pool)](ReadAheadStoragePool::Storage* value) {
+        pool->release(std::move(*value));
+        delete value;
+      });
+}
+
 struct UncachedPrefetch {
   explicit UncachedPrefetch(
       std::shared_ptr<ReadAheadStoragePool> storage_pool,
       ReadAheadStoragePool::Storage acquired,
       uint64_t begin, size_t count)
-      : pool(std::move(storage_pool)), storage(std::move(acquired)),
+      : pool(std::move(storage_pool)),
+        storage(retain_prefetch_storage(pool, std::move(acquired))),
         offset(begin), length(count), sink(*this) {}
 
-  ~UncachedPrefetch() {
-    pool->release(std::move(storage));
-  }
-
   std::shared_ptr<ReadAheadStoragePool> pool;
-  ReadAheadStoragePool::Storage storage;
+  std::shared_ptr<InodeFile> item_pin;
+  std::shared_ptr<ReadAheadStoragePool::Storage> storage;
   uint64_t offset;
   size_t length;
   size_t produced = 0;
@@ -9995,7 +10141,66 @@ struct UncachedPrefetch {
   bool complete = false;
   bool checksum_retrying = false;
   bool checksum_bad = false;
+  size_t read_pins = 0;
+  bool retire_when_idle = false;
+  bool checksum_hold = false;
+  size_t retired_prefix = 0;
+  size_t published_prefix = 0;
+  size_t active_replies = 0;
+  PrefetchContinuation* reply_drained = nullptr;
   PrefetchContinuation* continuations = nullptr;
+  std::function<void()> legacy_progress;
+
+  bool pin(uint64_t begin, size_t count) noexcept {
+    std::lock_guard guard(mutex);
+    if (!storage || begin < offset + retired_prefix || count > length ||
+        begin - offset > length - count) return false;
+    ++read_pins;
+    return true;
+  }
+
+  void retire(bool unpin = false) noexcept {
+    std::shared_ptr<ReadAheadStoragePool::Storage> released;
+    {
+      std::lock_guard guard(mutex);
+      if (unpin) {
+        assert(read_pins != 0);
+        --read_pins;
+      }
+      if (retire_when_idle && complete && !checksum_retrying && read_pins == 0) {
+        released = std::move(storage);
+      } else if (storage && read_pins == 0 && !checksum_hold && !checksum_retrying) {
+        const size_t page = size_t(::sysconf(_SC_PAGESIZE));
+        const size_t end = std::min(published_prefix, produced) / page * page;
+        if (end > retired_prefix) {
+          // No admitted READ refers to this prefix. STORE advances its prefix
+          // only after its actual completion; downloading writes later offsets.
+          if (storage->discard(retired_prefix, end - retired_prefix)) {
+            retired_prefix = end;
+          }
+        }
+      }
+    }
+    // Do not truncate or unmap while holding the range-selection mutex.
+  }
+
+  void publication_finished() noexcept {
+    {
+      std::lock_guard guard(mutex);
+      retire_when_idle = true;
+    }
+    retire();
+  }
+
+  void reply_finished() noexcept {
+    PrefetchContinuation* ready = nullptr;
+    {
+      std::lock_guard guard(mutex);
+      assert(active_replies != 0);
+      if (--active_replies == 0) ready = std::exchange(reply_drained, nullptr);
+    }
+    if (ready) ready->reactor->complete(&ready->task);
+  }
 
   bool subscribe(PrefetchContinuation& waiter) noexcept {
     std::lock_guard guard(mutex);
@@ -10037,7 +10242,7 @@ struct UncachedPrefetch {
   class Sink final : public RangeFileSink {
    public:
     explicit Sink(UncachedPrefetch& prefetch) noexcept
-        : RangeFileSink(prefetch.storage.fd.get(), 0, false),
+        : RangeFileSink(prefetch.storage->fd.get(), 0, false),
           prefetch_(prefetch) {}
 
     [[nodiscard]] bool cancelled() const noexcept override {
@@ -10067,6 +10272,7 @@ struct UncachedPrefetch {
         prefetch_.produced = response.body_bytes;
       }
       prefetch_.notify_waiters();
+      if (prefetch_.legacy_progress) prefetch_.legacy_progress();
     }
 
     UncachedPrefetch& prefetch_;
@@ -10074,6 +10280,249 @@ struct UncachedPrefetch {
   };
 
   Sink sink;
+};
+
+void warn_prefetch_budget(State& state, fuse_ino_t inode) {
+  const time_t now = wall_time_seconds();
+  time_t previous = state.prefetch_warning_time.load(std::memory_order_relaxed);
+  if (now - previous < 60 || !state.prefetch_warning_time.compare_exchange_strong(previous, now)) return;
+  const auto usage = state.prefetch_budget.snapshot();
+  fprintf(stderr, "warning: prefetch memory budget exhausted: inode=%llu used=%zu peak=%zu; shrinking speculative reads or waiting for demand capacity\n",
+          (unsigned long long)inode, usage.used, usage.peak);
+}
+
+std::shared_ptr<UncachedPrefetch> allocate_prefetch(
+    State& state, fuse_ino_t inode, uint64_t offset, size_t wanted,
+    uint64_t size, size_t preferred) {
+  const size_t page = state.page_size;
+  const auto rounded = [page](size_t n) { return (n + page - 1) / page * page; };
+  const size_t limit = PrefetchBudget::file_limit(size,
+      state.config.max_prefetch_window_size, state.config.max_file_prefetch_memory, page);
+  size_t length = size_t(std::min<uint64_t>(size - offset, preferred));
+  PrefetchBudget::Reservation charge;
+  if (length > wanted) {
+    charge = state.prefetch_budget.try_reserve(inode, limit, rounded(length), rounded(wanted), false);
+    if (charge) {
+      length = std::min(length, charge.bytes());
+    }
+  }
+  if (!charge) {
+    length = wanted;
+    charge = state.prefetch_budget.try_reserve(inode, limit, rounded(length), rounded(length), true);
+  }
+  if (!charge) {
+    warn_prefetch_budget(state, inode);
+    return {};
+  }
+  if (length < preferred && length < size - offset) warn_prefetch_budget(state, inode);
+  if (charge.bytes() > rounded(length)) charge.split(charge.bytes() - rounded(length)).reset();
+  auto p = std::make_shared<UncachedPrefetch>(state.read_ahead_pool,
+      state.read_ahead_pool->acquire(length, std::move(charge)), offset, length);
+  auto* item = static_cast<InodeFile*>(&inode_item(state, inode));
+  retain_inode_count(item->open_count, "pin prefetch inode identity");
+  p->item_pin = std::shared_ptr<InodeFile>(item, [](InodeFile* value) {
+    release_inode_count(value->open_count);
+  });
+  p->checksum_hold = state.config.verify_read_checksum && offset == 0 && length == size;
+  return p;
+}
+
+// Owns only immutable identity and an inode pin, not an open handle. Closing
+// the last handle can cancel a tail without waiting for a publication owner
+// that itself would keep that handle open.
+class AsyncPrefetchPublisher : public std::enable_shared_from_this<AsyncPrefetchPublisher> {
+ public:
+  AsyncPrefetchPublisher(State& state, FuseReactor& reactor,
+                         const OpenHandle& handle,
+                         std::shared_ptr<UncachedPrefetch> prefetch,
+                         size_t demand)
+      : state_(state), reactor_(reactor), prefetch_(std::move(prefetch)),
+        inode_(handle.inode), epoch_(handle.generation_epoch),
+        size_(handle.size), path_(handle.object_path.c_str()), next_(demand) {
+    prefetch_->published_prefix = demand;
+    item_ = prefetch_->item_pin;
+  }
+
+  void pause() noexcept { paused_ = true; ++revision_; }
+  void stop() noexcept {
+    pause();
+    prefetch_->publication_finished();
+  }
+  void begin_retry() {
+    pause();
+    {
+      std::lock_guard guard(prefetch_->mutex);
+      prefetch_->retire_when_idle = false;
+    }
+    retry_ready_ = false;
+    retry_invalidated_ = false;
+    auto context = std::make_unique<std::shared_ptr<AsyncPrefetchPublisher>>(shared_from_this());
+    if (!async_page_cache_fence(
+            state_, reactor_, inode_, off_t(prefetch_->offset), off_t(prefetch_->length),
+            invalidated_retry, context.get())) {
+      throw std::system_error(errno, std::generic_category(), "submit prefetch retry invalidation");
+    }
+    context.release();
+  }
+  void retry_complete() noexcept {
+    next_ = 0;
+    retry_ready_ = true;
+    if (retry_invalidated_) {
+      paused_ = false;
+      progress();
+    }
+  }
+  void progress() noexcept {
+    if (busy_ || paused_ || failed_) return;
+    try {
+      size_t available;
+      {
+        std::lock_guard guard(prefetch_->mutex);
+        if (prefetch_->error || prefetch_->checksum_bad || prefetch_->checksum_hold ||
+            prefetch_->checksum_retrying ||
+            prefetch_->cancelled.load(std::memory_order_acquire)) return;
+        available = prefetch_->produced;
+        if (!prefetch_->complete || prefetch_->offset + available != size_) {
+          available -= available % state_.page_size;
+        }
+      }
+      if (available <= next_) {
+        if (next_ == prefetch_->length) prefetch_->publication_finished();
+        return;
+      }
+      const size_t length = std::min(available - next_, kPreferredIoSize);
+      auto batch = std::make_unique<Batch>(shared_from_this(), next_, length);
+      busy_ = true;
+      batch.release()->start();
+    } catch (...) { fail(ENOMEM); }
+  }
+
+ private:
+  static void invalidated_retry(void* context, int result) noexcept {
+    std::unique_ptr<std::shared_ptr<AsyncPrefetchPublisher>> hold(
+        static_cast<std::shared_ptr<AsyncPrefetchPublisher>*>(context));
+    auto& owner = **hold;
+    if (result != 0 && result != -ENOENT) {
+      owner.fail(-result);
+      return;
+    }
+    owner.retry_invalidated_ = true;
+    if (owner.retry_ready_) {
+      owner.paused_ = false;
+      owner.progress();
+    }
+  }
+
+  struct Batch {
+    std::shared_ptr<AsyncPrefetchPublisher> owner;
+    std::shared_ptr<ReadAheadStoragePool::Storage> storage;
+    std::shared_lock<ReactorSharedMutex> fence;
+    AsyncIoRequest wait;
+    size_t offset;
+    size_t length;
+    size_t revision;
+    uint64_t notification = 0;
+    bool waiting = false;
+
+    Batch(std::shared_ptr<AsyncPrefetchPublisher> value, size_t off, size_t len)
+        : owner(std::move(value)), storage(owner->prefetch_->storage),
+          fence(owner->state_.prefetch_publication_mutex, std::defer_lock),
+          offset(off), length(len), revision(owner->revision_) {}
+    ~Batch() {
+      if (waiting) owner->state_.prefetch_publication_mutex.end_async_wait();
+    }
+    static void available(void* context, ssize_t result) noexcept {
+      auto* self = static_cast<Batch*>(context);
+      if (result < 0) finish(self, int(result));
+      else self->start();
+    }
+    static void finish(void* context, int result) noexcept {
+      std::unique_ptr<Batch> batch(static_cast<Batch*>(context));
+      auto owner = batch->owner;
+      const size_t end = batch->offset + batch->length;
+      const bool obsolete = batch->revision != owner->revision_;
+      batch.reset(); // Release fence/source ownership before any next STORE.
+      owner->busy_ = false;
+      if (result != 0) {
+        if (result == -ECANCELED) owner->progress();
+        else if (result == -ESTALE) owner->stop();
+        else owner->fail(-result);
+        return;
+      }
+      if (!obsolete) {
+        owner->next_ = end;
+        {
+          std::lock_guard guard(owner->prefetch_->mutex);
+          owner->prefetch_->published_prefix = end;
+        }
+        owner->prefetch_->retire();
+      }
+      owner->progress();
+    }
+    void start() noexcept {
+      try {
+        if (!fence.try_lock()) {
+          if (!waiting) {
+            wait.fd = owner->state_.prefetch_publication_mutex.begin_async_wait();
+            waiting = true;
+          }
+          if (!fence.try_lock()) {
+            wait.kind     = AsyncIoRequest::READ;
+            wait.data     = &notification;
+            wait.length   = sizeof(notification);
+            wait.complete = available;
+            wait.context  = this;
+            if (owner->reactor_.submit(wait)) return;
+            finish(this, -errno);
+            return;
+          }
+        }
+        if (waiting) {
+          owner->state_.prefetch_publication_mutex.end_async_wait();
+          waiting = false;
+        }
+        if (revision != owner->revision_ || owner->paused_ ||
+            owner->prefetch_->cancelled.load(std::memory_order_acquire)) {
+          finish(this, -ECANCELED);
+          return;
+        }
+        const uint64_t epoch = owner->item_->generation_epoch.load(std::memory_order_acquire)
+            & ((1ULL << 63) - 1);
+        if (epoch != owner->epoch_) {
+          finish(this, -ESTALE);
+          return;
+        }
+        if (!owner->reactor_.notify_store(
+                owner->inode_, off_t(owner->prefetch_->offset + offset),
+                storage->fd.get(), off_t(offset), length,
+                finish, this)) {
+          finish(this, -errno);
+        }
+      } catch (...) { finish(this, -EIO); }
+    }
+  };
+
+  void fail(int error) noexcept {
+    failed_ = true;
+    prefetch_->publication_finished();
+    fprintf(stderr, "warning: prefetch STORE failed: path=%s: %s\n",
+            path_.c_str(), strerror(error));
+  }
+  State& state_;
+  FuseReactor& reactor_;
+  std::shared_ptr<UncachedPrefetch> prefetch_;
+  std::shared_ptr<InodeFile> item_;
+  fuse_ino_t inode_;
+  uint64_t epoch_;
+  uint64_t size_;
+  ssostr<248> path_;
+  size_t next_;
+  size_t revision_ = 0;
+  bool busy_   = false;
+  bool paused_ = false;
+  bool failed_ = false;
+  bool retry_ready_       = false;
+  bool retry_invalidated_ = false;
 };
 
 bool wait_for_prefetch(UncachedPrefetch& prefetch, size_t wanted) {
@@ -10095,6 +10544,95 @@ bool wait_for_prefetch_complete(UncachedPrefetch& prefetch) {
   return prefetch.complete && prefetch.error == nullptr;
 }
 
+class LegacyPrefetchPublisher : public std::enable_shared_from_this<LegacyPrefetchPublisher> {
+ public:
+  LegacyPrefetchPublisher(State& s, const OpenHandle& h,
+                          std::shared_ptr<UncachedPrefetch> p, size_t demand)
+      : state_(s), prefetch_(std::move(p)), inode_(h.inode), epoch_(h.generation_epoch), next_(demand) {
+    item_ = prefetch_->item_pin;
+    prefetch_->published_prefix = demand;
+  }
+  void progress() noexcept {
+    try {
+      std::lock_guard guard(mutex_);
+      if (busy_ || failed_) return;
+      {
+        std::lock_guard lock(prefetch_->mutex);
+        size_t available = prefetch_->produced / state_.page_size * state_.page_size;
+        if (prefetch_->complete) available = prefetch_->produced;
+        if (available <= next_ && !prefetch_->complete) return;
+      }
+      busy_ = true;
+      std::lock_guard queue_guard(state_.legacy_publication_mutex);
+      if (!state_.publications) throw std::system_error(ENOTCONN, std::generic_category());
+      state_.publications->submit(this, [self = shared_from_this()] { self->run(); });
+    } catch (...) {
+      fail(EIO);
+    }
+  }
+ private:
+  void fail(int error) noexcept {
+    { std::lock_guard guard(mutex_); failed_ = true; busy_ = false; }
+    fprintf(stderr, "warning: legacy prefetch STORE failed: inode=%llu: %s\n",
+            (unsigned long long)inode_, strerror(error));
+    prefetch_->publication_finished();
+  }
+  void run() noexcept {
+    try {
+      size_t length;
+      bool complete;
+      std::shared_ptr<ReadAheadStoragePool::Storage> storage;
+      {
+        std::lock_guard guard(prefetch_->mutex);
+        complete = prefetch_->complete;
+        size_t available = prefetch_->produced / state_.page_size * state_.page_size;
+        if (complete) available = prefetch_->produced;
+        length = std::min(available - std::min(next_, available), kPreferredIoSize);
+        storage = prefetch_->storage;
+      }
+      if (length != 0) {
+        std::shared_lock fence(state_.prefetch_publication_mutex);
+        if (prefetch_->cancelled.load(std::memory_order_acquire) ||
+            (item_->generation_epoch.load(std::memory_order_acquire) & ((1ULL << 63) - 1)) != epoch_) {
+          fail(ESTALE);
+          return;
+        }
+        fuse_session* session;
+        { std::lock_guard guard(state_.session_mutex); session = state_.session; }
+        if (!session) { fail(ENOTCONN); return; }
+        fuse_bufvec buffers{};
+        buffers.count = 1;
+        buffers.buf[0].size = length;
+        buffers.buf[0].flags = fuse_buf_flags(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
+        buffers.buf[0].fd = storage->fd.get();
+        buffers.buf[0].pos = off_t(next_);
+        // Dedicated notification worker: never occupy the download/checksum
+        // workers, nor keep session/inode locks while STORE waits on a READ.
+        const int result = fuse_lowlevel_notify_store(session, inode_,
+            off_t(prefetch_->offset + next_), &buffers, FUSE_BUF_SPLICE_MOVE);
+        if (result != 0) { fail(-result); return; }
+        next_ += length;
+        { std::lock_guard guard(prefetch_->mutex); prefetch_->published_prefix = next_; }
+      }
+      storage.reset();
+      prefetch_->retire();
+      { std::lock_guard guard(mutex_); busy_ = false; }
+      if (complete && (next_ >= prefetch_->length || length == 0)) {
+        prefetch_->publication_finished();
+      } else progress();
+    } catch (...) { fail(EIO); }
+  }
+  State& state_;
+  std::shared_ptr<UncachedPrefetch> prefetch_;
+  std::shared_ptr<InodeFile> item_;
+  fuse_ino_t inode_;
+  uint64_t epoch_;
+  size_t next_;
+  std::mutex mutex_;
+  bool busy_ = false;
+  bool failed_ = false;
+};
+
 struct PrefetchTailTask {
   std::shared_ptr<UncachedPrefetch> prefetch;
   bool collect_stats;
@@ -10102,6 +10640,7 @@ struct PrefetchTailTask {
   std::atomic<uint64_t>* remote_read_bytes;
   HttpPool::Lease lease;
   std::unique_ptr<RangeDownload> download;
+  std::shared_ptr<LegacyPrefetchPublisher> publisher;
 };
 
 void run_prefetch_tail(void* context) noexcept {
@@ -10128,6 +10667,8 @@ void run_prefetch_tail(void* context) noexcept {
     task->prefetch->complete = true;
   }
   task->prefetch->notify_waiters();
+  if (task->publisher) task->publisher->progress();
+  else task->prefetch->publication_finished();
 }
 
 class UncachedFileReader final : public FileReader {
@@ -10142,7 +10683,7 @@ class UncachedFileReader final : public FileReader {
                     size_t wanted, uint64_t object_size);
 
   std::shared_ptr<UncachedPrefetch> select_async(
-      State& state, uint64_t offset, size_t wanted, uint64_t object_size,
+      State& state, fuse_ino_t inode, uint64_t offset, size_t wanted, uint64_t object_size,
       bool& created);
 
  private:
@@ -11253,6 +11794,8 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
       throw std::runtime_error("FUSE read is larger than pipe capacity");
     }
     Response response;
+    unsigned checksum_retries = 0;
+    bool checksum_terminal = false;
     for (unsigned attempt = 0; ; ++attempt) {
       try {
         const auto range_request =
@@ -11307,9 +11850,25 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
           state.range_signing_mode.compare_exchange_strong(
               expected, 1, std::memory_order_relaxed);
         }
+        if (state.config.verify_read_checksum && unsigned_offset == 0 &&
+            uint64_t(wanted) == object_size && response.body_bytes == wanted &&
+            content_range_matches(response, unsigned_offset, wanted, object_size)) {
+          try {
+            verify_read_checksum(response, pipe, wanted, state.config.checksum);
+          } catch (...) {
+            if (response.requires_consume) client.consume(response);
+            if (checksum_retries++ != 0) {
+              checksum_terminal = true;
+              handle.read_checksum_bad.store(true, std::memory_order_release);
+              throw;
+            }
+            pipe = Pipe::create(state.config.maximum_read_size);
+            continue;
+          }
+        }
         break;
       } catch (...) {
-        if (attempt == 3) {
+        if (attempt == 3 || checksum_terminal) {
           throw;
         }
         pipe = Pipe::create(state.config.maximum_read_size);
@@ -11327,10 +11886,6 @@ void read_open_file(State& state, OpenHandle& handle, bool use_cache,
         response.body_bytes != wanted) {
       throw_inconsistent_range_response(
           response, unsigned_offset, wanted, object_size, "GetObject");
-    }
-    if (state.config.verify_read_checksum && unsigned_offset == 0 &&
-        uint64_t(wanted) == object_size) {
-      verify_read_checksum(response, pipe, wanted, state.config.checksum);
     }
 
     fuse_bufvec buffers{};
@@ -11406,6 +11961,9 @@ UncachedFileReader::~UncachedFileReader() {
   if (prefetch_) {
     prefetch_->cancelled.store(true, std::memory_order_release);
   }
+  for (const auto& prefetch : retained_) {
+    prefetch->cancelled.store(true, std::memory_order_release);
+  }
   join();
 }
 
@@ -11419,11 +11977,15 @@ bool UncachedFileReader::try_prefetch(
     State& state, OpenHandle& handle, fuse_req_t request,
     uint64_t offset, size_t wanted, uint64_t object_size) {
   std::unique_lock reader_guard(mutex_);
-  const auto contains = [&](const UncachedPrefetch& value) {
-    return offset >= value.offset && wanted <= value.length &&
-        offset - value.offset <= value.length - wanted;
+  const auto contains = [&](UncachedPrefetch& value) {
+    return value.pin(offset, wanted);
   };
   std::shared_ptr<UncachedPrefetch> selected;
+  struct ReadPin {
+    std::shared_ptr<UncachedPrefetch> value;
+    ~ReadPin() { if (value) value->retire(true); }
+  } pin;
+  std::shared_ptr<LegacyPrefetchPublisher> publisher;
   std::unique_ptr<RangeDownload> started_download;
   HttpPool::Lease started_lease;
   if (prefetch_ && contains(*prefetch_)) {
@@ -11504,14 +12066,19 @@ bool UncachedFileReader::try_prefetch(
       return false;
     }
 
-    ReadAheadStoragePool::Storage storage =
-        state.read_ahead_pool->acquire(length);
-
     WorkerState& worker = worker_state(state);
+    selected = allocate_prefetch(state, handle.inode, offset, wanted, object_size, length);
+    if (!selected || selected->length <= wanted) return false;
+    if (!selected->pin(offset, wanted)) abort();
+    pin.value = selected;
     const AuthorizedRangeRequest range = make_range_request(
-        state, handle, worker, offset, length);
-    selected = std::make_shared<UncachedPrefetch>(
-        state.read_ahead_pool, std::move(storage), offset, length);
+        state, handle, worker, offset, selected->length);
+    if (offset % state.page_size == 0 && wanted % state.page_size == 0) {
+      publisher = std::make_shared<LegacyPrefetchPublisher>(state, handle, selected, wanted);
+      selected->legacy_progress = [weak = std::weak_ptr(publisher)] {
+        if (auto value = weak.lock()) value->progress();
+      };
+    }
     prefetch_ = selected;
     reader_guard.unlock();
     try {
@@ -11556,6 +12123,7 @@ bool UncachedFileReader::try_prefetch(
     reader_guard.lock();
   }
 
+  if (!pin.value) pin.value = selected;
   const size_t relative = size_t(offset - selected->offset);
   if (!started_download) {
     reader_guard.unlock();
@@ -11572,7 +12140,7 @@ bool UncachedFileReader::try_prefetch(
         selected,
         state.config.stats_interval_seconds != 0,
         &state.remote_reads, &state.remote_read_bytes,
-        std::move(started_lease), std::move(started_download)});
+        std::move(started_lease), std::move(started_download), std::move(publisher)});
     try {
       PrefetchTailTask* submitted = tail.release();
       try {
@@ -11594,7 +12162,7 @@ bool UncachedFileReader::try_prefetch(
   if (wanted < 2 * state.page_size) {
     result = fuse_reply_buf(
         request,
-        static_cast<const char*>(selected->storage.mapping) + relative,
+        static_cast<const char*>(selected->storage->mapping) + relative,
         wanted);
   } else {
     fuse_bufvec buffers{};
@@ -11602,7 +12170,7 @@ bool UncachedFileReader::try_prefetch(
     buffers.buf[0].size  = wanted;
     buffers.buf[0].flags = fuse_buf_flags(
         FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
-    buffers.buf[0].fd    = selected->storage.fd.get();
+    buffers.buf[0].fd    = selected->storage->fd.get();
     buffers.buf[0].pos   = off_t(relative);
     result = fuse_reply_data(
         request, &buffers, FUSE_BUF_SPLICE_MOVE);
@@ -11622,13 +12190,12 @@ void UncachedFileReader::read(
 }
 
 std::shared_ptr<UncachedPrefetch> UncachedFileReader::select_async(
-    State& state, uint64_t offset, size_t wanted, uint64_t object_size,
+    State& state, fuse_ino_t inode, uint64_t offset, size_t wanted, uint64_t object_size,
     bool& created) {
   std::lock_guard guard(mutex_);
   created = false;
-  const auto contains = [&](const UncachedPrefetch& p) {
-    return offset >= p.offset && wanted <= p.length &&
-        offset - p.offset <= p.length - wanted;
+  const auto contains = [&](UncachedPrefetch& p) {
+    return p.pin(offset, wanted);
   };
   if (prefetch_ && contains(*prefetch_)) {
     return prefetch_;
@@ -11648,9 +12215,8 @@ std::shared_ptr<UncachedPrefetch> UncachedFileReader::select_async(
     if (pending) {
       // A disjoint demand must not cancel the useful in-flight window or
       // expand another speculative window. Keep its bytes for overlap reuse.
-      auto storage = state.read_ahead_pool->acquire(wanted);
-      auto selected = std::make_shared<UncachedPrefetch>(
-          state.read_ahead_pool, std::move(storage), offset, wanted);
+      auto selected = allocate_prefetch(state, inode, offset, wanted, object_size, wanted);
+      if (!selected) return {};
       retained_.push_back(selected);
       retained_bytes_ += wanted;
       while (retained_.size() > 1 && retained_bytes_ > maximum) {
@@ -11658,23 +12224,27 @@ std::shared_ptr<UncachedPrefetch> UncachedFileReader::select_async(
         retained_.pop_front();
       }
       created = true;
+      if (!selected->pin(offset, wanted)) abort();
       return selected;
     }
   }
+  size_t next = next_window_;
   if (prefetch_) {
     if (offset == prefetch_->offset + prefetch_->length) {
-      next_window_ += std::min(next_window_, maximum - next_window_);
+      next += std::min(next, maximum - next);
     } else {
-      next_window_ = 1024U * 1024U;
+      next = 1024U * 1024U;
     }
+  }
+  const size_t length = size_t(std::min<uint64_t>(
+      object_size - offset, std::max(wanted, next)));
+  auto selected = allocate_prefetch(state, inode, offset, wanted, object_size, length);
+  if (!selected) return {};
+  next_window_ = next;
+  if (prefetch_) {
     retained_.push_back(prefetch_);
     retained_bytes_ += prefetch_->length;
   }
-  const size_t length = size_t(std::min<uint64_t>(
-      object_size - offset, std::max(wanted, next_window_)));
-  auto storage = state.read_ahead_pool->acquire(length);
-  auto selected = std::make_shared<UncachedPrefetch>(
-      state.read_ahead_pool, std::move(storage), offset, length);
   while (!retained_.empty() &&
          (length >= maximum || retained_bytes_ > maximum - length)) {
     retained_bytes_ -= retained_.front()->length;
@@ -11682,6 +12252,7 @@ std::shared_ptr<UncachedPrefetch> UncachedFileReader::select_async(
   }
   prefetch_ = selected;
   created = true;
+  if (!selected->pin(offset, wanted)) abort();
   return selected;
 }
 
@@ -11716,12 +12287,25 @@ class CachedFileWriter final : public FileWriter {
   void release(State& state, OpenHandle& handle) noexcept override;
 };
 
-std::unique_ptr<FileReader> make_file_reader(State& state,
-                                              OpenHandle&) {
+std::shared_ptr<FileReader> make_file_reader(State& state,
+                                             OpenHandle& handle) {
   if (state.local_cache) {
-    return std::make_unique<CachedFileReader>();
+    return std::make_shared<CachedFileReader>();
   }
-  return std::make_unique<UncachedFileReader>();
+  std::lock_guard guard(state.open_files_mutex);
+  auto found = state.open_files.find(handle.object_path);
+  if (found == state.open_files.end()) {
+    throw std::system_error(EBADF, std::generic_category(), "unregistered read handle");
+  }
+  auto& opened = found->second;
+  if (opened.reader_inode == handle.inode && opened.reader_epoch == handle.generation_epoch) {
+    if (auto reader = opened.uncached_reader.lock()) return reader;
+  }
+  auto reader = std::make_shared<UncachedFileReader>();
+  opened.uncached_reader = reader;
+  opened.reader_inode    = handle.inode;
+  opened.reader_epoch    = handle.generation_epoch;
+  return reader;
 }
 
 std::unique_ptr<FileWriter> make_file_writer(State& state,
@@ -11733,6 +12317,15 @@ std::unique_ptr<FileWriter> make_file_writer(State& state,
 }
 
 struct AsyncRangeTransfer {
+  struct RetrySink final : RangeFileSink {
+    UncachedPrefetch& prefetch;
+    RetrySink(int fd, UncachedPrefetch& value)
+        : RangeFileSink(fd, 0, false), prefetch(value) {}
+    void progress(const Response&, bool) override {}
+    bool cancelled() const noexcept override {
+      return prefetch.cancelled.load(std::memory_order_acquire);
+    }
+  };
   State& state;
   FuseReactor& reactor;
   std::shared_ptr<UncachedPrefetch> prefetch;
@@ -11742,16 +12335,21 @@ struct AsyncRangeTransfer {
   std::unique_ptr<AsyncSignedS3Request> retry_http;
   std::unique_ptr<ReadChecksumContext> checksums;
   std::unique_ptr<AsyncReadIdentityGate> retry_identity;
+  std::shared_ptr<AsyncPrefetchPublisher> publisher;
+  std::shared_ptr<ReadAheadStoragePool::Storage> retry_storage;
+  std::unique_ptr<RangeFileSink> retry_sink;
   Response checksum_response;
   FuseReactor::ReactorTask checksum_completion;
+  PrefetchContinuation retry_continuation;
   std::exception_ptr checksum_error;
   bool retried = false;
   bool checksum_valid = false;
+  bool checksum_available = false;
 
   struct Sink final : RangeFileSink {
     AsyncRangeTransfer& owner;
     explicit Sink(AsyncRangeTransfer& value)
-        : RangeFileSink(value.prefetch->storage.fd.get(), 0, false),
+        : RangeFileSink(value.prefetch->storage->fd.get(), 0, false),
           owner(value) {}
     bool cancelled() const noexcept override {
       return owner.prefetch->cancelled.load(std::memory_order_acquire);
@@ -11767,11 +12365,15 @@ struct AsyncRangeTransfer {
               response, owner.prefetch->offset, owner.prefetch->length,
               owner.object_size, "asynchronous GetObject");
         }
-        owner.prefetch->range_valid = true;
+        {
+          std::lock_guard guard(owner.prefetch->mutex);
+          owner.prefetch->range_valid = true;
+        }
         owner.prefetch->sink.start_publishing(response);
       } else {
         owner.prefetch->sink.progress(response, complete);
       }
+      if (owner.publisher) owner.publisher->progress();
     }
   } sink;
 
@@ -11823,6 +12425,10 @@ struct AsyncRangeTransfer {
       task->prefetch->checksum_bad = task->retried && error != nullptr;
     }
     task->prefetch->notify_waiters();
+    if (error && task->publisher) task->publisher->stop();
+    else if (task->publisher) task->publisher->progress();
+    else task->prefetch->publication_finished();
+    task->prefetch->retire();
   }
 
   static void verified(void* value) noexcept {
@@ -11835,8 +12441,12 @@ struct AsyncRangeTransfer {
           task->prefetch->checksum_retrying = true;
           task->prefetch->complete = false;
         }
-        queue_page_invalidation(task->state, task->checksums->handle,
-                                 off_t(task->prefetch->offset), off_t(task->prefetch->length));
+        if (task->publisher) {
+          task->publisher->begin_retry();
+        } else {
+          queue_page_invalidation(task->state, task->checksums->handle,
+                                   off_t(task->prefetch->offset), off_t(task->prefetch->length));
+        }
         task->retry_identity = std::make_unique<AsyncReadIdentityGate>(*task->checksums);
         if (!task->retry_identity->acquire(identity_ready, task.get())) {
           task.release();
@@ -11849,7 +12459,14 @@ struct AsyncRangeTransfer {
       }
     }
     const bool valid = !task->checksum_error && task->checksum_valid;
+    if (valid && !task->checksum_available && task->publisher) {
+      task->publisher->stop();
+      task->publisher.reset();
+      fprintf(stderr, "warning: prefetch checksum unavailable; withholding proactive STORE: path=%s\n",
+              task->checksums->path.c_str());
+    }
     if (!valid) {
+      if (task->publisher) task->publisher->stop();
       task->checksums->handle.read_checksum_bad.store(true, std::memory_order_release);
       queue_page_invalidation(task->state, task->checksums->handle,
                                off_t(task->prefetch->offset), off_t(task->prefetch->length));
@@ -11858,11 +12475,22 @@ struct AsyncRangeTransfer {
     }
     {
       std::lock_guard guard(task->prefetch->mutex);
+      if (valid && task->retry_storage) {
+        task->prefetch->storage = task->retry_storage;
+        task->prefetch->published_prefix = 0;
+        task->prefetch->retired_prefix = 0;
+      }
       task->prefetch->complete = true;
       task->prefetch->checksum_retrying = false;
       task->prefetch->checksum_bad = !valid;
+      task->prefetch->checksum_hold = false;
     }
     task->prefetch->notify_waiters();
+    if (valid && task->publisher) {
+      if (task->retried) task->publisher->retry_complete();
+      else task->publisher->progress();
+    } else if (!task->publisher) task->prefetch->publication_finished();
+    task->prefetch->retire();
   }
 
   static void identity_ready(void* value, std::exception_ptr error) noexcept {
@@ -11877,8 +12505,22 @@ struct AsyncRangeTransfer {
 
   void start_retry() noexcept {
     try {
+      {
+        // Unverified units are never STOREd. Pending READs already wait on
+        // checksum_retrying; only actual replies can still use the old bytes.
+        std::lock_guard guard(prefetch->mutex);
+        if (prefetch->active_replies != 0) {
+          retry_continuation.reactor = &reactor;
+          retry_continuation.task = {retry_after_replies, retry_cancelled, this};
+          if (!reactor.reserve_completion(&retry_continuation.task)) throw std::system_error(errno, std::generic_category(), "reserve retry reply drain");
+          prefetch->reply_drained = &retry_continuation;
+          return;
+        }
+        retry_storage = prefetch->storage;
+      }
+      retry_sink = std::make_unique<RetrySink>(retry_storage->fd.get(), *prefetch);
       auto args = checksum_retry_request(
-          *checksums, prefetch->offset, prefetch->length, sink);
+          *checksums, prefetch->offset, prefetch->length, *retry_sink);
       args.capture_headers = true;
       retry_http = std::make_unique<AsyncSignedS3Request>(
           state, reactor, std::move(args), received, this, 1);
@@ -11891,6 +12533,15 @@ struct AsyncRangeTransfer {
       checksum_error = std::current_exception();
       verified(this);
     }
+  }
+
+  static void retry_after_replies(void* context) noexcept {
+    static_cast<AsyncRangeTransfer*>(context)->start_retry();
+  }
+  static void retry_cancelled(void* context) noexcept {
+    auto* task = static_cast<AsyncRangeTransfer*>(context);
+    task->checksum_error = std::make_exception_ptr(std::system_error(ECANCELED, std::generic_category()));
+    verified(task);
   }
 
   void verify() noexcept {
@@ -11910,9 +12561,11 @@ struct AsyncRangeTransfer {
                                             algorithm, expected)) {
             checksum_valid = !retried;
           } else {
+            checksum_available = true;
             DataChecksum checksum(algorithm);
+            const auto& storage = retried ? retry_storage : prefetch->storage;
             checksum.update(std::span(
-                static_cast<const std::byte*>(prefetch->storage.mapping), prefetch->length));
+                static_cast<const std::byte*>(storage->mapping), prefetch->length));
             const auto actual = checksum.finish();
             uint64_t value = 0;
             checksum_valid = algorithm == CHECKSUM_CRC64XZ
@@ -11960,6 +12613,9 @@ struct AsyncReadTask {
         request(request_value), inode(inode_value), size(size_value),
         offset(offset_value), active(handle_value),
         identity(handle_value.identity_mutex, std::defer_lock) {}
+  ~AsyncReadTask() {
+    if (prefetch_pinned) prefetch->retire(true);
+  }
 
   State* state;
   OpenHandle* handle;
@@ -11971,6 +12627,7 @@ struct AsyncReadTask {
   std::shared_lock<ReactorSharedMutex> identity;
   FuseReactor* reactor = nullptr;
   std::shared_ptr<UncachedPrefetch> prefetch;
+  bool prefetch_pinned = false;
   PrefetchContinuation continuation;
   AsyncIoRequest wait;
   uint64_t notification = 0;
@@ -11996,6 +12653,7 @@ struct AsyncReadTask {
       prefetch->error = error;
       prefetch->complete = true;
     }
+    prefetch->publication_finished();
     prefetch->notify_waiters();
     try { std::rethrow_exception(error); }
     catch (...) { reply_callback_error(request); }
@@ -12248,29 +12906,40 @@ struct AsyncReadTask {
     std::unique_ptr<AsyncReadTask> task(static_cast<AsyncReadTask*>(context));
     try {
       bool retrying;
+      const size_t relative = size_t(uint64_t(task->offset) -
+                                     task->prefetch->offset);
+      struct ReplySource {
+        UncachedPrefetch* prefetch = nullptr;
+        std::shared_ptr<ReadAheadStoragePool::Storage> storage;
+        ~ReplySource() {
+          storage.reset();
+          if (prefetch) prefetch->reply_finished();
+        }
+      } source;
+      auto& storage = source.storage;
       {
         std::lock_guard guard(task->prefetch->mutex);
         retrying = task->prefetch->checksum_retrying;
-      }
-      if (retrying) {
-        task.release()->wait_prefetch();
-        return;
-      }
-      const size_t relative = size_t(uint64_t(task->offset) -
-                                     task->prefetch->offset);
-      {
-        std::lock_guard guard(task->prefetch->mutex);
         if (task->prefetch->checksum_bad) {
           throw std::system_error(EIO, std::generic_category(), "poisoned read checksum");
         }
-        if (task->prefetch->produced < relative + task->wanted ||
-            !task->prefetch->range_valid) {
+        if (!retrying && (task->prefetch->produced < relative + task->wanted ||
+                          !task->prefetch->range_valid)) {
           if (task->prefetch->error != nullptr) {
             std::rethrow_exception(task->prefetch->error);
           }
           throw std::system_error(EIO, std::generic_category(),
                                   "incomplete asynchronous read");
         }
+        if (!retrying) {
+          storage = task->prefetch->storage;
+          ++task->prefetch->active_replies;
+          source.prefetch = task->prefetch.get();
+        }
+      }
+      if (retrying) {
+        task.release()->wait_prefetch();
+        return;
       }
       if (task->handle->stale.load(std::memory_order_acquire)) {
         throw std::system_error(ESTALE, std::generic_category(),
@@ -12280,7 +12949,7 @@ struct AsyncReadTask {
       if (task->wanted < 2 * task->state->page_size) {
         result = fuse_reply_buf(
             task->request,
-            static_cast<const char*>(task->prefetch->storage.mapping) + relative,
+            static_cast<const char*>(storage->mapping) + relative,
             task->wanted);
       } else {
         fuse_bufvec buffers{};
@@ -12288,7 +12957,7 @@ struct AsyncReadTask {
         buffers.buf[0].size  = task->wanted;
         buffers.buf[0].flags = fuse_buf_flags(
             FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
-        buffers.buf[0].fd    = task->prefetch->storage.fd.get();
+        buffers.buf[0].fd    = storage->fd.get();
         buffers.buf[0].pos   = off_t(relative);
         result = fuse_reply_data(
             task->request, &buffers, FUSE_BUF_SPLICE_MOVE);
@@ -12362,16 +13031,37 @@ struct AsyncReadTask {
   void read_uncached() noexcept {
     try {
       const uint64_t begin = uint64_t(offset);
+      const auto budget = state->prefetch_budget.snapshot();
+      if (budget.stopped) throw std::system_error(ECANCELED, std::generic_category(), "prefetch budget stopped");
       bool created;
       if (state->local_cache) {
-        auto storage = state->read_ahead_pool->acquire(wanted);
-        prefetch = std::make_shared<UncachedPrefetch>(
-            state->read_ahead_pool, std::move(storage), begin, wanted);
+        prefetch = allocate_prefetch(*state, inode, begin, wanted, handle->size, wanted);
+        if (prefetch && !prefetch->pin(begin, wanted)) abort();
         created = true;
       } else {
         prefetch = static_cast<UncachedFileReader*>(handle->reader.get())->select_async(
-            *state, begin, wanted, handle->size, created);
+            *state, inode, begin, wanted, handle->size, created);
       }
+      if (!prefetch) {
+        const int fd = state->prefetch_budget.begin_async_wait(budget.revision);
+        if (fd < 0) {
+          continuation.task = {budget_ready, cancel, this};
+          if (!reactor->reserve_completion(&continuation.task)) throw std::system_error(errno, std::generic_category(), "budget retry");
+          reactor->complete(&continuation.task);
+          return;
+        }
+        wait = {};
+        wait.kind = AsyncIoRequest::READ;
+        wait.fd = fd;
+        wait.data = &notification;
+        wait.length = sizeof(notification);
+        wait.complete = budget_available;
+        wait.context = this;
+        if (reactor->submit(wait)) return;
+        state->prefetch_budget.end_async_wait();
+        throw std::system_error(errno, std::generic_category(), "submit prefetch budget wait");
+      }
+      prefetch_pinned = true;
       if (created) {
         start_uncached_transfer();
         return;
@@ -12381,6 +13071,18 @@ struct AsyncReadTask {
       reply_callback_error(request);
       delete this;
     }
+  }
+
+  static void budget_ready(void* context) noexcept {
+    static_cast<AsyncReadTask*>(context)->read_uncached();
+  }
+  static void budget_available(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncReadTask*>(context);
+    task->state->prefetch_budget.end_async_wait();
+    if (result < 0 && result != -EAGAIN) {
+      fuse_reply_err(task->request, -int(result));
+      delete task;
+    } else task->read_uncached();
   }
 
   void start_uncached_transfer() noexcept {
@@ -12400,6 +13102,12 @@ struct AsyncReadTask {
       args.capture_headers   = state->config.verify_read_checksum;
       auto transfer = std::make_unique<AsyncRangeTransfer>(
           *state, *reactor, prefetch, handle->size, std::move(args));
+      if (!state->local_cache && prefetch->length > wanted &&
+          (!state->config.verify_read_checksum || prefetch->checksum_hold) &&
+          prefetch->offset % state->page_size == 0 && wanted % state->page_size == 0) {
+        transfer->publisher = std::make_shared<AsyncPrefetchPublisher>(
+            *state, *reactor, *handle, prefetch, wanted);
+      }
       if (state->config.verify_read_checksum && prefetch->offset == 0 &&
           prefetch->length == handle->size) {
         transfer->checksums = std::make_unique<ReadChecksumContext>(
@@ -17590,6 +18298,14 @@ void print_help() {
       "(default 1000)\n"
       "      --stats-interval SEC emit aggregate JSON stats to stderr; "
       "0 disables (default 0)\n"
+      "      --max-prefetch-memory SIZE\n"
+      "                             process-wide speculative prefetch budget; "
+      "0 means automatic 10% of physical RAM (page rounded); explicit "
+      "values are page-aligned and at least 256 KiB\n"
+      "      --max-file-prefetch-memory SIZE\n"
+      "                             per-file speculative prefetch budget; "
+      "0 means automatic min(file size, twice the maximum prefetch window); "
+      "explicit values are page-aligned and at least 256 KiB\n"
       "  -T, --dir-cache-timeout MS\n"
       "                             directory cache TTL (default 1000)\n"
       "  -I, --max-cached-inodes N soft inode-cache limit "
