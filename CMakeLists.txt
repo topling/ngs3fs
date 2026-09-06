@@ -261,10 +261,10 @@ if(NGS3FS_BUILD_TESTS)
     set_tests_properties(fuse_${engine}_prefetch_budget_test PROPERTIES
       TIMEOUT 60 RESOURCE_LOCK fuse_mounts)
   endforeach()
-  add_test(NAME fuse_legacy_prefetch_store_test
+  add_test(NAME fuse_legacy_prefetch_no_store_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
             xxhash128 prefetch legacy)
-  set_tests_properties(fuse_legacy_prefetch_store_test PROPERTIES
+  set_tests_properties(fuse_legacy_prefetch_no_store_test PROPERTIES
     TIMEOUT 60 RESOURCE_LOCK fuse_mounts)
   add_test(NAME fuse_mmap_integration_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>)

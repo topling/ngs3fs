@@ -45,7 +45,6 @@ struct ReactorIoTest {
   std::atomic<bool> notification_drain_failed{false};
   bool worker_completed = false;
   std::array<char, 8> data{};
-  std::array<char, 8192> store_data{};
   char fairness_data = 0;
   std::array<char, 8> shutdown_data{};
   std::thread::id owner;
@@ -112,9 +111,9 @@ struct ReactorIoTest {
     fairness_peer.reset(fairness_sockets[1]);
     file.reset(memfd_create("reactor_io_test", MFD_CLOEXEC));
     if (!fake_fuse || !file) return false;
-    for (size_t i = 0; i < store_data.size(); ++i) store_data[i] = char(i % 113);
-    if (::pwrite(file.get(), store_data.data(), store_data.size(), 4096) !=
-        ssize_t(store_data.size())) return false;
+    // The two initial CQ-burst PREADs use this byte, independently of the
+    // later file-I/O test at offset zero.
+    if (::pwrite(file.get(), "b", 1, 4096) != 1) return false;
     pipe = Pipe::create(4096);
     group.session_ = session;
     auto value = std::make_unique<FuseReactor>();
@@ -394,33 +393,29 @@ struct ReactorIoTest {
       while (::recv(test.fake_fuse_peer.get(), discarded.data(), discarded.size(),
                     MSG_DONTWAIT) > 0) {}
       test.submitting_notification = true;
-      const bool accepted = test.reactor().notify_store(
-          FUSE_ROOT_ID, 16384, test.file.get(), 4096,
-          test.store_data.size(), notification_done, &test);
+      const bool accepted = test.reactor().notify_inval_inode(
+          FUSE_ROOT_ID, 16384, 8192, notification_done, &test);
       test.submitting_notification = false;
       test.check(accepted && test.notification_callbacks == 2,
-                 "fd-backed STORE was rejected or completed inline");
+                 "inode invalidation was rejected or completed inline");
     } else if (test.notification_callbacks == 3) {
-      std::array<char, sizeof(fuse_out_header) + sizeof(fuse_notify_store_out) + 8192> packet{};
+      std::array<char, sizeof(fuse_out_header) + sizeof(fuse_notify_inval_inode_out)> packet{};
       size_t received = 0;
       while (received < packet.size()) {
         const ssize_t count = ::recv(test.fake_fuse_peer.get(), packet.data() + received,
                                      packet.size() - received, MSG_DONTWAIT);
         if (count < 0 && errno == EINTR) continue;
-        if (!test.check(count > 0, "STORE callback preceded complete payload")) return;
+        if (!test.check(count > 0, "invalidation callback preceded complete notification")) return;
         received += size_t(count);
       }
       fuse_out_header header{};
-      fuse_notify_store_out body{};
+      fuse_notify_inval_inode_out body{};
       memcpy(&header, packet.data(), sizeof(header));
       memcpy(&body, packet.data() + sizeof(header), sizeof(body));
       if (!test.check(header.len == packet.size() && header.unique == 0 &&
-                      header.error == FUSE_NOTIFY_STORE &&
-                      body.nodeid == FUSE_ROOT_ID && body.offset == 16384 &&
-                      body.size == test.store_data.size(), "invalid STORE header") ||
-          !test.check(memcmp(packet.data() + sizeof(header) + sizeof(body),
-                             test.store_data.data(), test.store_data.size()) == 0,
-                       "invalid STORE fd offset or payload")) return;
+                      header.error == FUSE_NOTIFY_INVAL_INODE &&
+                      body.ino == FUSE_ROOT_ID && body.off == 16384 &&
+                      body.len == 8192, "invalid inode invalidation notification")) return;
       test.begin_shutdown_case();
     } else {
       test.check(false, "notification callback ran more than once");
@@ -670,6 +665,8 @@ struct ReactorIoTest {
     check(burst_completions == burst_io.size() &&
           burst_replies == burst_io.size() && !burst_reply_pending,
           "ready FUSE continuations were not drained between I/O CQEs");
+    check(burst_data[0] == 'b' && burst_data[1] == 'b',
+          "CQ burst PREAD returned incorrect data");
     return failed ? 1 : 0;
   }
 };

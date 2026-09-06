@@ -305,13 +305,13 @@ After the unit is fully present, the request worker reads the local file and
 computes the checksum without delaying a FUSE request that was already
 answered from the completed prefix.
 
-For uncached prefetch, verification-enabled reads never proactively issue
-`FUSE_NOTIFY_STORE` for a unit before it passes verification. This path currently
-verifies full objects only; unverifiable partial ranges are not proactively
-STOREd. Under a tight budget, ngs3fs avoids speculative full-object windows.
-An unpublished whole-file retry reuses staging after active replies drain;
-STORE waits for successful verification and completion of the earlier READ
-invalidation. Cached multipart verification above remains unchanged.
+No cached or uncached path issues `FUSE_NOTIFY_STORE`, including read prefetch
+and post-write page refill. Verification does not enable proactive publication.
+Existing kernel-cached data remains reusable where normal coherence permits;
+missing pages are loaded only in response to actual FUSE reads. Cached
+multipart verification above remains unchanged. An uncached whole-file retry
+must wait for active reply sources before reusing staging; it has no STORE
+publication phase.
 
 On mismatch:
 

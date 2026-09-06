@@ -1,8 +1,8 @@
 # io_uring reactor execution contract
 
-Status: the aligned whole-block receive revision below is implemented and
-passes 92/92 local CTest cases plus seven focused ThreadSanitizer cases.
-Runner CI and comparative performance validation for this revision are still
+Status: the aligned whole-block receive revision and global STORE removal
+below are implemented. The no-STORE revision passes all 92 local CTest cases
+in both the normal and ThreadSanitizer builds; fresh runner validation is
 pending. Caller-owned reactors
 use libfuse for classic-fusefd protocol semantics. FUSE-over-io-uring remains
 outside this revision.
@@ -14,8 +14,48 @@ This contract replaces the uncached memfd, anonymous donation, proactive
 uncached path receives into reusable user-space blocks and replies through
 `fuse_reply_buf` or `fuse_reply_iov`. FUSE retains its ordinary buffered page
 cache. A reply may copy into that cache; the design makes no page-donation or
-zero-copy guarantee. Cached reads, upload pipes, upload checksums and write-side
-page-cache publication are outside this replacement.
+zero-copy guarantee. Cached reads, upload pipes and upload checksums are
+outside this replacement, except for the global STORE prohibition below.
+
+### Global prohibition on proactive STORE (2026-09-06)
+
+Do not issue `FUSE_NOTIFY_STORE` from any ngs3fs path, including legacy read
+prefetch and cached/uncached write completion. Only actual FUSE READ requests
+receive data replies. Keep existing kernel page-cache contents where normal
+coherence permits; do not actively refill missing or partial pages after a
+write. Subsequent misses use the normal read path. This supersedes historical
+verified-STORE, write-page refill and publication-fence designs below.
+
+Remove the legacy STORE queue and its ownership/fencing machinery, not merely
+its syscall. Successful legacy downloads remain available to the reader until
+normal retention/eviction or close releases them; finishing a GET must not
+discard an unrequested tail. Reply, I/O cancellation and generation lifetime
+rules still apply. No STORE-specific worker or memory charge may survive.
+
+Runner run `34035663604` validates the preceding implementation: all five
+build/test jobs passed 92/92 cases, but a legacy socket-buffer sample exhausted
+its 192 MiB mount budget. Its per-file peak was only 10.98 MiB, and it logged
+1114 failed stale-handle STOREs. Its artifact is analysis-ready, but the failed
+sample is not a performance result. The no-STORE revision requires fresh tests
+and runner measurements; none of those earlier results verifies its removal.
+
+Local no-STORE validation: normal CTest 92/92 passed (94.14 seconds) and full
+ThreadSanitizer CTest 92/92 passed (170.85 seconds). The legacy no-STORE probe
+rejects the preceding binary and verifies that both paused and completed
+prefetch leave unrelated FUSE pages nonresident. Existing fully written-page
+reuse, close-to-open, complete contents and cached zero-GET reuse remain tested.
+Sixteen repeated legacy VersityGW random-read samples at unchanged 192 MiB
+mount / 68 MiB per-file benchmark budgets all had zero budget exhaustion,
+pressure eviction and request errors; maximum mount occupancy was 15.76 MiB.
+These local samples validate memory behavior, not comparative CPU or latency.
+
+Review follow-up (pre-existing, not fixed by removing STORE): inode data
+invalidation and ordinary replies currently share a serial reactor reply
+queue. An INVAL waiting on a locked READ folio can prevent that READ's later
+reply from being submitted. `IOSQE_ASYNC` alone does not break this queue
+dependency. Add a deterministic paused-READ / submitted-INVAL / completed-READ
+regression before separating notification submission from ordinary replies.
+Existing generation-conflict tests do not force this interleaving.
 
 ### Permanent mapping and block-lifetime rules
 

@@ -681,7 +681,6 @@ struct OpenHandle {
   std::vector<ssostr<96>> part_checksums;
   std::vector<uint64_t> part_checksum_values;
   std::vector<uint64_t> part_sizes;
-  std::vector<std::pair<uint64_t, uint64_t>> partial_write_pages;
   std::unique_ptr<RetainedPart> current_part;
   UniqueFd state_event;
   Pipe cache_write_pipe;
@@ -704,7 +703,6 @@ struct OpenHandle {
   bool registered              = false;
   bool inode_counted           = false;
   bool recovery_read           = false;
-  bool page_cache_store_failed = false;
   bool cache_read_seen         = false;
   bool write_after_flush_warned = false;
   // The initial reference belongs to the application's open handle. Release
@@ -946,7 +944,6 @@ struct State {
         http(std::make_unique<HttpPool>(config)),
         uploads(std::make_unique<UploadScheduler>(
             config.max_uploads, config.request_timeout_ms)),
-        publications(std::make_unique<UploadScheduler>(1, config.request_timeout_ms)),
         cache_reclaimer([this](std::stop_token stop) {
           cache_reclaim_loop(stop, this);
         }) {
@@ -984,12 +981,6 @@ struct State {
     if (cache_reclaimer.joinable()) {
       cache_reclaimer.join();
     }
-    std::unique_ptr<UploadScheduler> stopped_publications;
-    {
-      std::lock_guard guard(legacy_publication_mutex);
-      stopped_publications = std::move(publications);
-    }
-    stopped_publications.reset();
     uploads.reset();
   }
 
@@ -1058,9 +1049,6 @@ struct State {
   std::condition_variable open_files_condition;
   std::mutex cache_mutex;
   std::mutex session_mutex;
-  // Only speculative STORE and invalidation participate. Ordinary READ
-  // replies must bypass this fence: STORE may be waiting on their folios.
-  ReactorSharedMutex prefetch_publication_mutex;
   std::mutex metrics_mutex;
   std::mutex credentials_mutex;
   std::mutex rename_probe_mutex;
@@ -1082,8 +1070,6 @@ struct State {
   std::vector<std::shared_ptr<CacheEntry>> recovery_entries;
   std::unique_ptr<HttpPool> http;
   std::unique_ptr<UploadScheduler> uploads;
-  std::unique_ptr<UploadScheduler> publications;
-  std::mutex legacy_publication_mutex;
   fuse_session* session = nullptr;
   Credentials express_credentials;
   AsyncExpressSession* express_async_waiters = nullptr;
@@ -1111,7 +1097,6 @@ struct State {
   std::atomic<uint64_t> random_read_warning_ns{0};
   std::atomic<uint64_t> cache_bypass_warning_ns{0};
   std::atomic<uint64_t> request_error_warning_ns{0};
-  std::atomic<bool> page_cache_store_warned{false};
   std::atomic<bool> page_cache_invalidate_warned{false};
   bool splice_available            = true;
   bool atomic_o_trunc              = false;
@@ -1190,72 +1175,34 @@ void stats_report_loop(std::stop_token stop, State* state) noexcept {
   emit_runtime_stats(*state, "shutdown_stats");
 }
 
-struct AsyncPageCacheFence {
-  State& state;
+struct AsyncPageCacheInvalidation {
   FuseReactor& reactor;
   fuse_ino_t inode;
   off_t offset;
   off_t length;
   FuseReactor::NotifyFunction done;
   void* context;
-  std::unique_lock<ReactorSharedMutex> fence;
   FuseReactor::ReactorTask task;
-  AsyncIoRequest wait;
-  uint64_t notification = 0;
-  bool waiting = false;
-  bool invalidate;
 
-  AsyncPageCacheFence(State& s, FuseReactor& r, fuse_ino_t ino,
-                        off_t off, off_t len,
-                        FuseReactor::NotifyFunction fn, void* ctx, bool notify)
-      : state(s), reactor(r), inode(ino), offset(off), length(len),
-        done(fn), context(ctx),
-        fence(s.prefetch_publication_mutex, std::defer_lock), invalidate(notify) {
+  AsyncPageCacheInvalidation(FuseReactor& r, fuse_ino_t ino,
+                             off_t off, off_t len,
+                             FuseReactor::NotifyFunction fn, void* ctx)
+      : reactor(r), inode(ino), offset(off), length(len),
+        done(fn), context(ctx) {
     task = {start, cancel, this};
   }
-  ~AsyncPageCacheFence() {
-    if (waiting) state.prefetch_publication_mutex.end_async_wait(true);
-  }
   static void finish(void* context, int result) noexcept {
-    std::unique_ptr<AsyncPageCacheFence> self(
-        static_cast<AsyncPageCacheFence*>(context));
+    std::unique_ptr<AsyncPageCacheInvalidation> self(
+        static_cast<AsyncPageCacheInvalidation*>(context));
     auto done = self->done;
     void* value = self->context;
-    self.reset(); // Reopen publication before a reentrant completion.
+    self.reset();
     if (done) done(value, result);
   }
   static void cancel(void* context) noexcept { finish(context, -ECANCELED); }
-  static void available(void* context, ssize_t result) noexcept {
-    if (result < 0) finish(context, int(result));
-    else start(context);
-  }
   static void start(void* context) noexcept {
-    auto* self = static_cast<AsyncPageCacheFence*>(context);
+    auto* self = static_cast<AsyncPageCacheInvalidation*>(context);
     try {
-      if (!self->fence.try_lock()) {
-        if (!self->waiting) {
-          self->wait.fd = self->state.prefetch_publication_mutex.begin_async_wait(true);
-          self->waiting = true;
-        }
-        if (!self->fence.try_lock()) {
-          self->wait.kind     = AsyncIoRequest::READ;
-          self->wait.data     = &self->notification;
-          self->wait.length   = sizeof(self->notification);
-          self->wait.complete = available;
-          self->wait.context  = self;
-          if (self->reactor.submit(self->wait)) return;
-          finish(self, -errno);
-          return;
-        }
-      }
-      if (self->waiting) {
-        self->state.prefetch_publication_mutex.end_async_wait(true);
-        self->waiting = false;
-      }
-      if (!self->invalidate) {
-        finish(self, 0);
-        return;
-      }
       if (!self->reactor.notify_inval_inode(
               self->inode, self->offset, self->length, finish, self)) {
         finish(self, -errno);
@@ -1264,13 +1211,13 @@ struct AsyncPageCacheFence {
   }
 };
 
-bool async_page_cache_fence(State& state, FuseReactor& reactor,
+bool async_invalidate_page_cache(FuseReactor& reactor,
                                  fuse_ino_t inode, off_t offset, off_t length,
                                  FuseReactor::NotifyFunction done,
-                                 void* context, bool invalidate = true) noexcept {
+                                 void* context) noexcept {
   try {
-    auto task = std::make_unique<AsyncPageCacheFence>(
-        state, reactor, inode, offset, length, done, context, invalidate);
+    auto task = std::make_unique<AsyncPageCacheInvalidation>(
+        reactor, inode, offset, length, done, context);
     if (!reactor.post(&task->task)) return false;
     task.release();
     return true;
@@ -1292,7 +1239,7 @@ void invalidated_page_cache(void* context, int result) noexcept {
 void invalidate_page_cache(State& state, fuse_ino_t inode,
                            off_t offset = 0, off_t length = 0) noexcept {
   if (auto* reactor = current_fuse_reactor()) {
-    if (!async_page_cache_fence(state, *reactor, inode, offset, length,
+    if (!async_invalidate_page_cache(*reactor, inode, offset, length,
                                      invalidated_page_cache, &state)) {
       invalidated_page_cache(&state, -errno);
     }
@@ -1300,7 +1247,6 @@ void invalidate_page_cache(State& state, fuse_ino_t inode,
   }
   int error = 0;
   {
-    std::unique_lock fence(state.prefetch_publication_mutex);
     std::lock_guard guard(state.session_mutex);
     if (state.session == nullptr) {
       return;
@@ -6173,7 +6119,9 @@ void publish_written_metadata(OpenHandle& handle,
   }
   item.fsize.store(handle.stream_offset, std::memory_order_relaxed);
   item.mtime.store(mtime, std::memory_order_relaxed);
-  item.set_page_cache_valid(!handle.page_cache_store_failed);
+  // Keep any pages already populated by normal writes. Missing pages remain
+  // ordinary READ misses; valid does not imply whole-file residency.
+  item.set_page_cache_valid(true);
   item.set_pending(false);
   handle.generation_epoch = publish_inode_generation(
       item, object_generation(handle.etag, handle.version_id,
@@ -6409,145 +6357,6 @@ void send_retained_body(HttpClient& client, std::string_view method,
   }
 }
 
-bool store_page_cache(State& state, const OpenHandle& handle,
-                      RetainedPart& part, uint64_t offset) noexcept {
-  if (part.bytes == 0) {
-    return true;
-  }
-
-  int error = 0;
-  try {
-    const size_t alloc_size = offsetof(fuse_bufvec, buf) +
-        part.segments.size() * sizeof(fuse_buf);
-    auto storage = std::make_unique<std::byte[]>(alloc_size);
-    memset(storage.get(), 0, alloc_size);
-    auto* bufv = reinterpret_cast<fuse_bufvec*>(storage.get());
-    bufv->count = part.segments.size();
-    auto* bufs = reinterpret_cast<fuse_buf*>(
-        storage.get() + offsetof(fuse_bufvec, buf));
-    for (size_t i = 0; i < part.segments.size(); ++i) {
-      bufs[i].size  = part.segments[i].bytes;
-      bufs[i].flags = fuse_buf_flags(
-          FUSE_BUF_IS_FD | FUSE_BUF_FD_RETRY);
-      bufs[i].fd    = part.segments[i].pipe.read_fd();
-    }
-
-    std::lock_guard guard(state.session_mutex);
-    if (state.session == nullptr) {
-      return false;
-    }
-    const int result = fuse_lowlevel_notify_store(
-        state.session, handle.inode, off_t(offset), bufv,
-        FUSE_BUF_SPLICE_MOVE);
-    if (result == 0) {
-      return true;
-    }
-    error = -result;
-  } catch (const std::bad_alloc&) {
-    error = ENOMEM;
-  } catch (...) {
-    error = EIO;
-  }
-
-  if (!state.page_cache_store_warned.exchange(
-          true, std::memory_order_relaxed)) {
-    fprintf(stderr,
-            "warning: unable to retain uploaded data in page cache: "
-            "path=%s offset=%" PRIu64 " bytes=%" PRIu64 ": %s\n",
-            handle.object_path.c_str(), offset, part.bytes,
-            strerror(error));
-  }
-  return false;
-}
-
-void remember_partial_write_pages(OpenHandle& handle, uint64_t start,
-                                  uint64_t end, size_t page_size) {
-  const auto append = [&](uint64_t offset) {
-    const uint64_t page_end = offset > UINT64_MAX - page_size
-                                  ? UINT64_MAX
-                                  : offset + page_size;
-    if (!handle.partial_write_pages.empty() &&
-        offset <= handle.partial_write_pages.back().second) {
-      handle.partial_write_pages.back().second = std::max(
-          handle.partial_write_pages.back().second, page_end);
-    } else {
-      handle.partial_write_pages.emplace_back(offset, page_end);
-    }
-  };
-  if (start % page_size != 0) {
-    append(start - start % page_size);
-  }
-  if (end % page_size != 0) {
-    append(end - end % page_size);
-  }
-}
-
-bool store_cached_partial_pages(State& state,
-                                const OpenHandle& handle) noexcept {
-  const uint64_t maximum_chunk = state.config.part_size;
-  int error = 0;
-  try {
-    for (const auto& [range_start, range_end] :
-         handle.partial_write_pages) {
-      uint64_t offset = range_start;
-      const uint64_t end = std::min<uint64_t>(
-          range_end, handle.stream_offset);
-      while (offset < end) {
-        const size_t length = size_t(std::min<uint64_t>(
-            end - offset, maximum_chunk));
-        fuse_bufvec buffers{
-            .count = 1,
-            .idx   = 0,
-            .off   = 0,
-            .buf   = {{
-                .size     = length,
-                .flags    = fuse_buf_flags(0),
-                .mem      = nullptr,
-                .fd       = -1,
-                .pos      = 0,
-                .mem_size = 0,
-            }},
-        };
-        buffers.buf[0].flags = fuse_buf_flags(
-            FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
-        buffers.buf[0].fd  = handle.cache_entry->data_fd();
-        buffers.buf[0].pos = off_t(offset);
-        {
-          std::lock_guard guard(state.session_mutex);
-          if (state.session == nullptr) {
-            throw std::system_error(
-                ENOTCONN, std::generic_category(), "FUSE_NOTIFY_STORE");
-          }
-          const int result = fuse_lowlevel_notify_store(
-              state.session, handle.inode, off_t(offset), &buffers,
-              FUSE_BUF_SPLICE_MOVE);
-          if (result != 0) {
-            error = -result;
-            throw std::system_error(
-                error, std::generic_category(), "FUSE_NOTIFY_STORE");
-          }
-        }
-        offset += length;
-      }
-    }
-    return true;
-  } catch (const std::bad_alloc&) {
-    error = ENOMEM;
-  } catch (const std::system_error& exception) {
-    error = exception.code().value();
-  } catch (...) {
-    error = EIO;
-  }
-  if (!state.page_cache_store_warned.exchange(
-          true, std::memory_order_relaxed)) {
-    fprintf(stderr,
-            "warning: unable to retain partial cached writes in page cache: "
-            "path=%s: %s\n",
-            handle.object_path.c_str(), strerror(error));
-  }
-  return false;
-}
-
 void ensure_multipart(State& state, OpenHandle& handle) {
   {
     std::unique_lock guard(handle.mutex);
@@ -6686,7 +6495,6 @@ void upload_part_job(State& state, OpenHandle& handle,
   uint64_t checksum_value  = 0;
   const uint64_t part_size = part->bytes;
   int error_code           = 0;
-  bool cache_store_failed  = false;
   try {
     {
       std::lock_guard guard(handle.mutex);
@@ -6703,9 +6511,6 @@ void upload_part_job(State& state, OpenHandle& handle,
     etag = upload_part(state, handle, *part);
     checksum       = part->checksum.base64;
     checksum_value = part->checksum.integer;
-    cache_store_failed = !store_page_cache(
-        state, handle, *part,
-        uint64_t(part_number - 1) * state.config.part_size);
   } catch (const std::system_error& error) {
     error_code = error.code().value();
   } catch (...) {
@@ -6718,7 +6523,6 @@ void upload_part_job(State& state, OpenHandle& handle,
     error_code = ESTALE;
   }
   if (error_code == 0) {
-    handle.page_cache_store_failed |= cache_store_failed;
     handle.part_etags[part_number - 1] = std::move(etag);
     if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
       handle.part_checksums[part_number - 1] = std::move(checksum);
@@ -6769,7 +6573,6 @@ struct AsyncPartUpload {
   bool admitted = false;
   bool creating = false;
   bool waiting = false;
-  bool store_failed = false;
 
   static int error_code(std::exception_ptr error) noexcept {
     if (!error) return 0;
@@ -6792,7 +6595,6 @@ struct AsyncPartUpload {
       if (creating) handle.multipart_starting = false;
       if (handle.unlinked.load(std::memory_order_acquire)) error = ESTALE;
       if (error == 0) {
-        handle.page_cache_store_failed |= store_failed;
         handle.part_etags[number - 1].assign(etag.data(), etag.size());
         if (checksum_multipart_type(state.config.checksum) == "COMPOSITE") {
           handle.part_checksums[number - 1] = std::move(checksum.base64);
@@ -7015,11 +6817,6 @@ struct AsyncPartUpload {
     self->begin();
   }
 
-  static void stored(void* context) noexcept {
-    auto* self = static_cast<AsyncPartUpload*>(context);
-    self->finish(error_code(self->worker_error));
-  }
-
   static void received(void* context, Response&& response,
                        std::exception_ptr error) noexcept {
     auto* self = static_cast<AsyncPartUpload*>(context);
@@ -7071,11 +6868,7 @@ struct AsyncPartUpload {
         throw std::runtime_error("UploadPart response omitted ETag");
       }
       self->etag.assign(etag->second.data(), etag->second.size());
-      if (!self->part) { self->finish(0); return; }
-      self->local(stored, [self] {
-        self->store_failed = !store_page_cache(
-            self->state, self->handle, *self->part, self->offset);
-      });
+      self->finish(0);
     } catch (...) {
       if (self->creating) {
         fprintf(stderr, "error: CreateMultipartUpload outcome unknown; orphan cleanup may be required: %s\n",
@@ -7487,9 +7280,6 @@ void seal_write(State& state, OpenHandle& handle) {
           release_part_budget(state);
         }
         throw;
-      }
-      if (part && !store_page_cache(state, handle, *part, 0)) {
-        handle.page_cache_store_failed = true;
       }
       part.reset();
       if (reserved) {
@@ -9544,7 +9334,7 @@ struct AsyncOpen {
   std::optional<InodeWriteState> write_started;
   bool keep_cache = false;
   bool generation_conflict = false;
-  bool write_prefetch_drained = false;
+  bool write_generation_started = false;
   bool cache_initialized = false;
   bool cache_retry = false;
   fuse_ino_t created_parent = 0;
@@ -9716,7 +9506,7 @@ struct AsyncOpen {
       fuse_reply_err(task->request, EBUSY);
     } else {
       try {
-        task->write_prefetch_drained = task->handle->writable;
+        task->write_generation_started = task->handle->writable;
         if (!task->finish()) task.release();
       } catch (...) { reply_callback_error(task->request); }
     }
@@ -9725,21 +9515,10 @@ struct AsyncOpen {
   void invalidate_conflict() {
     // A local notification can wait for locked folios whose READ still needs
     // a storage worker. Await its io-wq completion without occupying that pool.
-    if (!async_page_cache_fence(state, reactor, inode, 0, 0, invalidated, this)) {
+    if (!async_invalidate_page_cache(reactor, inode, 0, 0, invalidated, this)) {
       throw std::system_error(errno, std::generic_category(),
                               "submit open generation invalidation");
     }
-  }
-
-  static void write_drained(void* context, int result) noexcept {
-    std::unique_ptr<AsyncOpen> task(static_cast<AsyncOpen*>(context));
-    try {
-      if (result != 0 && result != -ENOENT) {
-        throw std::system_error(-result, std::generic_category(), "drain prefetch before write open");
-      }
-      task->write_prefetch_drained = true;
-      if (!task->finish()) task.release();
-    } catch (...) { reply_callback_error(task->request); }
   }
 
   static void retired(void* context, std::exception_ptr error) noexcept {
@@ -9804,10 +9583,10 @@ struct AsyncOpen {
       throw std::system_error(EOPNOTSUPP, std::generic_category(),
                               "existing non-empty write open requires O_TRUNC");
     }
-    if (writable && handle->size != 0 && !write_prefetch_drained) {
+    if (writable && handle->size != 0 && !write_generation_started) {
       {
-        // A closed reader's STORE can outlive its handle. Close admission by
-        // advancing the epoch, then drain old STORE before exposing O_TRUNC.
+        // O_TRUNC starts a new generation; existing cache pages belong to
+        // the old object until normal kernel truncation removes them.
         InodeMetadataGuard guard(*handle->item);
         constexpr uint64_t refreshing = 1ULL << 63;
         constexpr uint64_t mask = refreshing - 1;
@@ -9817,12 +9596,7 @@ struct AsyncOpen {
         handle->generation_epoch = epoch;
         handle->item->set_page_cache_valid(false);
       }
-      // O_TRUNC itself discards the old cache. Do not expire attributes with
-      // an extra INVAL notification here; only drain pre-truncation STORE.
-      if (!async_page_cache_fence(state, reactor, inode, 0, 0, write_drained, this, false)) {
-        throw std::system_error(errno, std::generic_category(), "submit write-open fence");
-      }
-      return false;
+      write_generation_started = true;
     }
     if (!cache_initialized && state.local_cache && (writable || !handle->recovery_read)) {
       const CacheIdentity cache_identity{
@@ -9950,9 +9724,6 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
         handle->generation_epoch = epoch;
         handle->item->set_page_cache_valid(false);
       }
-      // Close old publication admission, then drain admitted STOREs before
-      // exposing O_TRUNC. The kernel truncation already removes old pages.
-      std::unique_lock fence(state.prefetch_publication_mutex);
     }
 
     if (!writable && state.local_cache && !handle->recovery_read) {
@@ -10376,19 +10147,15 @@ struct UncachedPrefetch {
   bool complete = false;
   bool checksum_retrying = false;
   bool checksum_bad = false;
-  // The uring anonymous path retains complete blocks for overlapping reads
-  // until budget pressure or close withdraws them.
+  // Uncached readers retain downloaded data for subsequent FUSE requests.
   bool retain_for_reuse = false;
   size_t read_pins = 0;
   bool retire_when_idle = false;
   bool checksum_hold = false;
-  size_t retired_prefix = 0;
-  size_t published_prefix = 0;
   size_t active_replies = 0;
   std::vector<PinnedRead> pinned_reads;
   PrefetchContinuation* reply_drained = nullptr;
   PrefetchContinuation* continuations = nullptr;
-  std::function<void()> legacy_progress;
 
   [[nodiscard]] bool uses_anonymous_storage() const noexcept {
     return storage != nullptr && storage->anonymous_storage != nullptr;
@@ -10400,7 +10167,7 @@ struct UncachedPrefetch {
     std::lock_guard guard(mutex);
     if (!storage || end <= offset || begin >= offset + length) return {};
     const size_t limit = complete || error ? produced : length;
-    size_t first = size_t(std::max(begin, offset + retired_prefix) - offset);
+    size_t first = size_t(std::max(begin, offset) - offset);
     size_t last = size_t(std::min(end, offset + limit) - offset);
     if (first >= last) return {};
     if (storage->anonymous_storage) {
@@ -10423,7 +10190,6 @@ struct UncachedPrefetch {
   bool pin(uint64_t begin, size_t count) {
     std::lock_guard guard(mutex);
     if (begin < offset || count > length || begin - offset > length - count ||
-        (!checksum_retrying && begin < offset + retired_prefix) ||
         (!storage && !checksum_retrying)) return false;
     const size_t relative = size_t(begin - offset);
     // Overlapping requests share the same completed or in-flight range.
@@ -10486,32 +10252,21 @@ struct UncachedPrefetch {
           }
         }
       }
-      const bool published_all = !checksum_hold && published_prefix == length;
-      if ((retire_when_idle || published_all) && complete &&
+      if (retire_when_idle && complete &&
           !checksum_retrying && read_pins == 0) {
-        // The last STORE needs only final truncation. Punching its suffix
-        // immediately before truncating repeats the retirement syscall path.
         released = std::move(storage);
       } else if (storage && !checksum_hold && !checksum_retrying) {
         if (storage->anonymous_storage != nullptr) {
           // Completed blocks stay useful regardless of which subranges have
           // been replied. Only pressure (or close) withdraws their storage.
           reclaimable = reclaimable_block() != SIZE_MAX;
-        } else if (read_pins == 0 && !retain_for_reuse) {
-          const size_t page = size_t(::sysconf(_SC_PAGESIZE));
-          const size_t end = std::min(published_prefix, produced) / page * page;
-          if (end > retired_prefix) {
-            if (storage->discard(retired_prefix, end - retired_prefix)) {
-              retired_prefix = end;
-            }
-          }
         }
       }
     }
     if (reclaimable && budget != nullptr) budget->notify_reclaimable();
   }
 
-  void publication_finished() noexcept {
+  void release_when_idle() noexcept {
     {
       std::lock_guard guard(mutex);
       retire_when_idle = true;
@@ -10606,7 +10361,6 @@ struct UncachedPrefetch {
       }
       prefetch_.notify_waiters();
       if (anonymous) prefetch_.retire();
-      if (prefetch_.legacy_progress) prefetch_.legacy_progress();
     }
 
     UncachedPrefetch& prefetch_;
@@ -10782,7 +10536,7 @@ std::shared_ptr<UncachedPrefetch> allocate_prefetch(
   auto p = std::make_shared<UncachedPrefetch>(state.read_ahead_pool,
       std::move(acquired), offset, length);
   p->budget = &state.prefetch_budget;
-  p->retain_for_reuse = anonymous;
+  p->retain_for_reuse = !state.local_cache;
   auto* item = static_cast<InodeFile*>(&inode_item(state, inode));
   retain_inode_count(item->open_count, "pin prefetch inode identity");
   p->item_pin = std::shared_ptr<InodeFile>(item, [](InodeFile* value) {
@@ -10813,95 +10567,6 @@ bool wait_for_prefetch_complete(UncachedPrefetch& prefetch) {
   return prefetch.complete && prefetch.error == nullptr;
 }
 
-class LegacyPrefetchPublisher : public std::enable_shared_from_this<LegacyPrefetchPublisher> {
- public:
-  LegacyPrefetchPublisher(State& s, const OpenHandle& h,
-                          std::shared_ptr<UncachedPrefetch> p, size_t demand)
-      : state_(s), prefetch_(std::move(p)), inode_(h.inode), epoch_(h.generation_epoch), next_(demand) {
-    item_ = prefetch_->item_pin;
-    prefetch_->published_prefix = demand;
-  }
-  void progress() noexcept {
-    try {
-      std::lock_guard guard(mutex_);
-      if (busy_ || failed_) return;
-      {
-        std::lock_guard lock(prefetch_->mutex);
-        size_t available = prefetch_->produced / state_.page_size * state_.page_size;
-        if (prefetch_->complete) available = prefetch_->produced;
-        if (available <= next_ && !prefetch_->complete) return;
-      }
-      busy_ = true;
-      std::lock_guard queue_guard(state_.legacy_publication_mutex);
-      if (!state_.publications) throw std::system_error(ENOTCONN, std::generic_category());
-      state_.publications->submit(this, [self = shared_from_this()] { self->run(); });
-    } catch (...) {
-      fail(EIO);
-    }
-  }
- private:
-  void fail(int error) noexcept {
-    { std::lock_guard guard(mutex_); failed_ = true; busy_ = false; }
-    fprintf(stderr, "warning: legacy prefetch STORE failed: inode=%llu: %s\n",
-            (unsigned long long)inode_, strerror(error));
-    prefetch_->publication_finished();
-  }
-  void run() noexcept {
-    try {
-      size_t length;
-      bool complete;
-      std::shared_ptr<ReadAheadStoragePool::Storage> storage;
-      {
-        std::lock_guard guard(prefetch_->mutex);
-        complete = prefetch_->complete;
-        size_t available = prefetch_->produced / state_.page_size * state_.page_size;
-        if (complete) available = prefetch_->produced;
-        length = std::min(available - std::min(next_, available), kPreferredIoSize);
-        storage = prefetch_->storage;
-      }
-      if (length != 0) {
-        std::shared_lock fence(state_.prefetch_publication_mutex);
-        if (prefetch_->cancelled.load(std::memory_order_acquire) ||
-            (item_->generation_epoch.load(std::memory_order_acquire) & ((1ULL << 63) - 1)) != epoch_) {
-          fail(ESTALE);
-          return;
-        }
-        fuse_session* session;
-        { std::lock_guard guard(state_.session_mutex); session = state_.session; }
-        if (!session) { fail(ENOTCONN); return; }
-        fuse_bufvec buffers{};
-        buffers.count = 1;
-        buffers.buf[0].size = length;
-        buffers.buf[0].flags = fuse_buf_flags(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
-        buffers.buf[0].fd = storage->fd.get();
-        buffers.buf[0].pos = off_t(next_);
-        // Dedicated notification worker: never occupy the download/checksum
-        // workers, nor keep session/inode locks while STORE waits on a READ.
-        const int result = fuse_lowlevel_notify_store(session, inode_,
-            off_t(prefetch_->offset + next_), &buffers, FUSE_BUF_SPLICE_MOVE);
-        if (result != 0) { fail(-result); return; }
-        next_ += length;
-        { std::lock_guard guard(prefetch_->mutex); prefetch_->published_prefix = next_; }
-      }
-      storage.reset();
-      prefetch_->retire();
-      { std::lock_guard guard(mutex_); busy_ = false; }
-      if (complete && (next_ >= prefetch_->length || length == 0)) {
-        prefetch_->publication_finished();
-      } else progress();
-    } catch (...) { fail(EIO); }
-  }
-  State& state_;
-  std::shared_ptr<UncachedPrefetch> prefetch_;
-  std::shared_ptr<InodeFile> item_;
-  fuse_ino_t inode_;
-  uint64_t epoch_;
-  size_t next_;
-  std::mutex mutex_;
-  bool busy_ = false;
-  bool failed_ = false;
-};
-
 struct PrefetchTailTask {
   std::shared_ptr<UncachedPrefetch> prefetch;
   bool collect_stats;
@@ -10909,7 +10574,6 @@ struct PrefetchTailTask {
   std::atomic<uint64_t>* remote_read_bytes;
   HttpPool::Lease lease;
   std::unique_ptr<RangeDownload> download;
-  std::shared_ptr<LegacyPrefetchPublisher> publisher;
 };
 
 void run_prefetch_tail(void* context) noexcept {
@@ -10936,8 +10600,7 @@ void run_prefetch_tail(void* context) noexcept {
     task->prefetch->complete = true;
   }
   task->prefetch->notify_waiters();
-  if (task->publisher) task->publisher->progress();
-  else task->prefetch->publication_finished();
+  if (task->prefetch->error) task->prefetch->release_when_idle();
 }
 
 class UncachedFileReader final : public FileReader {
@@ -12257,7 +11920,6 @@ bool UncachedFileReader::try_prefetch(
     std::shared_ptr<UncachedPrefetch> value;
     ~ReadPin() { if (value) value->retire(true); }
   } pin;
-  std::shared_ptr<LegacyPrefetchPublisher> publisher;
   std::unique_ptr<RangeDownload> started_download;
   HttpPool::Lease started_lease;
   if (prefetch_ && contains(*prefetch_)) {
@@ -12345,12 +12007,6 @@ bool UncachedFileReader::try_prefetch(
     pin.value = selected;
     const AuthorizedRangeRequest range = make_range_request(
         state, handle, worker, offset, selected->length);
-    if (offset % state.page_size == 0 && wanted % state.page_size == 0) {
-      publisher = std::make_shared<LegacyPrefetchPublisher>(state, handle, selected, wanted);
-      selected->legacy_progress = [weak = std::weak_ptr(publisher)] {
-        if (auto value = weak.lock()) value->progress();
-      };
-    }
     prefetch_ = selected;
     reader_guard.unlock();
     try {
@@ -12412,7 +12068,7 @@ bool UncachedFileReader::try_prefetch(
         selected,
         state.config.stats_interval_seconds != 0,
         &state.remote_reads, &state.remote_read_bytes,
-        std::move(started_lease), std::move(started_download), std::move(publisher)});
+        std::move(started_lease), std::move(started_download)});
     try {
       PrefetchTailTask* submitted = tail.release();
       try {
@@ -12781,7 +12437,7 @@ struct AsyncRangeTransfer {
     }
     task->prefetch->notify_waiters();
     if (error || !task->prefetch->retain_for_reuse) {
-      task->prefetch->publication_finished();
+      task->prefetch->release_when_idle();
     }
     task->prefetch->retire();
   }
@@ -12819,8 +12475,6 @@ struct AsyncRangeTransfer {
       std::lock_guard guard(task->prefetch->mutex);
       if (valid && task->retry_storage) {
         task->prefetch->storage = task->retry_storage;
-        task->prefetch->published_prefix = 0;
-        task->prefetch->retired_prefix = 0;
       }
       task->prefetch->complete = true;
       task->prefetch->checksum_retrying = false;
@@ -12829,7 +12483,7 @@ struct AsyncRangeTransfer {
     }
     task->prefetch->notify_waiters();
     if (!valid || !task->prefetch->retain_for_reuse) {
-      task->prefetch->publication_finished();
+      task->prefetch->release_when_idle();
     }
     task->prefetch->retire();
   }
@@ -12862,8 +12516,8 @@ struct AsyncRangeTransfer {
   void start_retry() noexcept {
     try {
       {
-        // Unverified units are never STOREd. Pending READs already wait on
-        // checksum_retrying; only actual replies can still use the old bytes.
+        // Pending READs wait on checksum_retrying; only actual replies can
+        // still use the old bytes.
         std::lock_guard guard(prefetch->mutex);
         if (prefetch->active_replies != 0) {
           retry_continuation.reactor = &reactor;
@@ -12875,8 +12529,8 @@ struct AsyncRangeTransfer {
         if (!retry_fence_started) {
           retry_fence_started = true;
           auto context = std::make_unique<AsyncRangeTransfer*>(this);
-          if (!async_page_cache_fence(
-                  state, reactor, checksums->handle.inode,
+          if (!async_invalidate_page_cache(
+                  reactor, checksums->handle.inode,
                   off_t(prefetch->offset), off_t(prefetch->length),
                   retry_cache_invalidated, context.get())) {
             throw std::system_error(errno, std::generic_category(),
@@ -13032,7 +12686,7 @@ struct AsyncReadTask {
           segment.prefetch->error = error;
           segment.prefetch->complete = true;
         }
-        segment.prefetch->publication_finished();
+        segment.prefetch->release_when_idle();
         segment.prefetch->notify_waiters();
       }
       try { std::rethrow_exception(error); }
@@ -13045,7 +12699,7 @@ struct AsyncReadTask {
       prefetch->error = error;
       prefetch->complete = true;
     }
-    prefetch->publication_finished();
+    prefetch->release_when_idle();
     prefetch->notify_waiters();
     try { std::rethrow_exception(error); }
     catch (...) { reply_callback_error(request); }
@@ -14241,8 +13895,6 @@ void CachedFileWriter::write(State& state, OpenHandle& handle,
       write_fuse_buffers_to_cache(
           state, *input, handle.cache_write_pipe,
           handle.cache_entry->data_fd(), start, length);
-      remember_partial_write_pages(
-          handle, start, end, handle.cache_entry->page_size());
       handle.cache_entry->publish_dirty(start, length, end);
       handle.stream_offset = end;
       handle.size          = end;
@@ -14368,8 +14020,6 @@ void CachedFileWriter::flush(State& state, OpenHandle& handle) {
         !handle.multipart_required) {
       guard.unlock();
       const Response response = put_cached_object(state, handle);
-      handle.page_cache_store_failed |=
-          !store_cached_partial_pages(state, handle);
       update_written_metadata(state, handle, response);
       commit_cached_write(handle);
       guard.lock();
@@ -14392,13 +14042,6 @@ void CachedFileWriter::flush(State& state, OpenHandle& handle) {
       }
       guard.unlock();
       complete_multipart(state, handle);
-      // The writer remains registered until this flush finishes, so no new
-      // opener can observe metadata before partial pages are restored.
-      handle.page_cache_store_failed |=
-          !store_cached_partial_pages(state, handle);
-      if (handle.page_cache_store_failed) {
-        handle.item->set_page_cache_valid(false);
-      }
       commit_cached_write(handle);
       guard.lock();
     }
@@ -15474,8 +15117,6 @@ struct AsyncCachedWrite final : AsyncWriteRequest {
     try {
       {
         std::lock_guard guard(self->handle.mutex);
-        remember_partial_write_pages(self->handle, uint64_t(self->offset),
-            self->end, self->handle.cache_entry->page_size());
         self->handle.stream_offset = self->end;
         self->handle.size = self->end;
         submit_ready_cached_parts(self->state, self->handle, false, &self->active);
@@ -15978,11 +15619,6 @@ struct AsyncFlushRequest {
       state.uploads->submit(&handle, [this] {
         try {
           IoExecutorScope local_only(nullptr, 0);
-          if (handle.cache_entry) {
-            handle.page_cache_store_failed |= !store_cached_partial_pages(state, handle);
-          } else if (part) {
-            handle.page_cache_store_failed |= !store_page_cache(state, handle, *part, 0);
-          }
           publish_written_metadata(handle, committed, metadata ? &*metadata : nullptr,
                                     sso_view(body_etag));
           if (handle.cache_entry) commit_cached_write(handle);

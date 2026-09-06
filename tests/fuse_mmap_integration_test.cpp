@@ -1739,42 +1739,6 @@ void wait_until_mounted(std::string_view file_path, pid_t process) {
   throw std::runtime_error("timed out waiting for FUSE mount");
 }
 
-bool prefetch_storage_empty(pid_t process, size_t* resident = nullptr) {
-  if (resident) *resident = 0;
-  char path[128];
-  snprintf(path, sizeof(path), "/proc/%ld/fd", long(process));
-  DIR* directory = ::opendir(path);
-  if (!directory) fail_errno("opendir daemon fds");
-  struct CloseDir {
-    DIR* directory;
-    ~CloseDir() { ::closedir(directory); }
-  } close{directory};
-  bool found = false;
-  bool empty = true;
-  while (dirent* entry = ::readdir(directory)) {
-    if (entry->d_name[0] == '.') continue;
-    char fd_path[512];
-    snprintf(fd_path, sizeof(fd_path), "%s/%s", path, entry->d_name);
-    char target[512];
-    const ssize_t n = ::readlink(fd_path, target, sizeof(target) - 1);
-    if (n < 0) {
-      if (errno == ENOENT) continue;
-      fail_errno("readlink daemon fd");
-    }
-    target[n] = 0;
-    if (strstr(target, "memfd:ngs3fs-read-ahead") == nullptr) continue;
-    struct stat st {};
-    if (::stat(fd_path, &st) != 0) {
-      if (errno == ENOENT) continue;
-      fail_errno("stat daemon prefetch fd");
-    }
-    found = true;
-    if (resident) *resident += size_t(st.st_blocks) * 512;
-    empty &= st.st_size == 0 && st.st_blocks == 0;
-  }
-  return found && empty;
-}
-
 int main(int argc, char** argv) {
   if (argc < 2 || argc > 6) {
     std::cerr << "usage: fuse_mmap_integration_test NGS3FS "
@@ -1813,6 +1777,8 @@ int main(int argc, char** argv) {
     const bool pressure_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-pressure";
     const bool pool_limited = argc >= 4 && std::string_view(argv[3]) == "prefetch-pool-limited";
     const bool pool_pressure = argc >= 4 && std::string_view(argv[3]) == "prefetch-pool-pressure";
+    const bool legacy_window_test = engine == "legacy" && argc >= 4 &&
+        std::string_view(argv[3]) == "prefetch";
     const bool pool_prefetch = engine == "uring" && argc >= 4 &&
         (pool_limited || std::string_view(argv[3]) == "prefetch-pool" ||
          std::string_view(argv[3]) == "prefetch" || shutdown_prefetch);
@@ -1988,11 +1954,17 @@ int main(int argc, char** argv) {
       }
     }
     const std::string checksum_option(checksum_option_name(checksum));
+    // Legacy policy checks retain four 1 MiB random windows. The default
+    // file-size cap also reserves demand space and intentionally shrinks the
+    // fourth window; 8 MiB covers this 4 MiB working set plus that reserve.
+    // Dedicated memory-pressure modes continue to use their smaller caps.
+    const char* memory_budget = pool_pressure ? "8MiB" :
+        pool_prefetch ? "128MiB" : legacy_window_test ? "8MiB" : nullptr;
     const pid_t process = start_daemon(
         argv[1], mountpoint, listener.port, checksum_option, cache_dir,
         engine, reactors, !prefetch_mode || verified_prefetch || budget_prefetch || partial_prefetch,
         verified_prefetch, budget_prefetch, pool_limited ? "16777216" : nullptr,
-        pool_pressure ? "8MiB" : (pool_prefetch ? "128MiB" : nullptr));
+        memory_budget);
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
@@ -2676,7 +2648,8 @@ int main(int argc, char** argv) {
             sent = shared.active_gets == 0;
           }
           // A sent response is not a completed client window: asynchronous
-          // checksum and STORE can still be pending. The next disjoint READ
+          // checksum and client-side receive completion can still be pending.
+          // The next disjoint READ
           // legitimately uses demand-only I/O until that window completes.
           // The exact-window assertions below require a quiescent client too.
           if (sent) {
@@ -2699,7 +2672,8 @@ int main(int argc, char** argv) {
         }
         throw std::runtime_error("timed out waiting for read-ahead GET");
       };
-      // Legacy staging retains its existing publication/overlap regressions.
+      // Legacy staging must satisfy actual requests without proactively
+      // publishing unrelated prefetch pages into the FUSE page cache.
       // Uring reaches the receive-pool contract branch above instead.
       if (engine == "legacy" && !verified_prefetch) {
         std::shared_ptr<SpecialObject> object;
@@ -2716,14 +2690,14 @@ int main(int argc, char** argv) {
         const std::string path = mountpoint + "/read-ahead-store.bin";
         UniqueFd first(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
         UniqueFd second(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
-        require(first && second, "open progressive STORE object");
+        require(first && second, "open legacy retained-prefetch object");
         require(::posix_fadvise(first.get(), 0, 0, POSIX_FADV_RANDOM) == 0 &&
                     ::posix_fadvise(second.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
-                "disable kernel read-ahead for STORE evidence");
+                "disable kernel read-ahead for no-STORE evidence");
         const size_t page = size_t(::sysconf(_SC_PAGESIZE));
         constexpr size_t probe = 384U * 1024U;
         void* mapping = ::mmap(nullptr, page, PROT_READ, MAP_SHARED, first.get(), off_t(probe));
-        require(mapping != MAP_FAILED, "map unfaulted STORE probe page");
+        require(mapping != MAP_FAILED, "map unfaulted no-STORE probe page");
         struct Unmap {
           void* mapping;
           size_t length;
@@ -2731,35 +2705,34 @@ int main(int argc, char** argv) {
         } unmap{mapping, page};
         unsigned char resident = 0;
         require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
-                "STORE probe page was already resident before any READ");
+                "no-STORE probe page was already resident before any READ");
         std::array<std::byte, 64U * 1024U> first_bytes{};
         pread_all(first.get(), first_bytes, 0);
         require(std::equal(first_bytes.begin(), first_bytes.end(), read_ahead.begin()),
-                "progressive STORE initial READ differs");
-        bool published = false;
+                "legacy retained-prefetch initial READ differs");
+        bool paused = false;
         for (unsigned i = 0; i < 2000; ++i) {
-          require(::mincore(mapping, page, &resident) == 0, "mincore STORE probe");
+          require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
+                  "legacy in-flight prefetch proactively STOREd an unrelated page");
           if (object->tail_paused.load(std::memory_order_acquire)) {
-            published = true;
+            paused = true;
             break;
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        require(published && !object->resume_tail.load(std::memory_order_acquire),
+        require(paused && !object->resume_tail.load(std::memory_order_acquire),
                 "prefetch did not reach the paused-tail observation point");
-        if (verified_prefetch || partial_prefetch) {
-          for (unsigned i = 0; i < 20; ++i) {
-            require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
-                    "unverified prefetched data was proactively STOREd");
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-          }
+        for (unsigned i = 0; i < 20; ++i) {
+          require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
+                  "legacy paused prefetch proactively STOREd an unrelated page");
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         {
           std::lock_guard guard(shared.mutex);
-          require(shared.active_gets > 0, "paused GET already completed before STORE evidence");
+          require(shared.active_gets > 0, "paused GET already completed before no-STORE evidence");
         }
         if (shutdown_prefetch) {
-          // Exit with a live download and a published prefix, not after the
+          // Exit with a live download and a replied demand prefix, not after the
           // staging has already retired. Let the server resume independently.
           require(::munmap(mapping, page) == 0, "unmap shutdown probe");
           unmap.mapping = MAP_FAILED;
@@ -2775,7 +2748,7 @@ int main(int argc, char** argv) {
           server.request_stop();
           server.join();
           require(::rmdir(mountpoint.c_str()) == 0, "remove prefetch shutdown mountpoint");
-          fprintf(stderr, "shutdown with active prefetch and published prefix: passed\n");
+          fprintf(stderr, "shutdown with active prefetch and demand-only replies: passed\n");
           return 0;
         }
         if (partial_prefetch) {
@@ -2783,14 +2756,17 @@ int main(int argc, char** argv) {
           wait_for_gets();
           require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
                   "unverifiable partial range was STOREd after download completion");
-          require(prefetch_storage_empty(process), "unverifiable range retained staging");
           {
             std::lock_guard guard(shared.mutex);
-            require(object->get_requests == 1, "unexpected GET before demand refetch");
+            require(object->get_requests == 1, "unexpected GET before demand reuse");
           }
           pread_all(second.get(), first_bytes, probe);
           require(std::equal(first_bytes.begin(), first_bytes.end(), read_ahead.begin() + probe),
-                  "unverifiable range demand refetch differs");
+                  "unverifiable range demand reuse differs");
+          {
+            std::lock_guard guard(shared.mutex);
+            require(object->get_requests == 1, "unverifiable retained range was fetched again");
+          }
           require(::munmap(mapping, page) == 0, "unmap unverifiable probe");
           unmap.mapping = MAP_FAILED;
           first.reset();
@@ -2800,7 +2776,7 @@ int main(int argc, char** argv) {
           server.request_stop();
           server.join();
           require(::rmdir(mountpoint.c_str()) == 0, "remove unverifiable mountpoint");
-          fprintf(stderr, "unverifiable partial range withheld from STORE: passed\n");
+          fprintf(stderr, "unverifiable partial range: no STORE and actual READ reuse passed\n");
           return 0;
         }
         std::array<std::exception_ptr, 8> errors{};
@@ -2822,7 +2798,7 @@ int main(int argc, char** argv) {
               std::vector<std::byte> bytes(256U * 1024U);
               pread_all(n % 2 ? first.get() : second.get(), bytes, offset);
               require(std::equal(bytes.begin(), bytes.end(), read_ahead.begin() + offset),
-                      "overlapping STORE/READ bytes differ");
+                      "overlapping retained-prefetch READ bytes differ");
             } catch (...) { errors[n] = std::current_exception(); }
           });
         }
@@ -2858,6 +2834,11 @@ int main(int argc, char** argv) {
           require(corrected, "checksum retry did not replace corrupt early READ data");
         }
         wait_for_gets();
+        for (unsigned i = 0; i < 20; ++i) {
+          require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
+                  "completed legacy prefetch proactively STOREd an unrelated page");
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
         pread_all(second.get(), first_bytes, probe);
         require(std::equal(first_bytes.begin(), first_bytes.end(), read_ahead.begin() + probe),
                 "retained prefetch bytes differ after completion");
@@ -2881,7 +2862,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "%s and overlapping cross-handle READ: passed\n",
                 verified_clean ? "checksum-verified retained prefetch" :
                 verified_prefetch ? "checksum-retry retained prefetch" :
-                "retained uncached prefetch without eager STORE");
+                "legacy uncached prefetch without any proactive STORE");
       }
       const std::string path = mountpoint + "/read-ahead.bin";
       if (verified_prefetch) {
@@ -3624,7 +3605,8 @@ int main(int argc, char** argv) {
       // mincore observes an evictable kernel cache, not a program invariant.
       // Sanitizer instrumentation can delay this check or add enough memory
       // pressure for ordinary reclaim to make it nondeterministic;
-      // byte/no-GET validation below remains active in every build.
+      // byte validation below remains active in every build. First/last
+      // partial pages need not be populated now that write-side STORE is gone.
       const long page_size = ::sysconf(_SC_PAGESIZE);
       require(page_size > 0, "sysconf(_SC_PAGESIZE) failed");
       const size_t mapped_size =
@@ -3644,12 +3626,27 @@ int main(int argc, char** argv) {
         errno = error;
         fail_errno("mincore locally written object");
       }
-      require(std::all_of(
-                  residency.begin(), residency.end(),
-                  [](unsigned char page) { return (page & 1U) != 0; }),
-              "partial cached writes were not retained in page cache");
+      if (residency.size() > 2) {
+        require(std::all_of(
+                    residency.begin() + 1, residency.end() - 1,
+                    [](unsigned char page) { return (page & 1U) != 0; }),
+                "fully written cached pages were not retained in page cache");
+      }
       ::munmap(resident_mapping, small_expected.size());
 #endif
+    }
+    const long native_page_size = ::sysconf(_SC_PAGESIZE);
+    require(native_page_size > 0, "invalid page size for written-page retention check");
+    const size_t write_page_size = size_t(native_page_size);
+    std::vector<std::byte> retained_write_page(write_page_size);
+    if (2 * write_page_size <= small_expected.size()) {
+      pread_all(visible_after_flush.get(), retained_write_page, write_page_size);
+      require(std::equal(retained_write_page.begin(), retained_write_page.end(),
+                         small_expected.begin() + write_page_size),
+              "fully written page differs after close-to-open");
+      std::lock_guard state_guard(shared.mutex);
+      require(shared.get_requests == gets_after_small_write,
+              "read-open discarded a fully written page already in page cache");
     }
     std::vector<std::byte> visible_bytes(small_expected.size());
     pread_all(visible_after_flush.get(), visible_bytes, 0);
@@ -3658,16 +3655,15 @@ int main(int argc, char** argv) {
     visible_after_flush.reset();
     {
       std::lock_guard state_guard(shared.mutex);
-      if (shared.get_requests != gets_after_small_write) {
-        for (size_t i = size_t(gets_after_small_write); i < shared.get_paths.size(); ++i) {
-          fprintf(stderr, "unexpected post-write GET: %s\n", shared.get_paths[i].c_str());
-        }
+      // No proactive STORE fills partially written boundary pages. An uncached
+      // READ may fetch them from S3; a local-cache READ can use its committed
+      // data file. Contents and flush visibility are required for both paths.
+      if (!cache_dir.empty()) {
+        require(shared.get_requests == gets_after_small_write,
+                "local cache refetched the object it just committed");
+        require(shared.checksum_mode_requests == checksum_mode_after_small_write,
+                "local-cache read unexpectedly requested checksum mode");
       }
-      require(shared.get_requests == gets_after_small_write,
-              "read-open discarded page cache left by the local writer");
-      require(shared.checksum_mode_requests ==
-                  checksum_mode_after_small_write,
-              "cached read unexpectedly requested checksum mode");
     }
     if (::fsync(writer.get()) != 0) {
       fail_errno("fsync sealed mounted object");
@@ -3814,6 +3810,15 @@ int main(int argc, char** argv) {
     require(static_cast<uint64_t>(status.st_size) ==
                 final_expected.size(),
             "close-to-open did not publish the new object size");
+    pread_all(reopened.get(), retained_write_page, write_page_size);
+    require(std::equal(retained_write_page.begin(), retained_write_page.end(),
+                       final_expected.begin() + write_page_size),
+            "fully written multipart page differs after close-to-open");
+    {
+      std::lock_guard state_guard(shared.mutex);
+      require(shared.get_requests == gets_after_multipart_write,
+              "multipart read-open discarded a fully written page already in page cache");
+    }
     void* updated_mapping =
         ::mmap(nullptr, final_expected.size(), PROT_READ, MAP_PRIVATE,
                reopened.get(), 0);
@@ -3827,10 +3832,10 @@ int main(int argc, char** argv) {
                    final_expected.end());
     ::munmap(updated_mapping, final_expected.size());
     require(updated_equal, "reopened mmap does not contain published bytes");
-    {
+    if (!cache_dir.empty()) {
       std::lock_guard state_guard(shared.mutex);
       require(shared.get_requests == gets_after_multipart_write,
-              "multipart read-open discarded locally written page cache");
+              "local cache refetched the multipart object it just committed");
     }
     const std::string renamed_path = mountpoint + "/renamed.bin";
     if (cache_dir.empty()) {

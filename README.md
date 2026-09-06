@@ -165,12 +165,12 @@ define the new uncached implementation.
   checksum verification on existing paths retains a worker fallback because its
   shared verification state still has blocking waits; the uring engine does
   not yet claim a complete all-FD event loop.
-- After each upload succeeds, `FUSE_NOTIFY_STORE` consumes the retained
-  FD-backed pipe chain into the ordinary kernel page cache, covering partial
-  pages that FUSE write-through mode otherwise discards. Later read opens keep
-  those pages when the object size is unchanged. No userspace data buffer is
-  introduced; the clean pages are never pinned and remain normally
-  reclaimable.
+- No path proactively sends `FUSE_NOTIFY_STORE`: neither legacy/uring read
+  prefetch nor cached/uncached write completion. Existing kernel page-cache
+  data remains normally reclaimable and reusable, but ngs3fs does not refill
+  missing pages after writes. A subsequent miss uses the ordinary read path.
+  Legacy prefetched data stays in its bounded staging storage for actual FUSE
+  reads; there is no background STORE queue competing with those reads.
 - The preferred application transfer size reported through `statfs.f_bsize`
   is fixed at 256 KiB. The allocation-unit field `statfs.f_frsize` remains
   4 KiB.
