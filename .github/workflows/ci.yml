@@ -489,11 +489,18 @@ jobs:
           name: random-read-benchmark-and-flamegraphs
           retention-days: 7
           if-no-files-found: error
+          # Keep memory evidence depth-bounded: ** would scan private cache trees.
           path: |
-            build/benchmarks/**/memory-plan.json
-            build/benchmarks/**/memory-evidence.json
-            build/profiles/**/memory-plan.json
-            build/profiles/**/memory-evidence.json
+            build/benchmarks/github-random-read-*/*/memory-plan.json
+            build/benchmarks/github-random-read-*/*/memory-evidence.json
+            build/benchmarks/github-io-engine-*/*/memory-plan.json
+            build/benchmarks/github-io-engine-*/*/memory-evidence.json
+            build/benchmarks/github-mountpoint-random-read-*/*/memory-plan.json
+            build/benchmarks/github-mountpoint-random-read-*/*/memory-evidence.json
+            build/benchmarks/github-socket-buffer/*/memory-plan.json
+            build/benchmarks/github-socket-buffer/*/memory-evidence.json
+            build/profiles/github-io-engine-*/memory-plan.json
+            build/profiles/github-io-engine-*/memory-evidence.json
             build/benchmarks/github-random-read-*/system.txt
             build/benchmarks/github-random-read-*/samples.csv
             build/benchmarks/github-random-read-*/summary.csv
