@@ -131,8 +131,8 @@ class RangeMemorySink {
 
   [[nodiscard]] virtual std::span<std::byte> writable(size_t maximum) = 0;
   virtual void commit(size_t bytes) = 0;
-  // Choose WAITALL when submitting a speculative receive without waiting
-  // readers. Readers arriving afterward wait for that receive to complete.
+  // Permit WAITALL for the writable payload span. The sink sets its receive
+  // unit independently of FUSE demand; HTTP framing still bounds each receive.
   [[nodiscard]] virtual bool receive_waitall() const noexcept { return false; }
   [[nodiscard]] virtual bool cancelled() const noexcept { return false; }
   virtual void progress(const Response& response, bool complete) = 0;

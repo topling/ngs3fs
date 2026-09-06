@@ -95,7 +95,6 @@ struct MountConfig {
   size_t max_prefetch_window_size   = kDefaultMaxPrefetchWindowSize;
   size_t max_prefetch_memory        = 0;
   size_t max_file_prefetch_memory   = 0;
-  size_t tail_read_ahead            = 64 * 1024;
   unsigned max_uploads              = 4;
   unsigned max_connections          = 8;
   int connect_timeout_ms            = kConnectTimeoutMs;
@@ -722,11 +721,22 @@ struct OpenHandle {
   std::condition_variable condition;
 };
 
+constexpr uint64_t kOpenPublished   = 1ULL << 62;
+constexpr uint64_t kOpenRequestMask = kOpenPublished - 1;
+
+void publish_open_handle(OpenHandle& handle) noexcept {
+  // The kernel carries fh between callbacks, but that handoff is not a C++
+  // publication edge. Publish every initialized field before exposing fh.
+  [[maybe_unused]] const uint64_t previous = handle.request_state.fetch_or(
+      kOpenPublished, std::memory_order_release);
+  assert((previous & kOpenPublished) == 0);
+}
+
 void drop_open_request(OpenHandle& handle) noexcept {
   constexpr uint64_t closing = 1ULL << 63;
   const uint64_t previous = handle.request_state.fetch_sub(
       1, std::memory_order_acq_rel);
-  if (previous == (closing | 1)) {
+  if ((previous & closing) != 0 && (previous & kOpenRequestMask) == 1) {
     // This decrement owns retirement. Neither release nor another guard may
     // delete the handle concurrently; callback publication precedes closing.
     handle.release_ready(handle.release_context);
@@ -762,7 +772,7 @@ class OpenRequestGuard {
         throw std::system_error(EBADF, std::generic_category(),
                                 "closing file handle");
       }
-      if (state == kActiveMask) {
+      if ((state & kActiveMask) == kActiveMask) {
         throw std::system_error(EOVERFLOW, std::generic_category(),
                                 "too many active file requests");
       }
@@ -798,7 +808,7 @@ class OpenRequestGuard {
 
  private:
   static constexpr uint64_t kClosing    = 1ULL << 63;
-  static constexpr uint64_t kActiveMask = kClosing - 1;
+  static constexpr uint64_t kActiveMask = kOpenRequestMask;
   OpenHandle& handle_;
 };
 
@@ -895,13 +905,21 @@ void cache_reclaim_loop(std::stop_token stop, State* state) noexcept;
 void cache_recovery_loop(std::stop_token stop, State* state) noexcept;
 void stats_report_loop(std::stop_token stop, State* state) noexcept;
 
+size_t receive_demand_capacity(size_t maximum_read) {
+  // Worst object offset within a block: one READ can need both edge blocks.
+  return ((maximum_read + kReceiveBlockSize - 2) / kReceiveBlockSize + 1) *
+      kReceiveBlockSize;
+}
+
 size_t prefetch_capacity(const MountConfig& config, size_t page) {
   if (config.max_prefetch_memory) return config.max_prefetch_memory;
   const long pages = ::sysconf(_SC_PHYS_PAGES);
   if (pages <= 0 || uint64_t(pages) > UINT64_MAX / page) {
     throw std::runtime_error("cannot determine physical RAM for prefetch budget");
   }
-  return std::max(config.maximum_read_size,
+  const size_t minimum = config.cache_dir.empty() && !config.tls && config.io_engine != IO_ENGINE_LEGACY
+      ? receive_demand_capacity(config.maximum_read_size) : config.maximum_read_size;
+  return std::max(minimum,
       PrefetchBudget::default_capacity(uint64_t(pages) * page, page));
 }
 
@@ -919,8 +937,8 @@ struct State {
         directory_mtime(wall_time_seconds()),
         page_size(size_t(::sysconf(_SC_PAGESIZE))),
         prefetch_budget(prefetch_capacity(config, page_size),
-                        config.cache_dir.empty() && config.io_engine != IO_ENGINE_LEGACY
-                            ? std::max(config.maximum_read_size, kReceiveBlockSize)
+                        config.cache_dir.empty() && !config.tls && config.io_engine != IO_ENGINE_LEGACY
+                            ? receive_demand_capacity(config.maximum_read_size)
                             : config.maximum_read_size, page_size),
         root_item(std::make_unique<InodeDir>()),
         read_ahead_pool(std::make_shared<ReadAheadStoragePool>(
@@ -933,7 +951,7 @@ struct State {
           cache_reclaim_loop(stop, this);
         }) {
     config.max_prefetch_memory = prefetch_capacity(config, page_size);
-    if (config.cache_dir.empty() && config.io_engine != IO_ENGINE_LEGACY) {
+    if (config.cache_dir.empty() && !config.tls && config.io_engine != IO_ENGINE_LEGACY) {
       read_ahead_pool->preallocate_receive_blocks(config.max_connections);
     }
     root_item->set_parent(root_item.get());
@@ -1027,6 +1045,8 @@ struct State {
   size_t page_size;
   PrefetchBudget prefetch_budget;
   std::atomic<time_t> prefetch_warning_time{0};
+  std::atomic<uint64_t> prefetch_budget_exhaustions{0};
+  std::atomic<uint64_t> prefetch_evicted_bytes{0};
   std::unique_ptr<InodeDir> root_item;
   std::shared_ptr<ReadAheadStoragePool> read_ahead_pool;
   std::mutex prefetch_windows_mutex;
@@ -1134,6 +1154,8 @@ void emit_runtime_stats(State& state, const char* event) noexcept {
           ",\"copied_write_bytes\":%" PRIu64
           ",\"prefetch_bytes\":%zu,\"prefetch_peak_bytes\":%zu"
           ",\"prefetch_file_peak_bytes\":%zu"
+          ",\"prefetch_budget_exhaustions\":%" PRIu64
+          ",\"prefetch_evicted_bytes\":%" PRIu64
           ",\"receive_pool_mapped_bytes\":%zu,\"receive_pool_idle_bytes\":%zu"
           ",\"receive_pool_capacity_bytes\":%zu"
           ",\"credential_source\":\"%s\"}\n",
@@ -1145,6 +1167,8 @@ void emit_runtime_stats(State& state, const char* event) noexcept {
           state.request_errors.load(std::memory_order_relaxed),
           state.cached_inodes.load(std::memory_order_relaxed), open_handles,
           pinned_bytes, fallback_bytes, prefetch.used, prefetch.peak, prefetch.file_peak,
+          state.prefetch_budget_exhaustions.load(std::memory_order_relaxed),
+          state.prefetch_evicted_bytes.load(std::memory_order_relaxed),
           receive_pool.mapped, receive_pool.idle, receive_pool.capacity,
           state.credentials.source_name());
 }
@@ -1929,7 +1953,6 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   constexpr int reactors_option                    = 270;
   constexpr int max_prefetch_memory_option         = 271;
   constexpr int max_file_prefetch_memory_option    = 272;
-  constexpr int tail_read_ahead_option             = 273;
   constexpr option long_options[] = {
       {"endpoint-host", required_argument, nullptr, 'e'},
       {"endpoint-port", required_argument, nullptr, 'p'},
@@ -1965,7 +1988,6 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
        max_prefetch_memory_option},
       {"max-file-prefetch-memory", required_argument, nullptr,
        max_file_prefetch_memory_option},
-      {"tail-read-ahead", required_argument, nullptr, tail_read_ahead_option},
       {"dir-cache-timeout", required_argument, nullptr, 'T'},
       {"max-cached-inodes", required_argument, nullptr, 'I'},
       {"part-size", required_argument, nullptr, 'P'},
@@ -2182,9 +2204,6 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
         config.max_file_prefetch_memory =
             parse_prefetch_memory("--max-file-prefetch-memory");
         break;
-      case tail_read_ahead_option:
-        config.tail_read_ahead = parse_prefetch_memory("--tail-read-ahead");
-        break;
       case 'T': {
         const uint64_t milliseconds =
             parse_required_unsigned("--dir-cache-timeout");
@@ -2346,18 +2365,21 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   if (config.max_prefetch_window_size % size_t(page_size) != 0) {
     throw std::logic_error("prefetch window is not page aligned");
   }
-  const size_t minimum_prefetch_memory =
-      config.cache_dir.empty() && config.io_engine != IO_ENGINE_LEGACY
-          ? kReceiveBlockSize : kPreferredIoSize;
+  const bool receive_blocks = config.cache_dir.empty() && !config.tls && config.io_engine != IO_ENGINE_LEGACY;
+  if (receive_blocks && (config.max_prefetch_window_size < kReceiveBlockSize ||
+                        config.max_prefetch_window_size % kReceiveBlockSize != 0)) {
+    throw std::invalid_argument("uncached io_uring prefetch window must use 2 MiB units");
+  }
+  const size_t minimum_prefetch_memory = receive_blocks
+      ? receive_demand_capacity(config.maximum_read_size) : kPreferredIoSize;
   const auto validate_prefetch_memory = [&](size_t value,
                                             std::string_view name) {
     if (value != 0 &&
         (value < minimum_prefetch_memory ||
-         value % (minimum_prefetch_memory == kReceiveBlockSize
-                       ? kReceiveBlockSize : size_t(page_size)) != 0)) {
+         value % (receive_blocks ? kReceiveBlockSize : size_t(page_size)) != 0)) {
       throw std::invalid_argument(std::string(name) +
-                                  (minimum_prefetch_memory == kReceiveBlockSize
-                                       ? " must be 0 or a multiple of 2 MiB"
+                                  (receive_blocks
+                                       ? " must be 0 or a multiple of 2 MiB large enough for a cross-block READ (at least 4 MiB)"
                                        : " must be 0 or a page-aligned size of at least 256 KiB"));
     }
   };
@@ -2602,7 +2624,11 @@ OpenHandle* handle_optional(const fuse_file_info* file) noexcept {
   if (file == nullptr || file->fh == 0) {
     return nullptr;
   }
-  return reinterpret_cast<OpenHandle*>(file->fh);
+  auto* handle = reinterpret_cast<OpenHandle*>(file->fh);
+  if ((handle->request_state.load(std::memory_order_acquire) & kOpenPublished) == 0) {
+    return nullptr;
+  }
+  return handle;
 }
 
 OpenHandle& handle_required(const fuse_file_info* file) {
@@ -9829,6 +9855,7 @@ struct AsyncOpen {
       handle->writer = make_file_writer(state, *handle);
       write_started = begin_inode_write(*handle->item);
     }
+    publish_open_handle(*handle);
     identity.unlock();
     file.fh = reinterpret_cast<uint64_t>(handle.get());
     file.direct_io = 0;
@@ -9976,6 +10003,7 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
       write_started = begin_inode_write(*handle->item);
     }
 
+    publish_open_handle(*handle);
     identity_guard.unlock();
     file->fh = reinterpret_cast<uint64_t>(handle.release());
     budget_reserved = false;
@@ -10137,6 +10165,7 @@ void create_cached_file(fuse_req_t request, fuse_ino_t parent, const char* name,
     entry.attr_timeout  = timeout;
     entry.entry_timeout = timeout;
     fill_inode_stat(state, inode, inode_item(state, inode), entry.attr);
+    publish_open_handle(*handle);
     file->fh          = reinterpret_cast<uint64_t>(handle.release());
     file->direct_io   = 0;
     file->keep_cache  = 0;
@@ -10347,8 +10376,8 @@ struct UncachedPrefetch {
   bool complete = false;
   bool checksum_retrying = false;
   bool checksum_bad = false;
-  // The uring anonymous path retains completed speculative chunks for a
-  // later overlapping demand until the reader's normal window eviction.
+  // The uring anonymous path retains complete blocks for overlapping reads
+  // until budget pressure or close withdraws them.
   bool retain_for_reuse = false;
   size_t read_pins = 0;
   bool retire_when_idle = false;
@@ -10357,7 +10386,6 @@ struct UncachedPrefetch {
   size_t published_prefix = 0;
   size_t active_replies = 0;
   std::vector<PinnedRead> pinned_reads;
-  std::vector<std::pair<size_t, size_t>> replied_ranges;
   PrefetchContinuation* reply_drained = nullptr;
   PrefetchContinuation* continuations = nullptr;
   std::function<void()> legacy_progress;
@@ -10427,24 +10455,14 @@ struct UncachedPrefetch {
     return false;
   }
 
-  void replied(size_t begin, size_t count) {
-    std::lock_guard guard(mutex);
-    if (!uses_anonymous_storage()) return;
-    size_t end = begin + count;
-    auto i = replied_ranges.begin();
-    while (i != replied_ranges.end() && i->second < begin) ++i;
-    auto first = i;
-    while (i != replied_ranges.end() && i->first <= end) {
-      begin = std::min(begin, i->first);
-      end = std::max(end, i->second);
-      ++i;
+  size_t reclaimable_block() const noexcept {
+    if (!storage || !storage->anonymous_storage) return SIZE_MAX;
+    for (size_t pos = 0; pos < produced; pos += kReceiveBlockSize) {
+      const size_t count = std::min(kReceiveBlockSize, length - pos);
+      if (count <= produced - pos && !has_pinned_overlap(pos, count) &&
+          storage->anonymous_storage->available(pos, count)) return pos;
     }
-    if (first == i) replied_ranges.insert(first, {begin, end});
-    else {
-      first->first = begin;
-      first->second = end;
-      replied_ranges.erase(first + 1, i);
-    }
+    return SIZE_MAX;
   }
 
   void retire(bool unpin = false, uint64_t begin = 0, size_t count = 0) noexcept {
@@ -10474,15 +10492,12 @@ struct UncachedPrefetch {
         // The last STORE needs only final truncation. Punching its suffix
         // immediately before truncating repeats the retirement syscall path.
         released = std::move(storage);
-      } else if (storage && read_pins == 0 && !checksum_hold && !checksum_retrying) {
+      } else if (storage && !checksum_hold && !checksum_retrying) {
         if (storage->anonymous_storage != nullptr) {
-          // Every reply referring to these intervals has completed. Keep
-          // unrequested prefetch bytes; recycle only wholly served blocks.
-          for (const auto& range : replied_ranges) {
-            storage->anonymous_storage->discard(range.first, range.second - range.first);
-          }
-          reclaimable = complete;
-        } else if (!retain_for_reuse) {
+          // Completed blocks stay useful regardless of which subranges have
+          // been replied. Only pressure (or close) withdraws their storage.
+          reclaimable = reclaimable_block() != SIZE_MAX;
+        } else if (read_pins == 0 && !retain_for_reuse) {
           const size_t page = size_t(::sysconf(_SC_PAGESIZE));
           const size_t end = std::min(published_prefix, produced) / page * page;
           if (end > retired_prefix) {
@@ -10578,12 +10593,19 @@ struct UncachedPrefetch {
 
    private:
     void publish(const Response& response, bool complete) {
-      (void)complete;
+      bool anonymous;
       {
         std::lock_guard guard(prefetch_.mutex);
-        prefetch_.produced = response.body_bytes;
+        anonymous = prefetch_.uses_anonymous_storage();
+        size_t available = response.body_bytes;
+        if (anonymous && available != prefetch_.length) {
+          available = available / kReceiveBlockSize * kReceiveBlockSize;
+        }
+        if (anonymous && available == prefetch_.produced && !complete) return;
+        prefetch_.produced = available;
       }
       prefetch_.notify_waiters();
+      if (anonymous) prefetch_.retire();
       if (prefetch_.legacy_progress) prefetch_.legacy_progress();
     }
 
@@ -10602,12 +10624,6 @@ struct UncachedPrefetch {
           prefetch_.storage->anonymous_storage == nullptr) {
         throw std::logic_error("missing anonymous prefetch storage");
       }
-      size_t end = SIZE_MAX;
-      for (const PinnedRead& pin : prefetch_.pinned_reads) {
-        if (pin.offset + pin.length > prefetch_.produced)
-          end = std::min(end, pin.offset + pin.length);
-      }
-      if (end != SIZE_MAX) maximum = std::min(maximum, end - prefetch_.produced);
       return prefetch_.storage->anonymous_storage->writable(maximum);
     }
 
@@ -10621,10 +10637,6 @@ struct UncachedPrefetch {
     }
 
     [[nodiscard]] bool receive_waitall() const noexcept override {
-      std::lock_guard guard(prefetch_.mutex);
-      for (const PinnedRead& pin : prefetch_.pinned_reads) {
-        if (pin.offset + pin.length > prefetch_.produced) return false;
-      }
       return true;
     }
 
@@ -10665,12 +10677,15 @@ struct UncachedReadSegment {
 
 void unpin_read_segments(std::vector<UncachedReadSegment>& segments) noexcept {
   for (auto& segment : segments) {
-    segment.prefetch->retire(true, segment.offset, segment.length);
+    if (segment.prefetch) {
+      segment.prefetch->retire(true, segment.offset, segment.length);
+    }
   }
   segments.clear();
 }
 
 void warn_prefetch_budget(State& state, fuse_ino_t inode) {
+  state.prefetch_budget_exhaustions.fetch_add(1, std::memory_order_relaxed);
   const time_t now = wall_time_seconds();
   time_t previous = state.prefetch_warning_time.load(std::memory_order_relaxed);
   if (now - previous < 60 || !state.prefetch_warning_time.compare_exchange_strong(previous, now)) return;
@@ -10693,6 +10708,17 @@ bool reclaim_prefetch_window(State& state) {
       if (!p->storage) {
         i = state.prefetch_windows.erase(i);
         continue;
+      }
+      const size_t pos = p->reclaimable_block();
+      if (pos != SIZE_MAX) {
+        const size_t count = std::min(kReceiveBlockSize, p->length - pos);
+        // Only completed, unpinned blocks are withdrawn. Reservations for
+        // the GET's unreceived suffix remain intact so its I/O can finish.
+        const size_t evicted = p->storage->anonymous_storage->discard(pos, count);
+        if (evicted != 0) {
+          state.prefetch_evicted_bytes.fetch_add(evicted, std::memory_order_relaxed);
+          return true;
+        }
       }
       if (p->complete && p->read_pins == 0 && p->active_replies == 0) {
         released = std::move(p->storage);
@@ -12459,11 +12485,18 @@ bool UncachedFileReader::select_async(
     for (auto i = retained_.rbegin(); i != retained_.rend(); ++i) function(*i);
   };
   bool created = false;
+  // A reclaimed window carries no history. Keep only live or in-flight
+  // coverage; capacity decisions are made per block by the mount budget.
+  std::erase_if(retained_, [](const auto& p) {
+    std::lock_guard guard(p->mutex);
+    return p->complete && !p->storage && p->read_pins == 0;
+  });
   const auto previous = prefetch_;
   const size_t previous_count = retained_.size();
-  const size_t previous_bytes = retained_bytes_;
   try {
     const uint64_t end = offset + wanted;
+    // Pin all existing coverage before admitting any missing GET. Otherwise
+    // an earlier hole's allocation can evict a later block needed by this READ.
     for (uint64_t pos = offset; pos < end; ) {
       std::shared_ptr<UncachedPrefetch> selected;
       uint64_t selected_end = pos;
@@ -12488,29 +12521,32 @@ bool UncachedFileReader::select_async(
         pos += count;
         continue;
       }
-
       const size_t count = size_t(std::min(end, gap_end) - pos);
-      uint64_t begin = pos;
-      size_t length = size_t(std::min<uint64_t>(
-          gap_end - pos, std::max(count, next)));
-      // Only a footer may extend backward, and never into live coverage.
-      if (!sequential && pos + length == object_size && length < next) {
-        const size_t back = size_t(std::min<uint64_t>(
-            pos, std::min(state.config.tail_read_ahead, next - length)));
-        begin -= back;
+      segments.push_back({nullptr, pos, count, false});
+      pos += count;
+    }
+    for (auto& segment : segments) {
+      if (segment.prefetch) continue;
+      const uint64_t begin = segment.offset / kReceiveBlockSize * kReceiveBlockSize;
+      const uint64_t demand_end = segment.offset + segment.length;
+      const uint64_t block_end = std::min<uint64_t>(object_size,
+          (demand_end + kReceiveBlockSize - 1) / kReceiveBlockSize * kReceiveBlockSize);
+      const size_t required = size_t(block_end - begin);
+      uint64_t gap_end = demand_end;
+      if (demand_end == end) {
+        gap_end = object_size;
         visit([&](const std::shared_ptr<UncachedPrefetch>& p) {
-          uint64_t scan = begin;
-          while (scan < pos) {
-            const auto live = p->coverage(scan, pos);
-            if (live.second == 0) break;
-            begin = std::max(begin, live.second);
-            scan = live.second;
-          }
+          const auto live = p->coverage(demand_end, object_size);
+          if (live.second != 0) gap_end = std::min(gap_end, live.first);
         });
-        length += size_t(pos - begin);
       }
-      selected = allocate_prefetch(state, inode, begin,
-          size_t(pos - begin) + count, object_size, length);
+      const size_t length = size_t(std::min<uint64_t>(
+          gap_end - begin, std::max(required, next)));
+      // A gap before another demanded segment ends at that existing block.
+      // Only the last gap may expand beyond demand, so speculation cannot
+      // consume capacity required for a later missing part of this READ.
+      auto selected = allocate_prefetch(state, inode, begin,
+          required, object_size, length);
       if (!selected) {
         // Do not wait while our own pins prevent reclaiming the old coverage.
         // Drop unstarted reservations too, before taking the wake revision.
@@ -12519,11 +12555,9 @@ bool UncachedFileReader::select_async(
         (void)reclaim_prefetch_window(state);
         return false;
       }
-      const size_t pinned = size_t(std::min(end, begin + selected->length) - pos);
-      if (!selected->pin(pos, pinned)) abort();
-      try { segments.push_back({selected, pos, pinned, true}); }
-      catch (...) { selected->retire(true, pos, pinned); throw; }
-      pos += pinned;
+      if (!selected->pin(segment.offset, segment.length)) abort();
+      segment.prefetch = std::move(selected);
+      segment.created = true;
       created = true;
     }
     // Publish newly admitted windows only after the whole READ fits. Other
@@ -12532,31 +12566,14 @@ bool UncachedFileReader::select_async(
       if (!segment.created) continue;
       if (prefetch_) {
         retained_.push_back(prefetch_);
-        retained_bytes_ += prefetch_->length;
       }
       prefetch_ = segment.prefetch;
     }
   } catch (...) {
     prefetch_ = previous;
     while (retained_.size() > previous_count) retained_.pop_back();
-    retained_bytes_ = previous_bytes;
     unpin_read_segments(segments);
     throw;
-  }
-  // Keep useful in-flight data even when another stream seeks elsewhere.
-  // Completed, unpinned windows can be dropped once the retained window is
-  // over its bound. Global memory pressure also reclaims such windows.
-  for (auto i = retained_.begin(); i != retained_.end() &&
-       retained_bytes_ > maximum; ) {
-    bool idle;
-    {
-      std::lock_guard progress_guard((*i)->mutex);
-      idle = (*i)->complete && (*i)->read_pins == 0;
-    }
-    if (idle) {
-      retained_bytes_ -= (*i)->length;
-      i = retained_.erase(i);
-    } else ++i;
   }
   if (created) next_window_ = next;
   next_offset_ = offset + wanted;
@@ -13360,7 +13377,6 @@ struct AsyncReadTask {
         fprintf(stderr, "asynchronous read reply failed: %s\n", strerror(-result));
       }
       task->request = nullptr;
-      if (result == 0) task->prefetch->replied(relative, task->wanted);
     } catch (...) {
       if (task->request != nullptr) reply_callback_error(task->request);
       else fprintf(stderr, "warning: receive block reclamation deferred after reply\n");
@@ -13428,10 +13444,6 @@ struct AsyncReadTask {
       task->request = nullptr;
       if (result != 0) {
         fprintf(stderr, "asynchronous segmented read reply failed: %s\n", strerror(-result));
-      } else {
-        for (const auto& segment : task->segments) {
-          segment.prefetch->replied(size_t(segment.offset - segment.prefetch->offset), segment.length);
-        }
       }
     } catch (...) {
       if (task->request) reply_callback_error(task->request);
@@ -18822,15 +18834,12 @@ void print_help() {
       "      --max-prefetch-memory SIZE\n"
       "                             process-wide speculative prefetch budget; "
       "0 means automatic 10% of physical RAM (page rounded); explicit "
-      "values use 2 MiB units for uring uncached reads, page units "
+      "values use 2 MiB units (at least 4 MiB) for uring uncached reads, page units "
       "(at least 256 KiB) otherwise\n"
       "      --max-file-prefetch-memory SIZE\n"
       "                             per-file speculative prefetch budget; "
       "0 means automatic min(file size, twice the maximum prefetch window); "
       "same allocation units as --max-prefetch-memory\n"
-      "      --tail-read-ahead SIZE\n"
-      "                             backward extension for uncached footer reads "
-      "(default 64 KiB; 0 disables)\n"
       "  -T, --dir-cache-timeout MS\n"
       "                             directory cache TTL (default 1000)\n"
       "  -I, --max-cached-inodes N soft inode-cache limit "

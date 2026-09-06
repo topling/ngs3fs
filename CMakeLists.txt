@@ -178,6 +178,9 @@ if(NGS3FS_BUILD_TESTS)
   enable_testing()
   add_compile_options(-UNDEBUG)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME random_read_memory_test
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/random_read_memory_test.py)
   add_test(NAME summarize_random_read_test
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/summarize_random_read_test.py)
@@ -307,12 +310,17 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME fuse_uring_prefetch_pool_limited_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
             xxhash128 prefetch-pool-limited uring)
+  add_test(NAME fuse_multi_reactor_prefetch_pool_pressure_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 prefetch-pool-pressure uring 2)
+  set_tests_properties(fuse_multi_reactor_prefetch_pool_pressure_test PROPERTIES
+    TIMEOUT 60 RESOURCE_LOCK fuse_mounts)
   # The receive-pool path intentionally omits uncached checksum verification
   # and never STOREs. Keep the legacy checksum gates instead of running those
   # obsolete requirements against the new uring contract; cached verification
   # remains covered by both cached integration engine variants above.
   # Old uring connection-pressure checks expected 256 KiB windows; bounded
-  # progress is now exercised by the 2 MiB prefetch-budget test above.
+  # progress is now exercised by the 4 MiB uring prefetch-budget test above.
   add_test(NAME fuse_legacy_prefetch_verified_clean_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
             xxhash128 prefetch-verified-clean legacy)
@@ -349,9 +357,27 @@ if(NGS3FS_BUILD_TESTS)
   set_tests_properties(prefetch_window_environment_test PROPERTIES
     ENVIRONMENT "UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE=67108864")
   add_test(NAME invalid_prefetch_window_environment_test
-    COMMAND ngs3fs --help)
+    COMMAND ngs3fs --io-engine legacy --help)
   set_tests_properties(invalid_prefetch_window_environment_test PROPERTIES
     ENVIRONMENT "UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE=1048577")
+  foreach(size 2097152 134217728)
+    add_test(NAME uring_prefetch_window_${size}_test
+      COMMAND ngs3fs --io-engine uring --help)
+    set_tests_properties(uring_prefetch_window_${size}_test PROPERTIES
+      ENVIRONMENT "UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE=${size}")
+  endforeach()
+  foreach(size 1048576 3145728)
+    add_test(NAME uring_prefetch_window_${size}_test
+      COMMAND ngs3fs --io-engine uring --help)
+    set_tests_properties(uring_prefetch_window_${size}_test PROPERTIES
+      ENVIRONMENT "UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE=${size}"
+      WILL_FAIL TRUE)
+  endforeach()
+  add_test(NAME auto_prefetch_window_subblock_test
+    COMMAND ngs3fs --io-engine auto --help)
+  set_tests_properties(auto_prefetch_window_subblock_test PROPERTIES
+    ENVIRONMENT "UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE=1048576"
+    WILL_FAIL TRUE)
   # CLI validation complements the real-mount pooled budget tests above.
   add_test(NAME max_prefetch_memory_option_test
     COMMAND ngs3fs --max-prefetch-memory 256MiB --help)
@@ -380,24 +406,20 @@ if(NGS3FS_BUILD_TESTS)
   foreach(option max-prefetch-memory max-file-prefetch-memory)
     string(REPLACE "-" "_" test_option "${option}")
     add_test(NAME uring_${test_option}_minimum_test
+      COMMAND ngs3fs --io-engine uring --${option} 4MiB --help)
+    add_test(NAME uring_${test_option}_single_block_test
       COMMAND ngs3fs --io-engine uring --${option} 2MiB --help)
     add_test(NAME uring_${test_option}_subblock_test
       COMMAND ngs3fs --io-engine uring --${option} 1MiB --help)
     add_test(NAME uring_${test_option}_fractional_block_test
       COMMAND ngs3fs --io-engine uring --${option} 3MiB --help)
-    set_tests_properties(uring_${test_option}_subblock_test
+    set_tests_properties(uring_${test_option}_single_block_test
+      uring_${test_option}_subblock_test
       uring_${test_option}_fractional_block_test PROPERTIES WILL_FAIL TRUE)
   endforeach()
-  add_test(NAME tail_read_ahead_option_test
+  add_test(NAME removed_tail_read_ahead_option_test
     COMMAND ngs3fs --tail-read-ahead 64KiB --help)
-  add_test(NAME tail_read_ahead_zero_test
-    COMMAND ngs3fs --tail-read-ahead 0 --help)
-  add_test(NAME tail_read_ahead_invalid_test
-    COMMAND ngs3fs --tail-read-ahead nope --help)
-  add_test(NAME tail_read_ahead_negative_test
-    COMMAND ngs3fs --tail-read-ahead -1 --help)
-  set_tests_properties(tail_read_ahead_invalid_test
-    tail_read_ahead_negative_test PROPERTIES WILL_FAIL TRUE)
+  set_tests_properties(removed_tail_read_ahead_option_test PROPERTIES WILL_FAIL TRUE)
   add_test(NAME removed_read_ahead_option_test
     COMMAND ngs3fs --read-ahead 1MiB --help)
   set_tests_properties(removed_read_ahead_option_test PROPERTIES WILL_FAIL TRUE)

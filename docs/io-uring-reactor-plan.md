@@ -1,9 +1,9 @@
 # io_uring reactor execution contract
 
-Status: the uncached receive-pool revision and cross-GET coverage joining are
-implemented. Final local CTest passes 86/86; runner performance validation
-remains pending. This is not a claim that latency improves at every core
-count. Caller-owned reactors
+Status: the aligned whole-block receive revision below is implemented and
+passes 92/92 local CTest cases plus seven focused ThreadSanitizer cases.
+Runner CI and comparative performance validation for this revision are still
+pending. Caller-owned reactors
 use libfuse for classic-fusefd protocol semantics. FUSE-over-io-uring remains
 outside this revision.
 
@@ -26,21 +26,30 @@ page-cache publication are outside this replacement.
   allocation and writable-page faults to pool growth.
 - Do not request `MAP_HUGETLB`. Do not add `MADV_NOHUGEPAGE`: an extra advice
   syscall is not part of this design. A 2 MiB allocation unit is a pool size,
-  not a promise of huge-page backing or object-offset alignment.
+  not a promise of huge-page backing. Object offsets are also aligned to this
+  2 MiB unit; the last object block ends at EOF.
 - Short replies reference slices of one block; long FUSE reads use
   `fuse_reply_iov` across as many blocks as needed without coalescing payloads
-  into another buffer. Reply only after the entire requested interval is
-  available, except for a genuine EOF. Buffer lifetime ends at actual reply
+  into another buffer. Reply only after every block intersecting the requested
+  interval is completely received, with the final block clipped at EOF. Do not
+  optimize reception or wakeups for a requested sub-block interval. Buffer
+  lifetime ends at actual reply
   transport completion, not merely admission to a deferred reply queue.
 - A block is reusable only after its receive operation, every reply source
   reference, and other consumers have retired. Cancellation completion alone
   does not retire the original receive's ownership. Received bytes and valid
   coverage are separate from allocated capacity; unwritten bytes are never
   exposed to FUSE.
-- Keep useful completed and in-progress prefetch coverage selectable. A
-  partially consumed block remains until its remaining coverage is served or
-  evicted. Only fully retired blocks enter the freelist; an overlapping READ
-  must attach to valid/in-progress coverage rather than duplicate the GET.
+- Keep completed and in-progress blocks selectable. Do not track which bytes
+  or pages have already been replied, or recycle a block merely because all
+  its bytes have been replied. Retain whole valid blocks within the budgets;
+  under pressure, reclaim whole blocks without active receive, waiting-read,
+  or reply ownership, even if some contents were never requested. Retention
+  can grow the pool toward its cap sooner, but cannot exceed that cap.
+- An overlapping READ attaches to current valid/pending coverage. After
+  eviction, retain no downloaded/replied history: both real demand and a later
+  speculative GET may fetch that block again. A block state is not evidence
+  of residency in the kernel's FUSE page cache. No proactive NOTIFY_STORE.
 
 ### Fetch sizing and access-pattern policy
 
@@ -51,19 +60,12 @@ page-cache publication are outside this replacement.
   access to the configured maximum, normally 128 MiB. Preserve the existing
   `UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE` override; do not introduce a second
   competing maximum. Clip requests at EOF and respect configured budgets.
-- A random GET starts at the requested object offset and normally covers
-  2 MiB forward, or enough to satisfy a longer FUSE request. Do not round its
-  start down to a 2 MiB or 8 MiB boundary. Pool blocks do not impose alignment
-  on Range GETs.
-- Prefetch normally extends only forward. A random forward range that reaches
-  EOF may extend its start backward by
-  `min(tail_read_ahead, offset, max(0, 2 MiB - forward_length))`.
-  `--tail-read-ahead` defaults to 64 KiB; zero disables backward extension.
-  Backward extension never raises a shorter random range above 2 MiB; a
-  longer demanded interval is not clipped to that size and receives no extra
-  backward coverage. This is coverage before the requested offset, not an
-  instruction merely to extend the request end to EOF. No Range extends
-  beyond the object size.
+- A random GET starts at the requested offset rounded down to 2 MiB and
+  covers the complete intersecting block(s), clipped at EOF. Round the end up
+  to the same block boundary. Longer FUSE reads can require multiple blocks.
+- Speculative extension is forward from this aligned coverage. There is no
+  footer exception, file-format detection, or --tail-read-ahead option. SST
+  footer and subsequent metadata reads use exactly the ordinary block rules.
 - Adjacency and hits in already completed or in-progress coverage preserve
   sequential state. Classify a request as random only when it is nonadjacent
   and outside both forms of coverage. Interleaved independent readers must
@@ -78,16 +80,15 @@ All socket I/O on the new uncached reactor path uses io_uring. HTTP parsing
 stays on the owning reactor. There are no network continuation worker threads
 and no checksum worker for this path in the first implementation.
 
-While a FUSE request awaits bytes, submit ordinary asynchronous receives sized
-for its still-needed interval and handle short completions. As soon as that
-whole request is ready, reply without waiting for the rest of the prefetch.
-Continue receiving the speculative remainder on the same reactor, preferably
-with native io_uring `RECV` plus `MSG_WAITALL` to reduce short-receive completion
-traffic. Use ordinary asynchronous short receives if that operation is not
-supported. Never implement this policy as a blocking userspace `recv` or as a
-network worker handoff.
+Receive each whole 2 MiB block on the same reactor, preferably with native
+io_uring RECV plus MSG_WAITALL, whether it contains current demand or is purely
+speculative. Do not size receives to a FUSE request's sub-block end. A completed
+block can satisfy its waiting reads while later blocks of the same 8-128 MiB
+GET are still downloading; do not wait for the whole GET. Use ordinary
+asynchronous short receives if WAITALL is unsupported. Never use a blocking
+userspace recv or a network worker handoff.
 
-Each speculative WAITALL covers at most the remaining space in one 2 MiB
+Each WAITALL covers at most the remaining space in one 2 MiB
 block. A new READ arriving during that receive waits for the existing
 completion; do not cancel WAITALL to expose its partial bytes. This explicitly
 accepted tradeoff avoids cancellation/reissue work on the intended
@@ -108,7 +109,7 @@ requests on the same ring.
 
 FUSE requests may arrive in any offset order, and different GETs may complete
 in any order. Only the received byte prefix **within one GET** is monotonic.
-Keep that GET's waiting reads with their required relative end offsets; wake
+Keep that GET's waiting reads with their required block-rounded end offsets; wake
 each satisfied request independently. Never block CQ harvesting on an
 unsatisfied read, or use a single file-wide received offset to decide readiness.
 The current small intrusive waiter list does not assume insertion order.
@@ -124,10 +125,15 @@ existing coverage. One read can wait on one unsatisfied slice at a time while
 all transfers continue independently; reply once, in file-offset order, when
 every slice is ready. Joining slices must not require a second payload buffer.
 
-Select and reserve the complete demand before starting newly created GETs.
+First pin all currently available or pending coverage of the complete READ,
+then allocate its missing blocks. Allocating an earlier hole must not evict a
+later block needed by the same READ merely because traversal has not reached
+it yet. Reserve the complete demand before starting newly created GETs.
 If admission fails, release this attempt's pins and unstarted reservations
-before asynchronously awaiting capacity. In particular, a 2 MiB mount budget
-must not deadlock on a request that itself pins the only reclaimable block.
+before asynchronously awaiting capacity. The minimum budget must cover the
+largest negotiated FUSE read's worst-case aligned block span (normally two
+blocks / 4 MiB), rather than only its byte length. No request may deadlock by
+pinning its own only reclaimable capacity.
 Normal eviction may remove old unpinned coverage before a subsequent attempt.
 
 ### Memory admission and read integrity
@@ -135,7 +141,8 @@ Normal eviction may remove old unpinned coverage before a subsequent attempt.
 - Preserve a mount budget defaulting to 10% of physical RAM and a shared
   per-file default of `min(file_size, 2 * maximum_prefetch_window)`. Existing
   explicit limits remain caps. Explicit uncached uring/auto limits accept zero
-  for automatic sizing or a multiple of 2 MiB. Automatic per-file capacity is
+  for automatic sizing or a multiple of 2 MiB large enough for that worst-case
+  demand span. Automatic per-file capacity is
   rounded up to the physical block quantum, including tiny files. Account
   consistently for those blocks; tiny files do not justify an uncharged full
   block or an unfinishable admission wait. Legacy/cached limits retain their
@@ -148,6 +155,8 @@ Normal eviction may remove old unpinned coverage before a subsequent attempt.
   coverage and reuse idle blocks, preserving demanded and outstanding-I/O
   ownership. Await capacity asynchronously when demand cannot fit. A logical
   large GET must not deadlock while holding blocks needed to service demand.
+  Shrink speculative GET lengths to available reservation capacity instead of
+  repeatedly evicting freshly received blocks just to finish an oversized GET.
   Rate-limit budget warnings to stderr using `fprintf`.
 - First implementation of this new uncached path skips read checksum
   verification. Do not align a GET downward to an 8 MiB checksum unit, delay a
@@ -157,17 +166,73 @@ Normal eviction may remove old unpinned coverage before a subsequent attempt.
 
 ### Required evidence before completion
 
-Cover early initial FUSE reply with a paused speculative tail; a new demand
-waiting safely for its existing WAITALL completion; overlapping and
+Cover a sub-block demand remaining blocked until its whole block is received;
+one ready block replying while the next block of its GET is paused; a new
+demand waiting safely for its existing WAITALL completion; overlapping and
 cross-block/iovec reads; short/error/cancel paths;
-sequential doubling, random coverage and backward footer bounds; memory reuse,
+sequential doubling, aligned random coverage and EOF; memory reuse,
 small-file rounding and pressure without starvation; and close/unmount while
 receives or replies still own blocks. Source and runtime checks must show no
 uncached STORE, splice, memfd, network worker handoff, or per-read mapping
 churn. Run appropriate full integration checks and kernel-inclusive A/B CPU
 and latency profiles before claiming improvement over legacy or competitors.
+Measure first-byte delay once per GET separately from payload transfer rate;
+localhost-only performance is not sufficient evidence for the S3 tradeoff.
 
-### Receive-pool execution evidence (2026-09-06)
+Uncached random-read performance comparisons must explicitly provision both
+mount and per-file budgets for the test working set, rounded to 2 MiB blocks,
+plus concurrent in-flight demand headroom. Record configured budgets, observed
+peaks and budget-pressure/reclamation counters in analysis artifacts. A normal
+performance sample that exhausts the budget or reclaims data under pressure
+is invalid, not evidence of the network/CPU tradeoff. Keep low-memory eviction
+and progress tests as separate correctness/stress cases. Do not change the
+production default of 10% physical RAM merely to size a benchmark. If the host
+cannot accommodate the planned experiment, reject it with an explanation
+rather than silently substituting a memory-pressure workload.
+
+### Whole-block revision execution evidence (2026-09-06)
+
+- Full normal build and CTest: 92/92 passed in 94.89 seconds. The seven focused
+  ThreadSanitizer cases passed in 43.17 seconds, including one/two-reactor
+  integration, retained-block pressure, limited windows and reactor I/O.
+  These are not results from a full ThreadSanitizer suite.
+- The strict pressure regression exposed a real admission bug: allocating a
+  missing prefix evicted a needed existing suffix before that suffix was
+  pinned, producing an extra GET. Two-phase admission now pins the entire
+  READ's existing coverage first; the unchanged regression passes.
+- Controlled HTTP/2 checks passed all six combinations of first-body-byte
+  delay (0/10/100 ms) and per-GET payload rate (unlimited/256 MiB/s), with two
+  reactors. Headers are not delayed. Whole-test timings include fixture work
+  and are not measurements of S3 TTFB or user READ latency. The runner is
+  configured to execute this matrix with both one and two reactors.
+- The benchmark memory planner's eight unit cases pass. A real VersityGW
+  smoke run with four 4 MiB files, two application threads and two reactors
+  passed: 48 MiB mount budget, 36 MiB per-file budget, zero budget exhaustion,
+  zero pressure eviction and zero request errors. Evidence is recorded in
+  `build/benchmarks/aligned-memory-smoke-uring2/memory-plan.json` and
+  `memory-evidence.json`. This small run validates the evidence pipeline,
+  not comparative performance; it fell back to 128 KiB kernel read-ahead
+  because it was run without permission to change the BDI setting.
+- Benchmarks retain graceful shutdown statistics before validating a sample;
+  normal unmount no longer races an unnecessary SIGTERM against final stats.
+  Memory plans and validation evidence are included in the runner artifact
+  allowlist. Low-budget correctness/stress cases remain separate.
+- A one-reactor 4000 Hz diagnostic profile with 16 files, eight application
+  threads and 1024 mixed pread/mmap operations also passed the non-pressure
+  gate: 96 MiB mount and 36 MiB per-file budgets, no pressure eviction or
+  exhaustion, and 23 measured page faults. It collected 3021 samples with
+  zero lost samples. Inclusive CPU is 50.22% in `tcp_recvmsg`, 21.85% in
+  `fuse_dev_do_write`, 1.09% in llhttp and 0.56% in range selection. These
+  stack percentages are not additive; they do not justify a more complex
+  allocation/eviction granularity. Remaining sampled `splice` calls are in
+  FUSE request intake, not the replaced socket-body receive path. Artifacts:
+  `build/profiles/aligned-blocks-memory-uring1`; binary SHA-256:
+  `558d2874b7741875741579994cc164105d56e1595da9a7c77a4d129140abf8ab`.
+  This sampled localhost run is not an unsampled latency/competitor A/B.
+- No runner CI pass or comparative speedup is claimed for these
+  changes. Historical profiles and test counts below belong to older builds.
+
+### Historical receive-pool execution evidence (before whole-block revision)
 
 - Focused real-FUSE tests passed 5/5 in 24.48 seconds: one-reactor pool
   (1.01 s), two-reactor pool (1.08 s), configured 16 MiB window cap (1.03 s),
@@ -194,7 +259,7 @@ and latency profiles before claiming improvement over legacy or competitors.
   these correctness runs. Comparable benchmarks and kernel-inclusive profiles
   are still required.
 
-### Final local review and runner handoff (2026-09-06)
+### Historical local review and runner handoff (before whole-block revision)
 
 - Final CTest: 86/86 passed in 88.89 seconds. Added coverage crosses two GETs
   without a duplicate download, completes those GETs out of order, refetches

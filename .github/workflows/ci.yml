@@ -82,6 +82,13 @@ jobs:
       - name: Bootstrap, build, and test
         run: ./scripts/bootstrap.sh
 
+      - name: Check whole-block reads with delayed and paced payloads
+        run: |
+          for reactors in 1 2; do
+            NGS3FS_REACTORS="$reactors" ./scripts/check_read_latency.sh \
+              "$GITHUB_WORKSPACE/build/read-latency-$reactors"
+          done
+
       - name: Verify local-cache page advice
         run: |
           trace=build/cache-noreuse.trace
@@ -169,6 +176,9 @@ jobs:
             build/libfuse-cases-*/*.log
             build/xfstests/*.log
             build/multi-mount/*.log
+            build/read-latency-*/*.log
+            build/read-latency-*/README.txt
+            build/read-latency-*/results.csv
 
   hardening:
     name: hardening (${{ matrix.name }})
@@ -338,7 +348,7 @@ jobs:
               ./scripts/benchmark_io_engine.sh \
               "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-$advice"
             printf '\nHeadline CPU and wall-time comparisons use these unsampled A/B runs (512 operations per worker). Separate 4000 Hz profiles identify hotspots; their instrumented CPU and wall times are not headline results.\n' \
-              >> "build/benchmarks/github-io-engine-$advice/summary.md"
+              | sudo tee -a "build/benchmarks/github-io-engine-$advice/summary.md" >/dev/null
             printf '\n## I/O engines: %s advice\n\n' "$advice" >> "$GITHUB_STEP_SUMMARY"
             cat "build/benchmarks/github-io-engine-$advice/summary.md" >> "$GITHUB_STEP_SUMMARY"
           done
@@ -480,6 +490,10 @@ jobs:
           retention-days: 7
           if-no-files-found: error
           path: |
+            build/benchmarks/**/memory-plan.json
+            build/benchmarks/**/memory-evidence.json
+            build/profiles/**/memory-plan.json
+            build/profiles/**/memory-evidence.json
             build/benchmarks/github-random-read-*/system.txt
             build/benchmarks/github-random-read-*/samples.csv
             build/benchmarks/github-random-read-*/summary.csv

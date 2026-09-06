@@ -25,6 +25,7 @@
 #include <chrono>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <exception>
 #include <filesystem>
@@ -163,6 +164,10 @@ struct ResponseSource {
   std::vector<std::byte> body;
   size_t cursor = 0;
   size_t end = 0;
+  size_t begin = 0;
+  uint64_t ttfb_ms = 100;
+  uint64_t bytes_per_second = 0;
+  std::chrono::steady_clock::time_point payload_started;
   std::string content_length;
   std::string content_range;
   bool delay = false;
@@ -193,6 +198,8 @@ struct SpecialObject {
 
 struct SharedServerState {
   std::mutex mutex;
+  uint64_t get_ttfb_ms = 100;
+  uint64_t get_bytes_per_second = 0;
   ChecksumAlgorithm checksum = CHECKSUM_XXHASH128;
   std::vector<std::byte> object;
   std::string object_key = "mmap.bin";
@@ -420,7 +427,9 @@ ssize_t read_body(nghttp2_session*, int32_t, uint8_t* buffer,
   auto& response = *static_cast<ResponseSource*>(source->ptr);
   if (response.delay && !response.delayed) {
     response.delayed = true;
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // One first-body-byte delay per GET, never one delay per DATA frame or block.
+    std::this_thread::sleep_for(std::chrono::milliseconds(response.ttfb_ms));
+    response.payload_started = std::chrono::steady_clock::now();
   }
   if (response.keepalive && response.keepalive->pause_after != 0 &&
       response.cursor >= response.keepalive->pause_after) {
@@ -447,6 +456,13 @@ ssize_t read_body(nghttp2_session*, int32_t, uint8_t* buffer,
     if (response.cursor < limit) count = std::min(count, limit - response.cursor);
   }
   if (count != 0) {
+    if (response.delay && response.bytes_per_second != 0) {
+      const double seconds = double(response.cursor + count - response.begin) /
+                             double(response.bytes_per_second);
+      std::this_thread::sleep_until(response.payload_started +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(seconds)));
+    }
     memcpy(buffer, response.object->data() + response.cursor, count);
   }
   response.cursor += count;
@@ -1303,6 +1319,9 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   response->delay = true;
   response->cursor = static_cast<size_t>(range.first);
   response->end = static_cast<size_t>(range.last + 1);
+  response->begin = response->cursor;
+  response->ttfb_ms = state.get_ttfb_ms;
+  response->bytes_per_second = state.get_bytes_per_second;
   response->content_length =
       std::to_string(response->end - response->cursor);
   response->content_range =
@@ -1642,10 +1661,13 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
                    std::string_view engine = "auto",
                    std::string_view reactors = "1",
                    bool verify_reads = true, bool whole_retry = false,
-                   bool low_budget = false, const char* max_window = nullptr) {
+                   bool low_budget = false, const char* max_window = nullptr,
+                   const char* memory_budget = nullptr) {
   // The receive-pool implementation deliberately omits uncached checksum
   // verification. Cached and legacy tests still request it explicitly.
   if (engine == "uring" && cache_dir.empty()) verify_reads = false;
+  const char* low_limit = engine == "uring" ? "4MiB" : "2MiB";
+  const char* mount_limit = memory_budget ? memory_budget : (low_budget ? low_limit : "0");
   const std::string port_text = std::to_string(port);
   const std::string uid_text  = std::to_string(::getuid());
   const std::string gid_text  = std::to_string(::getgid());
@@ -1669,8 +1691,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               "0750", "-I", "1", "--checksum", checksum.data(),
               "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "--io-engine", engine.data(),
-              "--max-prefetch-memory", low_budget ? "2MiB" : "0",
-              "--max-file-prefetch-memory", low_budget ? "2MiB" : "0",
+              "--max-prefetch-memory", mount_limit,
+              "--max-file-prefetch-memory", mount_limit,
               "--reactors", reactors.data(), "-f", mountpoint.data(),
               static_cast<char*>(nullptr));
     } else if (cache_dir.empty()) {
@@ -1679,8 +1701,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
               "0750", "-I", "1",
               "--checksum", checksum.data(), "--verify-read-checksum",
-              "--max-file-prefetch-memory", low_budget ? "2MiB" : (whole_retry ? "8MiB" : "0"),
-              "--max-prefetch-memory", low_budget ? "2MiB" : "0",
+              "--max-file-prefetch-memory", low_budget ? low_limit : (whole_retry ? "8MiB" : "0"),
+              "--max-prefetch-memory", low_budget ? low_limit : "0",
               "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "--io-engine", engine.data(),
               "--reactors", reactors.data(), "-f", mountpoint.data(),
@@ -1790,14 +1812,16 @@ int main(int argc, char** argv) {
     const bool partial_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-unverifiable";
     const bool pressure_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-pressure";
     const bool pool_limited = argc >= 4 && std::string_view(argv[3]) == "prefetch-pool-limited";
+    const bool pool_pressure = argc >= 4 && std::string_view(argv[3]) == "prefetch-pool-pressure";
     const bool pool_prefetch = engine == "uring" && argc >= 4 &&
         (pool_limited || std::string_view(argv[3]) == "prefetch-pool" ||
          std::string_view(argv[3]) == "prefetch" || shutdown_prefetch);
     const bool verified_prefetch = verified_clean || (argc >= 4 &&
         std::string_view(argv[3]) == "prefetch-verified");
     const bool budget_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-budget";
-    const bool prefetch_mode = verified_prefetch || budget_prefetch || shutdown_prefetch || partial_prefetch || pressure_prefetch || pool_prefetch || (argc >= 4 &&
+    const bool prefetch_mode = verified_prefetch || budget_prefetch || shutdown_prefetch || partial_prefetch || pressure_prefetch || pool_prefetch || pool_pressure || (argc >= 4 &&
         std::string_view(argv[3]) == "prefetch");
+    require(!pool_pressure || engine == "uring", "pool pressure requires io_uring");
     require(engine != "uring" || !(verified_prefetch || partial_prefetch || pressure_prefetch),
             "uring checksum/STORE/connection-pressure experiments were replaced by prefetch-pool and prefetch-budget");
     std::vector<std::byte> expected(512U * 1024U + 37U);
@@ -1823,6 +1847,26 @@ int main(int argc, char** argv) {
 
     Listener listener = make_listener();
     SharedServerState shared;
+    const auto environment_number = [](const char* name, uint64_t fallback) {
+      const char* text = ::getenv(name);
+      if (!text) return fallback;
+      char* end = nullptr;
+      errno = 0;
+      const auto value = ::strtoull(text, &end, 10);
+      require(*text && *text != '-' && errno == 0 && end && !*end,
+              "invalid integration-test network timing environment value");
+      return uint64_t(value);
+    };
+    shared.get_ttfb_ms = environment_number("NGS3FS_TEST_TTFB_MS", 100);
+    shared.get_bytes_per_second = environment_number(
+        "NGS3FS_TEST_PAYLOAD_BYTES_PER_SECOND", 0);
+    require(shared.get_ttfb_ms <= 1000,
+            "integration-test TTFB must not exceed its one-second fixture limit");
+    if (::getenv("NGS3FS_TEST_TTFB_MS") || ::getenv("NGS3FS_TEST_PAYLOAD_BYTES_PER_SECOND")) {
+      fprintf(stderr, "GET fixture: once-per-GET first-body delay=%llu ms, payload=%llu bytes/s (0=unlimited)\n",
+              (unsigned long long)shared.get_ttfb_ms,
+              (unsigned long long)shared.get_bytes_per_second);
+    }
     shared.checksum = checksum;
     shared.object   = expected;
     auto add_overwrite_object = [&](std::string key,
@@ -1852,14 +1896,27 @@ int main(int argc, char** argv) {
                          "\"read-ahead-random\"");
     add_overwrite_object("read-ahead-store.bin", read_ahead,
                          "\"read-ahead-store\"");
+    if (pool_pressure) {
+      auto bytes = read_ahead;
+      bytes.resize(8U * 1024U * 1024U + 37);
+      for (size_t i = read_ahead.size(); i < bytes.size(); ++i) {
+        bytes[i] = std::byte((i * 53 + 31) & 0xff);
+      }
+      add_overwrite_object("budget-inflight.bin", std::move(bytes),
+                           "\"budget-inflight\"");
+      add_overwrite_object("budget-demand.bin", read_ahead,
+                           "\"budget-demand\"");
+      add_overwrite_object("budget-pinned.bin", read_ahead,
+                           "\"budget-pinned\"");
+    }
     if (pool_prefetch) {
       add_overwrite_object("pool-random.bin", std::vector<std::byte>(8U * 1024U * 1024U + 37),
                            "\"pool-random\"");
       add_overwrite_object("pool-sequential.bin", std::vector<std::byte>(64U * 1024U * 1024U + 37),
                            "\"pool-sequential\"");
-      add_overwrite_object("pool-footer.bin", read_ahead, "\"pool-footer\"");
+      add_overwrite_object("pool-tail.bin", read_ahead, "\"pool-tail\"");
       add_overwrite_object("pool-order.bin", read_ahead, "\"pool-order\"");
-      shared.special_objects.at("pool-order.bin")->limited_range_end = 2U * 1024U * 1024U + 4096;
+      shared.special_objects.at("pool-order.bin")->limited_range_end = 2U * 1024U * 1024U;
       for (const char* name : {"pool-random.bin", "pool-sequential.bin", "pool-order.bin"}) {
         auto& bytes = shared.special_objects.at(name)->bytes;
         for (size_t i = 0; i != bytes.size(); ++i) {
@@ -1934,7 +1991,8 @@ int main(int argc, char** argv) {
     const pid_t process = start_daemon(
         argv[1], mountpoint, listener.port, checksum_option, cache_dir,
         engine, reactors, !prefetch_mode || verified_prefetch || budget_prefetch || partial_prefetch,
-        verified_prefetch, budget_prefetch, pool_limited ? "16777216" : nullptr);
+        verified_prefetch, budget_prefetch, pool_limited ? "16777216" : nullptr,
+        pool_pressure ? "8MiB" : (pool_prefetch ? "128MiB" : nullptr));
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
@@ -2003,6 +2061,143 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    if (pool_pressure) {
+      constexpr size_t block = 2U * 1024U * 1024U;
+      const size_t page = size_t(::sysconf(_SC_PAGESIZE));
+      const size_t off = block - page;
+      std::vector<std::byte> bytes(2 * page);
+      const auto wait = [](auto&& ready, const char* message) {
+        for (unsigned n = 0; n != 3000; ++n) {
+          if (ready()) return;
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        throw std::runtime_error(message);
+      };
+      const auto idle = [&] {
+        wait([&] {
+          std::lock_guard guard(shared.mutex);
+          return shared.active_gets == 0;
+        }, "partial-GET pressure did not drain");
+      };
+      // Pressure can reclaim a completed, unpinned block even though its
+      // GET is still receiving the next block. Waiting for the full GET
+      // here would prevent the unrelated demand from making progress.
+      auto inflight = shared.special_objects.at("budget-inflight.bin");
+      auto pinned = shared.special_objects.at("budget-pinned.bin");
+      inflight->send_limit.store(block, std::memory_order_release);
+      pinned->send_limit.store(block, std::memory_order_release);
+      UniqueFd a(::open((mountpoint + "/budget-inflight.bin").c_str(), O_RDONLY | O_CLOEXEC));
+      UniqueFd b(::open((mountpoint + "/budget-demand.bin").c_str(), O_RDONLY | O_CLOEXEC));
+      UniqueFd c(::open((mountpoint + "/budget-pinned.bin").c_str(), O_RDONLY | O_CLOEXEC));
+      require(bool(a) && bool(b) && bool(c), "open partial-GET budget pressure readers");
+      require(::posix_fadvise(a.get(), 0, 0, POSIX_FADV_RANDOM) == 0 &&
+                  ::posix_fadvise(b.get(), 0, 0, POSIX_FADV_RANDOM) == 0 &&
+                  ::posix_fadvise(c.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+              "disable kernel prefetch for partial-GET pressure");
+      std::array<std::byte, 128U * 1024U> first{}, other{};
+      std::vector<std::byte> crossing(2 * page);
+      std::array<std::atomic<bool>, 3> completed{};
+      std::array<std::exception_ptr, 3> failures{};
+      std::array<std::jthread, 3> pending;
+      struct ResumeBudget {
+        SpecialObject& object;
+        ~ResumeBudget() { object.send_limit.store(SIZE_MAX, std::memory_order_release); }
+      } resume{*inflight};
+      ResumeBudget resume_pinned{*pinned};
+      pending[0] = std::jthread([&] {
+        try { pread_all(a.get(), first, 0); }
+        catch (...) { failures[0] = std::current_exception(); }
+        completed[0].store(true, std::memory_order_release);
+      });
+      wait([&] { return completed[0].load(std::memory_order_acquire) &&
+                        inflight->tail_paused.load(std::memory_order_acquire); },
+           "budget-shrunk sequential GET did not publish its complete first block");
+      pending[0].join();
+      if (failures[0]) std::rethrow_exception(failures[0]);
+      require(std::equal(first.begin(), first.end(), inflight->bytes.begin()),
+              "partial-GET pressure first READ differs");
+      {
+        std::lock_guard guard(shared.mutex);
+        const auto& ranges = inflight->get_ranges;
+        require(ranges.size() == 1 && ranges[0].first == 0 &&
+                    ranges[0].last == 2 * block - 1 && shared.active_gets > 0,
+                "sequential GET did not leave 4 MiB reserved for demand within the 8 MiB cap");
+      }
+      pending[2] = std::jthread([&] {
+        try {
+          require(::readahead(c.get(), off_t(off), crossing.size()) == 0,
+                  "submit batched cross-block readahead under pressure");
+          pread_all(c.get(), crossing, off);
+        } catch (...) { failures[2] = std::current_exception(); }
+        completed[2].store(true, std::memory_order_release);
+      });
+      wait([&] { return pinned->tail_paused.load(std::memory_order_acquire); },
+           "cross-block pressure request did not pin both blocks before its pause");
+      require(!completed[2].load(std::memory_order_acquire),
+              "cross-block pressure request exposed its incomplete second block");
+      {
+        std::lock_guard guard(shared.mutex);
+        const auto& ranges = pinned->get_ranges;
+        require(ranges.size() == 1 && ranges[0].first == 0 &&
+                    ranges[0].last == 2 * block - 1,
+                "explicit cross-block readahead did not reserve both demand blocks together");
+      }
+      pending[1] = std::jthread([&] {
+        try { pread_all(b.get(), other, 4096); }
+        catch (...) { failures[1] = std::current_exception(); }
+        completed[1].store(true, std::memory_order_release);
+      });
+      wait([&] { return completed[1].load(std::memory_order_acquire); },
+           "unrelated demand could not evict a complete block from a pending GET");
+      pending[1].join();
+      if (failures[1]) std::rethrow_exception(failures[1]);
+      require(std::equal(other.begin(), other.end(), read_ahead.begin() + 4096),
+              "partial-GET pressure unrelated READ differs");
+      require(!completed[2].load(std::memory_order_acquire),
+              "pressure exposed pinned bytes before their receive completed");
+      inflight->send_limit.store(SIZE_MAX, std::memory_order_release);
+      pinned->send_limit.store(SIZE_MAX, std::memory_order_release);
+      wait([&] { return completed[2].load(std::memory_order_acquire); },
+           "pinned crossing demand did not resume after pressure");
+      pending[2].join();
+      if (failures[2]) std::rethrow_exception(failures[2]);
+      require(std::equal(crossing.begin(), crossing.end(), read_ahead.begin() + off),
+              "pinned crossing pressure READ differs");
+      idle();
+      require(::readahead(a.get(), off_t(off), bytes.size()) == 0,
+              "submit batched READ across evicted and retained blocks");
+      pread_all(a.get(), bytes, off);
+      require(std::equal(bytes.begin(), bytes.end(), inflight->bytes.begin() + off),
+              "cross-GET READ did not recover an evicted block beside retained coverage");
+      idle();
+      {
+        std::lock_guard guard(shared.mutex);
+        for (const char* name : {"budget-inflight.bin", "budget-pinned.bin", "budget-demand.bin"}) {
+          fprintf(stderr, "partial-GET pressure %s ranges:", name);
+          for (const auto& range : shared.special_objects.at(name)->get_ranges) {
+            fprintf(stderr, " [%llu,%llu]", (unsigned long long)range.first,
+                    (unsigned long long)range.last);
+          }
+          fprintf(stderr, "\n");
+        }
+        const auto& ranges = inflight->get_ranges;
+        require(ranges.size() == 2 && ranges.back().first == 0 &&
+                    ranges.back().last == block - 1,
+                "pressure-evicted block was not refetched without duplicating the retained block");
+      }
+      a.reset();
+      b.reset();
+      c.reset();
+      mounted.stop();
+      require(mounted.stopped_cleanly(), "partial-GET pressure shutdown was not clean");
+      shared.stop.store(true);
+      server.request_stop();
+      server.join();
+      require(::rmdir(mountpoint.c_str()) == 0, "remove partial-GET pressure mountpoint");
+      fprintf(stderr, "8 MiB stress-only budget: reclaim complete block from pending GET, pinned crossing demand, aligned refetch: passed\n");
+      return 0;
+    }
+
     if (budget_prefetch) {
       constexpr std::array<const char*, 3> names{
           "read-ahead.bin", "read-ahead-sequential.bin", "read-ahead-random.bin"};
@@ -2030,30 +2225,77 @@ int main(int argc, char** argv) {
       for (auto& reader : readers) reader.join();
       for (const auto& error : errors) if (error) std::rethrow_exception(error);
       if (engine == "uring") {
-        // A 2 MiB retained window plus a missing suffix cannot both fit this
-        // cap. Selection must release its pins and reclaim A before retrying,
-        // not repeatedly pin A and wait for that same allocation to disappear.
+        constexpr size_t block = 2U * 1024U * 1024U;
+        const auto wait = [](auto&& ready, const char* message) {
+          for (unsigned n = 0; n != 3000; ++n) {
+            if (ready()) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+          throw std::runtime_error(message);
+        };
+        const auto idle = [&] {
+          wait([&] {
+            std::lock_guard guard(shared.mutex);
+            return shared.active_gets == 0;
+          }, "low-budget GET did not complete");
+        };
+        // The minimum 4 MiB cap must admit the whole crossing READ: pinning
+        // its retained first block cannot starve the missing second block.
         UniqueFd fd(::open((mountpoint + "/read-ahead-store.bin").c_str(), O_RDONLY | O_CLOEXEC));
         require(bool(fd), "open tiny-budget crossing object");
         require(::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
                 "tiny-budget crossing random advice");
         std::array<std::byte, 128U * 1024U> bytes{};
         pread_all(fd.get(), bytes, 4096);
-        for (unsigned n = 0; n < 3000; ++n) {
-          bool idle;
-          { std::lock_guard guard(shared.mutex); idle = shared.active_gets == 0; }
-          if (idle) break;
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        const size_t off = 2U * 1024U * 1024U - bytes.size() / 2;
+        idle();
+        const size_t off = block - bytes.size() / 2;
+        require(::readahead(fd.get(), off_t(off), bytes.size()) == 0,
+                "submit batched minimum-budget cross-block readahead");
         pread_all(fd.get(), bytes, off);
         require(std::equal(bytes.begin(), bytes.end(), read_ahead.begin() + off),
-                "tiny-budget crossing read did not reclaim its own pinned coverage");
+                "tiny-budget crossing READ did not preserve retained coverage");
+        idle();
         {
           std::lock_guard guard(shared.mutex);
-          require(shared.special_objects.at("read-ahead-store.bin")->get_requests == 2,
-                  "tiny-budget crossing read did not finish with one replacement GET");
+          const auto& ranges = shared.special_objects.at("read-ahead-store.bin")->get_ranges;
+          require(ranges.size() == 2 && ranges[0].first == 0 &&
+                      ranges[0].last == block - 1 && ranges[1].first == block &&
+                      ranges[1].last == 2 * block - 1,
+                  "tiny-budget crossing READ did not fetch exactly its missing aligned block");
         }
+        fd.reset();
+        // All requests straddle the allocation boundary. The 4 MiB mount
+        // budget fits only one such demand; concurrent files must queue and
+        // progress without retaining a partial set of pins forever.
+        readers.clear();
+        errors.fill(nullptr);
+        start.store(false, std::memory_order_release);
+        for (unsigned n = 0; n < errors.size(); ++n) {
+          readers.emplace_back([&, n] {
+            try {
+              UniqueFd cross_fd(::open((mountpoint + "/" + names[n % names.size()]).c_str(),
+                                       O_RDONLY | O_CLOEXEC));
+              require(bool(cross_fd), "open concurrent cross-block budget reader");
+              require(::posix_fadvise(cross_fd.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+                      "cross-block budget random advice");
+              while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+              std::array<std::byte, 128U * 1024U> data{};
+              for (unsigned i = 0; i != 12; ++i) {
+                require(::posix_fadvise(cross_fd.get(), off_t(off), off_t(data.size()),
+                                        POSIX_FADV_DONTNEED) == 0,
+                        "drop cross-block pages for budget pressure");
+                require(::readahead(cross_fd.get(), off_t(off), data.size()) == 0,
+                        "submit concurrent batched cross-block readahead");
+                pread_all(cross_fd.get(), data, off);
+                require(std::equal(data.begin(), data.end(), read_ahead.begin() + off),
+                        "concurrent cross-block budget READ differs");
+              }
+            } catch (...) { errors[n] = std::current_exception(); }
+          });
+        }
+        start.store(true, std::memory_order_release);
+        for (auto& reader : readers) reader.join();
+        for (const auto& error : errors) if (error) std::rethrow_exception(error);
       }
       if (engine != "uring") {
         UniqueFd retry(::open((mountpoint + "/budget-retry.bin").c_str(), O_RDONLY | O_CLOEXEC));
@@ -2078,16 +2320,19 @@ int main(int argc, char** argv) {
       server.request_stop();
       server.join();
       if (::rmdir(mountpoint.c_str()) != 0) fail_errno("rmdir budget mountpoint");
-      fprintf(stderr, "2 MiB mount/file limits: 8 readers, 3 files, 512 random reads%s passed\n",
-              engine == "uring" ? "" : " and demand-only checksum retry");
+      fprintf(stderr, "%s mount/file limits: 8 readers, 3 files, 512 random reads%s passed\n",
+              engine == "uring" ? "4 MiB" : "2 MiB",
+              engine == "uring" ? " and 96 cross-block reads" :
+                                  " and demand-only checksum retry");
       return 0;
     }
 
     if (pool_prefetch) {
       constexpr size_t block = 2U * 1024U * 1024U;
-      constexpr size_t offset = 4096;
+      const size_t offset = shutdown_prefetch ? 0 : 4096;
       auto object = shared.special_objects.at("pool-random.bin");
-      object->send_limit.store(offset + 512U * 1024U, std::memory_order_release);
+      object->send_limit.store(shutdown_prefetch ? block : 512U * 1024U,
+                               std::memory_order_release);
       const std::string path = mountpoint + "/pool-random.bin";
       UniqueFd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
       if (!fd) fail_errno("open pooled prefetch object");
@@ -2139,27 +2384,28 @@ int main(int argc, char** argv) {
         }
         done[0].store(true, std::memory_order_release);
       });
-      wait([&] { return object->tail_paused.load(std::memory_order_acquire) &&
-                        done[0].load(std::memory_order_acquire); },
-           "first 128 KiB READ waited for the paused 2 MiB prefetch tail");
-      readers[0].join();
-      if (errors[0]) std::rethrow_exception(errors[0]);
-      require(std::equal(first.begin(), first.end(), object->bytes.begin() + offset),
-              "pooled prefetch initial READ differs");
-      require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
-              "uncached pooled prefetch proactively STOREd an unrelated page");
+      wait([&] { return object->tail_paused.load(std::memory_order_acquire); },
+           "pooled GET did not reach its controlled pause");
       {
         std::lock_guard guard(shared.mutex);
         const auto& ranges = object->get_ranges;
-        require(ranges.size() == 1 && ranges[0].first == offset &&
-                    ranges[0].last == offset + block - 1,
-                "random GET was not forward 2 MiB from the unaligned requested offset");
+        require(ranges.size() == 1 && ranges[0].first == 0 &&
+                    ranges[0].last == (shutdown_prefetch ? 4 * block : block) - 1,
+                "pooled GET did not use aligned 2 MiB random or 8 MiB sequential coverage");
         require(shared.active_gets > 0,
                 "pooled GET completed before the paused-tail observation");
         require(shared.checksum_mode_requests == 0,
                 "new uncached read path unexpectedly requested checksum verification");
       }
-      if (!shutdown_prefetch) {
+      if (shutdown_prefetch) {
+        wait([&] { return done[0].load(std::memory_order_acquire); },
+             "READ waited beyond its complete block for the paused sequential GET tail");
+      } else {
+        // The first READ's entire 128 KiB is already on the wire, but its
+        // containing 2 MiB block is incomplete and must not be published yet.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        require(!done[0].load(std::memory_order_acquire),
+                "pooled READ replied before its entire 2 MiB block arrived");
         readers.emplace_back([&] {
           try {
             pread_all(sibling.get(), second, offset + 768U * 1024U);
@@ -2168,20 +2414,31 @@ int main(int argc, char** argv) {
           }
           done[1].store(true, std::memory_order_release);
         });
-        // The requested bytes have not been sent yet. A demand arriving during
-        // a speculative WAITALL may wait for its full block; do not require
-        // cancellation or an early partial-buffer observation.
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         require(!done[1].load(std::memory_order_acquire),
                 "pooled READ exposed bytes beyond completed network input");
+        {
+          std::lock_guard guard(shared.mutex);
+          require(object->get_requests == 1,
+                  "cross-handle pending READ issued a duplicate GET");
+        }
         object->send_limit.store(SIZE_MAX, std::memory_order_release);
-        wait([&] { return done[1].load(std::memory_order_acquire); },
-             "new demand did not complete after the existing receive resumed");
+        wait([&] { return done[0].load(std::memory_order_acquire) &&
+                          done[1].load(std::memory_order_acquire); },
+             "whole-block readers did not complete after the existing receive resumed");
         readers[1].join();
         if (errors[1]) std::rethrow_exception(errors[1]);
         require(std::equal(second.begin(), second.end(),
                            object->bytes.begin() + offset + 768U * 1024U),
-                "pooled READ after speculative WAITALL differs");
+                "pooled READ after the block became complete differs");
+      }
+      readers[0].join();
+      if (errors[0]) std::rethrow_exception(errors[0]);
+      require(std::equal(first.begin(), first.end(), object->bytes.begin() + offset),
+              "pooled prefetch initial READ differs");
+      require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
+              "uncached pooled prefetch proactively STOREd an unrelated page");
+      if (!shutdown_prefetch) {
         idle();
         require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
                 "completed uncached pooled prefetch proactively STOREd unrelated data");
@@ -2190,9 +2447,8 @@ int main(int argc, char** argv) {
           require(object->get_requests == 1,
                   "overlapping pending READ issued a duplicate GET");
         }
-        // Begin the next adjacent 8 MiB window at 2 MiB + 4 KiB. A request
-        // at 4 MiB straddles its storage-block boundary despite FUSE's usual
-        // 256 KiB maximum request size, exercising scatter/gather replies.
+        // The next random miss fetches the aligned block. A later READ spans
+        // both GETs and must use their existing coverage, not redownload it.
         std::array<std::byte, 64U * 1024U> cross{};
         pread_all(fd.get(), cross, offset + block);
         idle();
@@ -2202,6 +2458,8 @@ int main(int argc, char** argv) {
         require(::posix_fadvise(fd.get(), off_t(edge), off_t(cross.size()),
                                 POSIX_FADV_DONTNEED) == 0,
                 "drop kernel pages across existing pooled GETs");
+        require(::readahead(fd.get(), off_t(edge), cross.size()) == 0,
+                "submit batched READ across existing pooled GETs");
         pread_all(fd.get(), cross, edge);
         require(std::equal(cross.begin(), cross.end(), object->bytes.begin() + edge),
                 "READ crossing two existing GETs differs");
@@ -2210,29 +2468,24 @@ int main(int argc, char** argv) {
           require(object->get_requests == 2,
                   "READ crossing two existing GETs downloaded overlapping bytes");
         }
-        pread_all(fd.get(), cross, 2 * block);
-        require(std::equal(cross.begin(), cross.end(), object->bytes.begin() + 2 * block),
-                "READ crossing a 2 MiB receive-block boundary differs");
-        idle();
-        // Serve the entire first 2 MiB block so it is recycled, while the
-        // second GET still retains its unconsumed bytes. A crossing READ now
-        // needs only the old block's hole, not another copy of its live suffix.
-        for (size_t off = offset; off < offset + block; off += cross.size()) {
+        // Replying every byte does not discard a block. While the memory
+        // budget fits, a page-cache miss must reuse the retained whole block.
+        for (size_t off = 0; off < block; off += cross.size()) {
           pread_all(fd.get(), cross, off);
         }
         require(::posix_fadvise(fd.get(), off_t(edge), off_t(cross.size()),
                                 POSIX_FADV_DONTNEED) == 0,
-                "drop kernel pages across recycled and retained coverage");
+                "drop kernel pages across fully served and retained coverage");
+        require(::readahead(fd.get(), off_t(edge), cross.size()) == 0,
+                "submit batched READ across retained pooled blocks");
         pread_all(fd.get(), cross, edge);
         require(std::equal(cross.begin(), cross.end(), object->bytes.begin() + edge),
-                "READ crossing recycled and retained coverage differs");
+                "READ crossing fully served and retained coverage differs");
         idle();
         {
           std::lock_guard guard(shared.mutex);
-          const auto& ranges = object->get_ranges;
-          require(ranges.size() == 3 && ranges.back().first == edge &&
-                      ranges.back().last == offset + block - 1,
-                  "READ crossing a recycled hole did not fetch only the missing prefix");
+          require(object->get_requests == 2,
+                  "fully served blocks were discarded without memory pressure");
         }
         {
           auto ordered = shared.special_objects.at("pool-order.bin");
@@ -2242,12 +2495,22 @@ int main(int argc, char** argv) {
           require(::posix_fadvise(order_fd.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
                   "disable kernel prefetch for reverse GET completion");
           std::atomic<bool> crossed{false};
+          std::atomic<bool> initial_done{false};
+          std::array<std::byte, 64U * 1024U> initial{};
+          std::exception_ptr initial_error;
           std::exception_ptr crossing_error;
+          std::jthread initial_read;
           std::jthread crossing;
           ResumePool resume_order{*ordered};
-          pread_all(order_fd.get(), cross, offset);
+          initial_read = std::jthread([&] {
+            try { pread_all(order_fd.get(), initial, offset); }
+            catch (...) { initial_error = std::current_exception(); }
+            initial_done.store(true, std::memory_order_release);
+          });
           wait([&] { return ordered->tail_paused.load(std::memory_order_acquire); },
                "first GET did not pause before reverse completion test");
+          require(!initial_done.load(std::memory_order_acquire),
+                  "incomplete first block was published before reverse completion test");
           pread_all(order_fd.get(), cross, offset + block);
           wait([&] {
             std::lock_guard guard(shared.mutex);
@@ -2257,7 +2520,11 @@ int main(int argc, char** argv) {
                                   POSIX_FADV_DONTNEED) == 0,
                   "drop kernel pages before reverse-completion crossing READ");
           crossing = std::jthread([&] {
-            try { pread_all(order_fd.get(), cross, edge); }
+            try {
+              require(::readahead(order_fd.get(), off_t(edge), cross.size()) == 0,
+                      "submit batched READ across complete and pending GETs");
+              pread_all(order_fd.get(), cross, edge);
+            }
             catch (...) { crossing_error = std::current_exception(); }
             crossed.store(true, std::memory_order_release);
           });
@@ -2268,7 +2535,11 @@ int main(int argc, char** argv) {
           wait([&] { return crossed.load(std::memory_order_acquire); },
                "cross-GET READ did not wake after its own missing prefix arrived");
           crossing.join();
+          initial_read.join();
+          if (initial_error) std::rethrow_exception(initial_error);
           if (crossing_error) std::rethrow_exception(crossing_error);
+          require(std::equal(initial.begin(), initial.end(), ordered->bytes.begin() + offset),
+                  "reverse-completion first block READ differs");
           require(std::equal(cross.begin(), cross.end(), ordered->bytes.begin() + edge),
                   "reverse-completion cross-GET READ differs");
           idle();
@@ -2303,23 +2574,44 @@ int main(int argc, char** argv) {
                   "sequential pooled GET ignored its configured maximum window");
         }
         seq.reset();
-        auto footer = shared.special_objects.at("pool-footer.bin");
-        UniqueFd tail(::open((mountpoint + "/pool-footer.bin").c_str(), O_RDONLY | O_CLOEXEC));
-        require(bool(tail), "open pooled footer object");
+        auto tail_object = shared.special_objects.at("pool-tail.bin");
+        UniqueFd tail(::open((mountpoint + "/pool-tail.bin").c_str(), O_RDONLY | O_CLOEXEC));
+        require(bool(tail), "open pooled short-tail object");
         require(::posix_fadvise(tail.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
-                "disable kernel prefetch for footer range test");
-        const size_t tail_off = (footer->bytes.size() / page - 1) * page;
-        std::vector<std::byte> tail_bytes(footer->bytes.size() - tail_off);
+                "disable kernel prefetch for aligned EOF range test");
+        const size_t tail_off = tail_object->bytes.size() / block * block;
+        std::vector<std::byte> tail_bytes(tail_object->bytes.size() - tail_off);
         pread_all(tail.get(), tail_bytes, tail_off);
-        require(std::equal(tail_bytes.begin(), tail_bytes.end(), footer->bytes.begin() + tail_off),
-                "pooled footer bytes differ");
+        require(std::equal(tail_bytes.begin(), tail_bytes.end(), tail_object->bytes.begin() + tail_off),
+                "pooled EOF tail bytes differ");
         idle();
         {
           std::lock_guard guard(shared.mutex);
-          const auto& ranges = footer->get_ranges;
-          require(ranges.size() == 1 && ranges[0].first == tail_off - 64U * 1024U &&
-                      ranges[0].last == footer->bytes.size() - 1,
-                  "footer GET did not extend backward by the default 64 KiB");
+          const auto& ranges = tail_object->get_ranges;
+          require(ranges.size() == 1 && ranges[0].first == tail_off &&
+                      ranges[0].last == tail_object->bytes.size() - 1,
+                  "short EOF block was not published using exactly the aligned tail range");
+        }
+        // The already retained short EOF block also participates in an iov
+        // READ with the previous full block; it must not be fetched again.
+        const size_t tail_edge = tail_off - page;
+        tail_bytes.resize(page + tail_object->bytes.size() - tail_off);
+        require(::posix_fadvise(tail.get(), off_t(tail_off), off_t(page),
+                                POSIX_FADV_DONTNEED) == 0,
+                "drop kernel EOF page before cross-block tail READ");
+        require(::readahead(tail.get(), off_t(tail_edge), tail_bytes.size()) == 0,
+                "submit batched READ across full and short EOF blocks");
+        pread_all(tail.get(), tail_bytes, tail_edge);
+        require(std::equal(tail_bytes.begin(), tail_bytes.end(),
+                           tail_object->bytes.begin() + tail_edge),
+                "READ crossing a full block and a short EOF block differs");
+        idle();
+        {
+          std::lock_guard guard(shared.mutex);
+          const auto& ranges = tail_object->get_ranges;
+          require(ranges.size() == 2 && ranges.back().first == tail_off - block &&
+                      ranges.back().last == tail_off - 1,
+                  "cross-block EOF READ redownloaded its retained tail");
         }
       }
       require(::munmap(mapping, page) == 0, "unmap pooled probe");
@@ -2339,7 +2631,7 @@ int main(int argc, char** argv) {
               "remove pooled prefetch mountpoint");
       fprintf(stderr, "%s: passed\n", shutdown_prefetch ?
               "pooled prefetch shutdown with active receive" :
-              "pooled early READ, pending demand, no STORE, cross-block reply, window growth and footer");
+              "pooled whole-block gate, pending dedup, no STORE, retained blocks, cross-block reply, window growth and aligned EOF");
       return 0;
     }
 

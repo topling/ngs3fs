@@ -377,7 +377,9 @@ class AnonymousRangeStorage {
   [[nodiscard]] bool copy_to(size_t offset, std::span<std::byte> output) const;
   [[nodiscard]] std::vector<std::span<const std::byte>> spans(
       size_t offset, size_t length) const;
-  // Recycle only complete blocks wholly covered by this served interval.
+  // Recycle only complete blocks wholly covered by this eviction interval.
+  // The caller excludes blocks owned by receives, waiting reads, and replies;
+  // whether their bytes have previously been replied is irrelevant.
   // Returns their logical byte count (a final tail may be shorter than 2MiB)
   // and releases one 2MiB reservation quantum for each recycled mapping.
   size_t discard(size_t offset, size_t length) noexcept;

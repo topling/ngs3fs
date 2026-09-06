@@ -9,41 +9,45 @@ multi-file namespace. It remains experimental rather than production-ready.
 
 ## Uncached io_uring reads
 
-The uncached io_uring implementation uses reusable 2 MiB anonymous receive blocks,
+The uncached io_uring design uses reusable 2 MiB anonymous receive blocks,
 populated once when the bounded pool grows and recycled through a freelist.
-Socket I/O and HTTP parsing run on the io_uring reactor. A pending FUSE read
-uses short receives and replies as soon as its full requested interval is
-ready; `fuse_reply_buf` or `fuse_reply_iov` references the block slices without
-assembling a second userspace buffer. Speculative reception then prefers
-io_uring `RECV | MSG_WAITALL`, falling back to ordinary asynchronous receives.
-A speculative receive covers at most one 2 MiB block; new demand waits for
-that completion without cancelling it, then receives priority over continued
-prefetch.
+Object offsets use the same 2 MiB alignment, with the last block clipped at
+EOF. Socket I/O and HTTP parsing run on the io_uring reactor. A FUSE read waits
+until every block intersecting its requested interval is fully received;
+`fuse_reply_buf` or `fuse_reply_iov` then references the required slices without
+assembling a second userspace buffer. A completed block may reply while later
+blocks of its GET are still downloading. Both demand and speculative receives
+prefer io_uring `RECV | MSG_WAITALL`, falling back to ordinary asynchronous
+receives. Each receive stays within one block and its HTTP framing boundary.
+New demand waits for the existing receive without cancelling it.
 
 This path has no memfd, pipe/splice/vmsplice transfer, proactive
 `NOTIFY_STORE`, or network continuation worker. Its first iteration skips
 uncached read checksum verification; cached verification and upload checksums
 keep their existing behavior. Mappings remain alive through actual receive
-and FUSE reply completion, and unconsumed prefetched data remains available
-until served or evicted. Idle freelist mappings count toward the bounded pool.
+and FUSE reply completion. Whole valid blocks remain available until eviction,
+including blocks whose contents have already been replied. There is no
+consumed-range bitmap or downloaded/replied history after eviction. Later
+demand or speculative GETs may fetch an evicted block again. Idle freelist
+mappings count toward the bounded pool.
 Block recycling uses the freelist; it does not map/unmap per read or request
 `MAP_HUGETLB` or `MADV_NOHUGEPAGE`.
 
 Sequential Range GETs start at 8 MiB and double to the configured maximum,
-normally 128 MiB. Random GETs start at the requested offset and read forward
-2 MiB (or enough for a longer FUSE request), without rounding the offset down.
-Random tail/footer reads reaching EOF may additionally extend backward by at
-most `--tail-read-ahead` (default 64 KiB, zero disables it), without growing a
-shorter random range beyond 2 MiB. A longer demanded interval is not clipped
-and gets no extra backward coverage. The 8 MiB default upload part size is
-independent of these GET lengths and the 2 MiB allocation blocks.
+normally 128 MiB. Random GETs round their start down and end up to cover the
+complete intersecting 2 MiB blocks, clipped at EOF. Speculative extension is
+forward from that coverage. Footer and metadata reads follow the same rules;
+there is no footer-specific option or file-format detection. The 8 MiB default
+upload part size is independent of GET lengths and allocation blocks.
 
-All 86 local tests pass, including one/two reactors, a configured window cap,
-a 2 MiB memory budget with concurrent reads, and active-receive shutdown.
-They verify early reply, cross-GET and cross-block reuse, out-of-order GET
-completion, retired-hole refetch, no proactive STORE, growth and footer bounds.
-Final runner performance comparison remains pending; local CPU savings do not
-imply lower latency at every core count.
+This aligned whole-block revision passes all 92 local CTest cases and seven
+focused ThreadSanitizer cases. Six controlled HTTP/2 cases independently vary
+first-body-byte delay and payload rate; they check correctness, not real-S3
+latency. Uncached random-read benchmarks explicitly budget for the working
+set plus in-flight headroom and reject samples showing budget exhaustion or
+pressure eviction. A real VersityGW smoke run passed this runtime gate.
+Runner CI and comparative performance measurements for this revision remain
+pending; these checks do not establish a CPU or latency improvement.
 The [reactor contract](docs/io-uring-reactor-plan.md) records the lifetime,
 memory-budget, WAITALL requirements and detailed evidence. Established
 legacy and cached behavior is described below; their transport details do not
@@ -477,13 +481,15 @@ and recreates the socket without locking its receive-buffer size.
 selection and is disabled unless explicitly requested. It accepts AWS checksum
 headers, Alibaba OSS CRC64, and Google XML API `x-goog-hash` CRC32C/MD5.
 The uncached io_uring path described above uses sequential GET lengths
-of `8 -> 16 -> 32 -> 64 -> 128 MiB` and 2 MiB forward random GETs. Adjacent
+of `8 -> 16 -> 32 -> 64 -> 128 MiB` and block-aligned random GETs. Adjacent
 requests and hits in completed or in-progress coverage preserve sequential
 state; only a nonadjacent miss resets it. A fetch window is logical coverage,
 so extending it does not eagerly populate every 2 MiB block in that window.
-Useful unconsumed bytes are retained within the budget and shared by
-overlapping reads, including while reception continues. Tail/footer backward
-coverage is configured by `--tail-read-ahead` and defaults to 64 KiB.
+Completed and pending blocks are shared by overlapping reads. Retain whole
+blocks within the budget regardless of which portions have already been
+replied, and evict only blocks without receive, waiting-read or reply owners.
+Eviction leaves no historical bitmap. Each intersecting block must complete
+before a read replies; the rest of the GET may continue independently.
 
 The receive-pool revision preserves `--max-prefetch-memory SIZE` and
 `--max-file-prefetch-memory SIZE` as mount-wide and shared per-inode limits.
@@ -492,9 +498,13 @@ Automatic defaults resolve to 10% of physical RAM for the mount and
 value is a cap, not clamped to file size. The revised accounting must include
 the physical 2 MiB allocation quantum, all active/ready/reply-owned blocks,
 and idle freelist mappings in the total mount pool cap. Explicit uncached
-uring/auto budgets must be zero or multiples of 2 MiB; automatic per-file
-capacity rounds up to a whole block, including for tiny files. Legacy/cached
-budgets retain the page-aligned minimum of 256 KiB. Pool reuse and eviction allow demanded
+uring/auto budgets must be zero or multiples of 2 MiB large enough for the
+largest negotiated FUSE read's worst-case aligned block span, normally 4 MiB.
+Automatic per-file capacity rounds up to whole blocks, including for tiny
+files. Admission reserves a read's whole demand before starting its new GETs;
+failed admission releases that attempt's pins and unstarted reservations
+before waiting. Legacy/cached budgets retain the page-aligned minimum of
+256 KiB. Pool reuse and eviction allow demanded
 reads to progress under pressure; budget warnings remain rate-limited stderr
 messages. These limits do not change a READ's negotiated maximum.
 `-L/--cache-dir` enables the persistent sparse local cache. Each S3 key maps to
@@ -571,9 +581,11 @@ concurrency, request size distribution, and the same worker-CPU accounting in
 the competitor. The benchmark treats failed `posix_fadvise`/`madvise` cache
 eviction as an error rather than silently reporting a warm-page sample.
 `scripts/compare_goofys.sh` runs both clients against the same VersityGW
-instance and sums every task's `/proc/PID/task/TID/schedstat` runtime, avoiding
-the leader-only and 10 ms quantization errors of `/proc/PID/stat`. The
-unprivileged kernel BDI read-ahead fallback is reported explicitly.
+instance. Its mmap workload sums every task's
+`/proc/PID/task/TID/schedstat` runtime. The concurrent random-read workload
+uses process-wide `/proc/PID/stat` CPU time; sufficiently long, repeated
+samples limit its clock-tick quantization error. The unprivileged kernel BDI
+read-ahead fallback is reported explicitly.
 
 The same script can reuse the concurrent multi-file random-read stress as a
 comparison workload. It prepares identical deterministic objects directly in
@@ -607,6 +619,28 @@ state; warm mode warms each client first and then drops the kernel page cache,
 so it measures persistent client-cache value rather than a leftover FUSE page.
 It drops kernel caches between samples when run with enough privilege and
 removes only the generated backend objects after each sample.
+
+Uncached ngs3fs random-read comparisons and profiles explicitly size their
+receive budgets for the entire working set (each file rounded up to 2 MiB),
+plus one worst-case block span per concurrent reader/connection. The per-file
+budget covers a whole file plus that in-flight allowance. For the default
+32 x 4 MiB files, 16 readers and 256 KiB maximum read this means a 192 MiB
+mount budget and 68 MiB per-file budget; it does not change mount defaults.
+Admission also reserves space for the server/FUSE page caches and daemon
+headroom, rejecting insufficient available or physical/cgroup memory rather
+than silently shrinking the budget. `memory-plan.json` records the calculation.
+`memory-evidence.json` requires final graceful-shutdown counters for budget
+exhaustion and pressure-evicted bytes to both be zero; a missing counter,
+allocation warning or pressure event makes the sample fail instead of joining
+the baseline. Peak reservations and sampled pool occupancy are retained as
+evidence. Intentionally constrained correctness tests are separate.
+
+`bash scripts/check_read_latency.sh` runs the existing H2 whole-block read
+fixture with independently selectable first-body-byte delays and payload rates
+(`READ_TEST_TTFB_MS` and `READ_TEST_PAYLOAD_RATES`, space-separated lists).
+Each GET pays its delay once (HTTP headers are not delayed); payload pacing is
+per GET, not per receive block. Its pass/fail logs check behavior under delayed/rate-limited delivery;
+whole-fixture wall time is not a latency or throughput benchmark.
 
 The profiler accepts the same workload and advice controls. It produces a
 standard SVG, a searchable/zoomable interactive HTML flame graph, folded

@@ -17,6 +17,8 @@ perf_event=${PERF_EVENT:-cpu-clock}
 perf_frequency=${PERF_FREQUENCY:-4000}
 perf_mmap_size=${PERF_MMAP_SIZE:-4M}
 io_args=()
+memory_args=()
+validate_memory=0
 if [[ -n "$io_engine" ]]; then
   io_args+=(--io-engine "$io_engine")
 fi
@@ -201,6 +203,16 @@ for binary in "${required_binaries[@]}" \
 done
 
 mkdir -p "$backend/$bucket" "$mount_dir"
+if [[ "$workload" = random-read && "$cache_mode" = none ]]; then
+  memory_limits=$(python3 "$project_dir/scripts/random_read_memory.py" plan \
+    --files "$random_files" --file-size "$random_file_size" \
+    --threads "$random_threads" --maximum-read "$random_maximum_read" \
+    --connections "$max_connections" --output "$run_dir/memory-plan.json")
+  read -r mount_memory file_memory <<<"$memory_limits"
+  memory_args=(--max-prefetch-memory "$mount_memory"
+    --max-file-prefetch-memory "$file_memory" --stats-interval 1)
+  validate_memory=1
+fi
 {
   printf 'ngs3fs_path=%s\n' "$(realpath "$ngs3fs")"
   printf 'ngs3fs_sha256=%s\n' "$(sha256sum "$ngs3fs" | cut -d' ' -f1)"
@@ -208,6 +220,8 @@ mkdir -p "$backend/$bucket" "$mount_dir"
   printf 'git_dirty=%s\n' "$(git -C "$project_dir" status --porcelain | tr '\n' ' ')"
   printf 'perf_event=%s\nperf_frequency=%s\n' "$perf_event" "$perf_frequency"
   printf 'perf_mmap_size=%s\n' "$perf_mmap_size"
+  printf 'ngs3fs_io_engine=%s\nngs3fs_reactors=%s\n' \
+    "${io_engine:-legacy}" "${reactors:-1}"
 } >"$run_dir/system.txt"
 if [[ "$workload" = mmap ]]; then
   dd if=/dev/urandom of="$backend/$bucket/$object" \
@@ -238,6 +252,7 @@ AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key \
   "$ngs3fs" -f -e 127.0.0.1 -p "$port" \
     -C "$max_connections" \
     "${io_args[@]}" \
+    "${memory_args[@]}" \
     -a "127.0.0.1:$port" \
     -b "$bucket" "${cache_arg[@]}" "$mount_dir" \
     >"$run_dir/ngs3fs.log" 2>&1 &
@@ -452,6 +467,21 @@ elif [[ "$workload" = write ]]; then
     "$profile_upload_part_requests" "$profile_complete_requests" \
     "$perf_event" "$perf_frequency" \
     >>"$run_dir/profile-summary.csv"
+fi
+
+if ((validate_memory)); then
+  # Stop after all sampled/retry work, and collect final high-water counters.
+  # Unmount triggers shutdown. A later SIGTERM could race signal-handler
+  # removal and terminate the process before its final statistics are written.
+  fusermount3 -u "$mount_dir"
+  wait "$ngs3fs_pid" 2>/dev/null || true
+  ngs3fs_pid=
+  if ! python3 "$project_dir/scripts/random_read_memory.py" verify \
+    --plan "$run_dir/memory-plan.json" --log "$run_dir/ngs3fs.log" \
+    --output "$run_dir/memory-evidence.json"; then
+    mv "$run_dir/profile-summary.csv" "$run_dir/profile-summary.invalid.csv"
+    exit 1
+  fi
 fi
 
 printf '%s\n' "$run_dir"

@@ -66,6 +66,8 @@ if [[ "$cache_mode" != none ]]; then
 fi
 ngs3fs_cache_args=()
 ngs3fs_io_args=()
+ngs3fs_memory_args=()
+validate_memory=0
 if [[ "$cache_mode" != none ]]; then
   ngs3fs_cache_args=(-L "$cache_dir" --cache-reserve 0)
 fi
@@ -161,6 +163,7 @@ start_ngs3fs() {
       --socket-buffer-size "$socket_buffer_size" \
       -C "$max_connections" \
       "${ngs3fs_io_args[@]}" \
+      "${ngs3fs_memory_args[@]}" \
       -e 127.0.0.1 -p "$port" \
       -a "127.0.0.1:$port" -b "$bucket" \
       "${ngs3fs_cache_args[@]}" \
@@ -171,7 +174,8 @@ start_ngs3fs() {
 
 stop_ngs3fs() {
   fusermount3 -u "$ngs3fs_mount"
-  kill "$ngs3fs_pid" 2>/dev/null || true
+  # Unmount wakes the daemon. Do not send SIGTERM after it may have removed
+  # libfuse's signal handlers but before it writes final shutdown statistics.
   wait "$ngs3fs_pid" 2>/dev/null || true
   ngs3fs_pid=
 }
@@ -382,6 +386,14 @@ run_random_read_client() {
       "$random_file_size"
     run_random_read_case ngs3fs "$ngs3fs_mount" "$ngs3fs_pid"
     stop_ngs3fs
+    if ((validate_memory)); then
+      if ! python3 "$project_dir/scripts/random_read_memory.py" verify \
+        --plan "$run_dir/memory-plan.json" --log "$run_dir/ngs3fs.log" \
+        --output "$run_dir/memory-evidence.json"; then
+        mv "$run_dir/random-read-summary.csv" "$run_dir/random-read-summary.invalid.csv"
+        return 1
+      fi
+    fi
   elif [[ "$client" = goofys ]]; then
     start_goofys
     test "$(stat -c %s "$goofys_mount/random-read/file-0000.bin")" = \
@@ -439,6 +451,17 @@ for binary in "${required_binaries[@]}"; do
 done
 
 mkdir -p "$backend/$bucket" "$ngs3fs_mount" "$goofys_mount"
+if [[ "$workload" = random-read && "$cache_mode" = none &&
+      ( "$client" = ngs3fs || "$client" = both ) ]]; then
+  memory_limits=$(python3 "$project_dir/scripts/random_read_memory.py" plan \
+    --files "$random_files" --file-size "$random_file_size" \
+    --threads "$random_threads" --maximum-read "$random_maximum_read" \
+    --connections "$max_connections" --output "$run_dir/memory-plan.json")
+  read -r mount_memory file_memory <<<"$memory_limits"
+  ngs3fs_memory_args=(--max-prefetch-memory "$mount_memory"
+    --max-file-prefetch-memory "$file_memory" --stats-interval 1)
+  validate_memory=1
+fi
 if [[ "$workload" = mmap ]]; then
   dd if=/dev/urandom of="$object_path" bs=1M count="$object_mib" status=none
   dd if="$object_path" of=/dev/null bs=8M status=none
