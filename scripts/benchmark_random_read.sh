@@ -33,7 +33,7 @@ mkdir -p "$output_dir"
   uname -a
   lscpu
   free -h
-  printf 'ngs3fs_commit=%s\n' "$(git -C "$project_dir" rev-parse HEAD)"
+  printf 'ngs3fs_commit=%s\n' "$(git -c safe.directory="$project_dir" -C "$project_dir" rev-parse HEAD)"
   printf 'reference_client=%s\n' "$reference_client"
   if [[ "$reference_client" = mountpoint-s3 ]]; then
     printf 'reference_binary=%s\n' \
@@ -47,6 +47,8 @@ mkdir -p "$output_dir"
     "${UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE:-134217728}"
   printf 'ngs3fs_io_engine=%s\n' "${NGS3FS_IO_ENGINE:-default}"
   printf 'ngs3fs_reactors=%s\n' "${NGS3FS_REACTORS:-default}"
+  printf 'ngs3fs_cache_block_size=%s\n' "${NGS3FS_CACHE_BLOCK_SIZE:-2MiB}"
+  printf 'ngs3fs_cache_unlimited=%s\n' "${NGS3FS_CACHE_UNLIMITED:-0}"
   go version 2>/dev/null || true
 } >"$output_dir/system.txt"
 

@@ -25,6 +25,14 @@ def milliseconds(nanoseconds):
     return f"{nanoseconds / 1_000_000:.3f}"
 
 
+def integer_median(values):
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) // 2
+
+
 def io_label(row):
     engine = row["ngs3fs_io_engine"]
     if engine == "legacy":
@@ -94,6 +102,96 @@ def read_comparisons(input_dirs, data_dir):
     return comparisons
 
 
+def read_client_cpu_evidence(input_dirs, comparisons, data_dir):
+    expected_by_suite = {}
+    for row in comparisons:
+        expected = expected_by_suite.setdefault(row["suite"], {})
+        expected[(row["advice"], "ngs3fs")] = row["samples"]
+        expected[(row["advice"], row["reference"])] = row["samples"]
+
+    evidence = {}
+    inputs_by_name = {path.name: path for path in input_dirs}
+    fieldnames = [
+        "sample", "advice", "client", "operations", "daemon_cpu_ns",
+        "workload_cpu_ns", "total_cpu_ns", "total_cpu_ns_per_operation",
+    ]
+    for suite, expected in expected_by_suite.items():
+        input_dir = inputs_by_name.get(suite)
+        if input_dir is None:
+            continue
+        rows = []
+        for cpu_path in sorted(input_dir.glob("*/client-cpu.csv")):
+            result_path = cpu_path.parent / "random-read-summary.csv"
+            if not result_path.is_file():
+                raise RuntimeError(
+                    f"client CPU sample has no random-read summary: {cpu_path}")
+            with result_path.open(newline="", encoding="utf-8") as source:
+                results = {row["client"]: row for row in csv.DictReader(source)}
+            with cpu_path.open(newline="", encoding="utf-8") as source:
+                for cpu in csv.DictReader(source):
+                    result = results.get(cpu["client"])
+                    if result is None:
+                        raise RuntimeError(
+                            f"client CPU sample has no matching result: {cpu_path}")
+                    key = (result["advice"], cpu["client"])
+                    if key not in expected:
+                        continue
+                    operations = (number(result, "pread_operations") +
+                                  number(result, "mmap_operations"))
+                    if operations == 0:
+                        raise RuntimeError(
+                            f"client CPU sample has no operations: {cpu_path}")
+                    daemon_cpu = number(cpu, "daemon_cpu_ns")
+                    workload_cpu = number(cpu, "workload_cpu_ns")
+                    total_cpu = daemon_cpu + workload_cpu
+                    total_per_operation = total_cpu // operations
+                    if (number(cpu, "total_cpu_ns") != total_cpu or
+                            number(cpu, "total_cpu_ns_per_operation") !=
+                            total_per_operation):
+                        raise RuntimeError(
+                            f"inconsistent client CPU totals: {cpu_path}")
+                    rows.append({
+                        "sample": cpu_path.parent.name,
+                        "advice": result["advice"],
+                        "client": cpu["client"],
+                        "operations": operations,
+                        "daemon_cpu_ns": daemon_cpu,
+                        "workload_cpu_ns": workload_cpu,
+                        "total_cpu_ns": total_cpu,
+                        "total_cpu_ns_per_operation": total_per_operation,
+                    })
+
+        grouped = {}
+        for row in rows:
+            grouped.setdefault((row["advice"], row["client"]), []).append(row)
+        complete = rows and all(
+            len(grouped.get(key, [])) == count
+            for key, count in expected.items())
+        output = data_dir / f"{suite}-client-cpu.csv"
+        if not complete:
+            output.unlink(missing_ok=True)
+            continue
+        rows.sort(key=lambda row: (row["advice"], row["client"], row["sample"]))
+        with output.open("w", newline="", encoding="utf-8") as destination:
+            writer = csv.DictWriter(destination, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        for comparison in (row for row in comparisons if row["suite"] == suite):
+            ngs3fs = grouped[(comparison["advice"], "ngs3fs")]
+            reference = grouped[(comparison["advice"], comparison["reference"])]
+            ngs3fs_total = integer_median(
+                [row["total_cpu_ns_per_operation"] for row in ngs3fs])
+            reference_total = integer_median(
+                [row["total_cpu_ns_per_operation"] for row in reference])
+            evidence[(suite, comparison["advice"])] = {
+                "ngs3fs_total_cpu_per_operation_ns": ngs3fs_total,
+                "reference_total_cpu_per_operation_ns": reference_total,
+                "reference_over_ngs3fs": ratio(reference_total, ngs3fs_total),
+                "source": f"data/{output.name}",
+            }
+    return evidence
+
+
 def write_csv(path, comparisons):
     if not comparisons:
         raise RuntimeError("no complete benchmark comparisons found")
@@ -112,7 +210,9 @@ def run_url():
     return ""
 
 
-def write_markdown(path, comparisons, generated, source_run):
+def write_markdown(path, comparisons, generated, source_run,
+                   client_cpu_evidence=None):
+    client_cpu_evidence = client_cpu_evidence or {}
     lines = [
         "# ngs3fs random-read CPU comparison",
         "",
@@ -136,12 +236,38 @@ def write_markdown(path, comparisons, generated, source_run):
             f"{row['ngs3fs_s3_get_median']} / "
             f"{row['reference_s3_get_median']} |"
         )
+    lines.extend([
+        "",
+        "## Total client CPU evidence",
+        "",
+        "The primary table above remains daemon CPU only. Total client CPU "
+        "adds workload-process CPU, including system-call time charged to the "
+        "workload, to daemon CPU. Independent S3-server CPU and unattributed "
+        "global kernel work are excluded.",
+        "",
+        "| Suite | Advice | Total CPU/op (ngs3fs / reference) | Reference / ngs3fs | Evidence |",
+        "|---|---|---:|---:|---|",
+    ])
+    for row in comparisons:
+        total = client_cpu_evidence.get((row["suite"], row["advice"]))
+        if total is None:
+            values = "unavailable | unavailable | client CPU unavailable"
+        else:
+            values = (
+                f"{milliseconds(total['ngs3fs_total_cpu_per_operation_ns'])} / "
+                f"{milliseconds(total['reference_total_cpu_per_operation_ns'])} ms | "
+                f"{total['reference_over_ngs3fs']:.2f}x | "
+                f"[per-sample CSV]({total['source']})")
+        lines.append(
+            f"| {row['suite']} | {row['advice']} | {values} |")
     if source_run:
         lines.extend(["", f"Source workflow: {source_run}"])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_html(path, comparisons, generated, source_run):
+def write_html(path, comparisons, generated, source_run,
+               client_cpu_evidence=None):
+    client_cpu_evidence = client_cpu_evidence or {}
     rows = []
     for row in comparisons:
         saving = row["ngs3fs_cpu_saving_percent"]
@@ -159,6 +285,25 @@ def write_html(path, comparisons, generated, source_run):
             <td class="number {saving_class}">{percent(saving)}</td>
             <td class="number">{row['ngs3fs_s3_get_median']:,} / {row['reference_s3_get_median']:,}</td>
             <td><a href="{html.escape(source)}">CSV</a></td>
+          </tr>""")
+    total_rows = []
+    for row in comparisons:
+        total = client_cpu_evidence.get((row["suite"], row["advice"]))
+        if total is None:
+            total_values = """
+            <td class="number">unavailable</td>
+            <td class="number">unavailable</td>
+            <td>client CPU unavailable</td>"""
+        else:
+            source = html.escape(total["source"])
+            total_values = f"""
+            <td class="number">{milliseconds(total['ngs3fs_total_cpu_per_operation_ns'])} / {milliseconds(total['reference_total_cpu_per_operation_ns'])}</td>
+            <td class="number">{total['reference_over_ngs3fs']:.2f}×</td>
+            <td><a href="{source}">per-sample CSV</a></td>"""
+        total_rows.append(f"""
+          <tr>
+            <td>{html.escape(row['suite'])}</td>
+            <td>{html.escape(row['advice'])}</td>{total_values}
           </tr>""")
     workflow = ""
     if source_run:
@@ -207,6 +352,21 @@ def write_html(path, comparisons, generated, source_run):
       </tbody>
     </table>
   </div>
+  <h2>Total client CPU evidence</h2>
+  <p>Total client CPU adds workload-process CPU, including system-call time
+  charged to the workload, to daemon CPU. Independent S3-server CPU and
+  unattributed global kernel work are excluded.</p>
+  <div class="card">
+    <table>
+      <thead><tr>
+        <th>Suite</th><th>Advice</th>
+        <th class="number">Total CPU/op<br>ngs3fs / reference (ms)</th>
+        <th class="number">Reference CPU ÷<br>ngs3fs CPU</th><th>Evidence</th>
+      </tr></thead>
+      <tbody>{''.join(total_rows)}
+      </tbody>
+    </table>
+  </div>
   <div class="notes">
     <p><strong>CPU/op</strong> is aggregate daemon CPU time divided by completed
     <code>pread</code> and mmap-fault operations. Values are medians, not wall time.</p>
@@ -238,11 +398,14 @@ def main():
     generated = datetime.datetime.now(datetime.timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S UTC")
     comparisons = read_comparisons(args.input_dirs, data_dir)
+    client_cpu = read_client_cpu_evidence(
+        args.input_dirs, comparisons, data_dir)
     source_run = run_url()
     write_csv(args.output_dir / "random-read-cpu-comparison.csv", comparisons)
     write_markdown(args.output_dir / "random-read-cpu-comparison.md",
-                   comparisons, generated, source_run)
-    write_html(args.output_dir / "index.html", comparisons, generated, source_run)
+                   comparisons, generated, source_run, client_cpu)
+    write_html(args.output_dir / "index.html", comparisons, generated,
+               source_run, client_cpu)
 
 
 if __name__ == "__main__":

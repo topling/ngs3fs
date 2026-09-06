@@ -13,12 +13,12 @@ read -r -a buffer_sizes <<<"${SOCKET_BUFFER_SIZES:-0 2MiB}"
 
 worktree_digest() {
   {
-    git -C "$project_dir" diff HEAD --binary --
-    git -C "$project_dir" ls-files --others --exclude-standard -z |
+    git -c safe.directory="$project_dir" -C "$project_dir" diff HEAD --binary --
+    git -c safe.directory="$project_dir" -C "$project_dir" ls-files --others --exclude-standard -z |
       sort -z |
       while IFS= read -r -d '' file; do
         printf 'untracked\0%s\0' "$file"
-        git -C "$project_dir" hash-object --no-filters -- "$file"
+        git -c safe.directory="$project_dir" -C "$project_dir" hash-object --no-filters -- "$file"
       done
   } | sha256sum | cut -d' ' -f1
 }
@@ -38,7 +38,7 @@ mkdir -p "$output_dir"
   lscpu
   free -h
   sysctl net.core.rmem_max net.ipv4.tcp_rmem
-  printf 'ngs3fs_commit=%s\n' "$(git -C "$project_dir" rev-parse HEAD)"
+  printf 'ngs3fs_commit=%s\n' "$(git -c safe.directory="$project_dir" -C "$project_dir" rev-parse HEAD)"
   printf 'worktree_sha256=%s\n' "$(worktree_digest)"
   printf 'socket_buffer_sizes=%s\n' "${buffer_sizes[*]}"
   printf 'advice=%s\n' "$advice"
@@ -62,7 +62,7 @@ for ((repetition = 1; repetition <= repetitions; ++repetition)); do
     ((++sample))
     label=${buffer_size//[^[:alnum:]]/_}
     run_dir="$output_dir/r$repetition-$label"
-    sync
+    sync -f "$output_dir"
     if ! echo 3 >/proc/sys/vm/drop_caches 2>/dev/null; then
       echo "warning: unable to drop kernel caches before sample $sample" >&2
     fi

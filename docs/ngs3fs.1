@@ -90,11 +90,35 @@ Soft inode cache limit. Default is 1000000.
 Enable the persistent sparse local data cache at path. Disabled by default.
 .TP
 .BI "--cache-size " bytes
-Maximum physical cache allocation. Zero means no fixed limit.
+Maximum physical cache allocation. Zero means no fixed limit, but the free-space
+reserve still applies. Default is zero.
 .TP
 .BI "--cache-reserve " size-or-percent
 Free space preserved on the cache filesystem. Default is 5%.
 .TP
+.BI "--cache-block-size " size
+Cache fill/publication and minimum punch-hole eviction unit. The value must be
+a positive multiple of 32 KiB and no larger than 128 MiB. Default is 2 MiB.
+This does not change the uncached receive pool, upload part size, kernel page
+size or statfs I/O size. Requires --cache-dir when explicitly supplied.
+.TP
+.B --cache-unlimited
+Disable configured cache-capacity limits, the free-space reserve, and
+capacity-driven eviction. This is distinct from the default --cache-size=0,
+requires --cache-dir, and cannot be combined with an explicitly supplied
+--cache-size or --cache-reserve. Physical ENOSPC remains possible.
+.PP
+In unlimited mode, a read-only open of a complete clean idle cache generation
+may use native Linux FUSE passthrough. Normal handles and mappings must drain
+before promotion; simultaneous passthrough opens share one backing
+registration, and a passthrough OPEN clears KEEP_CACHE. Missing kernel support
+or backing-registration permission falls back to ordinary cached I/O. With
+--verify-read-checksum, passthrough also requires completed successful
+verification; unavailable checksum metadata keeps ordinary cached I/O. An old
+passthrough mapping can continue reading its immutable old local inode after
+close or remote replacement. New opens retain the normal generation-conflict
+behavior. Later writers unlink and recreate an ever-exported cache data inode
+rather than truncating or punching holes in it.
 .SH WRITE OPTIONS
 .TP
 .BI "-P, --part-size " bytes

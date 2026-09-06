@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -63,6 +64,7 @@ class FuseReactor : public IoExecutor {
   // real local write (or shutdown cancellation); rejected calls do not callback.
   // Completion receives zero on success or a negative errno on failure.
   // The callback may destroy its context or submit another notification.
+  // Notifications retain FIFO order but never hold up ordinary FUSE replies.
   bool notify_inval_inode(fuse_ino_t inode, off_t offset, off_t length,
                            NotifyFunction done, void* context) noexcept;
 
@@ -116,6 +118,7 @@ class FuseReactor : public IoExecutor {
     unsigned flags = 0;
     bool pooled    = false;
     bool external  = false;
+    bool notification = false;
     NotifyFunction notify_done = nullptr;
     void* notify_context = nullptr;
 
@@ -123,6 +126,13 @@ class FuseReactor : public IoExecutor {
       return length <= sizeof(inline_data) ? inline_data :
           overflow_data.data();
     }
+  };
+
+  struct ReplyQueue {
+    Reply* head = nullptr;
+    Reply* tail = nullptr;
+    size_t count = 0;
+    bool pending = false;
   };
 
   enum IoKind {
@@ -246,8 +256,8 @@ class FuseReactor : public IoExecutor {
   FuseReactorGroup* group_         = nullptr;
   fuse_session* session_           = nullptr;
   io_uring ring_                   = {};
-  Reply* reply_head_               = nullptr;
-  Reply* reply_tail_               = nullptr;
+  // Indexed by Reply::notification: ordinary replies and notifications.
+  std::array<ReplyQueue, 2> reply_queues_{};
   NotifyFunction pending_notify_  = nullptr;
   void* pending_notify_context_    = nullptr;
   bool notify_accepted_            = false;
@@ -310,7 +320,6 @@ class FuseReactor : public IoExecutor {
   bool external_pending_           = false;
   bool dispatch_pending_           = false;
   bool task_pending_               = false;
-  bool reply_pending_              = false;
   bool wake_pending_               = false;
   bool first_receive_              = true;
   bool receive_active_             = false;

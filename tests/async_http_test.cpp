@@ -237,6 +237,9 @@ class QueueExecutor final : public IoExecutor {
   }
   bool reject_waitall = false;
   size_t rejected_waitalls = 0;
+  int socket_splice_error = 0;
+  int file_splice_error = 0;
+  size_t rejected_splices = 0;
   void (*before_complete)(void*, const AsyncIoRequest&, ssize_t) = nullptr;
   void* before_complete_context = nullptr;
 
@@ -301,6 +304,12 @@ class QueueExecutor final : public IoExecutor {
         saw_background_file_write_ |= pending.force_async;
         break;
       case AsyncIoRequest::SPLICE: {
+        const int error = pending.output_offset >= 0
+            ? file_splice_error : socket_splice_error;
+        if (error != 0) {
+          ++rejected_splices;
+          return -error;
+        }
         off_t input_offset = pending.input_offset + off_t(progress);
         off_t output_offset = pending.output_offset + off_t(progress);
         off_t* const input = pending.input_offset >= 0 ? &input_offset : nullptr;
@@ -549,11 +558,25 @@ class TestFileSink final : public RangeFileSink {
   TestFileSink(int fd, uint64_t offset, bool background_write) noexcept
       : RangeFileSink(fd, offset, background_write) {}
 
-  void progress(const Response&, bool complete) override {
+  void progress(const Response& response, bool complete) override {
+    if (!expected.empty()) {
+      check(response.body_bytes >= published &&
+            response.body_bytes <= expected.size(), "non-monotonic file progress");
+      std::vector<std::byte> bytes(response.body_bytes - published);
+      check(::pread(fd(), bytes.data(), bytes.size(),
+                    off_t(start + published)) == ssize_t(bytes.size()),
+            "file progress preceded the completed write");
+      check(std::equal(bytes.begin(), bytes.end(), expected.begin() + published),
+            "file progress exposed incorrect bytes");
+      published = response.body_bytes;
+    }
     ++progress_calls;
     completed |= complete;
   }
 
+  std::span<const std::byte> expected;
+  uint64_t start = 0;
+  size_t published = 0;
   size_t progress_calls = 0;
   bool completed = false;
 };
@@ -607,7 +630,7 @@ std::unique_ptr<HttpClient> connect_client(uint16_t port) {
       kRequestIoTimeoutMs, kConnectTimeoutMs, kProtocolProbeTimeoutMs);
 }
 
-void test_range_to_fd() {
+void test_range_to_fd(int socket_error = 0, int file_error = 0) {
   std::vector<std::byte> expected(97);
   for (size_t i = 0; i < expected.size(); ++i)
     expected[i] = std::byte((i * 29U + 11U) & 0xffU);
@@ -621,6 +644,8 @@ void test_range_to_fd() {
 
   constexpr uint64_t destination_offset = 19;
   TestFileSink destination(file.get(), destination_offset, true);
+  destination.expected = expected;
+  destination.start = destination_offset;
   AsyncHttpRequest request;
   request.path = "/range";
   request.range = true;
@@ -629,6 +654,8 @@ void test_range_to_fd() {
   request.destination = &destination;
 
   QueueExecutor executor;
+  executor.socket_splice_error = socket_error;
+  executor.file_splice_error = file_error;
   CompletionState completion;
   completion.operation = client->make_async_request(
       executor, std::move(request), complete_http, &completion);
@@ -646,8 +673,15 @@ void test_range_to_fd() {
   check(completion.response.externally_spliced_bytes +
             completion.response.fallback_copied_bytes == expected.size(),
         "range accounting mismatch");
-  check(completion.response.transport_splice_calls > 1,
-        "range body was not fragmented across splice operations");
+  if (socket_error == 0 && file_error == 0) {
+    check(completion.response.transport_splice_calls > 1,
+          "range body was not fragmented across splice operations");
+  } else {
+    check(executor.rejected_splices == 1,
+          "unsupported splice was skipped or retried repeatedly");
+    check(completion.response.fallback_copied_bytes == expected.size(),
+          "splice fallback did not copy the exact response body");
+  }
   check(completion.response.headers.at("x-fragmented") == "yes",
         "fragmented response header was not captured");
   if (destination.offset() != destination_offset + expected.size()) {
@@ -954,6 +988,10 @@ void test_queued_cancel() {
 
 int main() {
   test_range_to_fd();
+  test_range_to_fd(EPERM, 0);
+  test_range_to_fd(ENOSYS, 0);
+  test_range_to_fd(0, EPERM);
+  test_range_to_fd(0, EXDEV);
   test_range_to_memory(false, false, false);
   test_range_to_memory(false, false, true);
   test_range_to_memory(false, true, false);

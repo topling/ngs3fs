@@ -1662,7 +1662,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
                    std::string_view reactors = "1",
                    bool verify_reads = true, bool whole_retry = false,
                    bool low_budget = false, const char* max_window = nullptr,
-                   const char* memory_budget = nullptr) {
+                   const char* memory_budget = nullptr,
+                   const char* cache_block = "2MiB") {
   // The receive-pool implementation deliberately omits uncached checksum
   // verification. Cached and legacy tests still request it explicitly.
   if (engine == "uring" && cache_dir.empty()) verify_reads = false;
@@ -1684,7 +1685,17 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
     } else {
       ::unsetenv("UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE");
     }
-    if (!verify_reads) {
+    if (!verify_reads && !cache_dir.empty()) {
+      ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
+              port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
+              uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
+              "0750", "-I", "1", "--checksum", checksum.data(),
+              "--expected-bucket-owner", "111122223333", "--requester-pays",
+              "--stats-interval", "86400", "-L", cache_dir.data(),
+              "--cache-reserve", "0", "--cache-block-size", cache_block,
+              "--io-engine", engine.data(), "--reactors", reactors.data(),
+              "-f", mountpoint.data(), static_cast<char*>(nullptr));
+    } else if (!verify_reads) {
       ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
               port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
               uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
@@ -1724,6 +1735,137 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
   return process;
 }
 
+pid_t start_passthrough_daemon(
+    std::string_view executable, std::string_view mountpoint, uint16_t port,
+    std::string_view checksum, std::string_view cache_dir,
+    std::string_view trace_executable, std::string_view trace_output,
+    bool unlimited) {
+  const std::string port_text = std::to_string(port);
+  const std::string uid_text  = std::to_string(::getuid());
+  const std::string gid_text  = std::to_string(::getgid());
+  std::vector<std::string> daemon_arguments{
+      std::string(executable), "-e", "127.0.0.1", "-p", port_text,
+      "-a", "mock-s3", "-b", "bucket", "-u", uid_text, "-g", gid_text,
+      "-m", "0640", "-D", "0750", "-I", "1", "--checksum",
+      std::string(checksum), "--expected-bucket-owner", "111122223333",
+      "--requester-pays", "--stats-interval", "86400", "-L",
+      std::string(cache_dir), "--cache-block-size", "2MiB"};
+  if (unlimited) {
+    daemon_arguments.emplace_back("--cache-unlimited");
+  } else {
+    daemon_arguments.emplace_back("--cache-size");
+    daemon_arguments.emplace_back("64MiB");
+    daemon_arguments.emplace_back("--cache-reserve");
+    daemon_arguments.emplace_back("0");
+  }
+  daemon_arguments.insert(daemon_arguments.end(), {
+      "--io-engine", "auto", "--reactors", "1", "-f",
+      std::string(mountpoint)});
+
+  const pid_t process = ::fork();
+  if (process < 0) fail_errno("fork passthrough daemon");
+  if (process == 0) {
+    ::setenv("AWS_ACCESS_KEY_ID", "integration-access-key", 1);
+    ::setenv("AWS_SECRET_ACCESS_KEY", "integration-secret-key", 1);
+    ::unsetenv("AWS_SESSION_TOKEN");
+    ::unsetenv("UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE");
+
+    std::vector<std::string> traced_arguments;
+    std::vector<std::string>* selected = &daemon_arguments;
+    if (!trace_executable.empty()) {
+      traced_arguments = {
+          std::string(trace_executable), "-f", "-qq", "-e", "trace=ioctl",
+          "-o", std::string(trace_output)};
+      traced_arguments.insert(traced_arguments.end(),
+                              daemon_arguments.begin(),
+                              daemon_arguments.end());
+      selected = &traced_arguments;
+    }
+    std::vector<char*> arguments;
+    arguments.reserve(selected->size() + 1);
+    for (std::string& argument : *selected) {
+      arguments.push_back(argument.data());
+    }
+    arguments.push_back(nullptr);
+    ::execv(arguments.front(), arguments.data());
+    _exit(127);
+  }
+  return process;
+}
+
+struct TraceIoctlStats {
+  size_t calls = 0;
+  size_t successes = 0;
+  size_t unavailable = 0;
+};
+
+TraceIoctlStats trace_ioctl_stats(std::string_view path,
+                                  std::string_view needle,
+                                  bool positive_result_succeeds) {
+  const int fd = ::open(path.data(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    if (errno == ENOENT) return {};
+    fail_errno("open passthrough trace");
+  }
+  std::string contents;
+  std::array<char, 4096> buffer{};
+  for (;;) {
+    const ssize_t count = ::read(fd, buffer.data(), buffer.size());
+    if (count > 0) {
+      contents.append(buffer.data(), size_t(count));
+    } else if (count < 0 && errno == EINTR) {
+      continue;
+    } else if (count == 0) {
+      break;
+    } else {
+      const int error = errno;
+      ::close(fd);
+      errno = error;
+      fail_errno("read passthrough trace");
+    }
+  }
+  ::close(fd);
+  const std::string_view generic_needle =
+      needle == "FUSE_DEV_IOC_BACKING_OPEN"
+          ? "_IOC(_IOC_WRITE, 0xe5, 0x1, 0x10)"
+          : "_IOC(_IOC_WRITE, 0xe5, 0x2, 0x4)";
+  TraceIoctlStats stats;
+  for (size_t line_begin = 0; line_begin < contents.size();) {
+    const size_t line_end = contents.find('\n', line_begin);
+    const size_t symbolic = contents.find(needle, line_begin);
+    const size_t generic = contents.find(generic_needle, line_begin);
+    const bool matching_line = symbolic < line_end || generic < line_end;
+    const size_t result = contents.find(" = ", line_begin);
+    if (matching_line && result < line_end) {
+      ++stats.calls;
+      const size_t value = result + 3;
+      int64_t result_value = 0;
+      const auto parsed = std::from_chars(
+          contents.data() + value,
+          contents.data() + (line_end == std::string::npos
+                                 ? contents.size() : line_end),
+          result_value);
+      if (parsed.ec == std::errc{} &&
+          (positive_result_succeeds ? result_value > 0
+                                    : result_value == 0)) {
+        ++stats.successes;
+      }
+      const size_t result_end = line_end == std::string::npos
+                                    ? contents.size() : line_end;
+      const std::string_view result_text(contents.data() + value,
+                                         result_end - value);
+      if (result_text.starts_with("-1 EPERM ") ||
+          result_text.starts_with("-1 ENOSYS ") ||
+          result_text.starts_with("-1 EOPNOTSUPP ")) {
+        ++stats.unavailable;
+      }
+    }
+    if (line_end == std::string::npos) break;
+    line_begin = line_end + 1;
+  }
+  return stats;
+}
+
 void wait_until_mounted(std::string_view file_path, pid_t process) {
   for (int attempt = 0; attempt < 500; ++attempt) {
     struct stat status{};
@@ -1740,10 +1882,11 @@ void wait_until_mounted(std::string_view file_path, pid_t process) {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 2 || argc > 6) {
+  if (argc < 2 || argc > 7) {
     std::cerr << "usage: fuse_mmap_integration_test NGS3FS "
                  "[CHECKSUM [plain|cache|prefetch|prefetch-verified "
-                 "[auto|legacy|uring [REACTORS]]]]\n";
+                 "|passthrough|passthrough-budget "
+                 "[auto|legacy|uring [REACTORS [STRACE]]]]]\n";
     return 2;
   }
   if (::access("/dev/fuse", R_OK | W_OK) != 0) {
@@ -1753,6 +1896,7 @@ int main(int argc, char** argv) {
 
   std::string mountpoint;
   std::string cache_dir;
+  std::string trace_dir;
   try {
     ChecksumAlgorithm checksum = CHECKSUM_XXHASH128;
     if (argc >= 3 &&
@@ -1767,10 +1911,19 @@ int main(int argc, char** argv) {
     if (engine != "auto" && engine != "legacy" && engine != "uring") {
       throw std::invalid_argument("unknown integration-test io engine");
     }
-    const std::string_view reactors = argc == 6 ? argv[5] : "1";
+    const std::string_view reactors = argc >= 6 ? argv[5] : "1";
     if (reactors != "1" && reactors != "2") {
       throw std::invalid_argument("integration-test reactors must be 1 or 2");
     }
+    const bool cache_blocks_small = argc >= 4 && std::string_view(argv[3]) == "cache-blocks-96k";
+    const bool cache_blocks = cache_blocks_small ||
+        (argc >= 4 && std::string_view(argv[3]) == "cache-blocks");
+    const bool passthrough_mode = argc >= 4 &&
+        (std::string_view(argv[3]) == "passthrough" ||
+         std::string_view(argv[3]) == "passthrough-budget");
+    const bool passthrough_unlimited = passthrough_mode &&
+        std::string_view(argv[3]) == "passthrough";
+    const bool trace_passthrough = passthrough_unlimited && ::geteuid() == 0;
     const bool verified_clean = argc >= 4 && std::string_view(argv[3]) == "prefetch-verified-clean";
     const bool shutdown_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-shutdown";
     const bool partial_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-unverifiable";
@@ -1804,8 +1957,8 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < final_expected.size(); ++i) {
       final_expected[i] = static_cast<std::byte>((i * 17U + 11U) & 0xffU);
     }
-    std::vector<std::byte> overwrite_old(2U * 1024U * 1024U);
-    std::vector<std::byte> overwrite_source(2U * 1024U * 1024U);
+    std::vector<std::byte> overwrite_old(4U * 1024U * 1024U);
+    std::vector<std::byte> overwrite_source(4U * 1024U * 1024U);
     for (size_t i = 0; i < overwrite_old.size(); ++i) {
       overwrite_old[i] = static_cast<std::byte>((i * 31U + 19U) & 0xffU);
       overwrite_source[i] = static_cast<std::byte>((i * 47U + 23U) & 0xffU);
@@ -1862,6 +2015,14 @@ int main(int argc, char** argv) {
                          "\"read-ahead-random\"");
     add_overwrite_object("read-ahead-store.bin", read_ahead,
                          "\"read-ahead-store\"");
+    if (cache_blocks) {
+      add_overwrite_object("cache-blocks.bin", read_ahead, "\"cache-blocks\"");
+      std::vector<std::byte> bytes(40 * 1024 * 1024 + 37);
+      for (size_t i = 0; i != bytes.size(); ++i) {
+        bytes[i] = std::byte((i * 53 + (i >> 17) * 11 + 31) & 0xff);
+      }
+      add_overwrite_object("cache-sequential.bin", std::move(bytes), "\"cache-sequential\"");
+    }
     if (pool_pressure) {
       auto bytes = read_ahead;
       bytes.resize(8U * 1024U * 1024U + 37);
@@ -1926,10 +2087,10 @@ int main(int argc, char** argv) {
     };
     add_checksum_object("checksum-retry.bin", 1, 128U * 1024U);
     add_checksum_object("checksum-release.bin", 1, 128U * 1024U);
-    add_checksum_object("checksum-rename.bin", 1, 2U * 1024U * 1024U);
+    add_checksum_object("checksum-rename.bin", 1, 4U * 1024U * 1024U);
     {
       auto& object = *shared.special_objects.at("checksum-rename.bin");
-      object.bytes.resize(2U * 1024U * 1024U);
+      object.bytes.resize(4U * 1024U * 1024U);
       object.corrupted_bytes = object.bytes;
       object.corrupted_bytes[12345] ^= std::byte{0x80};
     }
@@ -1946,10 +2107,12 @@ int main(int argc, char** argv) {
     mountpoint = make_mountpoint();
     if (argc >= 4) {
       if (std::string_view(argv[3]) != "plain" &&
-          std::string_view(argv[3]) != "cache" && !prefetch_mode) {
+          std::string_view(argv[3]) != "cache" && !prefetch_mode &&
+          !cache_blocks && !passthrough_mode) {
         throw std::invalid_argument("unknown integration-test mode");
       }
-      if (std::string_view(argv[3]) == "cache") {
+      if (std::string_view(argv[3]) == "cache" || cache_blocks ||
+          passthrough_mode) {
         cache_dir = make_mountpoint();
       }
     }
@@ -1960,14 +2123,365 @@ int main(int argc, char** argv) {
     // Dedicated memory-pressure modes continue to use their smaller caps.
     const char* memory_budget = pool_pressure ? "8MiB" :
         pool_prefetch ? "128MiB" : legacy_window_test ? "8MiB" : nullptr;
-    const pid_t process = start_daemon(
-        argv[1], mountpoint, listener.port, checksum_option, cache_dir,
-        engine, reactors, !prefetch_mode || verified_prefetch || budget_prefetch || partial_prefetch,
-        verified_prefetch, budget_prefetch, pool_limited ? "16777216" : nullptr,
-        memory_budget);
+    pid_t process;
+    std::string trace_path;
+    if (passthrough_mode) {
+      if (trace_passthrough && argc != 7) {
+        throw std::invalid_argument(
+            "root passthrough integration mode requires strace");
+      }
+      if (trace_passthrough) {
+        trace_dir = make_mountpoint();
+        trace_path = trace_dir + "/ioctl.trace";
+      }
+      process = start_passthrough_daemon(
+          argv[1], mountpoint, listener.port, checksum_option, cache_dir,
+          trace_passthrough ? argv[6] : "", trace_path,
+          passthrough_unlimited);
+    } else {
+      process = start_daemon(
+          argv[1], mountpoint, listener.port, checksum_option, cache_dir,
+          engine, reactors,
+          !cache_blocks && (!prefetch_mode || verified_prefetch ||
+                            budget_prefetch || partial_prefetch),
+          verified_prefetch, budget_prefetch,
+          pool_limited ? "16777216" : nullptr, memory_budget,
+          cache_blocks_small ? "96KiB" : "2MiB");
+    }
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
+
+    if (passthrough_mode) {
+      UniqueFd initial(::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
+      require(bool(initial), "open initial ordinary cached reader");
+      struct stat initial_status{};
+      require(::fstat(initial.get(), &initial_status) == 0,
+              "stat initial ordinary cached reader");
+      std::vector<std::byte> initial_bytes(expected.size());
+      pread_all(initial.get(), initial_bytes, 0);
+      require(initial_bytes == expected,
+              "initial full-cache download returned wrong bytes");
+      initial.reset();
+
+      UniqueFd first;
+      TraceIoctlStats open_stats;
+      if (trace_passthrough) {
+        // A READ reply can complete just before the daemon processes RELEASE.
+        // Such an intervening OPEN is correctly kept ordinary, so close it and
+        // give the next OPEN a chance to perform the promotion.
+        for (unsigned attempt = 0; attempt != 200; ++attempt) {
+          first.reset(::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
+          require(bool(first), "open passthrough candidate");
+          open_stats = trace_ioctl_stats(
+              trace_path, "FUSE_DEV_IOC_BACKING_OPEN", true);
+          if (open_stats.calls != 0) break;
+          first.reset();
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        require(open_stats.calls != 0,
+                "no backing registration was attempted after normal RELEASE");
+      } else {
+        first.reset(::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
+        require(bool(first), "open budget-limited cached reader");
+      }
+      UniqueFd second(::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
+      require(bool(second), "open simultaneous passthrough candidate");
+      struct stat first_status{};
+      struct stat second_status{};
+      require(::fstat(first.get(), &first_status) == 0 &&
+                  ::fstat(second.get(), &second_status) == 0,
+              "stat passthrough candidates");
+      require(first_status.st_ino == initial_status.st_ino &&
+                  second_status.st_ino == initial_status.st_ino,
+              "passthrough promotion changed the FUSE inode number");
+
+      std::vector<std::byte> first_bytes(expected.size());
+      std::vector<std::byte> second_bytes(expected.size());
+      pread_all(first.get(), first_bytes, 0);
+      pread_all(second.get(), second_bytes, 0);
+      require(first_bytes == expected && second_bytes == expected,
+              "simultaneous readonly candidates returned wrong bytes");
+
+      void* old_mapping = ::mmap(nullptr, expected.size(), PROT_READ,
+                                 MAP_SHARED, first.get(), 0);
+      if (old_mapping == MAP_FAILED) fail_errno("mmap passthrough candidate");
+      require(memcmp(old_mapping, expected.data(), expected.size()) == 0,
+              "passthrough candidate mmap returned wrong bytes");
+      first.reset();
+      require(memcmp(old_mapping, expected.data(), expected.size()) == 0,
+              "mmap stopped working after its readonly fd closed");
+
+      if (trace_passthrough) {
+        open_stats = trace_ioctl_stats(
+            trace_path, "FUSE_DEV_IOC_BACKING_OPEN", true);
+      }
+      const bool native_passthrough = open_stats.successes != 0;
+      const bool passthrough_unavailable = trace_passthrough &&
+          !native_passthrough && open_stats.calls != 0 &&
+          open_stats.unavailable == open_stats.calls;
+      if (trace_passthrough && native_passthrough) {
+        require(open_stats.calls == 1 && open_stats.successes == 1,
+                "simultaneous readonly opens did not reuse one backing ID");
+      } else if (trace_passthrough) {
+        require(passthrough_unavailable,
+                "backing registration failed without an explicit "
+                "EPERM/ENOSYS/EOPNOTSUPP limitation");
+      }
+
+      second.reset();
+      if (native_passthrough) {
+        for (unsigned attempt = 0; attempt != 200 &&
+             trace_ioctl_stats(trace_path,
+                               "FUSE_DEV_IOC_BACKING_CLOSE", false)
+                 .successes == 0;
+             ++attempt) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const TraceIoctlStats close_stats = trace_ioctl_stats(
+            trace_path, "FUSE_DEV_IOC_BACKING_CLOSE", false);
+        require(close_stats.calls == 1 && close_stats.successes == 1,
+                "last readonly close did not close the shared backing ID");
+      } else {
+        require(::munmap(old_mapping, expected.size()) == 0,
+                "unmap ordinary fallback mapping");
+        old_mapping = MAP_FAILED;
+      }
+
+      std::vector<std::byte> replacement(expected.size());
+      for (size_t i = 0; i < replacement.size(); ++i) {
+        replacement[i] = std::byte((i * 61U + 37U) & 0xffU);
+      }
+      UniqueFd writer;
+      retry_after_fuse_release("open replacement after passthrough", [&] {
+        writer.reset(::open(file_path.c_str(),
+                            O_WRONLY | O_TRUNC | O_CLOEXEC));
+        return writer ? 0 : -1;
+      });
+      test_write_all(writer.get(), replacement);
+      writer.reset();
+
+      if (native_passthrough) {
+        require(memcmp(old_mapping, expected.data(), expected.size()) == 0,
+                "old passthrough mmap changed after generation replacement");
+      }
+      UniqueFd replacement_reader;
+      retry_after_fuse_release("open replacement generation", [&] {
+        replacement_reader.reset(
+            ::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
+        return replacement_reader ? 0 : -1;
+      });
+      struct stat replacement_status{};
+      require(::fstat(replacement_reader.get(), &replacement_status) == 0 &&
+                  replacement_status.st_ino == initial_status.st_ino,
+              "replacement generation changed the FUSE inode number");
+      std::vector<std::byte> replacement_bytes(replacement.size());
+      pread_all(replacement_reader.get(), replacement_bytes, 0);
+      require(replacement_bytes == replacement,
+              "new readonly open did not see the replacement generation");
+      if (old_mapping != MAP_FAILED) {
+        require(::munmap(old_mapping, expected.size()) == 0,
+                "unmap old passthrough generation");
+      }
+      replacement_reader.reset();
+
+      mounted.stop();
+      require(mounted.stopped_cleanly(),
+              "passthrough wiring mount did not exit cleanly");
+      server.request_stop();
+      server.join();
+      rethrow_server_failure(shared);
+      require(::rmdir(mountpoint.c_str()) == 0,
+              "remove passthrough wiring mountpoint");
+      std::filesystem::remove_all(cache_dir);
+      cache_dir.clear();
+      mountpoint.clear();
+
+      if (passthrough_unavailable) {
+        fprintf(stdout,
+                "SKIP: kernel/libfuse explicitly denied native passthrough; "
+                "ordinary unlimited-cache fallback passed; trace retained "
+                "at %s\n", trace_path.c_str());
+        return 77;
+      } else if (trace_passthrough) {
+        fprintf(stdout,
+                "FUSE native passthrough OPEN wiring, shared backing, mmap "
+                "lifetime and immutable replacement passed\n");
+      } else if (passthrough_unlimited) {
+        fprintf(stdout,
+                "FUSE unlimited-cache ordinary fallback semantics passed; "
+                "native passthrough evidence requires root\n");
+      } else {
+        fprintf(stdout,
+                "FUSE budget-limited cache correctly retained ordinary "
+                "cached I/O\n");
+      }
+      if (!trace_dir.empty()) {
+        std::filesystem::remove_all(trace_dir);
+        trace_dir.clear();
+      }
+      return 0;
+    }
+
+    if (cache_blocks) {
+      const size_t block = cache_blocks_small ? 96 * 1024 : 2 * 1024 * 1024;
+      const size_t page = size_t(::sysconf(_SC_PAGESIZE));
+      const auto wait = [&](const auto& condition, const char* message) {
+        for (unsigned i = 0; i != 3000 && !condition(); ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(condition(), message);
+      };
+      auto object = shared.special_objects.at("cache-blocks.bin");
+      UniqueFd fd(::open((mountpoint + "/cache-blocks.bin").c_str(), O_RDONLY | O_CLOEXEC));
+      UniqueFd sibling(::open((mountpoint + "/cache-blocks.bin").c_str(), O_RDONLY | O_CLOEXEC));
+      require(bool(fd) && bool(sibling), "open cached block readers");
+      require(::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_RANDOM) == 0 &&
+                  ::posix_fadvise(sibling.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+              "disable kernel readahead for cached block checks");
+      object->send_limit.store(block - page, std::memory_order_release);
+      std::array<std::atomic<bool>, 2> done{};
+      std::array<std::exception_ptr, 2> errors;
+      std::array<std::vector<std::byte>, 2> bytes{std::vector<std::byte>(page), std::vector<std::byte>(page)};
+      std::array<std::jthread, 2> readers;
+      struct Resume {
+        SpecialObject& object;
+        ~Resume() { object.send_limit.store(SIZE_MAX, std::memory_order_release); }
+      } resume{*object};
+      const auto launch = [&](unsigned i, int file, size_t offset) {
+        readers[i] = std::jthread([&, i, file, offset] {
+          try { pread_all(file, bytes[i], offset); }
+          catch (...) { errors[i] = std::current_exception(); }
+          done[i].store(true, std::memory_order_release);
+        });
+      };
+      launch(0, fd.get(), page);
+      wait([&] { return object->tail_paused.load(std::memory_order_acquire); },
+           "cached GET did not stop before its last block page");
+      launch(1, sibling.get(), block / 2);
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+      require(!done[0].load(std::memory_order_acquire) && !done[1].load(std::memory_order_acquire),
+              "cached READ replied before its complete block was stored");
+      {
+        std::lock_guard guard(shared.mutex);
+        require(object->get_ranges.size() == 1 && object->get_ranges[0].first == 0 &&
+                    object->get_ranges[0].last == block - 1,
+                "cached pending overlap duplicated GET or random GET was not block aligned");
+      }
+      object->send_limit.store(SIZE_MAX, std::memory_order_release);
+      for (unsigned i = 0; i != readers.size(); ++i) {
+        readers[i].join();
+        if (errors[i]) std::rethrow_exception(errors[i]);
+        const size_t offset = i ? block / 2 : page;
+        require(std::equal(bytes[i].begin(), bytes[i].end(), object->bytes.begin() + offset),
+                "cached block reader received wrong bytes");
+      }
+      std::vector<std::byte> cross(2 * page);
+      pread_all(fd.get(), cross, block - page);
+      require(std::equal(cross.begin(), cross.end(), object->bytes.begin() + block - page),
+              "cached READ crossing complete and missing blocks differs");
+      require(::posix_fadvise(fd.get(), 0, off_t(2 * block), POSIX_FADV_DONTNEED) == 0,
+              "drop ordinary FUSE pages for cached-hit check");
+      pread_all(fd.get(), cross, block - page);
+      {
+        std::lock_guard guard(shared.mutex);
+        require(object->get_ranges.size() == 2 && object->get_ranges.back().first == block &&
+                    object->get_ranges.back().last == 2 * block - 1,
+                "cached cross-block read refetched complete data");
+      }
+      std::vector<std::byte> tail(37);
+      pread_all(fd.get(), tail, object->bytes.size() - tail.size());
+      require(std::equal(tail.begin(), tail.end(), object->bytes.end() - tail.size()),
+              "cached EOF bytes differ");
+      {
+        std::lock_guard guard(shared.mutex);
+        const auto& range = object->get_ranges.back();
+        require(range.first == (object->bytes.size() - 1) / block * block &&
+                    range.last == object->bytes.size() - 1,
+                "cached EOF GET was not aligned and clipped");
+        require(shared.checksum_mode_requests == 0 && shared.object_attributes_requests == 0,
+                "unchecked cached reader requested checksum metadata");
+      }
+      fd.reset();
+      sibling.reset();
+
+      auto sequence = shared.special_objects.at("cache-sequential.bin");
+      UniqueFd seq(::open((mountpoint + "/cache-sequential.bin").c_str(), O_RDONLY | O_CLOEXEC));
+      require(bool(seq), "open cached sequential reader");
+      require(::posix_fadvise(seq.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+              "disable kernel readahead for cached window checks");
+      sequence->send_limit.store(block, std::memory_order_release);
+      std::atomic<bool> first_done{false};
+      std::exception_ptr first_error;
+      std::vector<std::byte> first(page);
+      std::jthread first_reader([&] {
+        try { pread_all(seq.get(), first, 0); }
+        catch (...) { first_error = std::current_exception(); }
+        first_done.store(true, std::memory_order_release);
+      });
+      Resume resume_sequence{*sequence};
+      wait([&] { return sequence->tail_paused.load(std::memory_order_acquire); },
+           "cached sequential GET did not stop after first block");
+      wait([&] { return first_done.load(std::memory_order_acquire); },
+           "cached READ waited for the speculative GET tail after its block completed");
+      first_reader.join();
+      if (first_error) std::rethrow_exception(first_error);
+      require(std::equal(first.begin(), first.end(), sequence->bytes.begin()),
+              "cached sequential first block differs");
+      const size_t initial = (8 * 1024 * 1024 + block - 1) / block * block;
+      {
+        std::lock_guard guard(shared.mutex);
+        require(sequence->get_ranges.size() == 1 && sequence->get_ranges[0].first == 0 &&
+                    sequence->get_ranges[0].last == initial - 1,
+                "cached sequential initial GET is not eight MiB rounded to blocks");
+      }
+      // A non-adjacent hit in the pending window must neither create a GET
+      // nor reset sequential growth. Completing that block releases its READ
+      // while the remaining GET is still deliberately paused.
+      first_done.store(false, std::memory_order_release);
+      first_reader = std::jthread([&] {
+        try { pread_all(seq.get(), first, block + page); }
+        catch (...) { first_error = std::current_exception(); }
+        first_done.store(true, std::memory_order_release);
+      });
+      sequence->send_limit.store(2 * block, std::memory_order_release);
+      wait([&] { return first_done.load(std::memory_order_acquire); },
+           "cached pending-window READ did not resume at its block boundary");
+      first_reader.join();
+      if (first_error) std::rethrow_exception(first_error);
+      require(std::equal(first.begin(), first.end(), sequence->bytes.begin() + block + page),
+              "cached pending-window READ differs");
+      sequence->send_limit.store(SIZE_MAX, std::memory_order_release);
+      size_t begin = 0;
+      size_t window = initial;
+      for (unsigned n = 0; n != 3; ++n) {
+        const size_t end = std::min(sequence->bytes.size(), begin + window);
+        pread_all(seq.get(), first, end - page);
+        require(std::equal(first.begin(), first.end(), sequence->bytes.begin() + end - page),
+                "cached sequential window tail differs");
+        {
+          std::lock_guard guard(shared.mutex);
+          require(sequence->get_ranges.size() == n + 1 &&
+                      sequence->get_ranges.back().first == begin &&
+                      sequence->get_ranges.back().last == end - 1,
+                  "cached sequential GET did not double once per consumed window");
+        }
+        if (end == sequence->bytes.size()) break;
+        begin = end;
+        window *= 2;
+        pread_all(seq.get(), first, begin);
+      }
+      seq.reset();
+      mounted.stop();
+      require(mounted.stopped_cleanly(), "cached block mount did not exit cleanly");
+      shared.stop.store(true);
+      server.request_stop();
+      server.join();
+      require(::rmdir(mountpoint.c_str()) == 0, "remove cached block mountpoint");
+      std::filesystem::remove_all(cache_dir);
+      fprintf(stderr, "cached %zu-byte blocks: whole-block gate, pending dedup, hits, crossing, EOF and window growth passed\n", block);
+      return 0;
+    }
 
     if (pressure_prefetch) {
       std::array<UniqueFd, 8> files;
@@ -3388,19 +3902,19 @@ int main(int argc, char** argv) {
         fail_errno("open checksum rename object");
       }
       std::array<std::byte, 4096> checksum_rename_first{};
-      // Fetch only half a checksum unit. Validation cannot start until the
-      // second half is fetched after rename; no timing barrier holds a GET
-      // identity lock while rename needs its exclusive counterpart.
+      // Start at a nonzero offset: a random GET fills one 2 MiB block, half
+      // this 4 MiB checksum part. The other block is fetched after rename;
+      // no timing barrier holds a GET identity lock against rename.
       require(posix_fadvise(checksum_rename_file.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
               "disable kernel prefetch for checksum rename test");
-      pread_all(checksum_rename_file.get(), checksum_rename_first, 0);
+      pread_all(checksum_rename_file.get(), checksum_rename_first, 4096);
       require(::rename(checksum_rename_source.c_str(),
                        checksum_rename_destination.c_str()) == 0,
               "rename before checksum unit completion failed");
       std::array<std::byte, 4096> checksum_rename_second{};
-      pread_all(checksum_rename_file.get(), checksum_rename_second, 1024U * 1024U);
+      pread_all(checksum_rename_file.get(), checksum_rename_second, 2U * 1024U * 1024U);
       require(std::equal(checksum_rename_first.begin(),
-                         checksum_rename_first.end(), checksum_test.begin()),
+                         checksum_rename_first.end(), checksum_test.begin() + 4096),
               "renamed checksum object's initial read returned wrong bytes");
       bool renamed_checksum_retry_started = false;
       for (unsigned attempt = 0; attempt != 2000; ++attempt) {
@@ -4211,9 +4725,10 @@ int main(int argc, char** argv) {
         fail_errno("open old overwrite destination");
       }
       std::array<std::byte, 4096> old_prefix{};
-      pread_all(old_destination.get(), old_prefix, 0);
+      constexpr uint64_t old_prefix_offset = 4096;
+      pread_all(old_destination.get(), old_prefix, old_prefix_offset);
       require(std::equal(old_prefix.begin(), old_prefix.end(),
-                         overwrite_old.begin()),
+                         overwrite_old.begin() + old_prefix_offset),
               "old overwrite destination returned wrong cached prefix");
       {
         std::lock_guard state_guard(shared.mutex);
@@ -4245,7 +4760,7 @@ int main(int argc, char** argv) {
                          overwrite_source.begin()),
               "new overwrite destination did not read source content");
 
-      constexpr uint64_t old_tail_offset = 1536U * 1024U;
+      constexpr uint64_t old_tail_offset = 3U * 1024U * 1024U;
       std::array<std::byte, 4096> old_tail{};
       pread_all(old_destination.get(), old_tail, old_tail_offset);
       require(std::equal(old_tail.begin(), old_tail.end(),
@@ -4329,6 +4844,9 @@ int main(int argc, char** argv) {
     if (!cache_dir.empty()) {
       std::filesystem::remove_all(cache_dir);
     }
+    if (!trace_dir.empty()) {
+      std::filesystem::remove_all(trace_dir);
+    }
     std::cout << "FUSE mmap integration passed: " << expected.size()
               << " bytes\n";
     return 0;
@@ -4338,6 +4856,10 @@ int main(int argc, char** argv) {
     }
     if (!cache_dir.empty()) {
       std::filesystem::remove_all(cache_dir);
+    }
+    if (!trace_dir.empty()) {
+      fprintf(stderr, "passthrough trace retained at %s/ioctl.trace\n",
+              trace_dir.c_str());
     }
     std::cerr << "fuse_mmap_integration_test: " << error.what() << '\n';
     return 1;

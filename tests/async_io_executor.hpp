@@ -121,6 +121,10 @@ class TestAsyncIoExecutor final : public IoExecutor {
   [[nodiscard]] size_t syscall_count() const noexcept { return syscall_count_; }
   [[nodiscard]] bool saw_connect() const noexcept { return saw_connect_; }
 
+  int socket_splice_error = 0;
+  int file_splice_error = 0;
+  size_t rejected_splices = 0;
+
  private:
   struct Pending {
     AsyncIoRequest* request = nullptr;
@@ -161,6 +165,10 @@ class TestAsyncIoExecutor final : public IoExecutor {
     ssize_t result = -1;
     switch (pending.kind) {
       case AsyncIoRequest::RECEIVE:
+        if (pending.force_async) {
+          fprintf(stderr, "network receive was forced onto io-wq\n");
+          abort();
+        }
         result = ::recv(pending.fd, data + progress, length, int(pending.flags));
         break;
       case AsyncIoRequest::READ:
@@ -182,6 +190,12 @@ class TestAsyncIoExecutor final : public IoExecutor {
         saw_background_file_write_ |= pending.force_async;
         break;
       case AsyncIoRequest::SPLICE: {
+        const int error = pending.output_offset >= 0
+            ? file_splice_error : socket_splice_error;
+        if (error != 0) {
+          ++rejected_splices;
+          return -error;
+        }
         off_t input_offset = pending.input_offset + off_t(progress);
         off_t output_offset = pending.output_offset + off_t(progress);
         off_t* const input = pending.input_offset >= 0 ? &input_offset : nullptr;

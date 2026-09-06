@@ -434,8 +434,15 @@ int main(int argc, char** argv) {
   }
   struct timespec start;
   struct timespec finish;
+  struct timespec cpu_start;
+  struct timespec cpu_finish;
   if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
     fprintf(stderr, "clock_gettime failed: %s\n", strerror(errno));
+    atomic_store_explicit(&shared.failed, 1, memory_order_relaxed);
+  }
+  if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start) != 0) {
+    fprintf(stderr, "clock_gettime(CLOCK_PROCESS_CPUTIME_ID) failed: %s\n",
+            strerror(errno));
     atomic_store_explicit(&shared.failed, 1, memory_order_relaxed);
   }
   pthread_mutex_lock(&shared.mutex);
@@ -453,6 +460,11 @@ int main(int argc, char** argv) {
   }
   if (clock_gettime(CLOCK_MONOTONIC, &finish) != 0) {
     fprintf(stderr, "clock_gettime failed: %s\n", strerror(errno));
+    atomic_store_explicit(&shared.failed, 1, memory_order_relaxed);
+  }
+  if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_finish) != 0) {
+    fprintf(stderr, "clock_gettime(CLOCK_PROCESS_CPUTIME_ID) failed: %s\n",
+            strerror(errno));
     atomic_store_explicit(&shared.failed, 1, memory_order_relaxed);
   }
   uint64_t bytes = 0;
@@ -481,15 +493,26 @@ int main(int argc, char** argv) {
   } else {
     elapsed_ns -= (uint64_t)(start.tv_nsec - finish.tv_nsec);
   }
+  uint64_t workload_cpu_ns =
+      (uint64_t)(cpu_finish.tv_sec - cpu_start.tv_sec) *
+      UINT64_C(1000000000);
+  if (cpu_finish.tv_nsec >= cpu_start.tv_nsec) {
+    workload_cpu_ns +=
+        (uint64_t)(cpu_finish.tv_nsec - cpu_start.tv_nsec);
+  } else {
+    workload_cpu_ns -=
+        (uint64_t)(cpu_start.tv_nsec - cpu_finish.tv_nsec);
+  }
   printf("random-read stress passed: access=pread,mmap advice=%s "
          "files=%zu threads=%zu "
          "operations=%zu pread_operations=%zu mmap_operations=%zu "
-         "bytes=%llu elapsed_ns=%llu file_size=%zu maximum_read=%zu "
-         "seed=%llu\n",
+         "bytes=%llu elapsed_ns=%llu workload_cpu_ns=%llu "
+         "file_size=%zu maximum_read=%zu seed=%llu\n",
          config.random_advice ? "random" : "normal",
          config.files, config.threads, config.operations, pread_operations,
          mmap_operations, (unsigned long long)bytes,
-         (unsigned long long)elapsed_ns, config.file_size,
+         (unsigned long long)elapsed_ns,
+         (unsigned long long)workload_cpu_ns, config.file_size,
          config.maximum_read, (unsigned long long)config.seed);
   return 0;
 }

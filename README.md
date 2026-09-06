@@ -136,7 +136,10 @@ define the new uncached implementation.
   The former uncached verification/STORE experiment is superseded by the
   receive-pool contract above; do not infer proactive read publication or
   checksum support for the replacement from that earlier implementation.
-- FUSE remains in cached mode; `direct_io` is never enabled.
+- FUSE remains in cached mode and `direct_io` is never enabled. In explicit
+  `--cache-unlimited` mode, a read-only open of a complete clean cache entry
+  may instead use native Linux FUSE passthrough. Missing kernel capability or
+  backing-registration permission falls back to ordinary cached I/O.
 - The FUSE transport can be selected with `--io-engine auto|legacy|uring`.
   `legacy` remains the default while the uring engine is experimental and its
   CPU cost remains higher on the local random-read benchmark.
@@ -508,16 +511,33 @@ before waiting. Legacy/cached budgets retain the page-aligned minimum of
 reads to progress under pressure; budget warnings remain rate-limited stderr
 messages. These limits do not change a READ's negotiated maximum.
 `-L/--cache-dir` enables the persistent sparse local cache. Each S3 key maps to
-a sparse data file plus mmap-backed metadata with a two-bit state per host
-page. Clean hits are returned from the cache FD; misses fetch adaptively from
-1 MiB through a 128 MiB maximum prefetch window, rather than forcing S3 to
-mirror every small FUSE read. For both uncached read-ahead and local-cache
+a sparse data file plus mmap-backed metadata with a two-bit state per fixed
+32 KiB bitmap unit. Clean hits are returned from the cache FD; misses fetch
+complete `--cache-block-size` units (2 MiB by default) and expand adaptively
+from 8 MiB through a 128 MiB maximum prefetch window, rather than forcing S3 to
+mirror every small FUSE read. The block size must be a positive 32 KiB multiple
+no larger than 128 MiB. For both uncached read-ahead and local-cache
 fetch expansion, the unstable environment variable
 `UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE` overrides that maximum with a
 page-aligned integer byte count of at least 1 MiB. `--cache-size` limits
 physical allocation and `--cache-reserve` preserves filesystem free space
 (5% by default). Clean regions use second-chance CLOCK eviction; a read
 bypasses the cache if clean space cannot be reclaimed.
+
+`--cache-unlimited` is an explicit no-capacity-eviction mode. It requires
+`--cache-dir` and cannot be combined with an explicitly supplied
+`--cache-size` or `--cache-reserve`; the legacy default `--cache-size=0` still
+keeps the 5% reserve. Physical `ENOSPC` remains possible. In unlimited mode, a
+read-only open whose whole current generation is clean and idle can be exported
+with native FUSE passthrough. Normal handles and mappings must drain before the
+first passthrough open, simultaneous passthrough opens share one kernel backing
+registration, and passthrough OPEN replies clear `KEEP_CACHE`. With
+`--verify-read-checksum`, export also requires completed successful background
+verification; an unavailable manifest stays on ordinary cached I/O. An old
+passthrough mapping may continue to read its immutable old local inode after
+close or remote replacement. New opens keep the normal generation-conflict
+rules, and later replacement writers unlink and recreate any ever-exported
+cache data inode rather than modifying it in place.
 
 Cache data files remain buffered. Each newly opened data-file description gets
 one whole-file `POSIX_FADV_NOREUSE` hint so supporting kernels prefer reclaiming

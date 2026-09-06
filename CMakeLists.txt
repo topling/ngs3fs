@@ -249,6 +249,47 @@ if(NGS3FS_BUILD_TESTS)
   add_executable(fuse_mmap_integration_test
     tests/fuse_mmap_integration_test.cpp)
   target_link_libraries(fuse_mmap_integration_test PRIVATE ngs3fs_core)
+
+  find_program(STRACE_EXECUTABLE strace)
+  if(STRACE_EXECUTABLE)
+    add_test(NAME fuse_native_passthrough_wiring_test
+      COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+              xxhash128 passthrough auto 1 ${STRACE_EXECUTABLE})
+    set_tests_properties(fuse_native_passthrough_wiring_test
+      PROPERTIES TIMEOUT 90 RESOURCE_LOCK fuse_mounts SKIP_RETURN_CODE 77)
+  endif()
+  add_test(NAME fuse_passthrough_budget_fallback_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 passthrough-budget auto 1)
+  set_tests_properties(fuse_passthrough_budget_fallback_test
+    PROPERTIES TIMEOUT 90 RESOURCE_LOCK fuse_mounts)
+
+  add_executable(native_passthrough_integration_test
+    tests/native_passthrough_integration_test.cpp)
+  target_link_libraries(native_passthrough_integration_test PRIVATE
+    FUSE3::fuse3)
+  target_compile_definitions(native_passthrough_integration_test PRIVATE
+    FUSE_USE_VERSION=318)
+  target_compile_options(native_passthrough_integration_test PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+  add_test(NAME native_passthrough_fallback_test
+    COMMAND native_passthrough_integration_test)
+  add_test(NAME native_passthrough_real_test
+    COMMAND native_passthrough_integration_test --require-passthrough)
+  set_tests_properties(
+    native_passthrough_fallback_test
+    native_passthrough_real_test
+    PROPERTIES TIMEOUT 30 RESOURCE_LOCK fuse_mounts SKIP_RETURN_CODE 77)
+
+  foreach(engine legacy uring)
+    foreach(blocks cache-blocks cache-blocks-96k)
+      add_test(NAME fuse_${engine}_${blocks}_test
+        COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+                xxhash128 ${blocks} ${engine} 2)
+      set_tests_properties(fuse_${engine}_${blocks}_test PROPERTIES
+        TIMEOUT 60 RESOURCE_LOCK fuse_mounts)
+    endforeach()
+  endforeach()
   foreach(engine legacy uring)
     add_test(NAME fuse_${engine}_prefetch_shutdown_test
       COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
@@ -466,6 +507,42 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME cache_reserve_invalid_test
     COMMAND ngs3fs --cache-reserve 100% --help)
   set_tests_properties(cache_reserve_invalid_test PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME cache_block_size_option_test
+    COMMAND ngs3fs -L /tmp/ngs3fs-option-test
+            --cache-block-size 2MiB --help)
+  add_test(NAME cache_block_size_minimum_test
+    COMMAND ngs3fs -L /tmp/ngs3fs-option-test
+            --cache-block-size 32KiB --help)
+  add_test(NAME cache_block_size_maximum_test
+    COMMAND ngs3fs -L /tmp/ngs3fs-option-test
+            --cache-block-size 128MiB --help)
+  foreach(value 0 32769 129MiB)
+    string(REPLACE "MiB" "mib" test_value "${value}")
+    add_test(NAME cache_block_size_${test_value}_invalid_test
+      COMMAND ngs3fs -L /tmp/ngs3fs-option-test
+              --cache-block-size ${value} --help)
+    set_tests_properties(cache_block_size_${test_value}_invalid_test
+      PROPERTIES WILL_FAIL TRUE)
+  endforeach()
+  add_test(NAME cache_block_size_requires_dir_test
+    COMMAND ngs3fs --cache-block-size 2MiB --help)
+  set_tests_properties(cache_block_size_requires_dir_test
+    PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME cache_unlimited_option_test
+    COMMAND ngs3fs -L /tmp/ngs3fs-option-test --cache-unlimited --help)
+  add_test(NAME cache_unlimited_requires_dir_test
+    COMMAND ngs3fs --cache-unlimited --help)
+  add_test(NAME cache_unlimited_size_conflict_test
+    COMMAND ngs3fs -L /tmp/ngs3fs-option-test --cache-unlimited
+            --cache-size 0 --help)
+  add_test(NAME cache_unlimited_reserve_conflict_test
+    COMMAND ngs3fs -L /tmp/ngs3fs-option-test --cache-unlimited
+            --cache-reserve 5% --help)
+  set_tests_properties(
+    cache_unlimited_requires_dir_test
+    cache_unlimited_size_conflict_test
+    cache_unlimited_reserve_conflict_test
+    PROPERTIES WILL_FAIL TRUE)
 
   add_test(NAME write_options_test
     COMMAND ngs3fs --part-size 8MiB --max-uploads 4

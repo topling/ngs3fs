@@ -82,6 +82,22 @@ jobs:
       - name: Bootstrap, build, and test
         run: ./scripts/bootstrap.sh
 
+      - name: Check privileged native passthrough
+        run: |
+          mkdir -p build/passthrough
+          set +e
+          sudo ctest --test-dir build/dev --output-on-failure -V \
+            -R '^(native_passthrough_real_test|fuse_native_passthrough_wiring_test|fuse_passthrough_budget_fallback_test)$' \
+            >build/passthrough/native.log 2>&1
+          result=$?
+          set -e
+          cat build/passthrough/native.log
+          test "$result" = 0
+          if grep -q 'Skipped' build/passthrough/native.log; then
+            echo 'Some native passthrough tests were unavailable on this kernel; see native.log for the explicit reason. Fallback remains covered by CTest.' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Check whole-block reads with delayed and paced payloads
         run: |
           for reactors in 1 2; do
@@ -179,6 +195,7 @@ jobs:
             build/read-latency-*/*.log
             build/read-latency-*/README.txt
             build/read-latency-*/results.csv
+            build/passthrough/*.log
 
   hardening:
     name: hardening (${{ matrix.name }})
@@ -325,11 +342,9 @@ jobs:
       - name: Compare concurrent random reads
         run: |
           for mode in none cold warm; do
-            io_engine=legacy
-            if [[ "$mode" = none ]]; then io_engine=uring; fi
             sudo env \
               GOOFYS_BIN="$GITHUB_WORKSPACE/build/tools/goofys" \
-              NGS3FS_IO_ENGINE="$io_engine" \
+              NGS3FS_IO_ENGINE=uring \
               NGS3FS_REACTORS=1 \
               BENCHMARK_REPETITIONS=4 \
               CACHE_MODE="$mode" \
@@ -378,15 +393,41 @@ jobs:
             port=$((port + 1))
           done
 
+      - name: A/B test cached io engines and unlimited passthrough
+        run: |
+          for mode in cold warm; do
+            sudo env CACHE_MODE="$mode" DROP_CACHES_AFTER_WARMUP=1 \
+              BENCHMARK_REPETITIONS=3 RANDOM_READ_OPERATIONS=512 \
+              ./scripts/benchmark_io_engine.sh \
+              "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-cache-$mode"
+          done
+          sudo env CACHE_MODE=warm NGS3FS_CACHE_UNLIMITED=1 \
+            DROP_CACHES_AFTER_WARMUP=1 BENCHMARK_REPETITIONS=3 \
+            RANDOM_READ_OPERATIONS=512 \
+            ./scripts/benchmark_io_engine.sh \
+            "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-cache-unlimited"
+
+      - name: Profile cached block reads on one reactor
+        if: always()
+        run: |
+          for mode in cold warm; do
+            sudo env NGS3FS_IO_ENGINE=uring NGS3FS_REACTORS=1 \
+              WORKLOAD=random-read RANDOM_READ_OPERATIONS=512 \
+              RANDOM_READ_ADVICE=normal CACHE_MODE="$mode" \
+              PERF_BIN="$(command -v perf)" PERF_LIB_DIR= \
+              PERF_EVENT=cpu-clock PERF_FREQUENCY=4000 \
+              PERF_STAT_EVENTS=task-clock,context-switches,cpu-migrations,page-faults \
+              PORT=17664 ./scripts/profile_ngs3fs.sh \
+              "$GITHUB_WORKSPACE/build/profiles/github-io-engine-cache-$mode"
+          done
+
       - name: Compare Mountpoint concurrent random reads
         run: |
           for mode in none cold warm; do
-            io_engine=legacy
-            if [[ "$mode" = none ]]; then io_engine=uring; fi
             sudo env \
               REFERENCE_CLIENT=mountpoint-s3 \
               MOUNTPOINT_S3_BIN="$GITHUB_WORKSPACE/build/tools/mount-s3" \
-              NGS3FS_IO_ENGINE="$io_engine" \
+              NGS3FS_IO_ENGINE=uring \
               NGS3FS_REACTORS=1 \
               BENCHMARK_REPETITIONS=3 \
               CACHE_MODE="$mode" \
@@ -503,6 +544,10 @@ jobs:
             build/profiles/github-io-engine-*/memory-evidence.json
             build/benchmarks/github-random-read-*/system.txt
             build/benchmarks/github-random-read-*/samples.csv
+            build/benchmarks/github-random-read-*/*/client-cpu.csv
+            build/benchmarks/github-io-engine-*/*/client-cpu.csv
+            build/benchmarks/github-mountpoint-random-read-*/*/client-cpu.csv
+            build/benchmarks/github-socket-buffer/*/client-cpu.csv
             build/benchmarks/github-random-read-*/summary.csv
             build/benchmarks/github-random-read-*/*/random-read-summary.csv
             build/benchmarks/github-random-read-*/*/*-random-read-result.txt

@@ -723,6 +723,7 @@ class Http2Client final : public HttpClient {
   uint32_t maximum_frame_size = 16U * 1024U;
   int callback_errno = 0;
   bool reconnect_required = false;
+  bool socket_splice_supported = true;
   bool file_splice_supported = true;
   bool receive_waitall_supported = true;
   bool tls = false;
@@ -2605,6 +2606,7 @@ class Http1Client final : public HttpClient {
   size_t receive_buffer_size = 0;
   bool request_active        = false;
   bool upload_chunked        = false;
+  bool socket_splice_supported = true;
   bool file_splice_supported = true;
   bool receive_waitall_supported = true;
   uint64_t tls_upload_request_id = 0;
@@ -3677,10 +3679,11 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
           buffer_.data(), buffer_.size());
   }
 
-  void ensure_pipe(size_t capacity) {
-    capacity = std::min(capacity, kPreferredIoSize);
-    if (client_.file_staging.capacity() < capacity) {
-      client_.file_staging = Pipe::create(capacity);
+  void ensure_pipe() {
+    if (client_.file_staging.capacity() == 0) {
+      // A denied F_SETPIPE_SZ leaves a smaller usable pipe. Reuse that actual
+      // capacity instead of retrying allocation and enlargement every chunk.
+      client_.file_staging = Pipe::create(kPreferredIoSize);
     }
   }
 
@@ -3701,7 +3704,7 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
             source.length, false, client_.socket.get(), -1, -1,
             false, SPLICE_F_MOVE | SPLICE_F_MORE);
     } else {
-      ensure_pipe(source.length);
+      ensure_pipe();
       stage_ = UPLOAD_PIPE;
       post(AsyncIoRequest::SPLICE, source.fd, nullptr,
             std::min(source.length, client_.file_staging.capacity()),
@@ -3862,7 +3865,13 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
         post_memory_receive(client_.socket.get(), destination);
         return;
       }
-      ensure_pipe(*fixed_remaining_);
+      if (!client_.socket_splice_supported || !client_.file_splice_supported) {
+        stage_ = RECEIVE_BODY;
+        post(AsyncIoRequest::RECEIVE, client_.socket.get(), buffer_.data(),
+              std::min(*fixed_remaining_, buffer_.size()));
+        return;
+      }
+      ensure_pipe();
       stage_ = SOCKET_PIPE;
       post(AsyncIoRequest::SPLICE, client_.socket.get(), nullptr,
             std::min(*fixed_remaining_, client_.file_staging.capacity()),
@@ -3907,8 +3916,15 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
       complete_response();
       return;
     }
-    if (stage_ == PIPE_FILE && io_.transferred == 0 &&
-        (result == -EINVAL || result == -ENOSYS || result == -EOPNOTSUPP)) {
+    if (stage_ == SOCKET_PIPE && io_.transferred == 0 && result < 0 &&
+        unsupported_file_splice(int(-result))) {
+      client_.socket_splice_supported = false;
+      fprintf(stderr, "warning: socket splice unavailable; receiving HTTP body directly\n");
+      body_next();
+      return;
+    }
+    if (stage_ == PIPE_FILE && io_.transferred == 0 && result < 0 &&
+        unsupported_file_splice(int(-result))) {
       client_.file_splice_supported = false;
       fprintf(stderr, "warning: local-file splice unavailable; copying HTTP body\n");
       copied_.resize(buffered_);
@@ -3943,6 +3959,10 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
       case RECEIVE_BODY:
         if (!fixed_remaining_) {
           parse_body(std::span(buffer_).first(n));
+          return;
+        }
+        if (request_.range && response_.status < 300 && request_.destination) {
+          write_file(buffer_.data(), n, false);
           return;
         }
         response_.body.insert(response_.body.end(),
@@ -4215,10 +4235,9 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
           header_.data(), header_.size(), true);
   }
 
-  void ensure_pipe(size_t size) {
-    size = std::min(size, kPreferredIoSize);
-    if (client_.file_staging.capacity() < size) {
-      client_.file_staging = Pipe::create(size);
+  void ensure_pipe() {
+    if (client_.file_staging.capacity() == 0) {
+      client_.file_staging = Pipe::create(kPreferredIoSize);
     }
   }
 
@@ -4247,7 +4266,7 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
       } else if (request_.memory_destination != nullptr) {
         socket_to_memory();
       } else {
-        socket_to_pipe();
+        receive_file_body();
       }
       return;
     }
@@ -4261,8 +4280,15 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
           payload_.data(), payload_.size(), true);
   }
 
-  void socket_to_pipe() {
-    ensure_pipe(frame_remaining_);
+  void receive_file_body() {
+    if (!client_.socket_splice_supported || !client_.file_splice_supported) {
+      copied_.resize(std::min(frame_remaining_, kPreferredIoSize));
+      stage_ = PIPE_COPY;
+      post(AsyncIoRequest::RECEIVE, client_.socket.get(),
+            copied_.data(), copied_.size());
+      return;
+    }
+    ensure_pipe();
     stage_ = SOCKET_PIPE;
     post(AsyncIoRequest::SPLICE, client_.socket.get(), nullptr,
           std::min(frame_remaining_, client_.file_staging.capacity()), false,
@@ -4321,7 +4347,7 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
       if (request_.memory_destination != nullptr) {
         socket_to_memory();
       } else {
-        socket_to_pipe();
+        receive_file_body();
       }
     } else {
       flush();
@@ -4388,7 +4414,7 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
             source.length, false, client_.socket.get(),
             -1, -1, false, SPLICE_F_MOVE | SPLICE_F_MORE);
     } else {
-      ensure_pipe(source.length);
+      ensure_pipe();
       stage_ = UPLOAD_PIPE;
       post(AsyncIoRequest::SPLICE, source.fd, nullptr,
             std::min(source.length, client_.file_staging.capacity()),
@@ -4414,8 +4440,15 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
       start_request();
       return;
     }
-    if (stage_ == PIPE_FILE && io_.transferred == 0 &&
-        (result == -EINVAL || result == -ENOSYS || result == -EOPNOTSUPP)) {
+    if (stage_ == SOCKET_PIPE && io_.transferred == 0 && result < 0 &&
+        unsupported_file_splice(int(-result))) {
+      client_.socket_splice_supported = false;
+      fprintf(stderr, "warning: socket splice unavailable; receiving HTTP/2 body directly\n");
+      receive_file_body();
+      return;
+    }
+    if (stage_ == PIPE_FILE && io_.transferred == 0 && result < 0 &&
+        unsupported_file_splice(int(-result))) {
       client_.file_splice_supported = false;
       fprintf(stderr, "warning: local-file splice unavailable; copying HTTP/2 body\n");
       copied_.resize(buffered_);

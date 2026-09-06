@@ -1,6 +1,9 @@
 # Persistent local cache specification
 
-Status: implemented as an experimental feature; production validation is ongoing.
+Status (2026-09-06): the block-cache revision below is approved for
+implementation, including native passthrough's old-handle generation
+exception. The older implementation is not evidence that this revision has
+passed validation.
 
 This document is normative for the ngs3fs persistent local cache. Where this
 document conflicts with an older README description, this document governs the
@@ -42,7 +45,9 @@ after each data-file open, and length zero covers the whole file.
 
 `POSIX_FADV_NOREUSE` is advisory rather than an immediate eviction request.
 ngs3fs does not use `POSIX_FADV_DONTNEED`, direct I/O, page retrieval, or FUSE
-passthrough to enforce a strict single-copy invariant. The advice is best effort:
+passthrough for partially cached or budget-limited files to enforce a strict
+single-copy invariant. Fully cached unlimited-mode files may use native
+passthrough under the separate admission contract below. The advice is best effort:
 ngs3fs neither detects kernel support nor makes mount correctness depend on it.
 
 ## Mount options
@@ -53,14 +58,31 @@ ngs3fs neither detects kernel support nor makes mount correctness depend on it.
   default, means that no fixed maximum is imposed.
 - `--cache-reserve SIZE|PERCENT` preserves free space on the cache filesystem.
   The default is `5%`.
+- `--cache-block-size SIZE` is the cache fill/publication and minimum
+  punch-hole eviction unit, default 2 MiB. It must be a positive multiple of
+  the fixed 32 KiB bitmap unit, no larger than 128 MiB. It does not change the
+  uncached receive pool, upload part size, kernel page size or statfs I/O size.
+- `--cache-unlimited` disables both configured capacity limits and all
+  capacity-driven eviction, including the free-space reserve. It is distinct
+  from `--cache-size=0`, does not change the defaults, and requires `--cache-dir`.
+  Do not silently combine it with explicitly supplied `--cache-size` or
+  `--cache-reserve`: reject conflicting options. Physical ENOSPC remains real;
+  clean read misses may use the existing safe remote bypass, whereas local
+  writes fail rather than sacrifice accepted data. No capacity limit means
+  eligible complete files can use native passthrough, not infinite disk space.
 - `UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE` sets the upper bound for the
   adaptive speculative window for both uncached reads and cache fills. The
   default is 128 MiB. An override is an integer byte count of at least 1 MiB
   and must be page aligned; invalid values warn and retain the default. A
-  larger FUSE demand is never truncated to this speculative limit.
+  larger FUSE demand is never truncated to this speculative limit. Uncached
+  io_uring additionally requires a positive multiple of its 2 MiB receive
+  block; cached windows round down to configured cache blocks, with at least
+  one block. These are different from the fixed 32 KiB bitmap unit.
 - `--max-prefetch-memory SIZE` and `--max-file-prefetch-memory SIZE` are
-  experimental CLI budget fields, with implementation gated by focused tests.
-  An explicit nonzero value must be page aligned and at least 256 KiB. Both
+  receive-storage budgets, not disk-cache fill budgets. Outside the uncached
+  io_uring block pool, a nonzero value must be page aligned and at least
+  256 KiB; that pool instead requires 2 MiB multiples large enough for a
+  cross-block FUSE demand (at least 4 MiB with the default maximum READ). Both
   default to `0` (automatic): 10% of physical RAM rounded down to a page for
   the process budget, and the smaller of file size and twice the maximum
   prefetch window for the per-file default. An explicit per-file value is a
@@ -72,6 +94,8 @@ The existing multipart upload size is also the cache write-reservation unit.
 It defaults to 8 MiB and is not duplicated as a cache-specific option.
 
 When both `--cache-size` and `--cache-reserve` apply, the stricter limit wins.
+The explicit unlimited mode disables both; it never silently turns itself
+back into an eviction mode after a passthrough file has been exported.
 Invalid values fail the mount; they are never silently rounded to a materially
 different policy.
 
@@ -105,12 +129,15 @@ A root superblock binds the cache to the canonical mount namespace:
 - bucket;
 - mounted key prefix;
 - addressing mode and provider mode when they affect key interpretation;
-- cache format version, byte order, page size, and path-encoding version.
+- cache format version, byte order, fixed bitmap unit and path-encoding version.
 
 Credentials are not part of this identity. Reusing a cache root with a
 different namespace or an incompatible format fails without deleting data.
-Clean entries may be rebuilt during a compatible format migration. Dirty
-entries are never silently discarded or reinterpreted.
+This revision uses a new format with no old-format decoder, migration, or
+compatibility branches. A mismatched root is rejected without deleting data.
+Dirty entries are never silently discarded or reinterpreted. Native OS/FS
+allocation alignment is runtime information, not the bitmap format. Changing
+cache block size on a later mount does not change the 32 KiB bitmap layout.
 
 At mount time ngs3fs verifies that the cache filesystem:
 
@@ -153,21 +180,25 @@ Each S3 key has at most one active cached generation:
 
 The metadata format contains at least:
 
-- magic, format version, header length, and page size;
+- magic, format version, header length, and fixed 32 KiB bitmap unit;
 - full S3 key;
 - ETag, Version ID, object size, and S3 modification time;
 - logical `written_end` for a replacement writer;
 - write phase and monotonically increasing generation epoch;
 - multipart Upload ID, upload part size, and checksum algorithm;
-- the two-bit page-state bitmap.
+- the two-bit 32 KiB-unit state bitmap;
+- a persistent ever-exported flag protecting data inodes used by passthrough.
 
 Variable-length recovery records are bounds-checked before use. Metadata space
 is allocated before it is mapped, so an in-range metadata store cannot fail
 later with `SIGBUS` because the file was sparse.
 
-## Page state and publication
+## Fixed bitmap state and whole-block publication
 
-Each runtime page consumes two persistent bits:
+Each 32 KiB of logical file data consumes two persistent bits, independently
+of native page size and configured cache block size. A default 2 MiB block
+therefore has 64 entries occupying 16 bytes. The final partial unit ends at
+the logical file size; zeroes beyond EOF are never valid file contents.
 
 | Bits | State | Meaning |
 | --- | --- | --- |
@@ -177,9 +208,12 @@ Each runtime page consumes two persistent bits:
 | `11` | BAD | Data failed checksum validation and its retry |
 
 `READ_PENDING` is published in the persistent bitmap before the GET begins.
-It is an inter-thread ownership state, not durable work: after a process
-restart, every surviving READ_PENDING page is changed to MISSING and its
-possibly partial extent is punched before it can be served. `VERIFYING`,
+It is an inter-thread ownership state, not durable work: on lazy object open
+after restart, surviving READ_PENDING units become MISSING before being
+served. No clean-tree mount scan or redundant pending-count header is added.
+Only complete, unpinned eviction blocks with no valid neighbours may be
+punched; otherwise leave an invalid allocated extent for later whole-block
+reuse/reclamation. `VERIFYING`,
 `RETRYING`, reference bits, and pin counts remain transient in-memory state.
 Locally written pages are CLEAN in the bitmap while the entry-level dirty flag
 keeps the whole replacement generation non-evictable and authoritative until
@@ -197,10 +231,21 @@ Publication ordering is:
 
 Readers acquire page state before pinning and issuing an FD-backed reply.
 Eviction waits for pins, changes CLEAN to MISSING, punches the extent, and then
-releases capacity accounting. A page is CLEAN only after a whole page has been
-received, except for the final partial page at object EOF.
+releases capacity accounting. Read fills publish CLEAN only after all bytes
+of a configured cache block have been written successfully, except that the
+last block ends at EOF. A 32 KiB bitmap entry does not authorize independent
+32 KiB eviction or partial-block early READ replies. Writer publication is
+bounded instead by the dirty generation's written_end; it never claims that
+unwritten bytes in the last 32 KiB unit are readable.
 
-Every fetch claim carries a generation epoch. Completion from an old GET,
+Every fetch claim carries a generation epoch and unique active claim identity.
+It also records a monotonic published prefix. Once a completed block is
+released for eviction/refill, the old claim must never change or punch it
+again: a newer GET may already own that block. Completion/failure cleanup
+touches only the old claim's still-owned unfinished tail; checksum retry must
+independently acquire and protect its complete scope before rewriting it.
+Late/duplicate publish, finish or fail calls from a retired claim are no-ops,
+even if a newer claim uses the same generation and range. Completion from an old GET,
 checksum task, retry, or writer is discarded after a generation change and
 must never publish into the new generation.
 
@@ -242,42 +287,47 @@ progress is published.
 
 ### Fetch selection
 
-The first read and a detected jump request at least 1 MiB. Sequential reads
-double the per-handle window up to 128 MiB by default, capped by
-`UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE`. The actual claim:
+Cache misses align downward to `--cache-block-size` (default 2 MiB). A random
+miss downloads at least that complete block, clipped at EOF. The sequential
+HTTP window starts at 8 MiB, grows by doubling, and is bounded by
+`UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE` (default 128 MiB). Window sizing is
+rounded to complete cache blocks, always allowing at least one block. The
+8 MiB initial GET is not an upload/checksum alignment constraint. A request
+adjacent to prior demand or covered by completed/pending prefetch is not a
+random jump. There is no footer/backwards exception beyond block alignment.
 
-- begins at the first missing page needed by the FUSE request;
-- is page aligned except at EOF;
-- expands only forward;
-- may cross already CLEAN islands to avoid another S3 request;
-- stops before another READ_PENDING or BAD range;
-- never crosses the object generation or EOF.
+A partially cached block may be downloaded in full for the same pinned S3
+identity, including its CLEAN islands. One claim owns each fill block; all
+overlapping fetches reuse or wait for it. Never overwrite local DIRTY data,
+an exported immutable backing inode, or data pinned for a reply or checksum.
+Waiting covers the whole conflicting block, including conflicts outside the
+immediate FUSE request; final unpin and claim retirement must wake waiters.
+Disjoint fill blocks may proceed concurrently. Reservation failure before
+data modification restores the prior CLEAN mask and wakes waiters, then uses
+the existing clean-read bypass. A failed/short GET never leaves partial data
+marked CLEAN; previously completed independent blocks remain usable.
 
-The process and per-file prefetch budgets further reduce speculative claims
-when capacity is tight; they never reduce the demand bytes needed to satisfy
-the current READ. A rate-limited warning is emitted when pressure changes the
-speculative window.
+An existing cache hit replies immediately. A miss replies exactly once when
+every configured block intersecting that FUSE request has been downloaded
+and written to the sparse file. It does not wait for speculative later blocks,
+fdatasync, or background checksum completion. Only actual FUSE READs receive
+data; NOTIFY_STORE is prohibited on every path.
 
-Overlapping fetches coalesce through READ_PENDING. Readers that need a pending
-page wait for its state to become CLEAN, MISSING, or BAD; they never issue a
-duplicate GET for that page. Disjoint misses may fetch concurrently. Once
-every page needed by the FUSE request is CLEAN, ngs3fs sends exactly one reply
-immediately. The same GET may continue filling its speculative tail afterward.
+Demand has priority over speculative tails. Expanded fills use bulk connection
+admission, preserving the control/demand connection reserve; lack of bulk
+capacity reduces a speculative window to complete demand blocks, never a
+sub-block fetch. This on-disk cache does not allocate or reuse uncached receive
+pool buffers, and has no cached receive freelist. Disk reservations, not
+uncached anonymous-memory budgets, bound cached capacity.
 
-Demand misses have priority over speculative tails. A cache miss expands only
-when a bulk connection is immediately available. Uploads and expanded fills
-use only the first `max-connections - 1` connections, leaving one connection
-available to an exact demand read or control call. When no bulk connection is
-immediately available, the miss fetches only the page-aligned range needed by
-the FUSE request. Whole pages already published by a failed tail remain valid.
-
-With the uring engine, the dispatch worker performs only the cache-state
-claim and submits one stable cache-fill task. HTTP parsing and socket receive
-then continue on a reactor-local fiber. Writes into the sparse cache data file
-are ring operations forced onto io-wq with `IOSQE_ASYNC`; the reactor itself
-does not execute a buffered filesystem write. CLEAN is published only after
-the corresponding file-write completion, and pending readers are notified
-after that publication.
+With uring, explicit owner-reactor continuations drive HTTP parsing, socket
+I/O and pipe-to-file/body-to-file operations. Buffered file operations are
+submitted with IOSQE_ASYNC so they cannot block the reactor on storage.
+No fiber or synchronous worker-to-reactor handoff is introduced. Existing
+metadata allocation/eviction and checksum CPU work may use the background
+pool. Without read verification, retain eligible socket/pipe/file splice;
+HTTP framing and header-overread bytes use bounded copies. The legacy/TLS
+fallback keeps identical bitmap, block-completion and error semantics.
 
 For a cached FUSE write, the callback copies only the one-element
 `fuse_bufvec` descriptor, marks the original input as transferred, and retains
@@ -285,6 +335,51 @@ the FD-backed dispatch pipe until the reactor task finishes consuming it. The
 dispatch worker then returns immediately. Payload pages remain pipe-backed,
 and pipe-to-cache-file work is submitted to io-wq; no synchronous
 worker-to-reactor I/O handoff or payload copy is introduced.
+
+### Unlimited complete-file native passthrough
+
+Only read-only, fully cached unlimited-mode opens may export a backing file.
+Admission checks under the entry lock: current generation, all units CLEAN,
+not DIRTY/stale, no fill/retry/verification in progress. If verification is
+enabled, every relevant checksum must have completed successfully; unavailable
+checksums keep the ordinary cached path. Export is not an excuse to add a
+foreground checksum wait to open.
+
+Checksum verification results are not persisted across mounts. If an
+ever-exported generation is reopened with verification enabled but no usable
+in-memory verification result, retain the ordinary read path and warn once
+per cache entry that this immutable generation cannot be reverified/retried
+in place. Do not silently mark it verified or export it again under that
+verification policy. Replacing the named generation follows the normal
+unlink-and-recreate rule, not a special startup scan or forced redownload.
+
+Negotiate kernel/libfuse passthrough capability and stacking depth. A missing
+capability or denied backing registration warns and falls back before OPEN
+is replied. Never return a normal-mode open on an inode already using
+passthrough, or pretend an OPEN reply can be retried in another mode.
+
+Normal FUSE handles and their mmap lifetimes must drain before the first
+passthrough open. Existing normal handles are not converted or forced closed.
+All simultaneous passthrough opens of an inode reuse one backing registration;
+their replies clear KEEP_CACHE. Writes stay managed by ngs3fs and retain the
+existing same-key exclusivity contract.
+
+A passthrough mmap can outlive FUSE_RELEASE without further daemon callbacks.
+Before export, persist an ever-exported flag in the mmap metadata. Any later
+writer, remote generation replacement, or reclamation must replace/unlink
+that data inode instead of truncating, punching or refilling it in place,
+including after daemon restart. There remains only one named active cache
+generation; old unlinked inodes survive only through VFS references, not a
+multi-version cache directory or background old-generation registry.
+Here persistence means the existing process-crash contract: publish the
+ever-exported flag through the shared mmap before registration. Do not add a
+mandatory msync/fdatasync or an operating-system-crash durability promise.
+
+Accepted best-effort exception: unlike ordinary handles that subsequently
+return ESTALE, old passthrough reads/mappings cannot be revoked on external
+object replacement and may continue reading the immutable old backing.
+New opens retain the existing conflict/EBUSY rules. No forced revocation or
+cross-client strong guarantee is claimed.
 
 ### Read checksum behavior
 
@@ -305,6 +400,16 @@ After the unit is fully present, the request worker reads the local file and
 computes the checksum without delaying a FUSE request that was already
 answered from the completed prefix.
 
+Verification must pin its entire local source range. If a whole-object fetch
+has already lost a completed block to legitimate eviction or another fetch
+owns an overlapping refill, skip that best-effort verification instead of
+hashing holes or forcing a whole-file redownload. This is not a verified
+result and cannot qualify the file for checksum-gated passthrough.
+Full-object fallback verification and multipart verification must not own
+overlapping source scopes at the same time. Different nonoverlapping parts
+may share an eviction block; their verification pins must not cause retry
+to wait for one another when no actual reply still references the block.
+
 No cached or uncached path issues `FUSE_NOTIFY_STORE`, including read prefetch
 and post-write page refill. Verification does not enable proactive publication.
 Existing kernel-cached data remains reusable where normal coherence permits;
@@ -316,7 +421,9 @@ publication phase.
 On mismatch:
 
 1. mark the unit BAD/RETRYING;
-2. issue exactly one new GET for the same independently verifiable unit;
+2. prevent new overlapping replies, wait for already admitted reply-source
+   pins to drain (excluding the verifier's own pin), then issue exactly one
+   new GET for the same independently verifiable unit;
 3. make subsequent reads and mmap faults that reach FUSE wait for that shared
    retry;
 4. publish CLEAN on successful revalidation;
@@ -452,15 +559,20 @@ Capacity accounting includes allocated data extents, metadata, dirty markers,
 and outstanding physical reservations. Concurrent reservations are atomic.
 Before reserving, ngs3fs checks both the configured maximum and current
 `statvfs` free-space reserve.
+An unlinked exported inode leaves named-cache accounting immediately. Its
+remaining lifetime belongs to the VFS and is not tracked by a second cache
+registry; any space still held by old mappings remains visible in `statvfs`.
 
-When space is needed, clean data is reclaimed in fixed regions of
-`max(1 MiB, page_size)`. The policy is an approximate, mount-global
+When space is needed, clean data is reclaimed in aligned units of
+`--cache-block-size` (default 2 MiB), never individual bitmap units. Adjacent
+units may be combined; a final EOF block uses the same aligned punch range
+without extending the visible file size. The policy is an approximate, mount-global
 second-chance CLOCK:
 
 - a cache access sets a transient reference bit;
 - the first CLOCK pass clears the bit;
 - a later unreferenced pass may evict the region;
-- dirty generations, READ_PENDING, BAD, pinned, or pending-operation data is
+- dirty generations, READ_PENDING, BAD, pinned, exported, or pending-operation data is
   never evicted;
 - eviction changes page state before punching the corresponding hole;
 - a region containing CLEAN and MISSING pages remains evictable;
@@ -475,6 +587,9 @@ with `ENOSPC`. Dirty data is never sacrificed to satisfy a read miss.
 
 An unlinked object retained for an old reader is not evictable until the last
 such reader closes.
+
+Unlimited mode never enters capacity CLOCK or cold-tree eviction. Physical
+allocation failure must not enable punching as an implicit fallback.
 
 ## Unlink behavior
 
@@ -592,7 +707,7 @@ The implementation is not complete until the following pass:
 3. HTTP/1.1 and HTTP/2 tests that stream bodies larger than pipe capacity into
    a sparse file and publish progress without flow-control stalls.
 4. Cached read tests for hit, miss, mixed ranges, coalescing, disjoint fetches,
-   adaptive expansion, early FUSE reply, cancellation, and generation change.
+   adaptive expansion, whole-block reply gate, cancellation, and generation change.
 5. Checksum tests for background success, one shared retry, retry failure,
    read `EIO`, and mmap invalidation/`SIGBUS` where the kernel permits it.
 6. Cached write tests for all open-flag combinations, zero-length replacement,
@@ -607,6 +722,12 @@ The implementation is not complete until the following pass:
 10. Runner benchmarks against goofys and Mountpoint for S3, followed by an
     interactive ngs3fs flamegraph. Client-side time excluding network transfer
     remains targeted at no more than 20% of the fastest relevant competitor.
+11. Fixed 32 KiB bitmap, non-default cache block size, EOF, partial-CLEAN
+    redownload, request-external PENDING/pin waits, reservation rollback,
+    late claim callbacks, and lazy restart cleanup with no valid-neighbour loss.
+12. Unlimited no-eviction and native-passthrough capability/permission fallback,
+    old normal mmap blocking promotion, simultaneous backing reuse, and old
+    passthrough mmap surviving close/replacement/remount with unchanged bytes.
 
 The integration server deliberately commits one multipart object and closes
 the connection before returning the Complete response; ngs3fs must resolve the

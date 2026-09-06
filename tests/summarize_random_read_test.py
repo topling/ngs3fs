@@ -22,8 +22,8 @@ class RandomReadReportTest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="ngs3fs-report-test-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        data = self.root / "data"
-        data.mkdir()
+        self.data = self.root / "data"
+        self.data.mkdir()
         inputs = []
         for mode, engine in [("none", "uring"), ("warm", "legacy"), ("old", None)]:
             path = self.root / mode
@@ -32,7 +32,7 @@ class RandomReadReportTest(unittest.TestCase):
             rows = [
                 dict(advice="normal", client=name, cache_mode=mode,
                      cpu_per_operation_median_ns=cpu, wall_median_ns=cpu * 100,
-                     s3_get_median=12, samples=3)
+                     s3_get_median=12, samples=2)
                 for name, cpu in [("ngs3fs", 1_000_000), ("mountpoint-s3", 2_000_000)]
             ]
             with (path / "summary.csv").open("w", newline="", encoding="utf-8") as stream:
@@ -44,8 +44,41 @@ class RandomReadReportTest(unittest.TestCase):
                     f"ngs3fs_io_engine={engine}\nngs3fs_reactors=1\n",
                     encoding="utf-8",
                 )
-        self.rows = summary.read_comparisons(inputs, data)
+        self.inputs = inputs
+        self.rows = summary.read_comparisons(inputs, self.data)
         self.modes = {row["suite"]: row for row in self.rows}
+
+    def write_client_cpu_sample(self, suite, sample, client, advice,
+                                daemon_cpu, workload_cpu, operations=10):
+        path = self.root / suite / sample
+        path.mkdir()
+        total_cpu = daemon_cpu + workload_cpu
+        with (path / "client-cpu.csv").open(
+                "w", newline="", encoding="utf-8") as stream:
+            fields = [
+                "client", "daemon_cpu_ns", "workload_cpu_ns",
+                "total_cpu_ns", "total_cpu_ns_per_operation",
+            ]
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerow({
+                "client": client,
+                "daemon_cpu_ns": daemon_cpu,
+                "workload_cpu_ns": workload_cpu,
+                "total_cpu_ns": total_cpu,
+                "total_cpu_ns_per_operation": total_cpu // operations,
+            })
+        with (path / "random-read-summary.csv").open(
+                "w", newline="", encoding="utf-8") as stream:
+            fields = ["client", "advice", "pread_operations", "mmap_operations"]
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerow({
+                "client": client,
+                "advice": advice,
+                "pread_operations": operations // 2,
+                "mmap_operations": operations - operations // 2,
+            })
 
     def test_recorded_settings_and_missing_metadata(self):
         self.assertEqual(self.modes["none"]["ngs3fs_io_engine"], "uring")
@@ -87,6 +120,56 @@ class RandomReadReportTest(unittest.TestCase):
                 self.assertEqual(int(row["reference_cpu_per_operation_ns"]), 2_000_000)
                 self.assertEqual(float(row["reference_cpu_over_ngs3fs"]), 2.0)
                 self.assertEqual(float(row["ngs3fs_cpu_saving_percent"]), 50.0)
+
+    def test_total_client_cpu_uses_daemon_plus_workload_and_links_samples(self):
+        samples = [
+            ("r1-ngs3fs", "ngs3fs", 8_000_000, 2_000_000),
+            ("r2-ngs3fs", "ngs3fs", 16_000_000, 4_000_000),
+            ("r1-reference", "mountpoint-s3", 12_000_000, 8_000_000),
+            ("r2-reference", "mountpoint-s3", 24_000_000, 16_000_000),
+        ]
+        for sample, client, daemon, workload in samples:
+            self.write_client_cpu_sample(
+                "none", sample, client, "normal", daemon, workload)
+        evidence = summary.read_client_cpu_evidence(
+            self.inputs, self.rows, self.data)
+        total = evidence[("none", "normal")]
+        self.assertEqual(
+            total["ngs3fs_total_cpu_per_operation_ns"], 1_500_000)
+        self.assertEqual(
+            total["reference_total_cpu_per_operation_ns"], 3_000_000)
+        self.assertEqual(total["reference_over_ngs3fs"], 2.0)
+
+        sample_path = self.data / "none-client-cpu.csv"
+        with sample_path.open(newline="", encoding="utf-8") as stream:
+            copied = list(csv.DictReader(stream))
+        self.assertEqual(len(copied), 4)
+        self.assertEqual(
+            int(copied[0]["total_cpu_ns"]),
+            int(copied[0]["daemon_cpu_ns"]) +
+            int(copied[0]["workload_cpu_ns"]))
+
+        markdown = self.root / "summary.md"
+        page = self.root / "index.html"
+        summary.write_markdown(markdown, self.rows, "test", "", evidence)
+        summary.write_html(page, self.rows, "test", "", evidence)
+        for report in (markdown.read_text(encoding="utf-8"),
+                       page.read_text(encoding="utf-8")):
+            self.assertIn("1.500", report)
+            self.assertIn("3.000", report)
+            self.assertIn("data/none-client-cpu.csv", report)
+
+    def test_missing_old_client_cpu_is_unavailable_without_fabricated_file(self):
+        evidence = summary.read_client_cpu_evidence(
+            self.inputs, self.rows, self.data)
+        self.assertNotIn(("old", "normal"), evidence)
+        self.assertFalse((self.data / "old-client-cpu.csv").exists())
+        markdown = self.root / "summary.md"
+        summary.write_markdown(markdown, self.rows, "test", "", evidence)
+        report = markdown.read_text(encoding="utf-8")
+        self.assertIn(
+            "| old | normal | unavailable | unavailable | "
+            "client CPU unavailable |", report)
 
 
 if __name__ == "__main__":

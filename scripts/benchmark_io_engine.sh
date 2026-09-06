@@ -10,6 +10,7 @@ repetitions=${BENCHMARK_REPETITIONS:-3}
 base_port=${PORT:-17800}
 drop_caches=${BENCHMARK_DROP_CACHES:-1}
 cache_drop_status=not-attempted
+cache_mode=${CACHE_MODE:-none}
 
 if [[ -e "$output_dir" ]]; then
   echo "benchmark output directory already exists: $output_dir" >&2
@@ -29,12 +30,15 @@ mkdir -p "$output_dir"
   uname -a
   lscpu
   free -h
-  printf 'ngs3fs_commit=%s\n' "$(git -C "$project_dir" rev-parse HEAD)"
+  printf 'ngs3fs_commit=%s\n' "$(git -c safe.directory="$project_dir" -C "$project_dir" rev-parse HEAD)"
   printf 'repetitions=%s\n' "$repetitions"
   printf 'cache_drop_requested=%s\n' "$drop_caches"
   printf 'workload=random-read\n'
   printf 'advice=%s\n' "${RANDOM_READ_ADVICE:-random}"
-  printf 'git_dirty=%s\n' "$(git -C "$project_dir" status --porcelain | tr '\n' ' ')"
+  printf 'cache_mode=%s\n' "$cache_mode"
+  printf 'cache_block_size=%s\n' "${NGS3FS_CACHE_BLOCK_SIZE:-2MiB}"
+  printf 'cache_unlimited=%s\n' "${NGS3FS_CACHE_UNLIMITED:-0}"
+  printf 'git_dirty=%s\n' "$(git -c safe.directory="$project_dir" -C "$project_dir" status --porcelain | tr '\n' ' ')"
   printf 'ngs3fs_path=%s\n' "$(realpath "${NGS3FS_BIN:-$project_dir/build/dev/ngs3fs}")"
   printf 'ngs3fs_sha256=%s\n' "$(sha256sum "${NGS3FS_BIN:-$project_dir/build/dev/ngs3fs}" 2>/dev/null | cut -d' ' -f1 || true)"
   printf 'goofys_path=%s\n' "$(realpath "${GOOFYS_BIN:-/home/leipeng/.cache/goofys-reference/bin/goofys}")"
@@ -75,7 +79,7 @@ for ((repetition = 1; repetition <= repetitions; ++repetition)); do
     WORKLOAD=random-read \
     CLIENT=ngs3fs \
     RANDOM_READ_ADVICE="${RANDOM_READ_ADVICE:-random}" \
-    CACHE_MODE=none \
+    CACHE_MODE="$cache_mode" \
     PORT="$((base_port + sample))" \
       "$project_dir/scripts/compare_goofys.sh" "$run_dir"
     sample_summary=$(tail -n 1 "$run_dir/random-read-summary.csv")
@@ -136,6 +140,9 @@ awk -F, '
   NR == 1 { print "# ngs3fs io-engine random-read benchmark\n"; print "Median daemon CPU and wall time across repeated samples."; print ""; print "| Engine | Reactors | CPU/op (ms) | Wall (ms) | S3 GET |"; print "|---|---:|---:|---:|---:|"; next }
   { printf "| %s | %s | %.3f | %.3f | %s |\n", $1, $2, $13 / 1000000, $5 / 1000000, $17 }
 ' "$output_dir/summary.csv" >"$output_dir/summary.md"
+printf '\nCache mode: %s; cache block: %s; unlimited: %s. CPU in the table is daemon CPU only. Each sample also contains client-cpu.csv with workload CPU and the daemon + workload total; use that total when assessing passthrough. It excludes the separate S3 server and unattributed global kernel work.\n' \
+  "$cache_mode" "${NGS3FS_CACHE_BLOCK_SIZE:-2MiB}" \
+  "${NGS3FS_CACHE_UNLIMITED:-0}" >>"$output_dir/summary.md"
 
 cat "$output_dir/summary.md"
 printf '%s\n' "$output_dir"

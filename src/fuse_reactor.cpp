@@ -803,6 +803,7 @@ ssize_t FuseReactor::async_writev(int fd, const iovec* iov, int count,
   reply->req       = req;
   reply->kind      = REPLY_WRITE;
   reply->output_fd = fd;
+  reply->notification = req == nullptr;
   if (local && req == nullptr && reactor->pending_notify_ != nullptr) {
     reply->notify_done = reactor->pending_notify_;
     reply->notify_context = reactor->pending_notify_context_;
@@ -894,6 +895,7 @@ ssize_t FuseReactor::async_splice(int input_fd, int output_fd, size_t length,
   reply->input_fd  = input_fd;
   reply->output_fd = output_fd;
   reply->flags     = flags;
+  reply->notification = req == nullptr;
   if (local && req == nullptr && reactor->pending_notify_ != nullptr) {
     reply->notify_done = reactor->pending_notify_;
     reply->notify_context = reactor->pending_notify_context_;
@@ -1329,6 +1331,7 @@ void FuseReactor::release_reply(Reply* reply) noexcept {
   reply->output_fd          = -1;
   reply->flags              = 0;
   reply->external           = false;
+  reply->notification       = false;
   reply->notify_done        = nullptr;
   reply->notify_context     = nullptr;
   reply->next               = reply_free_;
@@ -1819,7 +1822,8 @@ void FuseReactor::drain_shutdown() noexcept {
     }
 
     const bool drained = io_requests_.empty() && async_pending_ == 0 &&
-        !reply_pending_ && !cancel_pending &&
+        !reply_queues_[0].pending && !reply_queues_[1].pending &&
+        !cancel_pending &&
         task_count_.load(std::memory_order_acquire) == 0 &&
         dispatch_count_ == 0 && receive_count_ == 0 &&
         callback_count_ == 0;
@@ -1857,7 +1861,9 @@ bool FuseReactor::resume_receive() noexcept {
   if (fuse_session_exited(session_)) {
     return true;
   }
-  const bool receive_ready = reply_count_ >= max_reply_count_ ||
+  // Notification backlog cannot suppress READ admission: INVAL may be waiting
+  // for a locked folio whose request has not yet been read from /dev/fuse.
+  const bool receive_ready = reply_queues_[0].count >= max_reply_count_ ||
       submit_receive();
   if (receive_ready && submit_external_receive() &&
       submit_dispatch_receive() &&
@@ -1871,15 +1877,19 @@ bool FuseReactor::resume_receive() noexcept {
 }
 
 bool FuseReactor::enqueue_reply(Reply* reply) noexcept {
-  if (reply_head_ == nullptr) {
+  // An INVAL write can wait for a FUSE_READ that has not been replied to yet.
+  // Keep each lane ordered, but let ordinary replies unblock notifications.
+  ReplyQueue& queue = reply_queues_[reply->notification];
+  if (queue.head == nullptr) {
     if (!submit_reply(reply)) {
       return false;
     }
-    reply_head_ = reply;
+    queue.head = reply;
   } else {
-    reply_tail_->next = reply;
+    queue.tail->next = reply;
   }
-  reply_tail_ = reply;
+  queue.tail = reply;
+  ++queue.count;
   ++reply_count_;
   reply_high_water_ = std::max(reply_high_water_, reply_count_);
   return true;
@@ -1904,9 +1914,9 @@ bool FuseReactor::submit_reply(Reply* reply) noexcept {
   }
   // An invalidation can wait for a locked folio whose FUSE_READ still needs an
   // owner reply. Let io-wq perform that wait, never the reactor's submit path.
-  if (reply->req == nullptr) sqe->flags |= IOSQE_ASYNC;
+  if (reply->notification) sqe->flags |= IOSQE_ASYNC;
   io_uring_sqe_set_data(sqe, reply);
-  reply_pending_ = true;
+  reply_queues_[reply->notification].pending = true;
   return true;
 }
 
@@ -1918,14 +1928,16 @@ void FuseReactor::complete_reply(Reply* reply, int result) noexcept {
       error_ = terminal_result;
     }
   }
-  reply_head_ = reply->next;
-  if (reply_head_ == nullptr) {
-    reply_tail_ = nullptr;
+  ReplyQueue& queue = reply_queues_[reply->notification];
+  queue.head = reply->next;
+  if (queue.head == nullptr) {
+    queue.tail = nullptr;
   }
   --reply_count_;
+  --queue.count;
   ++completed_replies_;
-  reply_pending_ = false;
-  if (terminal_result == 0 && initialization_owner_ &&
+  queue.pending = false;
+  if (terminal_result == 0 && !reply->notification && initialization_owner_ &&
       !initialization_complete_) {
     initialization_complete_ = true;
     if (!initialize_receive_clones()) {
@@ -1935,7 +1947,7 @@ void FuseReactor::complete_reply(Reply* reply, int result) noexcept {
     group_->reactor_initialized();
   }
   if (!group_->shutting_down_.load(std::memory_order_acquire) &&
-      reply_head_ != nullptr && !submit_reply(reply_head_)) {
+      queue.head != nullptr && !submit_reply(queue.head)) {
     error_ = -EAGAIN;
   }
   resume_receive();
@@ -1945,15 +1957,18 @@ void FuseReactor::complete_reply(Reply* reply, int result) noexcept {
 }
 
 void FuseReactor::fail_replies(int result) noexcept {
-  while (reply_head_ != nullptr) {
-    Reply* reply = reply_head_;
-    reply_head_ = reply->next;
-    --reply_count_;
-    if (reply_head_ == nullptr) reply_tail_ = nullptr;
-    retire_reply(reply, result);
+  for (ReplyQueue& queue : reply_queues_) {
+    while (queue.head != nullptr) {
+      Reply* reply = queue.head;
+      queue.head = reply->next;
+      --reply_count_;
+      --queue.count;
+      if (queue.head == nullptr) queue.tail = nullptr;
+      retire_reply(reply, result);
+    }
+    queue.tail = nullptr;
+    queue.pending = false;
   }
-  reply_tail_ = nullptr;
-  reply_pending_ = false;
 }
 
 void FuseReactor::fail_external_replies(int result) noexcept {

@@ -188,12 +188,20 @@ class TestFileSink final : public RangeFileSink {
       : RangeFileSink(fd, offset) {}
 
   void progress(const Response& response, bool complete) override {
+    if (!expected.empty()) {
+      assert(response.body_bytes >= produced && response.body_bytes <= expected.size());
+      std::vector<std::byte> visible(response.body_bytes - produced);
+      assert(::pread(fd(), visible.data(), visible.size(), off_t(produced)) ==
+             ssize_t(visible.size()));
+      assert(std::equal(visible.begin(), visible.end(), expected.begin() + produced));
+    }
     ++calls;
     produced = response.body_bytes;
     completed |= complete;
   }
 
   size_t calls = 0;
+  std::span<const std::byte> expected;
   size_t produced = 0;
   bool completed = false;
 };
@@ -221,8 +229,7 @@ class TestMemorySink final : public RangeMemorySink {
   bool completed = false;
 };
 
-int main(int argc, char** argv) {
-  const std::string_view mode = argc == 2 ? argv[1] : "";
+int run_test(std::string_view mode, int socket_error = 0, int file_error = 0) {
   const bool memory = mode == "--async-memory" || mode == "--async-memory-padded";
   const bool asynchronous = mode == "--async" || memory;
   const bool padded = mode == "--async-memory-padded";
@@ -251,12 +258,15 @@ int main(int argc, char** argv) {
   UniqueFd file(::memfd_create("h2-range-file", MFD_CLOEXEC));
   assert(file);
   TestFileSink sink(file.get(), 0);
+  sink.expected = expected;
   TestMemorySink memory_sink(expected.size());
   const size_t& produced = memory ? memory_sink.produced : sink.produced;
   const bool& completed = memory ? memory_sink.completed : sink.completed;
   Response response;
   if (asynchronous) {
     TestAsyncIoExecutor executor(4093);
+    executor.socket_splice_error = socket_error;
+    executor.file_splice_error = file_error;
     AsyncHttpRequest request;
     request.path = "/bucket/key";
     request.range = true;
@@ -289,6 +299,9 @@ int main(int argc, char** argv) {
     if (completion.error) std::rethrow_exception(completion.error);
     assert(executor.parameters_preserved());
     assert(executor.saw_background_file_write() == !memory);
+    if (socket_error != 0 || file_error != 0) {
+      assert(executor.rejected_splices == 1);
+    }
   } else {
     auto download = client->begin_range_to_fd(
         "/bucket/key", 0, expected.size(), sink, {}, false, true);
@@ -300,9 +313,11 @@ int main(int argc, char** argv) {
   }
   assert(response.status == 206);
   assert(response.body_bytes == expected.size());
-  assert(response.externally_spliced_bytes == (memory ? 0 : expected.size()));
-  assert(padded ? response.fallback_copied_bytes > 0
-                : response.fallback_copied_bytes == 0);
+  const bool copying = socket_error != 0 || file_error != 0;
+  assert(response.externally_spliced_bytes == (memory || copying ? 0 : expected.size()));
+  if (copying) assert(response.fallback_copied_bytes == expected.size());
+  else assert(padded ? response.fallback_copied_bytes > 0
+                     : response.fallback_copied_bytes == 0);
   assert(response.fallback_copied_bytes <= expected.size());
   assert(response.wire_start_ns != 0);
   assert(response.wire_last_data_ns >= response.wire_start_ns);
@@ -316,5 +331,19 @@ int main(int argc, char** argv) {
   if (memory) actual = std::move(memory_sink.data);
   else read_all(file.get(), actual);
   assert(actual == expected);
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  const std::string_view mode = argc == 2 ? argv[1] : "";
+  run_test(mode);
+  if (mode == "--async") {
+    // Eight MiB exceeds the four-MiB receive window: a missing shadow
+    // consume/WINDOW_UPDATE on either copy fallback would stall this transfer.
+    run_test(mode, EPERM, 0);
+    run_test(mode, ENOSYS, 0);
+    run_test(mode, 0, EPERM);
+    run_test(mode, 0, EXDEV);
+  }
   return 0;
 }

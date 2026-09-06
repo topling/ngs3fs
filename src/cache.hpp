@@ -27,6 +27,8 @@ enum CachePageState : uint8_t {
 };
 
 constexpr size_t kDefaultMaxPrefetchWindowSize = 128U * 1024U * 1024U;
+constexpr size_t kCacheBitmapUnit              = 32U * 1024U;
+constexpr size_t kDefaultCacheBlockSize        = 2U * 1024U * 1024U;
 
 struct CacheConfig {
   std::string root;
@@ -36,9 +38,11 @@ struct CacheConfig {
   unsigned reserve_percent        = 5;
   size_t max_prefetch_window_size = kDefaultMaxPrefetchWindowSize;
   size_t page_size                = 4096;
+  size_t block_size               = kDefaultCacheBlockSize;
   uint64_t upload_part_size       = 8ULL * 1024ULL * 1024ULL;
   uint32_t checksum_algorithm     = 0;
   bool reserve_is_percent         = true;
+  bool unlimited                  = false;
 };
 
 struct CacheIdentity {
@@ -116,10 +120,15 @@ class CacheEntry {
   [[nodiscard]] CacheIdentitySnapshot identity_snapshot() const;
   [[nodiscard]] std::string write_id() const;
   [[nodiscard]] size_t page_size() const noexcept;
+  [[nodiscard]] size_t block_size() const noexcept;
   [[nodiscard]] bool stale() const noexcept;
   [[nodiscard]] bool dirty() const noexcept;
+  [[nodiscard]] bool exported() const noexcept;
+  [[nodiscard]] bool try_export(bool verify);
 
   [[nodiscard]] bool range_clean(uint64_t offset, size_t length) const;
+  [[nodiscard]] bool range_available_or_pending(
+      uint64_t offset, size_t length) const;
   [[nodiscard]] bool range_bad(uint64_t offset, size_t length) const;
   [[nodiscard]] bool fully_clean() const;
   bool prepare_read(uint64_t offset, size_t length);
@@ -153,9 +162,16 @@ class CacheEntry {
   void publish_clean(const CacheFetchClaim& claim, size_t published,
                      size_t length, bool final);
   void finish_fetch(const CacheFetchClaim& claim) noexcept;
+  void rollback_fetch(const CacheFetchClaim& claim) noexcept;
   void fail_fetch(const CacheFetchClaim& claim) noexcept;
   void mark_bad(const CacheFetchClaim& claim) noexcept;
+  // Full-object checks are best effort if any published block was evicted or
+  // acquired by another fetch. A successful pin lasts until claim retirement.
+  [[nodiscard]] bool pin_fetch_verification(const CacheFetchClaim& claim);
   void begin_retry(const CacheFetchClaim& claim);
+  // Quarantine the pinned scope, then wait for old reply pins to drain.
+  // As with begin_async_wait, a returned fd is paired with end_async_wait.
+  int begin_retry_wait(const CacheFetchClaim& claim);
   void finish_retry(const CacheFetchClaim& claim, bool valid) noexcept;
   bool begin_checksum_manifest(bool wait = true);
   void finish_checksum_manifest(
@@ -166,6 +182,8 @@ class CacheEntry {
                                     bool skip_in_progress = false);
   void wait_for_checksum(uint64_t offset, size_t length);
   void checksum_mismatch(const CacheChecksumClaim& claim) noexcept;
+  void wait_for_checksum_retry(const CacheChecksumClaim& claim);
+  int begin_checksum_retry_wait(const CacheChecksumClaim& claim);
   void finish_checksum(const CacheChecksumClaim& claim,
                        bool valid) noexcept;
   // A retry signed for an identity that was renamed while its handle closed
@@ -188,7 +206,12 @@ class CacheEntry {
                                      CachePageState state) const noexcept;
   [[nodiscard]] bool range_ready_locked(uint64_t offset,
                                         size_t length) const noexcept;
+  [[nodiscard]] size_t block_first_page(uint64_t offset) const noexcept;
+  [[nodiscard]] size_t block_last_page(uint64_t offset) const noexcept;
   bool end_fetch_locked(const CacheFetchClaim& claim) noexcept;
+  bool begin_retry_locked(const CacheFetchClaim& claim);
+  bool begin_checksum_retry_locked(const CacheChecksumClaim& claim);
+  bool retry_pins_ready_locked(uint64_t offset, size_t length) const noexcept;
   uint8_t checksum_blocked_locked(uint64_t offset, size_t length) const noexcept;
   void wait_locked(std::unique_lock<std::mutex>& guard);
   void notify_waiters_locked() noexcept;
@@ -206,6 +229,7 @@ class CacheEntry {
   uint64_t size_       = 0;
   uint64_t epoch_      = 0;
   size_t page_size_    = 0;
+  size_t block_size_   = 0;
   size_t page_count_   = 0;
   size_t bitmap_offset_ = 0;
   mutable std::mutex mutex_;
@@ -213,7 +237,19 @@ class CacheEntry {
   unsigned waiters_ = 0;
   std::vector<uint8_t> referenced_;
   std::vector<uint32_t> region_pins_;
-  std::vector<uint64_t> active_claims_;
+  struct ActiveFetch {
+    uint64_t id     = 0;
+    uint64_t epoch  = 0;
+    uint64_t offset = 0;
+    size_t length   = 0;
+    // Complete blocks already handed back to the cache may be evicted and
+    // acquired by another fetch while this GET still owns its pending tail.
+    size_t published = 0;
+    bool verifying  = false;
+    bool retrying   = false;
+    std::vector<CachePageState> prior_states;
+  };
+  std::vector<ActiveFetch> active_claims_;
   std::vector<uint8_t> reserved_units_;
   std::vector<CacheChecksumPart> checksum_parts_;
   std::vector<uint8_t> checksum_states_;

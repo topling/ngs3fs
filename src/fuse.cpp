@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/eventfd.h>
@@ -56,6 +57,7 @@ constexpr size_t kMaximumListResponseSize      = 8U * 1024U * 1024U;
 constexpr unsigned kDirectoryListLimit         = 1000;
 constexpr uint32_t kKernelReadAheadSize        = 256U * 1024U;
 constexpr unsigned kFuseReactorQueueDepth      = 256;
+constexpr unsigned long kFuseBackingCloseIoctl = _IOW(229, 2, uint32_t);
 constexpr char kMaxPrefetchWindowEnvironment[] =
     "UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE";
 
@@ -88,6 +90,7 @@ struct MountConfig {
   uint64_t part_size                = 8ULL * 1024ULL * 1024ULL;
   uint64_t cache_size               = 0;
   uint64_t cache_reserve            = 5;
+  size_t cache_block_size           = kDefaultCacheBlockSize;
   uint64_t max_pinned_memory        = 256ULL * 1024ULL * 1024ULL;
   uint64_t directory_cache_ns       = 1000ULL * 1000ULL * 1000ULL;
   size_t max_cached_inodes          = 1'000'000;
@@ -115,6 +118,10 @@ struct MountConfig {
   bool verify_read_checksum            = false;
   bool socket_receive_buffer_explicit  = false;
   bool cache_reserve_is_percent        = true;
+  bool cache_size_explicit             = false;
+  bool cache_reserve_explicit          = false;
+  bool cache_block_size_explicit       = false;
+  bool cache_unlimited                 = false;
   bool requester_pays                  = false;
 };
 
@@ -166,6 +173,12 @@ enum PipeInput {
   PIPE_INPUT_FD,
 };
 
+enum OpenIoMode : uint8_t {
+  OPEN_IO_PENDING,
+  OPEN_IO_NORMAL,
+  OPEN_IO_PASSTHROUGH,
+};
+
 struct PipeSegment {
   Pipe pipe;
   size_t bytes    = 0;
@@ -192,6 +205,9 @@ class FileReader {
   virtual void read(State& state, OpenHandle& handle,
                     fuse_req_t request, fuse_ino_t inode,
                     size_t size, off_t offset) = 0;
+  virtual void read_async(State& state, OpenHandle& handle,
+                          fuse_req_t request, fuse_ino_t inode,
+                          size_t size, off_t offset, FuseReactor& reactor) = 0;
 };
 
 class FileWriter {
@@ -692,7 +708,9 @@ struct OpenHandle {
   size_t pending_parts         = 0;
   unsigned next_part_number    = 1;
   WriteState write_state       = WRITE_OPEN;
+  OpenIoMode io_mode           = OPEN_IO_PENDING;
   int write_error              = 0;
+  int backing_id               = 0;
   bool current_reservation     = false;
   bool multipart_starting      = false;
   bool multipart_required      = false;
@@ -995,8 +1013,16 @@ struct State {
   }
 
   struct OpenFileState {
+    struct InodeIoState {
+      size_t pending_readers     = 0;
+      size_t normal_readers      = 0;
+      size_t passthrough_readers = 0;
+      int backing_id             = 0;
+    };
+
     std::vector<OpenHandle*> handles;
     std::weak_ptr<FileReader> uncached_reader;
+    std::map<fuse_ino_t, InodeIoState> inode_io;
     fuse_ino_t reader_inode = 0;
     uint64_t reader_epoch   = 0;
     size_t readers = 0;
@@ -1093,6 +1119,7 @@ struct State {
   std::atomic<uint64_t> request_errors{0};
   bool budget_exhausted            = false;
   bool cache_budget_warned         = false;
+  bool passthrough_enabled         = false;
   uint64_t cache_warning_ns        = 0;
   std::atomic<uint64_t> random_read_warning_ns{0};
   std::atomic<uint64_t> cache_bypass_warning_ns{0};
@@ -1899,6 +1926,8 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   constexpr int reactors_option                    = 270;
   constexpr int max_prefetch_memory_option         = 271;
   constexpr int max_file_prefetch_memory_option    = 272;
+  constexpr int cache_block_size_option            = 273;
+  constexpr int cache_unlimited_option             = 274;
   constexpr option long_options[] = {
       {"endpoint-host", required_argument, nullptr, 'e'},
       {"endpoint-port", required_argument, nullptr, 'p'},
@@ -1925,6 +1954,10 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       {"cache-size", required_argument, nullptr, cache_size_option},
       {"cache-reserve", required_argument, nullptr,
        cache_reserve_option},
+      {"cache-block-size", required_argument, nullptr,
+       cache_block_size_option},
+      {"cache-unlimited", no_argument, nullptr,
+       cache_unlimited_option},
       {"expected-bucket-owner", required_argument, nullptr,
        expected_bucket_owner_option},
       {"requester-pays", no_argument, nullptr, requester_pays_option},
@@ -2082,8 +2115,10 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
         break;
       case cache_size_option:
         config.cache_size = parse_required_size("--cache-size");
+        config.cache_size_explicit = true;
         break;
       case cache_reserve_option: {
+        config.cache_reserve_explicit = true;
         if (optarg == nullptr || *optarg == '\0') {
           throw std::invalid_argument("invalid --cache-reserve");
         }
@@ -2107,6 +2142,22 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
         }
         break;
       }
+      case cache_block_size_option: {
+        const uint64_t value = parse_required_size("--cache-block-size");
+        if (value == 0 || value > 128ULL * 1024ULL * 1024ULL ||
+            value % kCacheBitmapUnit != 0 ||
+            value > std::numeric_limits<size_t>::max()) {
+          throw std::invalid_argument(
+              "--cache-block-size must be a positive multiple of 32 KiB "
+              "and at most 128 MiB");
+        }
+        config.cache_block_size = size_t(value);
+        config.cache_block_size_explicit = true;
+        break;
+      }
+      case cache_unlimited_option:
+        config.cache_unlimited = true;
+        break;
       case expected_bucket_owner_option:
         if (optarg == nullptr || *optarg == '\0') {
           throw std::invalid_argument(
@@ -2303,6 +2354,19 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   if (config.max_pinned_memory < config.part_size) {
     throw std::invalid_argument(
         "--max-pinned-memory must be at least --part-size");
+  }
+  if (config.cache_block_size_explicit && config.cache_dir.empty()) {
+    throw std::invalid_argument("--cache-block-size requires --cache-dir");
+  }
+  if (config.cache_unlimited) {
+    if (config.cache_dir.empty()) {
+      throw std::invalid_argument("--cache-unlimited requires --cache-dir");
+    }
+    if (config.cache_size_explicit || config.cache_reserve_explicit) {
+      throw std::invalid_argument(
+          "--cache-unlimited cannot be combined with explicitly supplied "
+          "--cache-size or --cache-reserve");
+    }
   }
   const long page_size = ::sysconf(_SC_PAGESIZE);
   if (page_size <= 0) {
@@ -2981,9 +3045,11 @@ void initialize_local_cache(State& state) {
       .reserve_percent = unsigned(state.config.cache_reserve),
       .max_prefetch_window_size = state.config.max_prefetch_window_size,
       .page_size = state.page_size,
+      .block_size = state.config.cache_block_size,
       .upload_part_size = state.config.part_size,
       .checksum_algorithm = uint32_t(state.config.checksum),
       .reserve_is_percent = state.config.cache_reserve_is_percent,
+      .unlimited = state.config.cache_unlimited,
   });
   std::vector<std::string> isolated_keys;
   state.recovery_entries = state.local_cache->recover_dirty(&isolated_keys);
@@ -3343,9 +3409,12 @@ class AsyncS3Request {
   using Complete = AsyncHttpOperation::Complete;
 
   AsyncS3Request(State& state, FuseReactor& reactor, AsyncHttpRequest arguments,
-                 Complete complete, void* context, unsigned max_attempts = 4)
+                 Complete complete, void* context, unsigned max_attempts = 4,
+                 HttpPool::Lease lease = {}, bool bulk = false)
       : state_(state), reactor_(reactor), arguments_(std::move(arguments)),
         complete_(complete), context_(context), max_attempts_(max_attempts) {
+    bulk_ = bulk || bool(lease);
+    lease_ = std::move(lease);
     task_ = {run, cancel_queued, this};
   }
 
@@ -3427,11 +3496,15 @@ class AsyncS3Request {
         arguments_.headers = std::move(headers);
         resign_ = false;
       }
-      lease_ = state_.http->try_acquire();
+      if (!lease_) {
+        lease_ = bulk_ ? state_.http->try_acquire_bulk()
+                       : state_.http->try_acquire();
+      }
       if (!lease_) {
         const int fd = state_.http->begin_async_wait();
         pool_wait_ = true;
-        lease_ = state_.http->try_acquire();
+        lease_ = bulk_ ? state_.http->try_acquire_bulk()
+                      : state_.http->try_acquire();
         if (!lease_) {
           wait_ = {};
           wait_.kind       = AsyncIoRequest::READ;
@@ -3571,6 +3644,7 @@ class AsyncS3Request {
   UniqueFd timer_;
   uint64_t notification_ = 0;
   bool pool_wait_ = false;
+  bool bulk_ = false;
   bool started_ = false;
   bool cancelled_ = false;
   bool ambiguous_ = false;
@@ -3839,10 +3913,14 @@ class AsyncSignedS3Request {
 
   AsyncSignedS3Request(State& state, FuseReactor& reactor, AsyncHttpRequest args,
                         Complete complete, void* context, unsigned attempts = 4,
-                        std::string_view payload_hash = kEmptyPayloadSha256)
+                        std::string_view payload_hash = kEmptyPayloadSha256,
+                        HttpPool::Lease lease = {}, bool bulk = false)
       : state_(state), reactor_(reactor), args_(std::move(args)),
         complete_(complete), context_(context), attempts_(attempts),
-        payload_hash_(payload_hash) {}
+        payload_hash_(payload_hash) {
+    bulk_ = bulk || bool(lease);
+    lease_ = std::move(lease);
+  }
 
   bool start() {
     if (started_ || complete_ == nullptr) {
@@ -3897,7 +3975,8 @@ class AsyncSignedS3Request {
     arguments.headers.insert(
         arguments.headers.end(), headers.begin(), headers.end());
     request_ = std::make_unique<AsyncS3Request>(
-        state_, reactor_, std::move(arguments), received, this, attempts_);
+        state_, reactor_, std::move(arguments), received, this, attempts_,
+        std::move(lease_), bulk_);
     return request_->start();
   }
 
@@ -3942,6 +4021,8 @@ class AsyncSignedS3Request {
   void* context_;
   unsigned attempts_;
   ssostr<72> payload_hash_;
+  HttpPool::Lease lease_;
+  bool bulk_ = false;
   unsigned session_attempt_ = 0;
   bool ambiguous_ = false;
   bool started_ = false;
@@ -4204,6 +4285,7 @@ void register_open_handle(State& state, fuse_ino_t inode,
   if (handle.writable) {
     opened.writer = true;
   } else {
+    ++opened.inode_io[inode].pending_readers;
     ++opened.readers;
   }
   try {
@@ -4213,6 +4295,13 @@ void register_open_handle(State& state, fuse_ino_t inode,
       opened.writer = false;
     } else {
       --opened.readers;
+      auto mode = opened.inode_io.find(inode);
+      if (mode != opened.inode_io.end() &&
+          --mode->second.pending_readers == 0 &&
+          mode->second.normal_readers == 0 &&
+          mode->second.passthrough_readers == 0) {
+        opened.inode_io.erase(mode);
+      }
     }
     if (!opened.writer && opened.readers == 0) {
       state.open_files.erase(position);
@@ -4223,11 +4312,18 @@ void register_open_handle(State& state, fuse_ino_t inode,
       count, count + 1, std::memory_order_relaxed,
       std::memory_order_relaxed)) {
     if (count == UINT32_MAX) {
-        std::erase(opened.handles, &handle);
+      std::erase(opened.handles, &handle);
       if (handle.writable) {
         opened.writer = false;
       } else {
         --opened.readers;
+        auto mode = opened.inode_io.find(inode);
+        if (mode != opened.inode_io.end() &&
+            --mode->second.pending_readers == 0 &&
+            mode->second.normal_readers == 0 &&
+            mode->second.passthrough_readers == 0) {
+          opened.inode_io.erase(mode);
+        }
       }
       if (!opened.writer && opened.readers == 0) {
         state.open_files.erase(position);
@@ -4239,6 +4335,83 @@ void register_open_handle(State& state, fuse_ino_t inode,
   handle.id            = ++state.next_handle_id;
   handle.registered    = true;
   handle.inode_counted = true;
+}
+
+auto find_open_file(State& state, std::string_view path,
+                    const OpenHandle& handle) {
+  auto position = state.open_files.find(path);
+  if (position == state.open_files.end() ||
+      std::find(position->second.handles.begin(),
+                position->second.handles.end(), &handle) ==
+          position->second.handles.end()) {
+    position = std::find_if(
+        state.open_files.begin(), state.open_files.end(),
+        [&](const auto& opened) {
+          return std::find(opened.second.handles.begin(),
+                           opened.second.handles.end(), &handle) !=
+              opened.second.handles.end();
+        });
+  }
+  return position;
+}
+
+bool select_passthrough_io(State& state, fuse_req_t request,
+                           OpenHandle& handle) {
+  if (handle.writable || handle.io_mode != OPEN_IO_PENDING) return false;
+  std::lock_guard guard(state.open_files_mutex);
+  auto opened = find_open_file(state, handle.object_path, handle);
+  if (opened == state.open_files.end()) {
+    throw std::system_error(EBADF, std::generic_category(),
+                            "unregistered open handle");
+  }
+  auto mode = opened->second.inode_io.find(handle.inode);
+  if (mode == opened->second.inode_io.end() ||
+      mode->second.pending_readers == 0) {
+    throw std::logic_error("open I/O mode registry is inconsistent");
+  }
+
+  if (mode->second.normal_readers != 0) {
+    --mode->second.pending_readers;
+    ++mode->second.normal_readers;
+    handle.io_mode = OPEN_IO_NORMAL;
+    return false;
+  }
+  const bool eligible = state.passthrough_enabled &&
+      state.config.cache_unlimited && handle.cache_entry &&
+      !handle.recovery_read &&
+      handle.cache_entry->try_export(state.config.verify_read_checksum);
+  if (!eligible) {
+    if (mode->second.passthrough_readers != 0) {
+      throw std::system_error(
+          EBUSY, std::generic_category(),
+          "inode passthrough generation cannot use normal I/O");
+    }
+    --mode->second.pending_readers;
+    ++mode->second.normal_readers;
+    handle.io_mode = OPEN_IO_NORMAL;
+    return false;
+  }
+  if (mode->second.backing_id == 0) {
+    errno = 0;
+    mode->second.backing_id =
+        fuse_passthrough_open(request, handle.cache_entry->data_fd());
+    if (mode->second.backing_id == 0) {
+      const int error = errno == 0 ? EIO : errno;
+      fprintf(stderr,
+              "warning: native FUSE passthrough registration denied for "
+              "path=%s: %s; using ordinary cached I/O\n",
+              handle.object_path.c_str(), strerror(error));
+      --mode->second.pending_readers;
+      ++mode->second.normal_readers;
+      handle.io_mode = OPEN_IO_NORMAL;
+      return false;
+    }
+  }
+  --mode->second.pending_readers;
+  ++mode->second.passthrough_readers;
+  handle.io_mode    = OPEN_IO_PASSTHROUGH;
+  handle.backing_id = mode->second.backing_id;
+  return true;
 }
 
 void release_open_inode(State& state, OpenHandle& handle) noexcept {
@@ -4253,22 +4426,11 @@ void release_open_inode(State& state, OpenHandle& handle) noexcept {
 
 void unregister_open_handle(State& state, std::string_view path,
                             OpenHandle& handle,
-                            bool release_inode = true) noexcept {
+                            bool release_inode = true,
+                            fuse_req_t passthrough_request = nullptr) noexcept {
   {
     std::lock_guard open_files_guard(state.open_files_mutex);
-    auto position = state.open_files.find(path);
-    if (position == state.open_files.end() ||
-        std::find(position->second.handles.begin(),
-                  position->second.handles.end(), &handle) ==
-            position->second.handles.end()) {
-      position = std::find_if(
-          state.open_files.begin(), state.open_files.end(),
-          [&](const auto& opened) {
-            return std::find(opened.second.handles.begin(),
-                             opened.second.handles.end(), &handle) !=
-                opened.second.handles.end();
-          });
-    }
+    auto position = find_open_file(state, path, handle);
     if (position != state.open_files.end()) {
       State::OpenFileState& opened = position->second;
       const size_t erased = std::erase(opened.handles, &handle);
@@ -4282,6 +4444,55 @@ void unregister_open_handle(State& state, std::string_view path,
         opened.writer = false;
       } else if (opened.readers != 0) {
         --opened.readers;
+        auto mode = opened.inode_io.find(handle.inode);
+        if (mode != opened.inode_io.end()) {
+          size_t* count = handle.io_mode == OPEN_IO_PASSTHROUGH
+                              ? &mode->second.passthrough_readers
+                          : handle.io_mode == OPEN_IO_NORMAL
+                              ? &mode->second.normal_readers
+                              : &mode->second.pending_readers;
+          if (*count == 0) {
+            fprintf(stderr,
+                    "warning: open I/O mode registry underflow: path=%s\n",
+                    handle.object_path.c_str());
+          } else {
+            --*count;
+          }
+          if (mode->second.passthrough_readers == 0 &&
+              mode->second.backing_id != 0) {
+            if (passthrough_request != nullptr) {
+              if (fuse_passthrough_close(
+                      passthrough_request, mode->second.backing_id) < 0) {
+                fprintf(stderr,
+                        "warning: native FUSE passthrough close failed for "
+                        "path=%s backing_id=%d: %s\n",
+                        handle.object_path.c_str(), mode->second.backing_id,
+                        strerror(errno));
+              }
+            } else {
+              const int session_fd = state.session == nullptr
+                  ? -1 : fuse_session_fd(state.session);
+              int backing_id = mode->second.backing_id;
+              if (session_fd < 0 ||
+                  ::ioctl(session_fd, kFuseBackingCloseIoctl,
+                          &backing_id) < 0) {
+                const int error = session_fd < 0 ? ENODEV : errno;
+                fprintf(stderr,
+                        "warning: native FUSE passthrough close after failed "
+                        "OPEN reply failed for path=%s backing_id=%d: %s; "
+                        "registration will be released by unmount\n",
+                        handle.object_path.c_str(), mode->second.backing_id,
+                        strerror(error));
+              }
+            }
+            mode->second.backing_id = 0;
+          }
+          if (mode->second.pending_readers == 0 &&
+              mode->second.normal_readers == 0 &&
+              mode->second.passthrough_readers == 0) {
+            opened.inode_io.erase(mode);
+          }
+        }
       }
       if (!opened.writer && opened.readers == 0) {
         state.open_files.erase(position);
@@ -4440,6 +4651,22 @@ void finish_open_file_rename(State& state,
       destination->second.handles.end(), source->second.handles.begin(),
       source->second.handles.end());
   destination->second.readers += source->second.readers;
+  for (const auto& [inode, source_mode] : source->second.inode_io) {
+    auto [mode, inserted] = destination->second.inode_io.try_emplace(
+        inode, source_mode);
+    if (inserted) continue;
+    if (mode->second.backing_id != 0 && source_mode.backing_id != 0 &&
+        mode->second.backing_id != source_mode.backing_id) {
+      throw std::logic_error(
+          "one inode acquired multiple passthrough registrations");
+    }
+    mode->second.pending_readers += source_mode.pending_readers;
+    mode->second.normal_readers += source_mode.normal_readers;
+    mode->second.passthrough_readers += source_mode.passthrough_readers;
+    if (mode->second.backing_id == 0) {
+      mode->second.backing_id = source_mode.backing_id;
+    }
+  }
   destination->second.writer = destination->second.writer ||
       source->second.writer;
   state.open_files.erase(source);
@@ -8736,6 +8963,17 @@ void ngs3fs_init(void* userdata, fuse_conn_info* connection) {
   auto& state = *static_cast<State*>(userdata);
   connection->no_interrupt = 1;
   unsigned int desired = FUSE_CAP_ASYNC_READ | FUSE_CAP_ATOMIC_O_TRUNC;
+  if (state.config.cache_unlimited) {
+    if ((connection->capable & FUSE_CAP_PASSTHROUGH) != 0) {
+      desired |= FUSE_CAP_PASSTHROUGH;
+      connection->max_backing_stack_depth = FUSE_BACKING_STACKED_UNDER;
+      state.passthrough_enabled = true;
+    } else {
+      fprintf(stderr,
+              "warning: kernel FUSE passthrough capability is unavailable; "
+              "using ordinary cached I/O\n");
+    }
+  }
   if ((connection->capable & FUSE_CAP_EXPLICIT_INVAL_DATA) != 0) {
     desired |= FUSE_CAP_EXPLICIT_INVAL_DATA;
     connection->want &= ~unsigned(FUSE_CAP_AUTO_INVAL_DATA);
@@ -8746,6 +8984,8 @@ void ngs3fs_init(void* userdata, fuse_conn_info* connection) {
   }
   connection->want &= ~unsigned(FUSE_CAP_WRITEBACK_CACHE);
   connection->want |= connection->capable & desired;
+  state.passthrough_enabled = state.passthrough_enabled &&
+      (connection->want & FUSE_CAP_PASSTHROUGH) != 0;
   state.atomic_o_trunc =
       (connection->want & FUSE_CAP_ATOMIC_O_TRUNC) != 0;
   connection->max_readahead = kKernelReadAheadSize;
@@ -9629,11 +9869,15 @@ struct AsyncOpen {
       handle->writer = make_file_writer(state, *handle);
       write_started = begin_inode_write(*handle->item);
     }
+    const bool passthrough = !writable &&
+        select_passthrough_io(state, request, *handle);
     publish_open_handle(*handle);
     identity.unlock();
     file.fh = reinterpret_cast<uint64_t>(handle.get());
     file.direct_io = 0;
     file.keep_cache = keep_cache ? 1 : 0;
+    file.backing_id = passthrough ? handle->backing_id : 0;
+    if (passthrough) file.keep_cache = 0;
     file.nonseekable = writable ? 1 : 0;
     file.noflush = writable ? 0 : 1;
     int result;
@@ -9687,6 +9931,7 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
   bool registered      = false;
   bool budget_reserved = false;
   bool keep_cache      = false;
+  bool passthrough     = false;
   std::unique_ptr<OpenHandle> handle;
   std::string registered_path;
   std::optional<InodeWriteState> write_started;
@@ -9774,6 +10019,9 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
       write_started = begin_inode_write(*handle->item);
     }
 
+    if (!writable) {
+      passthrough = select_passthrough_io(state, request, *handle);
+    }
     publish_open_handle(*handle);
     identity_guard.unlock();
     file->fh = reinterpret_cast<uint64_t>(handle.release());
@@ -9782,6 +10030,8 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
     // MAP_SHARED writable mappings without requiring direct I/O.
     file->direct_io   = 0;
     file->keep_cache  = keep_cache ? 1 : 0;
+    file->backing_id  = passthrough ? handle_optional(file)->backing_id : 0;
+    if (passthrough) file->keep_cache = 0;
     file->nonseekable = writable ? 1 : 0;
     file->noflush     = writable ? 0 : 1;
     if (fuse_reply_open(request, file) != 0) {
@@ -10609,6 +10859,8 @@ class UncachedFileReader final : public FileReader {
 
   void read(State& state, OpenHandle& handle, fuse_req_t request,
             fuse_ino_t inode, size_t size, off_t offset) override;
+  void read_async(State&, OpenHandle&, fuse_req_t, fuse_ino_t,
+                   size_t, off_t, FuseReactor&) override;
 
   bool try_prefetch(State& state, OpenHandle& handle,
                     fuse_req_t request, uint64_t offset,
@@ -10904,6 +11156,7 @@ bool service_cached_checksums(State& state, OpenHandle& handle,
         continue;
       }
       entry.checksum_mismatch(claim);
+      entry.wait_for_checksum_retry(claim);
       HttpPool::Lease acquired;
       if (existing == nullptr || !*existing) {
         acquired = state.http->acquire();
@@ -11119,6 +11372,7 @@ struct AsyncCacheChecksum {
   uint64_t notification = 0;
   std::exception_ptr error;
   bool retrying = false;
+  bool retry_invalidated = false;
   bool valid = false;
 
   AsyncCacheChecksum(const ReadChecksumContext& ctx, CacheChecksumClaim claim)
@@ -11159,19 +11413,47 @@ struct AsyncCacheChecksum {
     }
     try {
       self->retrying = true;
-      if (self->whole) self->context.entry->begin_retry(self->whole);
-      else self->context.entry->checksum_mismatch(self->part);
-      // Already completed FUSE reads cannot be recalled. Invalidation ensures
-      // later faults wait for the retry or observe its failure.
-      queue_page_invalidation(self->context.state, self->context.handle,
-                               off_t(self->offset()), off_t(self->length()));
-      if (!self->identity.acquire(identity_ready, self.get())) {
-        self.release();
-        return;
-      }
-      self.release()->start_retry();
+      if (!self->whole) self->context.entry->checksum_mismatch(self->part);
+      self.release()->await_retry_pins();
     } catch (...) {
       self.release()->finish(false);
+    }
+  }
+
+  static void retry_pins_ready(void* value, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncCacheChecksum*>(value);
+    self->context.entry->end_async_wait();
+    if (result < 0) self->finish(false);
+    else self->await_retry_pins();
+  }
+
+  void await_retry_pins() noexcept {
+    try {
+      const int fd = whole ? context.entry->begin_retry_wait(whole)
+                           : context.entry->begin_checksum_retry_wait(part);
+      // Quarantine precedes invalidation: any new miss must wait for the
+      // retry, while already admitted replies retain their original bytes.
+      if (!retry_invalidated) {
+        queue_page_invalidation(context.state, context.handle,
+                                 off_t(offset()), off_t(length()));
+        retry_invalidated = true;
+      }
+      if (fd >= 0) {
+        wait.kind       = AsyncIoRequest::READ;
+        wait.fd         = fd;
+        wait.data       = &notification;
+        wait.length     = sizeof(notification);
+        wait.timeout_ms = 0;
+        wait.complete   = retry_pins_ready;
+        wait.context    = this;
+        if (context.reactor.submit(wait)) return;
+        context.entry->end_async_wait();
+        throw std::system_error(errno, std::generic_category(), "submit cache retry pin wait");
+      }
+      if (!identity.acquire(identity_ready, this)) return;
+      start_retry();
+    } catch (...) {
+      finish(false);
     }
   }
 
@@ -11288,6 +11570,13 @@ struct AsyncCacheChecksum {
         if (context.entry->checksum_manifest_available()) {
           context.entry->finish_fetch(whole);
           start_cached_checksums(context, whole.offset, whole.length);
+          delete this;
+          return;
+        }
+        if (!context.entry->pin_fetch_verification(whole)) {
+          // Published blocks can have been legitimately evicted or claimed
+          // again. Do not refetch a whole object just for best-effort checks.
+          context.entry->finish_fetch(whole);
           delete this;
           return;
         }
@@ -11431,18 +11720,24 @@ bool cache_response_matches(const Response& response,
 
 size_t cache_fetch_expansion(State& state, OpenHandle& handle,
                              uint64_t offset, size_t wanted) {
-  constexpr size_t initial = 1024U * 1024U;
+  const size_t block = handle.cache_entry->block_size();
+  const size_t maximum = std::max(block,
+      state.config.max_prefetch_window_size / block * block);
+  const size_t initial = std::min(maximum,
+      (8 * 1024 * 1024 + block - 1) / block * block);
+  const bool covered = handle.cache_entry->range_available_or_pending(offset, wanted);
   std::lock_guard guard(handle.mutex);
   if (!handle.cache_read_seen) {
-    handle.cache_read_window = initial;
+    handle.cache_read_window = offset == 0 ? initial : block;
     handle.cache_read_seen = true;
+  } else if (covered) {
+    // Reading inside a completed or in-flight window is not random, and
+    // consuming that window must not double the next GET on every FUSE READ.
   } else if (offset == handle.cache_last_read_end) {
-    const size_t remaining =
-        state.config.max_prefetch_window_size - handle.cache_read_window;
-    handle.cache_read_window +=
-        std::min(handle.cache_read_window, remaining);
+    handle.cache_read_window = std::max(initial, handle.cache_read_window +
+        std::min(handle.cache_read_window, maximum - handle.cache_read_window));
   } else {
-    handle.cache_read_window = initial;
+    handle.cache_read_window = block;
   }
   handle.cache_last_read_end = offset + wanted;
   return std::max(wanted, handle.cache_read_window);
@@ -11496,11 +11791,11 @@ bool read_cached(State& state, OpenHandle& handle,
 
       try {
         if (!entry.prepare_read(claim.offset, claim.length)) {
-          entry.fail_fetch(claim);
+          entry.rollback_fetch(claim);
           return false;
         }
       } catch (...) {
-        entry.fail_fetch(claim);
+        entry.rollback_fetch(claim);
         throw;
       }
     }
@@ -11564,7 +11859,8 @@ bool read_cached(State& state, OpenHandle& handle,
           claim.offset == 0 && uint64_t(claim.length) == handle.size;
       const CacheChecksumResult checked =
           state.config.verify_read_checksum && checksum_scope_matches &&
-              !entry.checksum_manifest_available()
+              !entry.checksum_manifest_available() &&
+              entry.pin_fetch_verification(claim)
               ? verify_cached_checksum(response, entry, claim.offset,
                                        claim.length, state.config.checksum)
               : CACHE_CHECKSUM_UNAVAILABLE;
@@ -12241,6 +12537,8 @@ bool UncachedFileReader::select_async(
 
 class CachedFileReader final : public FileReader {
  public:
+  void read_async(State&, OpenHandle&, fuse_req_t, fuse_ino_t,
+                   size_t, off_t, FuseReactor&) override;
   void read(State& state, OpenHandle& handle, fuse_req_t request,
             fuse_ino_t inode, size_t size, off_t offset) override {
     read_open_file(state, handle, true, nullptr,
@@ -12634,16 +12932,22 @@ struct AsyncRangeTransfer {
 struct AsyncReadTask {
   AsyncReadTask(State& state_value, OpenHandle& handle_value,
                 fuse_req_t request_value, fuse_ino_t inode_value,
-                size_t size_value, off_t offset_value)
+                size_t size_value, off_t offset_value, FuseReactor& reactor_value)
       : state(&state_value), handle(&handle_value),
         request(request_value), inode(inode_value), size(size_value),
         offset(offset_value), active(handle_value),
-        identity(handle_value.identity_mutex, std::defer_lock) {}
-  ~AsyncReadTask() {
-    unpin_read_segments(segments);
-    if (prefetch_pinned) {
-      prefetch->retire(true, uint64_t(offset), wanted);
-    }
+        identity(handle_value.identity_mutex, std::defer_lock),
+        reactor(&reactor_value) {}
+  virtual ~AsyncReadTask() = default;
+
+  // Bypass belongs to this already admitted READ, even if close has started.
+  // Retain its active reference before moving the held identity lock.
+  explicit AsyncReadTask(AsyncReadTask&& source)
+      : state(source.state), handle(source.handle), request(source.request),
+        inode(source.inode), size(source.size), offset(source.offset),
+        active(source.active), identity(std::move(source.identity)),
+        reactor(source.reactor), wanted(source.wanted) {
+    source.request = nullptr;
   }
 
   State* state;
@@ -12654,30 +12958,104 @@ struct AsyncReadTask {
   off_t offset;
   OpenRequestGuard active;
   std::shared_lock<ReactorSharedMutex> identity;
-  FuseReactor* reactor = nullptr;
+  FuseReactor* reactor;
+  AsyncIoRequest wait;
+  uint64_t notification = 0;
+  size_t wanted = 0;
+
+  virtual void read_ready() noexcept = 0;
+
+  static void available(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncReadTask*>(context);
+    task->handle->identity_mutex.end_async_wait();
+    if (result < 0) {
+      fuse_reply_err(task->request, -int(result));
+      delete task;
+      return;
+    }
+    task->start();
+  }
+
+  void start() noexcept {
+    try {
+      if (!identity.try_lock()) {
+        const int fd = handle->identity_mutex.begin_async_wait();
+        if (!identity.try_lock()) {
+          wait.kind       = AsyncIoRequest::READ;
+          wait.fd         = fd;
+          wait.data       = &notification;
+          wait.length     = sizeof(notification);
+          wait.timeout_ms = 0;
+          wait.complete   = available;
+          wait.context    = this;
+          if (reactor->submit(wait)) return;
+          handle->identity_mutex.end_async_wait();
+          throw std::system_error(errno, std::generic_category(),
+                                  "submit identity wait");
+        }
+        handle->identity_mutex.end_async_wait();
+      }
+      if (offset < 0) {
+        throw std::system_error(EINVAL, std::generic_category(), "read offset");
+      }
+      if (handle->inode != inode || handle->writable) {
+        throw std::system_error(EBADF, std::generic_category(), "read handle");
+      }
+      if (handle->read_checksum_bad.load(std::memory_order_acquire)) {
+        throw std::system_error(EIO, std::generic_category(), "read checksum mismatch");
+      }
+      if (handle->stale.load(std::memory_order_acquire) ||
+          (handle->generation_epoch != 0 &&
+           (handle->item->generation_epoch.load(std::memory_order_acquire) &
+            ((1ULL << 63) - 1)) != handle->generation_epoch)) {
+        throw std::system_error(ESTALE, std::generic_category(), "read generation");
+      }
+      const uint64_t begin = uint64_t(offset);
+      if (begin >= handle->size || size == 0) {
+        fuse_reply_buf(request, nullptr, 0);
+        delete this;
+        return;
+      }
+      wanted = size_t(std::min<uint64_t>(size, handle->size - begin));
+      warn_random_read(*state, handle->object_path, handle->size, begin, size);
+      read_ready();
+    } catch (...) {
+      reply_callback_error(request);
+      delete this;
+    }
+  }
+
+};
+
+struct AsyncUncachedReadTask final : AsyncReadTask {
+  AsyncUncachedReadTask(UncachedFileReader& reader_value,
+                        State& state_value, OpenHandle& handle_value,
+                        fuse_req_t request_value, fuse_ino_t inode_value,
+                        size_t size_value, off_t offset_value, FuseReactor& reactor_value)
+      : AsyncReadTask(state_value, handle_value, request_value, inode_value,
+                      size_value, offset_value, reactor_value),
+        reader(&reader_value) {}
+
+  // A local-cache allocation failure uses a one-shot uncached transfer; it
+  // must not revisit cache claims or enter the cached reader again.
+  explicit AsyncUncachedReadTask(AsyncReadTask& source)
+      : AsyncReadTask(std::move(source)) {}
+
+  ~AsyncUncachedReadTask() override {
+    unpin_read_segments(segments);
+    if (prefetch_pinned) {
+      prefetch->retire(true, uint64_t(offset), wanted);
+    }
+  }
+
+  UncachedFileReader* reader = nullptr;
   std::shared_ptr<UncachedPrefetch> prefetch;
   std::vector<UncachedReadSegment> segments;
   bool prefetch_pinned = false;
   PrefetchContinuation continuation;
-  AsyncIoRequest wait;
-  uint64_t notification = 0;
-  size_t wanted = 0;
-  size_t expansion = 0;
-  CacheFetchClaim cache_claim;
-  std::unique_ptr<CacheReadSink> cache_sink;
-  std::unique_ptr<AsyncS3Request> cache_http;
-  std::unique_ptr<AsyncSignedS3Request> cache_signed_http;
-  std::exception_ptr prepare_error;
-  bool cache_prepared = false;
-  std::unique_ptr<ReadChecksumContext> checksums;
   AsyncCredentialWait credential_wait;
-  bool credential_cached = false;
 
   void credential_failed(std::exception_ptr error) noexcept {
-    if (credential_cached) {
-      cache_received(this, Response{}, error);
-      return;
-    }
     if (!segments.empty()) {
       for (auto& segment : segments) {
         if (!segment.created) continue;
@@ -12707,21 +13085,19 @@ struct AsyncReadTask {
   }
 
   static void credentials_ready(void* context, ssize_t result) noexcept {
-    auto* task = static_cast<AsyncReadTask*>(context);
+    auto* task = static_cast<AsyncUncachedReadTask*>(context);
     try {
       if (result < 0) {
         throw std::system_error(int(-result), std::generic_category(),
                                 "wait for read credentials");
       }
-      if (task->credential_cached) cache_prepared_ready(task);
-      else task->start_uncached_transfer();
+      task->start_uncached_transfer();
     } catch (...) {
       task->credential_failed(std::current_exception());
     }
   }
 
-  void credentials_pending(bool cached) noexcept {
-    credential_cached = cached;
+  void credentials_pending() noexcept {
     try {
       if (credential_wait.start(*state, *reactor, credentials_ready, this)) return;
       throw std::system_error(errno, std::generic_category(),
@@ -12732,224 +13108,13 @@ struct AsyncReadTask {
   }
 
   static void cancel(void* context) noexcept {
-    std::unique_ptr<AsyncReadTask> task(static_cast<AsyncReadTask*>(context));
-    if (task->cache_claim) {
-      task->handle->cache_entry->fail_fetch(task->cache_claim);
-    }
-    if (!task->cache_sink || !task->cache_sink->replied()) {
-      fuse_reply_err(task->request, EIO);
-    }
-  }
-
-  static void cache_available(void* context, ssize_t result) noexcept {
-    auto* task = static_cast<AsyncReadTask*>(context);
-    task->handle->cache_entry->end_async_wait();
-    if (result < 0) {
-      fuse_reply_err(task->request, -int(result));
-      delete task;
-      return;
-    }
-    task->read_cache();
-  }
-
-  static void cache_received(void* context, Response&& response,
-                              std::exception_ptr error) noexcept {
-    std::unique_ptr<AsyncReadTask> task(static_cast<AsyncReadTask*>(context));
-    CacheEntry& entry = *task->handle->cache_entry;
-    try {
-      if (error) std::rethrow_exception(error);
-      if (!cache_response_matches(response, task->cache_claim, task->handle->size)) {
-        throw_inconsistent_range_response(
-            response, task->cache_claim.offset, task->cache_claim.length,
-            task->handle->size, "asynchronous cached GetObject");
-      }
-      const CacheFetchClaim fetched = task->cache_claim;
-      if (task->checksums && fetched.offset == 0 &&
-          fetched.length == task->handle->size &&
-          !entry.checksum_manifest_available()) {
-        auto* check = new AsyncCacheChecksum(
-            *task->checksums, fetched, std::move(response));
-        task->cache_claim = {};
-        check->start();
-      } else {
-        entry.finish_fetch(fetched);
-        if (task->checksums) {
-          start_cached_checksums(*task->checksums, fetched.offset, fetched.length);
-        }
-      }
-      task->cache_claim = {};
-      if (task->state->config.stats_interval_seconds != 0) {
-        task->state->remote_reads.fetch_add(1, std::memory_order_relaxed);
-        task->state->remote_read_bytes.fetch_add(
-            fetched.length, std::memory_order_relaxed);
-      }
-      if (task->cache_sink->replied()) return;
-      task->cache_http.reset();
-      task->cache_signed_http.reset();
-      task->cache_sink.reset();
-      task.release()->read_cache();
-    } catch (...) {
-      entry.fail_fetch(task->cache_claim);
-      if (!task->cache_sink || !task->cache_sink->replied()) {
-        reply_callback_error(task->request);
-      } else {
-        fprintf(stderr, "warning: cache fill failed after asynchronous read reply\n");
-      }
-    }
-  }
-
-  static void cache_prepared_ready(void* context) noexcept {
-    auto* task = static_cast<AsyncReadTask*>(context);
-    try {
-      if (task->prepare_error) std::rethrow_exception(task->prepare_error);
-      if (!task->cache_prepared) {
-        task->handle->cache_entry->fail_fetch(task->cache_claim);
-        task->cache_claim = {};
-        task->read_uncached();
-        return;
-      }
-      WorkerState& worker = worker_state(*task->state);
-      const auto range = make_range_request(
-          *task->state, *task->handle, worker,
-          task->cache_claim.offset, task->cache_claim.length,
-          !task->state->config.directory_bucket);
-      task->cache_sink = std::make_unique<CacheReadSink>(
-          *task->handle->cache_entry, task->cache_claim, task->request,
-          uint64_t(task->offset), task->wanted);
-      AsyncHttpRequest args;
-      args.method.assign("GET");
-      args.path.assign(range.path().data(), range.path().size());
-      args.headers.assign(range.headers.begin(), range.headers.end());
-      args.destination       = task->cache_sink.get();
-      args.range             = true;
-      args.offset            = task->cache_claim.offset;
-      args.length            = task->cache_claim.length;
-      args.measure_transport = task->state->config.report_metrics;
-      args.capture_headers   = task->state->config.verify_read_checksum;
-      bool accepted;
-      if (task->state->config.directory_bucket) {
-        task->cache_signed_http = std::make_unique<AsyncSignedS3Request>(
-            *task->state, *task->reactor, std::move(args), cache_received, task);
-        accepted = task->cache_signed_http->start();
-      } else {
-        task->cache_http = std::make_unique<AsyncS3Request>(
-            *task->state, *task->reactor, std::move(args), cache_received, task);
-        accepted = task->cache_http->start();
-      }
-      if (!accepted) {
-        throw std::system_error(errno, std::generic_category(),
-                                "submit asynchronous cached GetObject");
-      }
-    } catch (const CredentialRefreshPending&) {
-      task->credentials_pending(true);
-    } catch (...) {
-      cache_received(task, Response{}, std::current_exception());
-    }
-  }
-
-  void read_cache() noexcept {
-    try {
-      CacheEntry& entry = *handle->cache_entry;
-      if (state->config.verify_read_checksum && !checksums) {
-        checksums = std::make_unique<ReadChecksumContext>(
-            *state, *reactor, *handle, active);
-        ensure_async_checksum_manifest(*checksums);
-      }
-      if (expansion == 0) {
-        expansion = cache_fetch_expansion(*state, *handle, uint64_t(offset), wanted);
-      }
-      for (;;) {
-        if (checksums) {
-          if (entry.stale()) {
-            throw std::system_error(ESTALE, std::generic_category(), "stale checksum generation");
-          }
-          if (entry.checksum_failed(uint64_t(offset), wanted)) {
-            throw std::system_error(EIO, std::generic_category(), "cached part checksum mismatch");
-          }
-          const int fd = entry.begin_checksum_wait(uint64_t(offset), wanted);
-          if (fd >= 0) {
-            wait.kind       = AsyncIoRequest::READ;
-            wait.fd         = fd;
-            wait.data       = &notification;
-            wait.length     = sizeof(notification);
-            wait.timeout_ms = 0;
-            wait.complete   = cache_available;
-            wait.context    = this;
-            if (reactor->submit(wait)) return;
-            entry.end_async_wait();
-            throw std::system_error(errno, std::generic_category(), "submit checksum wait");
-          }
-          start_cached_checksums(*checksums, uint64_t(offset), wanted);
-        }
-        if (entry.pin_clean(uint64_t(offset), wanted)) {
-          const int result = reply_pinned_cached_range(
-              request, entry, uint64_t(offset), wanted);
-          if (result != 0) {
-            fprintf(stderr, "asynchronous cache hit reply failed: %s\n",
-                    strerror(-result));
-          }
-          delete this;
-          return;
-        }
-        if (entry.range_bad(uint64_t(offset), wanted)) {
-          throw std::system_error(EIO, std::generic_category(), "poisoned cache range");
-        }
-        cache_claim = entry.claim_fetch(uint64_t(offset), wanted, expansion);
-        if (cache_claim) break;
-        const int fd = entry.begin_async_wait(uint64_t(offset), wanted);
-        if (fd < 0) continue;
-        wait.kind       = AsyncIoRequest::READ;
-        wait.fd         = fd;
-        wait.data       = &notification;
-        wait.length     = sizeof(notification);
-        wait.timeout_ms = 0;
-        wait.complete   = cache_available;
-        wait.context    = this;
-        if (reactor->submit(wait)) return;
-        entry.end_async_wait();
-        throw std::system_error(errno, std::generic_category(), "submit cache wait");
-      }
-      // Allocation/eviction can write to local storage. Only its completion
-      // comes back here; HTTP parsing and socket I/O never enter this worker.
-      continuation.task = {cache_prepared_ready, cancel, this};
-      if (!reactor->reserve_completion(&continuation.task)) {
-        throw std::system_error(errno, std::generic_category(), "reserve cache completion");
-      }
-      try {
-        state->uploads->submit(handle, [this] {
-          try {
-            IoExecutorScope local_only(nullptr, 0);
-            cache_prepared = handle->cache_entry->prepare_read(
-                cache_claim.offset, cache_claim.length);
-          } catch (...) {
-            prepare_error = std::current_exception();
-          }
-          reactor->complete(&continuation.task);
-        });
-      } catch (...) {
-        prepare_error = std::current_exception();
-        reactor->complete(&continuation.task);
-      }
-    } catch (...) {
-      if (cache_claim) handle->cache_entry->fail_fetch(cache_claim);
-      reply_callback_error(request);
-      delete this;
-    }
-  }
-
-  static void available(void* context, ssize_t result) noexcept {
-    auto* task = static_cast<AsyncReadTask*>(context);
-    task->handle->identity_mutex.end_async_wait();
-    if (result < 0) {
-      fuse_reply_err(task->request, -int(result));
-      delete task;
-      return;
-    }
-    task->start();
+    std::unique_ptr<AsyncUncachedReadTask> task(
+        static_cast<AsyncUncachedReadTask*>(context));
+    fuse_reply_err(task->request, EIO);
   }
 
   static void ready(void* context) noexcept {
-    std::unique_ptr<AsyncReadTask> task(static_cast<AsyncReadTask*>(context));
+    std::unique_ptr<AsyncUncachedReadTask> task(static_cast<AsyncUncachedReadTask*>(context));
     if (task->segments.size() > 1) {
       ready_segments(std::move(task));
       return;
@@ -13037,7 +13202,7 @@ struct AsyncReadTask {
     }
   }
 
-  static void ready_segments(std::unique_ptr<AsyncReadTask> task) noexcept {
+  static void ready_segments(std::unique_ptr<AsyncUncachedReadTask> task) noexcept {
     try {
       // Each GET has its own monotonic prefix. Wait on at most one missing
       // segment at a time; completion order between GETs is irrelevant.
@@ -13105,65 +13270,7 @@ struct AsyncReadTask {
     }
   }
 
-  void start() noexcept {
-    try {
-      if (!identity.try_lock()) {
-        const int fd = handle->identity_mutex.begin_async_wait();
-        if (!identity.try_lock()) {
-          wait.kind       = AsyncIoRequest::READ;
-          wait.fd         = fd;
-          wait.data       = &notification;
-          wait.length     = sizeof(notification);
-          wait.timeout_ms = 0;
-          wait.complete   = available;
-          wait.context    = this;
-          if (reactor->submit(wait)) return;
-          handle->identity_mutex.end_async_wait();
-          throw std::system_error(errno, std::generic_category(),
-                                  "submit identity wait");
-        }
-        handle->identity_mutex.end_async_wait();
-      }
-      if (offset < 0) {
-        throw std::system_error(EINVAL, std::generic_category(), "read offset");
-      }
-      if (handle->inode != inode || handle->writable) {
-        throw std::system_error(EBADF, std::generic_category(), "read handle");
-      }
-      if (handle->read_checksum_bad.load(std::memory_order_acquire)) {
-        throw std::system_error(EIO, std::generic_category(), "read checksum mismatch");
-      }
-      if (handle->stale.load(std::memory_order_acquire) ||
-          (handle->generation_epoch != 0 &&
-           (handle->item->generation_epoch.load(std::memory_order_acquire) &
-            ((1ULL << 63) - 1)) != handle->generation_epoch)) {
-        throw std::system_error(ESTALE, std::generic_category(), "read generation");
-      }
-      const uint64_t begin = uint64_t(offset);
-      if (begin >= handle->size || size == 0) {
-        fuse_reply_buf(request, nullptr, 0);
-        delete this;
-        return;
-      }
-      wanted = size_t(std::min<uint64_t>(size, handle->size - begin));
-      warn_random_read(*state, handle->object_path, handle->size, begin, size);
-      if (handle->recovery_read && handle->cache_entry) {
-        reply_cached_range(request, *handle->cache_entry, begin, wanted);
-        delete this;
-        return;
-      }
-      if (handle->cache_entry) {
-        read_cache();
-        return;
-      }
-      read_uncached();
-    } catch (...) {
-      reply_callback_error(request);
-      delete this;
-    }
-  }
-
-  void read_uncached() noexcept {
+  void read_ready() noexcept override {
     try {
       const uint64_t begin = uint64_t(offset);
       const auto budget = state->prefetch_budget.snapshot();
@@ -13171,13 +13278,13 @@ struct AsyncReadTask {
       bool created = false;
       bool selected;
       uint64_t wait_revision = budget.revision;
-      if (state->local_cache) {
+      if (reader == nullptr) {
         prefetch = allocate_prefetch(*state, inode, begin, wanted, handle->size, wanted);
         if (prefetch && !prefetch->pin(begin, wanted)) abort();
         created = true;
         selected = prefetch != nullptr;
       } else {
-        selected = static_cast<UncachedFileReader*>(handle->reader.get())->select_async(
+        selected = reader->select_async(
             *state, inode, begin, wanted, handle->size, segments, wait_revision);
       }
       if (!selected) {
@@ -13212,15 +13319,15 @@ struct AsyncReadTask {
   }
 
   static void budget_ready(void* context) noexcept {
-    static_cast<AsyncReadTask*>(context)->read_uncached();
+    static_cast<AsyncUncachedReadTask*>(context)->read_ready();
   }
   static void budget_available(void* context, ssize_t result) noexcept {
-    auto* task = static_cast<AsyncReadTask*>(context);
+    auto* task = static_cast<AsyncUncachedReadTask*>(context);
     task->state->prefetch_budget.end_async_wait();
     if (result < 0 && result != -EAGAIN) {
       fuse_reply_err(task->request, -int(result));
       delete task;
-    } else task->read_uncached();
+    } else task->read_ready();
   }
 
   void start_uncached_transfer() noexcept {
@@ -13260,10 +13367,10 @@ struct AsyncReadTask {
       args.offset            = prefetch->offset;
       args.length            = prefetch->length;
       args.measure_transport = state->config.report_metrics;
-      args.capture_headers   = state->local_cache && state->config.verify_read_checksum;
+      args.capture_headers   = reader == nullptr && state->config.verify_read_checksum;
       auto transfer = std::make_unique<AsyncRangeTransfer>(
           *state, *reactor, prefetch, handle->size, std::move(args));
-      if (state->local_cache && state->config.verify_read_checksum && prefetch->offset == 0 &&
+      if (reader == nullptr && state->config.verify_read_checksum && prefetch->offset == 0 &&
           prefetch->length == handle->size) {
         transfer->checksums = std::make_unique<ReadChecksumContext>(
             *state, *reactor, *handle, active);
@@ -13271,9 +13378,8 @@ struct AsyncReadTask {
       transfer.release()->start();
       wait_prefetch();
     } catch (const CredentialRefreshPending&) {
-      credentials_pending(false);
+      credentials_pending();
     } catch (...) {
-      credential_cached = false;
       credential_failed(std::current_exception());
     }
   }
@@ -13304,6 +13410,300 @@ struct AsyncReadTask {
   }
 };
 
+struct AsyncCachedReadTask final : AsyncReadTask {
+  using AsyncReadTask::AsyncReadTask;
+
+  size_t expansion = 0;
+  CacheFetchClaim cache_claim;
+  HttpPool::Lease cache_lease;
+  std::unique_ptr<CacheReadSink> cache_sink;
+  std::unique_ptr<AsyncS3Request> cache_http;
+  std::unique_ptr<AsyncSignedS3Request> cache_signed_http;
+  std::exception_ptr prepare_error;
+  bool cache_prepared = false;
+  FuseReactor::ReactorTask prepare_task;
+  std::unique_ptr<ReadChecksumContext> checksums;
+  AsyncCredentialWait credential_wait;
+
+  void bypass() noexcept {
+    std::unique_ptr<AsyncUncachedReadTask> task;
+    try {
+      task = std::make_unique<AsyncUncachedReadTask>(*this);
+    } catch (...) {
+      reply_callback_error(request);
+      delete this;
+      return;
+    }
+    delete this;
+    task.release()->read_ready();
+  }
+
+  static void credentials_ready(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncCachedReadTask*>(context);
+    try {
+      if (result < 0) {
+        throw std::system_error(int(-result), std::generic_category(),
+                                "wait for read credentials");
+      }
+      cache_prepared_ready(task);
+    } catch (...) {
+      cache_received(task, Response{}, std::current_exception());
+    }
+  }
+
+  void credentials_pending() noexcept {
+    try {
+      if (credential_wait.start(*state, *reactor, credentials_ready, this)) return;
+      throw std::system_error(errno, std::generic_category(),
+                              "submit read credential wait");
+    } catch (...) {
+      cache_received(this, Response{}, std::current_exception());
+    }
+  }
+
+  static void cancel(void* context) noexcept {
+    std::unique_ptr<AsyncCachedReadTask> task(static_cast<AsyncCachedReadTask*>(context));
+    if (task->cache_claim) {
+      if (task->cache_sink) task->handle->cache_entry->fail_fetch(task->cache_claim);
+      else task->handle->cache_entry->rollback_fetch(task->cache_claim);
+    }
+    if (!task->cache_sink || !task->cache_sink->replied()) {
+      fuse_reply_err(task->request, EIO);
+    }
+  }
+
+  static void cache_available(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncCachedReadTask*>(context);
+    task->handle->cache_entry->end_async_wait();
+    if (result < 0) {
+      fuse_reply_err(task->request, -int(result));
+      delete task;
+      return;
+    }
+    task->read_ready();
+  }
+
+  static void cache_received(void* context, Response&& response,
+                              std::exception_ptr error) noexcept {
+    std::unique_ptr<AsyncCachedReadTask> task(static_cast<AsyncCachedReadTask*>(context));
+    CacheEntry& entry = *task->handle->cache_entry;
+    try {
+      if (error) std::rethrow_exception(error);
+      if (!cache_response_matches(response, task->cache_claim, task->handle->size)) {
+        throw_inconsistent_range_response(
+            response, task->cache_claim.offset, task->cache_claim.length,
+            task->handle->size, "asynchronous cached GetObject");
+      }
+      const CacheFetchClaim fetched = task->cache_claim;
+      if (task->checksums && fetched.offset == 0 &&
+          fetched.length == task->handle->size &&
+          !entry.checksum_manifest_available()) {
+        auto* check = new AsyncCacheChecksum(
+            *task->checksums, fetched, std::move(response));
+        task->cache_claim = {};
+        check->start();
+      } else {
+        entry.finish_fetch(fetched);
+        if (task->checksums) {
+          start_cached_checksums(*task->checksums, fetched.offset, fetched.length);
+        }
+      }
+      task->cache_claim = {};
+      if (task->state->config.stats_interval_seconds != 0) {
+        task->state->remote_reads.fetch_add(1, std::memory_order_relaxed);
+        task->state->remote_read_bytes.fetch_add(
+            fetched.length, std::memory_order_relaxed);
+      }
+      if (task->cache_sink->replied()) return;
+      task->cache_http.reset();
+      task->cache_signed_http.reset();
+      task->cache_sink.reset();
+      task.release()->read_ready();
+    } catch (...) {
+      if (task->cache_sink) entry.fail_fetch(task->cache_claim);
+      else entry.rollback_fetch(task->cache_claim);
+      if (!task->cache_sink || !task->cache_sink->replied()) {
+        reply_callback_error(task->request);
+      } else {
+        fprintf(stderr, "warning: cache fill failed after asynchronous read reply\n");
+      }
+    }
+  }
+
+  static void cache_prepared_ready(void* context) noexcept {
+    auto* task = static_cast<AsyncCachedReadTask*>(context);
+    try {
+      if (task->prepare_error) std::rethrow_exception(task->prepare_error);
+      if (!task->cache_prepared) {
+        task->handle->cache_entry->rollback_fetch(task->cache_claim);
+        task->cache_claim = {};
+        task->cache_lease = {};
+        task->bypass();
+        return;
+      }
+      WorkerState& worker = worker_state(*task->state);
+      const auto range = make_range_request(
+          *task->state, *task->handle, worker,
+          task->cache_claim.offset, task->cache_claim.length,
+          !task->state->config.directory_bucket);
+      task->cache_sink = std::make_unique<CacheReadSink>(
+          *task->handle->cache_entry, task->cache_claim, task->request,
+          uint64_t(task->offset), task->wanted);
+      AsyncHttpRequest args;
+      args.method.assign("GET");
+      args.path.assign(range.path().data(), range.path().size());
+      args.headers.assign(range.headers.begin(), range.headers.end());
+      args.destination       = task->cache_sink.get();
+      args.range             = true;
+      args.offset            = task->cache_claim.offset;
+      args.length            = task->cache_claim.length;
+      args.measure_transport = task->state->config.report_metrics;
+      args.capture_headers   = task->state->config.verify_read_checksum;
+      bool accepted;
+      if (task->state->config.directory_bucket) {
+        task->cache_signed_http = std::make_unique<AsyncSignedS3Request>(
+            *task->state, *task->reactor, std::move(args), cache_received, task,
+            4, kEmptyPayloadSha256, std::move(task->cache_lease));
+        accepted = task->cache_signed_http->start();
+      } else {
+        task->cache_http = std::make_unique<AsyncS3Request>(
+            *task->state, *task->reactor, std::move(args), cache_received, task,
+            4, std::move(task->cache_lease));
+        accepted = task->cache_http->start();
+      }
+      if (!accepted) {
+        throw std::system_error(errno, std::generic_category(),
+                                "submit asynchronous cached GetObject");
+      }
+    } catch (const CredentialRefreshPending&) {
+      task->credentials_pending();
+    } catch (...) {
+      cache_received(task, Response{}, std::current_exception());
+    }
+  }
+
+  void read_ready() noexcept override {
+    if (!handle->cache_entry) {
+      bypass();
+      return;
+    }
+    if (handle->recovery_read) {
+      try {
+        reply_cached_range(request, *handle->cache_entry, uint64_t(offset), wanted);
+      } catch (...) { reply_callback_error(request); }
+      delete this;
+      return;
+    }
+    try {
+      CacheEntry& entry = *handle->cache_entry;
+      if (state->config.verify_read_checksum && !checksums) {
+        checksums = std::make_unique<ReadChecksumContext>(
+            *state, *reactor, *handle, active);
+        ensure_async_checksum_manifest(*checksums);
+      }
+      if (expansion == 0) {
+        expansion = cache_fetch_expansion(*state, *handle, uint64_t(offset), wanted);
+      }
+      for (;;) {
+        if (checksums) {
+          if (entry.stale()) {
+            throw std::system_error(ESTALE, std::generic_category(), "stale checksum generation");
+          }
+          if (entry.checksum_failed(uint64_t(offset), wanted)) {
+            throw std::system_error(EIO, std::generic_category(), "cached part checksum mismatch");
+          }
+          const int fd = entry.begin_checksum_wait(uint64_t(offset), wanted);
+          if (fd >= 0) {
+            wait.kind       = AsyncIoRequest::READ;
+            wait.fd         = fd;
+            wait.data       = &notification;
+            wait.length     = sizeof(notification);
+            wait.timeout_ms = 0;
+            wait.complete   = cache_available;
+            wait.context    = this;
+            if (reactor->submit(wait)) return;
+            entry.end_async_wait();
+            throw std::system_error(errno, std::generic_category(), "submit checksum wait");
+          }
+          start_cached_checksums(*checksums, uint64_t(offset), wanted);
+        }
+        if (entry.pin_clean(uint64_t(offset), wanted)) {
+          const int result = reply_pinned_cached_range(
+              request, entry, uint64_t(offset), wanted);
+          if (result != 0) {
+            fprintf(stderr, "asynchronous cache hit reply failed: %s\n",
+                    strerror(-result));
+          }
+          delete this;
+          return;
+        }
+        if (entry.range_bad(uint64_t(offset), wanted)) {
+          throw std::system_error(EIO, std::generic_category(), "poisoned cache range");
+        }
+        cache_lease = expansion > wanted ? state->http->try_acquire_bulk()
+                                        : HttpPool::Lease{};
+        cache_claim = entry.claim_fetch(uint64_t(offset), wanted,
+                                        cache_lease ? expansion : wanted);
+        if (cache_claim) break;
+        cache_lease = {};
+        const int fd = entry.begin_async_wait(uint64_t(offset), wanted);
+        if (fd < 0) continue;
+        wait.kind       = AsyncIoRequest::READ;
+        wait.fd         = fd;
+        wait.data       = &notification;
+        wait.length     = sizeof(notification);
+        wait.timeout_ms = 0;
+        wait.complete   = cache_available;
+        wait.context    = this;
+        if (reactor->submit(wait)) return;
+        entry.end_async_wait();
+        throw std::system_error(errno, std::generic_category(), "submit cache wait");
+      }
+      // Allocation/eviction can write to local storage. Only its completion
+      // comes back here; HTTP parsing and socket I/O never enter this worker.
+      prepare_task = {cache_prepared_ready, cancel, this};
+      if (!reactor->reserve_completion(&prepare_task)) {
+        throw std::system_error(errno, std::generic_category(), "reserve cache completion");
+      }
+      try {
+        state->uploads->submit(handle, [this] {
+          try {
+            IoExecutorScope local_only(nullptr, 0);
+            cache_prepared = handle->cache_entry->prepare_read(
+                cache_claim.offset, cache_claim.length);
+          } catch (...) {
+            prepare_error = std::current_exception();
+          }
+          reactor->complete(&prepare_task);
+        });
+      } catch (...) {
+        prepare_error = std::current_exception();
+        reactor->complete(&prepare_task);
+      }
+    } catch (...) {
+      if (cache_claim) handle->cache_entry->rollback_fetch(cache_claim);
+      reply_callback_error(request);
+      delete this;
+    }
+  }
+
+};
+
+void UncachedFileReader::read_async(
+    State& state, OpenHandle& handle, fuse_req_t request, fuse_ino_t inode,
+    size_t size, off_t offset, FuseReactor& reactor) {
+  auto task = std::make_unique<AsyncUncachedReadTask>(
+      *this, state, handle, request, inode, size, offset, reactor);
+  task.release()->start();
+}
+
+void CachedFileReader::read_async(
+    State& state, OpenHandle& handle, fuse_req_t request, fuse_ino_t inode,
+    size_t size, off_t offset, FuseReactor& reactor) {
+  auto task = std::make_unique<AsyncCachedReadTask>(
+      state, handle, request, inode, size, offset, reactor);
+  task.release()->start();
+}
 void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
                  off_t offset, fuse_file_info* file) {
   try {
@@ -13315,10 +13715,7 @@ void ngs3fs_read(fuse_req_t request, fuse_ino_t inode, size_t size,
     }
     FuseReactor* reactor = current_fuse_reactor();
     if (reactor != nullptr) {
-      auto task = std::make_unique<AsyncReadTask>(
-          state, handle, request, inode, size, offset);
-      task->reactor = reactor;
-      task.release()->start();
+      handle.reader->read_async(state, handle, request, inode, size, offset, *reactor);
       return;
     }
     OpenRequestGuard active(handle);
@@ -16094,7 +16491,7 @@ void ngs3fs_release(fuse_req_t request, fuse_ino_t,
       // The application has closed the handle. Internal read/checksum tasks
       // retain its lifetime, but must not prohibit a new application writer.
       handle.registered = false;
-      unregister_open_handle(state, {}, handle, false);
+      unregister_open_handle(state, {}, handle, false, request);
     }
     task.release();
     drop_open_request(handle);
@@ -18446,14 +18843,21 @@ void print_help() {
       "crc32, crc32c, crc64nvme, sha1, sha256, md5, xxhash64, "
       "xxhash3, xxhash128, sha512, crc64xz (default auto)\n"
       "      --verify-read-checksum\n"
-      "                             best-effort verification for cached/legacy reads; "
-      "uring uncached verification is deferred (default off)\n"
+      "                             background best-effort verification for "
+      "cached/legacy reads; the first read or mmap fault may complete before "
+      "verification; uring uncached verification is deferred (default off)\n"
       "  -L, --cache-dir PATH      persistent sparse local cache (default off)\n"
       "      --cache-size BYTES    maximum physical cache allocation; "
-      "0 is unlimited (default 0)\n"
+      "0 imposes no fixed maximum while the reserve still applies (default 0)\n"
       "      --cache-reserve SIZE|PERCENT\n"
       "                             preserve cache-filesystem free space "
       "(default 5%)\n"
+      "      --cache-block-size SIZE\n"
+      "                             cache fill/publication and minimum eviction "
+      "unit; positive 32 KiB multiple, at most 128 MiB (default 2 MiB)\n"
+      "      --cache-unlimited     disable configured capacity limits and "
+      "capacity eviction; requires --cache-dir and conflicts with explicit "
+      "--cache-size/--cache-reserve\n"
       "      --connect-timeout MS  TCP connect timeout (default 5000)\n"
       "      --request-timeout MS  no-I/O-progress timeout "
       "(default 30000)\n"

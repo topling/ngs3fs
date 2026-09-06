@@ -17,6 +17,10 @@ struct CacheTestAccess {
     return cache.key_mutex(key);
   }
   static bool evict_cold(LocalCache& cache) { return cache.evict_cold(); }
+  static bool evict_one(LocalCache& cache) { return cache.evict_one(); }
+  static uint64_t allocated_bytes(LocalCache& cache) {
+    return cache.allocated_bytes();
+  }
 };
 
 struct TemporaryDirectory {
@@ -78,6 +82,7 @@ int main() {
       .reserve_percent = 5,
       .max_prefetch_window_size = 8U * 1024U * 1024U,
       .page_size = 4096,
+      .block_size = kCacheBitmapUnit,
       .upload_part_size = 8U * 1024U * 1024U,
       .reserve_is_percent = true,
   };
@@ -132,10 +137,14 @@ int main() {
            std::future_status::timeout);
     write_test_bytes(entry->data_fd(), 0, 4096);
     entry->publish_clean(claim, 0, 4096, false);
+    assert(pending_waiter.wait_for(std::chrono::milliseconds(20)) ==
+           std::future_status::timeout);
+    write_test_bytes(entry->data_fd(), 4096, 9000 - 4096);
+    entry->publish_clean(claim, 4096, 9000, true);
     assert(pending_waiter.get());
-    assert(entry->range_clean(0, 4096));
-    assert(!entry->range_clean(4096, 1));
+    assert(entry->range_clean(0, 9000));
 
+    assert(entry->pin_fetch_verification(claim));
     entry->begin_retry(claim);
     auto waiter = std::async(std::launch::async, [&] {
       entry->wait_for_range(0, 4096);
@@ -151,22 +160,22 @@ int main() {
     const CacheFetchClaim unaligned_claim = unaligned->claim_fetch(
         100, 4096, 4096);
     assert(unaligned_claim.offset == 0);
-    assert(unaligned_claim.length == 8192);
+    assert(unaligned_claim.length == 9000);
     unaligned->fail_fetch(unaligned_claim);
 
     std::shared_ptr<CacheEntry> partial_pending = cache.open(
         test_identity("partial-pending", "etag-pending", 8192));
     const CacheFetchClaim one_page = partial_pending->claim_fetch(
         0, 4096, 4096);
-    assert(one_page.offset == 0 && one_page.length == 4096);
+    assert(one_page.offset == 0 && one_page.length == 8192);
     auto overlap_waiter = std::async(std::launch::async, [&] {
       partial_pending->wait_for_range(0, 8192);
       return partial_pending->range_clean(0, 4096);
     });
     assert(overlap_waiter.wait_for(std::chrono::milliseconds(20)) ==
            std::future_status::timeout);
-    write_test_bytes(partial_pending->data_fd(), 0, 4096);
-    partial_pending->publish_clean(one_page, 0, 4096, true);
+    write_test_bytes(partial_pending->data_fd(), 0, 8192);
+    partial_pending->publish_clean(one_page, 0, 8192, true);
     partial_pending->finish_fetch(one_page);
     assert(overlap_waiter.get());
 
@@ -176,7 +185,7 @@ int main() {
     assert(tail->prepare_read(0, 4097));
     write_test_bytes(tail->data_fd(), 0, 4097);
     tail->publish_clean(tail_claim, 0, 4097, false);
-    assert(tail->range_clean(0, 4096));
+    assert(!tail->range_clean(0, 4096));
     assert(!tail->range_clean(4096, 1));
     tail->publish_clean(tail_claim, 4097, 4097, true);
     assert(tail->range_clean(0, 4097));
@@ -313,18 +322,19 @@ int main() {
         }
       };
       const CacheIdentity async_old_identity =
-          test_identity("async-generation", "etag-old", 8192);
+          test_identity("async-generation", "etag-old", 2 * kCacheBitmapUnit);
       const CacheIdentity async_new_identity =
-          test_identity("async-generation", "etag-new", 8192);
+          test_identity("async-generation", "etag-new", 2 * kCacheBitmapUnit);
       std::shared_ptr<CacheEntry> async_old = cache.open(async_old_identity);
       const CacheFetchClaim async_claim =
-          async_old->claim_fetch(0, 8192, 8192);
-      assert(async_claim.offset == 0 && async_claim.length == 8192);
+          async_old->claim_fetch(0, 8192, 2 * kCacheBitmapUnit);
+      assert(async_claim.offset == 0 &&
+             async_claim.length == 2 * kCacheBitmapUnit);
       const bool prepared =
           async_old->prepare_read(async_claim.offset, async_claim.length);
       assert(prepared);
-      write_test_bytes(async_old->data_fd(), 0, 8192);
-      async_old->publish_clean(async_claim, 0, 4096, false);
+      write_test_bytes(async_old->data_fd(), 0, kCacheBitmapUnit);
+      async_old->publish_clean(async_claim, 0, kCacheBitmapUnit, false);
       const bool pinned = async_old->pin_clean(0, 4096);
       assert(pinned);
       struct stat async_before{};
@@ -427,18 +437,21 @@ int main() {
       const CacheIdentity rename_source_identity =
           test_identity("async-rename-source", "source-etag", 4096);
       const CacheIdentity rename_destination_identity =
-          test_identity("async-rename-destination", "destination-etag", 8192);
+          test_identity("async-rename-destination", "destination-etag",
+                        2 * kCacheBitmapUnit);
       std::shared_ptr<CacheEntry> rename_source =
           cache.open(rename_source_identity);
       std::shared_ptr<CacheEntry> rename_destination =
           cache.open(rename_destination_identity);
       const CacheFetchClaim rename_claim =
-          rename_destination->claim_fetch(0, 8192, 8192);
+          rename_destination->claim_fetch(
+              0, 8192, 2 * kCacheBitmapUnit);
       const bool rename_prepared = rename_destination->prepare_read(
           rename_claim.offset, rename_claim.length);
       assert(rename_prepared);
-      write_test_bytes(rename_destination->data_fd(), 0, 8192);
-      rename_destination->publish_clean(rename_claim, 0, 4096, false);
+      write_test_bytes(rename_destination->data_fd(), 0, kCacheBitmapUnit);
+      rename_destination->publish_clean(
+          rename_claim, 0, kCacheBitmapUnit, false);
       const bool rename_pinned = rename_destination->pin_clean(0, 4096);
       assert(rename_pinned);
       const auto source_namespace = namespace_status(rename_source_identity.key);
@@ -821,7 +834,7 @@ int main() {
         "mixed-region", "etag-mixed", 1024U * 1024U);
     std::shared_ptr<CacheEntry> mixed = cache.open(mixed_identity);
     CacheFetchClaim first = mixed->claim_fetch(0, 4096, 4096);
-    assert(first.length == 4096);
+    assert(first.length == kCacheBitmapUnit);
     assert(mixed->prepare_read(first.offset, first.length));
     write_test_bytes(mixed->data_fd(), first.offset, first.length);
     mixed->publish_clean(first, 0, first.length, true);
@@ -837,6 +850,342 @@ int main() {
     mixed = cache.open(mixed_identity);
     assert(mixed);
     assert(!mixed->range_clean(0, 4096));
+  }
+
+  {
+    TemporaryDirectory block_directory;
+    CacheConfig blocks = config;
+    blocks.root       = block_directory.path;
+    blocks.block_size = 2 * kCacheBitmapUnit;
+    LocalCache cache(blocks);
+    std::shared_ptr<CacheEntry> entry = cache.open(test_identity(
+        "whole-block", "etag-block", 4 * kCacheBitmapUnit));
+    assert(entry->page_size() == kCacheBitmapUnit);
+    assert(entry->block_size() == 2 * kCacheBitmapUnit);
+
+    CacheFetchClaim claim = entry->claim_fetch(
+        kCacheBitmapUnit + 17, 1, 1);
+    assert(claim.offset == 0 && claim.length == 2 * kCacheBitmapUnit);
+    assert(entry->range_available_or_pending(0, claim.length));
+    assert(entry->prepare_read(claim.offset, claim.length));
+    write_test_bytes(entry->data_fd(), 0, claim.length);
+    entry->publish_clean(claim, 0, kCacheBitmapUnit, false);
+    assert(!entry->range_clean(0, 1));
+    entry->publish_clean(claim, kCacheBitmapUnit, claim.length, false);
+    assert(entry->range_clean(0, claim.length));
+    entry->finish_fetch(claim);
+    assert(!entry->try_export(false));
+
+    assert(entry->begin_checksum_manifest());
+    entry->finish_checksum_manifest({
+        CacheChecksumPart{0, kCacheBitmapUnit, 1, "first"},
+        CacheChecksumPart{kCacheBitmapUnit, kCacheBitmapUnit, 1, "second"},
+        CacheChecksumPart{2 * kCacheBitmapUnit, kCacheBitmapUnit, 1, "third"},
+        CacheChecksumPart{3 * kCacheBitmapUnit, kCacheBitmapUnit, 1, "fourth"},
+    });
+    CacheChecksumClaim abandoned = entry->claim_checksum(
+        kCacheBitmapUnit, 1);
+    assert(abandoned.action == CACHE_CHECKSUM_VERIFY);
+    entry->abandon_checksum(abandoned);
+    assert(entry->range_clean(0, kCacheBitmapUnit));
+    assert(!entry->range_clean(kCacheBitmapUnit, 1));
+
+    CacheFetchClaim rollback = entry->claim_fetch(
+        kCacheBitmapUnit, 1, 1);
+    assert(rollback.offset == 0 &&
+           rollback.length == 2 * kCacheBitmapUnit);
+    entry->rollback_fetch(rollback);
+    assert(entry->range_clean(0, kCacheBitmapUnit));
+    assert(!entry->range_clean(kCacheBitmapUnit, 1));
+    entry->publish_clean(rollback, 0, rollback.length, true);
+    entry->finish_fetch(rollback);
+    assert(!entry->range_clean(kCacheBitmapUnit, 1));
+
+    assert(entry->pin_clean(0, kCacheBitmapUnit));
+    assert(!entry->claim_fetch(kCacheBitmapUnit, 1, 1));
+    auto pin_waiter = std::async(std::launch::async, [&] {
+      entry->wait_for_range(kCacheBitmapUnit, 1);
+      return true;
+    });
+    assert(pin_waiter.wait_for(std::chrono::milliseconds(20)) ==
+           std::future_status::timeout);
+    entry->unpin(0, kCacheBitmapUnit);
+    assert(pin_waiter.get());
+
+    CacheFetchClaim refill = entry->claim_fetch(kCacheBitmapUnit, 1, 1);
+    assert(refill.offset == 0 && refill.length == 2 * kCacheBitmapUnit);
+    assert(entry->prepare_read(refill.offset, refill.length));
+    write_test_bytes(entry->data_fd(), refill.offset, refill.length);
+    entry->publish_clean(refill, 0, refill.length, false);
+    entry->finish_fetch(refill);
+
+    std::shared_ptr<CacheEntry> failed = cache.open(test_identity(
+        "failed-tail", "etag-failed", 4 * kCacheBitmapUnit));
+    CacheFetchClaim expanded = failed->claim_fetch(
+        0, 1, 2 * blocks.block_size);
+    assert(expanded.offset == 0 &&
+           expanded.length == 4 * kCacheBitmapUnit);
+    assert(failed->prepare_read(expanded.offset, expanded.length));
+    write_test_bytes(failed->data_fd(), expanded.offset, blocks.block_size);
+    failed->publish_clean(expanded, 0, blocks.block_size, false);
+    failed->fail_fetch(expanded);
+    assert(failed->range_clean(0, blocks.block_size));
+    assert(!failed->range_clean(blocks.block_size, 1));
+    const CacheFetchClaim late = expanded;
+    failed->mark_bad(late);
+    failed->publish_clean(late, 0, late.length, true);
+    failed->finish_fetch(late);
+    assert(!failed->range_bad(0, 1));
+    assert(!failed->range_clean(blocks.block_size, 1));
+  }
+
+  for (bool failed_tail : {false, true}) {
+    TemporaryDirectory overlap_directory;
+    CacheConfig blocks = config;
+    blocks.root       = overlap_directory.path;
+    blocks.block_size = 2 * kCacheBitmapUnit;
+    LocalCache cache(blocks);
+    auto entry = cache.open(test_identity(
+        "reclaimed-prefix", "etag-prefix", 2 * blocks.block_size));
+    const CacheFetchClaim first = entry->claim_fetch(
+        0, 1, 2 * blocks.block_size);
+    assert(first.length == 2 * blocks.block_size);
+    assert(entry->prepare_read(first.offset, first.length));
+    write_test_bytes(entry->data_fd(), 0, blocks.block_size);
+    entry->publish_clean(first, 0, blocks.block_size, false);
+    assert(CacheTestAccess::evict_one(cache));
+    assert(!entry->range_clean(0, 1));
+
+    const CacheFetchClaim replacement = entry->claim_fetch(0, 1, 1);
+    assert(replacement.offset == 0 &&
+           replacement.length == blocks.block_size);
+    assert(entry->prepare_read(replacement.offset, replacement.length));
+    write_test_bytes(entry->data_fd(), 0, kCacheBitmapUnit);
+    // An older progress callback cannot publish the new owner's partial data.
+    entry->publish_clean(first, 0, blocks.block_size, false);
+    assert(!entry->range_clean(0, 1));
+    if (failed_tail) {
+      entry->fail_fetch(first);
+    } else {
+      write_test_bytes(entry->data_fd(), blocks.block_size, blocks.block_size);
+      entry->publish_clean(first, blocks.block_size, first.length, true);
+      assert(!entry->pin_fetch_verification(first));
+      entry->finish_fetch(first);
+    }
+    assert(entry->range_available_or_pending(0, replacement.length));
+    assert(!entry->range_clean(0, 1));
+    std::array<std::byte, 4096> bytes{};
+    assert(::pread(entry->data_fd(), bytes.data(), bytes.size(), 0) ==
+           ssize_t(bytes.size()));
+    for (size_t i = 0; i < bytes.size(); ++i) assert(bytes[i] == std::byte(i));
+    write_test_bytes(entry->data_fd(), kCacheBitmapUnit, kCacheBitmapUnit);
+    entry->publish_clean(replacement, 0, replacement.length, false);
+    entry->finish_fetch(replacement);
+    assert(entry->range_clean(0, replacement.length));
+  }
+
+  {
+    TemporaryDirectory retry_directory;
+    CacheConfig blocks = config;
+    blocks.root       = retry_directory.path;
+    blocks.block_size = 2 * kCacheBitmapUnit;
+    LocalCache cache(blocks);
+    auto entry = cache.open(test_identity(
+        "pinned-whole-retry", "etag-retry", blocks.block_size));
+    const auto claim = entry->claim_fetch(0, 1, 1);
+    assert(entry->prepare_read(claim.offset, claim.length));
+    write_test_bytes(entry->data_fd(), claim.offset, claim.length);
+    entry->publish_clean(claim, 0, claim.length, true);
+    assert(entry->pin_fetch_verification(claim));
+    assert(!entry->begin_checksum_manifest());
+    assert(!entry->checksum_manifest_available());
+    assert(entry->claim_checksum(0, 1).action == CACHE_CHECKSUM_NONE);
+    assert(!CacheTestAccess::evict_one(cache));
+    assert(entry->pin_clean(0, 1));
+    const int wait_fd = entry->begin_retry_wait(claim);
+    assert(wait_fd >= 0);
+    assert(!entry->pin_clean(0, 1));
+    assert(!entry->claim_fetch(0, 1, 1));
+    entry->unpin(0, 1);
+    uint64_t wake = 0;
+    assert(::read(wait_fd, &wake, sizeof(wake)) == ssize_t(sizeof(wake)));
+    entry->end_async_wait();
+    assert(entry->begin_retry_wait(claim) == -1);
+    write_test_bytes(entry->data_fd(), claim.offset, claim.length);
+    entry->finish_retry(claim, true);
+    assert(entry->range_clean(0, claim.length));
+    assert(entry->begin_checksum_manifest());
+    entry->checksum_manifest_unavailable();
+    assert(CacheTestAccess::evict_one(cache));
+  }
+
+  {
+    TemporaryDirectory part_retry_directory;
+    CacheConfig blocks = config;
+    blocks.root       = part_retry_directory.path;
+    blocks.block_size = 2 * kCacheBitmapUnit;
+    LocalCache cache(blocks);
+    auto entry = cache.open(test_identity(
+        "shared-block-parts", "etag-parts", blocks.block_size));
+    const auto fetch = entry->claim_fetch(0, 1, 1);
+    assert(entry->prepare_read(fetch.offset, fetch.length));
+    write_test_bytes(entry->data_fd(), fetch.offset, fetch.length);
+    entry->publish_clean(fetch, 0, fetch.length, true);
+    assert(entry->begin_checksum_manifest());
+    entry->finish_checksum_manifest({
+        CacheChecksumPart{0, kCacheBitmapUnit, 1, "first"},
+        CacheChecksumPart{kCacheBitmapUnit, kCacheBitmapUnit, 1, "second"},
+    });
+    assert(!entry->pin_fetch_verification(fetch));
+    entry->finish_fetch(fetch);
+    const auto first = entry->claim_checksum(0, 1);
+    const auto second = entry->claim_checksum(kCacheBitmapUnit, 1);
+    assert(first.action == CACHE_CHECKSUM_VERIFY);
+    assert(second.action == CACHE_CHECKSUM_VERIFY);
+    assert(entry->pin_clean(0, 1));
+    const int first_fd = entry->begin_checksum_retry_wait(first);
+    const int second_fd = entry->begin_checksum_retry_wait(second);
+    assert(first_fd >= 0 && second_fd >= 0);
+    assert(!entry->pin_clean(0, 1));
+    assert(!entry->pin_clean(kCacheBitmapUnit, 1));
+    // Two disjoint verifiers share one block. The final real reply unpin
+    // leaves two verification pins, and must wake both retry waiters.
+    entry->unpin(0, 1);
+    uint64_t wake = 0;
+    assert(::read(first_fd, &wake, sizeof(wake)) == ssize_t(sizeof(wake)));
+    entry->end_async_wait();
+    assert(::read(second_fd, &wake, sizeof(wake)) == ssize_t(sizeof(wake)));
+    entry->end_async_wait();
+    assert(entry->begin_checksum_retry_wait(first) == -1);
+    assert(entry->begin_checksum_retry_wait(second) == -1);
+    entry->wait_for_checksum_retry(first);
+    entry->wait_for_checksum_retry(second);
+    write_test_bytes(entry->data_fd(), 0, blocks.block_size);
+    entry->finish_checksum(first, true);
+    entry->finish_checksum(second, true);
+    assert(entry->pin_clean(0, blocks.block_size));
+    entry->unpin(0, blocks.block_size);
+    assert(CacheTestAccess::evict_one(cache));
+  }
+
+  {
+    TemporaryDirectory physical_directory;
+    CacheConfig physical = config;
+    physical.root = physical_directory.path;
+    {
+      LocalCache cache(physical);
+      assert(cache.open(test_identity("physical-page", "etag", 1))
+                 ->page_size() == kCacheBitmapUnit);
+    }
+    physical.page_size = 8192;
+    {
+      LocalCache cache(physical);
+      assert(cache.open(test_identity("physical-page", "etag", 1))
+                 ->page_size() == kCacheBitmapUnit);
+    }
+  }
+
+  {
+    TemporaryDirectory invalid_block_directory;
+    CacheConfig invalid = config;
+    invalid.root = invalid_block_directory.path;
+    invalid.block_size = kCacheBitmapUnit + 1;
+    bool rejected = false;
+    try {
+      LocalCache cache(invalid);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
+
+  {
+    TemporaryDirectory export_directory;
+    CacheConfig unlimited = config;
+    unlimited.root               = export_directory.path;
+    unlimited.maximum_bytes      = 1;
+    unlimited.reserve_percent    = 100;
+    unlimited.reserve_is_percent = true;
+    unlimited.unlimited          = true;
+    int old_backing_fd = -1;
+    struct stat old_status{};
+    {
+      LocalCache cache(unlimited);
+      std::shared_ptr<CacheEntry> old = cache.open(
+          test_identity("exported", "etag-old", 4096));
+      CacheFetchClaim claim = old->claim_fetch(0, 1, 1);
+      assert(old->prepare_read(claim.offset, claim.length));
+      write_test_bytes(old->data_fd(), 0, claim.length);
+      old->publish_clean(claim, 0, claim.length, true);
+      old->finish_fetch(claim);
+      assert(!old->try_export(true));
+      assert(old->try_export(false));
+      assert(old->exported());
+      assert(::fstat(old->data_fd(), &old_status) == 0);
+      old_backing_fd = ::dup(old->data_fd());
+      assert(old_backing_fd >= 0);
+
+      std::shared_ptr<CacheEntry> verified = cache.open(
+          test_identity("verified-export", "etag-verified", 4096));
+      CacheFetchClaim verified_fetch = verified->claim_fetch(0, 1, 1);
+      assert(verified->prepare_read(
+          verified_fetch.offset, verified_fetch.length));
+      write_test_bytes(
+          verified->data_fd(), verified_fetch.offset, verified_fetch.length);
+      verified->publish_clean(
+          verified_fetch, 0, verified_fetch.length, true);
+      verified->finish_fetch(verified_fetch);
+      assert(verified->begin_checksum_manifest());
+      verified->finish_checksum_manifest({
+          CacheChecksumPart{0, 4096, 1, "verified"},
+      });
+      CacheChecksumClaim checksum = verified->claim_checksum(0, 1);
+      assert(checksum.action == CACHE_CHECKSUM_VERIFY);
+      verified->finish_checksum(checksum, true);
+      assert(verified->try_export(true));
+    }
+    {
+      LocalCache cache(unlimited);
+      std::shared_ptr<CacheEntry> persisted = cache.open(
+          test_identity("exported", "etag-old", 4096));
+      assert(persisted->exported());
+      assert(!persisted->begin_checksum_manifest());
+      assert(!persisted->begin_checksum_manifest());
+      assert(!persisted->checksum_manifest_available());
+      assert(!persisted->try_export(true));
+      const uint64_t old_allocated = CacheTestAccess::allocated_bytes(cache);
+      std::shared_ptr<CacheEntry> replacement = cache.open(
+          test_identity("exported", "etag-new", 4096));
+      assert(CacheTestAccess::allocated_bytes(cache) ==
+             old_allocated - uint64_t(old_status.st_blocks) * 512);
+      struct stat new_status{};
+      assert(::fstat(replacement->data_fd(), &new_status) == 0);
+      assert(old_status.st_dev != new_status.st_dev ||
+             old_status.st_ino != new_status.st_ino);
+      std::array<std::byte, 16> bytes{};
+      assert(::pread(old_backing_fd, bytes.data(), bytes.size(), 0) ==
+             ssize_t(bytes.size()));
+      for (size_t i = 0; i < bytes.size(); ++i) {
+        assert(bytes[i] == std::byte(i));
+      }
+      assert(!replacement->exported());
+
+      auto verified = cache.open(
+          test_identity("verified-export", "etag-verified", 4096));
+      struct stat verified_status{};
+      assert(::fstat(verified->data_fd(), &verified_status) == 0);
+      const uint64_t writer_allocated = CacheTestAccess::allocated_bytes(cache);
+      auto writer = cache.create_writer(
+          test_identity("verified-export", "etag-verified", 4096),
+          unlimited.upload_part_size);
+      // Starting an empty writer can also release the old bitmap's pages.
+      assert(CacheTestAccess::allocated_bytes(cache) <=
+             writer_allocated - uint64_t(verified_status.st_blocks) * 512);
+      assert(::pread(verified->data_fd(), bytes.data(), bytes.size(), 0) ==
+             ssize_t(bytes.size()));
+      for (size_t i = 0; i < bytes.size(); ++i) assert(bytes[i] == std::byte(i));
+    }
+    assert(::close(old_backing_fd) == 0);
   }
   return 0;
 }

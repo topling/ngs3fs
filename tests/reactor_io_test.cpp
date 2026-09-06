@@ -56,6 +56,8 @@ struct ReactorIoTest {
   unsigned cancellations = 0;
   unsigned cleanup_count = 0;
   unsigned notification_callbacks = 0;
+  unsigned queued_reply_callbacks = 0;
+  unsigned blocked_reply_callbacks = 0;
   unsigned fairness_iterations = 0;
   unsigned fairness_completion_iteration = 0;
   unsigned burst_completions = 0;
@@ -300,19 +302,70 @@ struct ReactorIoTest {
     if (submit()) check(reactor().cancel(io), "cancel rejected active receive");
   }
 
-  bool fill_fuse_socket() noexcept {
-    const int flags = fcntl(fake_fuse.get(), F_GETFL);
+  bool fill_socket(int fd) noexcept {
+    const int flags = fcntl(fd, F_GETFL);
     if (!check(flags >= 0 &&
-               fcntl(fake_fuse.get(), F_SETFL, flags | O_NONBLOCK) == 0,
+               fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0,
                "make fake FUSE socket nonblocking")) return false;
     std::array<char, 4096> padding{};
     ssize_t result;
     do {
-      result = ::write(fake_fuse.get(), padding.data(), padding.size());
+      result = ::write(fd, padding.data(), padding.size());
     } while (result > 0 || (result < 0 && errno == EINTR));
     const bool full = result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
-    const bool restored = fcntl(fake_fuse.get(), F_SETFL, flags) == 0;
+    const bool restored = fcntl(fd, F_SETFL, flags) == 0;
     return check(full && restored, "fill fake FUSE socket");
+  }
+
+  bool queue_plain_reply(char value, FuseReactor::NotifyFunction done) noexcept {
+    auto* reply = reactor().acquire_reply();
+    if (!check(reply != nullptr, "allocate queued reply")) return false;
+    reply->length = 1;
+    reply->data()[0] = u_char(value);
+    reply->output_fd = fairness_socket.get();
+    // Exercise the ordinary queued-reply lane without a real kernel request.
+    // This private harness completion replaces fuse_reply_async_complete.
+    reply->notify_done = done;
+    reply->notify_context = this;
+    if (!reactor().enqueue_reply(reply)) {
+      reactor().release_reply(reply);
+      return check(false, "enqueue ordinary reply");
+    }
+    return true;
+  }
+
+  static void queued_reply_done(void* context, int result) noexcept {
+    auto& test = *static_cast<ReactorIoTest*>(context);
+    if (!test.check(result == 0 && test.notification_callbacks == 0,
+                    "pending invalidation blocked ordinary reply")) return;
+    char value = 0;
+    if (!test.check(::recv(test.fairness_peer.get(), &value, 1,
+                          MSG_DONTWAIT) == 1 &&
+                    value == char('a' + test.queued_reply_callbacks),
+                    "ordinary reply lane lost FIFO order")) return;
+    if (++test.queued_reply_callbacks == 2) {
+      test.notification_can_drain.store(true, std::memory_order_release);
+      test.notification_can_drain.notify_one();
+    }
+  }
+
+  void blocked_reply_case() noexcept {
+    if (!fill_socket(fairness_socket.get()) ||
+        !queue_plain_reply('z', blocked_reply_done)) return;
+    submitting_notification = true;
+    const bool accepted = reactor().notify_inval_inode(
+        FUSE_ROOT_ID, 0, 4096, notification_done, this);
+    submitting_notification = false;
+    check(accepted && notification_callbacks == 3,
+          "notification behind ordinary reply was rejected or inline");
+  }
+
+  static void blocked_reply_done(void* context, int result) noexcept {
+    auto& test = *static_cast<ReactorIoTest*>(context);
+    if (!test.check(result == 0 && test.notification_callbacks == 4,
+                    "notification did not bypass blocked ordinary reply")) return;
+    ++test.blocked_reply_callbacks;
+    test.begin_shutdown_case();
   }
 
   void begin_shutdown_case() noexcept {
@@ -334,7 +387,7 @@ struct ReactorIoTest {
   }
 
   void notification_case() noexcept {
-    if (!fill_fuse_socket()) return;
+    if (!fill_socket(fake_fuse.get())) return;
     notification_drain = std::thread([this] {
       notification_can_drain.wait(false, std::memory_order_acquire);
       std::array<char, 65536> discarded{};
@@ -416,7 +469,21 @@ struct ReactorIoTest {
                       header.error == FUSE_NOTIFY_INVAL_INODE &&
                       body.ino == FUSE_ROOT_ID && body.off == 16384 &&
                       body.len == 8192, "invalid inode invalidation notification")) return;
-      test.begin_shutdown_case();
+      test.blocked_reply_case();
+    } else if (test.notification_callbacks == 4) {
+      if (!test.check(test.blocked_reply_callbacks == 0,
+                      "ordinary reply was not blocked during notification")) return;
+      std::array<char, 65536> discarded{};
+      size_t drained = 0;
+      ssize_t count;
+      do {
+        count = ::recv(test.fairness_peer.get(), discarded.data(),
+                       discarded.size(), MSG_DONTWAIT);
+        if (count > 0) drained += size_t(count);
+      } while (count > 0 || (count < 0 && errno == EINTR));
+      test.check(drained > 0 && count < 0 &&
+                 (errno == EAGAIN || errno == EWOULDBLOCK),
+                 "unable to drain blocked ordinary reply");
     } else {
       test.check(false, "notification callback ran more than once");
     }
@@ -509,8 +576,14 @@ struct ReactorIoTest {
                       "read was blocked by pending notification")) return;
       if (!test.check(test.notification_callbacks == 0,
                       "notification serialized an unrelated read")) return;
-      test.notification_can_drain.store(true, std::memory_order_release);
-      test.notification_can_drain.notify_one();
+      // Both ordinary replies must complete while INVAL remains blocked.
+      // Draining INVAL earlier would hide a shared-FIFO dependency cycle.
+      const unsigned pending = io_uring_sq_ready(&test.reactor().ring_);
+      if (test.queue_plain_reply('a', queued_reply_done)) {
+        if (!test.check(io_uring_sq_ready(&test.reactor().ring_) == pending + 1,
+                        "ordinary reply was queued behind INVAL")) return;
+        test.queue_plain_reply('b', queued_reply_done);
+      }
     }
   }
 
@@ -563,6 +636,90 @@ struct ReactorIoTest {
                  io_executor() == &test.reactor() && current_fuse_reactor() == &test.reactor(),
                "reserved worker completion lacks owner scope");
     test.worker_completed = true;
+  }
+
+  bool reply_shutdown_case() {
+    ReactorIoTest test;
+    if (!check(test.initialize(), "initialize reply shutdown case")) return false;
+    FuseReactor& owner = test.reactor();
+    if (!check(io_uring_enable_rings(&owner.ring_) == 0,
+               "enable reply shutdown ring") ||
+        !test.fill_socket(test.fake_fuse.get()) ||
+        !test.fill_socket(test.fairness_socket.get())) return false;
+    struct Completion {
+      unsigned count = 0;
+      int result = 0;
+    };
+    std::array<Completion, 4> completions{};
+    FuseReactor::current_ = &owner;
+    FuseReactorReplyScope scope(&owner);
+    bool accepted = true;
+    for (size_t i = 0; i < completions.size(); ++i) {
+      auto* reply = owner.acquire_reply();
+      if (reply == nullptr) {
+        accepted = false;
+        break;
+      }
+      reply->length = 1;
+      reply->data()[0] = 'x';
+      reply->notification = i >= 2;
+      reply->output_fd = i >= 2 ? test.fake_fuse.get() :
+          test.fairness_socket.get();
+      reply->notify_context = &completions[i];
+      reply->notify_done = [](void* context, int result) noexcept {
+        auto& completion = *static_cast<Completion*>(context);
+        ++completion.count;
+        completion.result = result;
+      };
+      if (!owner.enqueue_reply(reply)) {
+        owner.release_reply(reply);
+        accepted = false;
+        break;
+      }
+    }
+    const bool submitted = accepted && io_uring_submit(&owner.ring_) == 2;
+    // A running io-wq write is not necessarily cancellable. The fake device
+    // must eventually release it, just as a real outstanding READ reply or
+    // connection teardown releases an INVAL folio wait. Use an admitted
+    // shutdown continuation, not a sleep, to make that release deterministic.
+    FuseReactor::ReactorTask cleanup{};
+    cleanup.context = &test;
+    cleanup.run = [](void* context) noexcept {
+      auto& value = *static_cast<ReactorIoTest*>(context);
+      std::array<char, 65536> discarded{};
+      for (int fd : {value.fake_fuse_peer.get(), value.fairness_peer.get()}) {
+        ssize_t count;
+        do {
+          count = ::recv(fd, discarded.data(), discarded.size(), MSG_DONTWAIT);
+        } while (count > 0 || (count < 0 && errno == EINTR));
+      }
+    };
+    const bool reserved = owner.reserve_completion(&cleanup);
+    if (reserved) owner.complete(&cleanup);
+    else {
+      accepted = false;
+      cleanup.run(cleanup.context);
+    }
+    test.group.begin_shutdown();
+    fuse_session_exit(test.session);
+    owner.drain_shutdown();
+    const bool drained = !owner.reply_queues_[0].pending &&
+        !owner.reply_queues_[1].pending && owner.reply_count_ == 2 &&
+        completions[0].count == 1 && completions[0].result <= 0 &&
+        completions[2].count == 1 && completions[2].result <= 0 &&
+        completions[1].count == 0 && completions[3].count == 0;
+    // The two queued tails were never submitted; retire them only after both
+    // original CQEs prove the kernel has stopped accessing the lane heads.
+    owner.fail_replies(-ENOTCONN);
+    FuseReactor::current_ = nullptr;
+    bool completed = owner.reply_count_ == 0;
+    for (const Completion& completion : completions) {
+      completed = completed && completion.count == 1 && completion.result <= 0;
+    }
+    return check(accepted && submitted && reserved && drained && completed &&
+                 completions[1].result == -ENOTCONN &&
+                 completions[3].result == -ENOTCONN,
+                 "shutdown lost or prematurely freed a reply lane");
   }
 
   bool shutdown_admission_case() {
@@ -647,6 +804,7 @@ struct ReactorIoTest {
       result = group.run();
     });
     event_loop.join();
+    check(reply_shutdown_case(), "reply shutdown regression case failed");
     check(shutdown_admission_case(),
           "shutdown admission regression case failed");
     check(result == 0, "reactor exited with error");
@@ -657,7 +815,8 @@ struct ReactorIoTest {
            "shutdown skipped accepted I/O or callbacks");
     check(cleanup_count == cleanup_stages.size() + 1,
            "shutdown skipped overflow cleanup continuations");
-    check(notification_callbacks == 3,
+    check(notification_callbacks == 4 && queued_reply_callbacks == 2 &&
+          blocked_reply_callbacks == 1,
           "accepted notifications did not each complete exactly once");
     check(fairness_completion_iteration >= 64 &&
           fairness_completion_iteration < 1024,

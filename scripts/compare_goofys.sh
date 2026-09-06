@@ -27,6 +27,8 @@ random_seed=${RANDOM_READ_SEED:-0x4e47533346535244}
 random_advice=${RANDOM_READ_ADVICE:-random}
 cache_mode=${CACHE_MODE:-none}
 cache_dir=${CACHE_DIR:-${NGS3FS_CACHE_DIR:-}}
+cache_block_size=${NGS3FS_CACHE_BLOCK_SIZE:-2MiB}
+cache_unlimited=${NGS3FS_CACHE_UNLIMITED:-0}
 perf=${PERF_BIN:-perf}
 drop_after_warmup=${DROP_CACHES_AFTER_WARMUP:-0}
 
@@ -53,6 +55,13 @@ case "$cache_mode" in
     exit 2
     ;;
 esac
+case "$cache_unlimited" in
+  0 | 1) ;;
+  *)
+    echo "unsupported NGS3FS_CACHE_UNLIMITED: $cache_unlimited (expected 0 or 1)" >&2
+    exit 2
+    ;;
+esac
 if [[ "$cache_mode" != none ]]; then
   if [[ -z "$cache_dir" ]]; then
     cache_dir="$run_dir/ngs3fs-cache"
@@ -69,7 +78,12 @@ ngs3fs_io_args=()
 ngs3fs_memory_args=()
 validate_memory=0
 if [[ "$cache_mode" != none ]]; then
-  ngs3fs_cache_args=(-L "$cache_dir" --cache-reserve 0)
+  ngs3fs_cache_args=(-L "$cache_dir" --cache-block-size "$cache_block_size")
+  if [[ "$cache_unlimited" = 1 ]]; then
+    ngs3fs_cache_args+=(--cache-unlimited)
+  else
+    ngs3fs_cache_args+=(--cache-reserve 0)
+  fi
 fi
 if [[ -n "$io_engine" ]]; then
   ngs3fs_io_args+=(--io-engine "$io_engine")
@@ -309,9 +323,11 @@ run_random_read_case() {
   local elapsed_ns=
   local pread_operations=
   local mmap_operations=
+  local workload_cpu_ns=
   local start_ns
   local end_ns
   local used_ns
+  local total_cpu_ns
   local total_operations
   local first_line
   local last_line
@@ -357,23 +373,30 @@ run_random_read_case() {
       elapsed_ns=*) elapsed_ns=${token#elapsed_ns=} ;;
       pread_operations=*) pread_operations=${token#pread_operations=} ;;
       mmap_operations=*) mmap_operations=${token#mmap_operations=} ;;
+      workload_cpu_ns=*) workload_cpu_ns=${token#workload_cpu_ns=} ;;
     esac
   done
   if [[ -z "$bytes" || -z "$elapsed_ns" ||
-        -z "$pread_operations" || -z "$mmap_operations" ]]; then
+        -z "$pread_operations" || -z "$mmap_operations" ||
+        -z "$workload_cpu_ns" ]]; then
     echo "unable to parse random-read result: $result" >&2
     return 1
   fi
   total_operations=$((pread_operations + mmap_operations))
+  total_cpu_ns=$((used_ns + workload_cpu_ns))
   printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "$client" "$random_advice" "$max_connections" \
     "$random_files" "$random_threads" "$total_operations" \
     "$pread_operations" "$mmap_operations" "$bytes" "$elapsed_ns" \
     "$used_ns" "$((used_ns / total_operations))" "$get_requests" \
     >>"$run_dir/random-read-summary.csv"
-  printf '%s: wall_ns=%s daemon_cpu_ns=%s daemon_cpu_ns_per_operation=%s s3_get_requests=%s\n' \
-    "$client" "$elapsed_ns" "$used_ns" "$((used_ns / total_operations))" \
-    "$get_requests"
+  printf '%s,%s,%s,%s,%s\n' \
+    "$client" "$used_ns" "$workload_cpu_ns" "$total_cpu_ns" \
+    "$((total_cpu_ns / total_operations))" \
+    >>"$run_dir/client-cpu.csv"
+  printf '%s: wall_ns=%s daemon_cpu_ns=%s workload_cpu_ns=%s total_cpu_ns=%s total_cpu_ns_per_operation=%s s3_get_requests=%s\n' \
+    "$client" "$elapsed_ns" "$used_ns" "$workload_cpu_ns" \
+    "$total_cpu_ns" "$((total_cpu_ns / total_operations))" "$get_requests"
 }
 
 run_random_read_client() {
@@ -518,6 +541,9 @@ if [[ "$workload" = random-read ]]; then
   printf '%s\n' \
     'client,advice,max_connections,files,threads,operations,pread_operations,mmap_operations,bytes,wall_ns,daemon_cpu_ns,daemon_cpu_ns_per_operation,s3_get_requests' \
     >"$run_dir/random-read-summary.csv"
+  printf '%s\n' \
+    'client,daemon_cpu_ns,workload_cpu_ns,total_cpu_ns,total_cpu_ns_per_operation' \
+    >"$run_dir/client-cpu.csv"
   case "$client" in
     ngs3fs | goofys | mountpoint-s3) run_random_read_client "$client" ;;
     both)
