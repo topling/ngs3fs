@@ -29,6 +29,9 @@ struct ReactorIoTest {
   Pipe pipe;
   AsyncIoRequest io;
   AsyncIoRequest fairness_io;
+  std::array<AsyncIoRequest, 2> burst_io{};
+  std::array<char, 2> burst_data{};
+  FuseReactor::ReactorTask burst_ready{};
   AsyncIoRequest shutdown_io;
   std::array<FuseReactor::ReactorTask, 32> tasks{};
   FuseReactor::ReactorTask rejected{};
@@ -56,6 +59,9 @@ struct ReactorIoTest {
   unsigned notification_callbacks = 0;
   unsigned fairness_iterations = 0;
   unsigned fairness_completion_iteration = 0;
+  unsigned burst_completions = 0;
+  unsigned burst_replies = 0;
+  bool burst_reply_pending = false;
   bool submitting = false;
   bool submitting_notification = false;
   bool shutdown_completed = false;
@@ -214,6 +220,18 @@ struct ReactorIoTest {
     auto& test = *static_cast<ReactorIoTest*>(context);
     noop(context);
     if (!test.initialize_fuse_protocol()) return;
+    test.burst_ready = {burst_reply, cancelled, &test};
+    for (size_t i = 0; i < test.burst_io.size(); ++i) {
+      auto& io = test.burst_io[i];
+      io.kind = AsyncIoRequest::PREAD;
+      io.fd = test.file.get();
+      io.input_offset = 4096;
+      io.data = &test.burst_data[i];
+      io.length = 1;
+      io.complete = burst_done;
+      io.context = &test;
+      if (!test.check(test.reactor().submit(io), "submit CQ burst")) return;
+    }
     test.fairness_io.fd = test.fairness_socket.get();
     test.fairness_io.data = &test.fairness_data;
     test.fairness_io.length = 1;
@@ -229,6 +247,25 @@ struct ReactorIoTest {
     test.io.processor_context = &test;
     if (!test.check(::write(test.peer.get(), "x", 1) == 1, "feed initial parser byte")) return;
     test.submit();
+  }
+
+  static void burst_done(void* context, ssize_t result) noexcept {
+    auto& test = *static_cast<ReactorIoTest*>(context);
+    if (!test.check(result == 1, "CQ burst receive failed") ||
+        !test.check(!test.burst_reply_pending,
+                    "next I/O CQE overtook a ready FUSE continuation")) return;
+    ++test.burst_completions;
+    test.burst_reply_pending = true;
+    if (!test.check(test.reactor().reserve_completion(&test.burst_ready),
+                    "reserve CQ burst reply")) return;
+    test.reactor().complete(&test.burst_ready);
+  }
+
+  static void burst_reply(void* context) noexcept {
+    auto& test = *static_cast<ReactorIoTest*>(context);
+    test.check(test.burst_reply_pending, "CQ burst reply lost its admission");
+    test.burst_reply_pending = false;
+    ++test.burst_replies;
   }
 
   static void fairness_callback(void* context) noexcept {
@@ -630,6 +667,9 @@ struct ReactorIoTest {
     check(fairness_completion_iteration >= 64 &&
           fairness_completion_iteration < 1024,
           "continuously ready callbacks starved an asynchronous CQE");
+    check(burst_completions == burst_io.size() &&
+          burst_replies == burst_io.size() && !burst_reply_pending,
+          "ready FUSE continuations were not drained between I/O CQEs");
     return failed ? 1 : 0;
   }
 };

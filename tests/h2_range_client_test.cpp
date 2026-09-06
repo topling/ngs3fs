@@ -54,6 +54,7 @@ struct ServerState {
   std::vector<std::byte> body;
   size_t offset = 0;
   bool response_submitted = false;
+  bool padded = false;
   std::string content_length;
   std::string content_range;
 };
@@ -63,7 +64,8 @@ ssize_t read_body(nghttp2_session*, int32_t, uint8_t* buffer,
                   nghttp2_data_source* source, void*) {
   auto& state = *static_cast<ServerState*>(source->ptr);
   const size_t count =
-      std::min(length, state.body.size() - state.offset);
+      std::min({length, state.body.size() - state.offset,
+                state.padded ? size_t(8191) : SIZE_MAX});
   memcpy(buffer, state.body.data() + state.offset, count);
   state.offset += count;
   if (state.offset == state.body.size()) {
@@ -116,7 +118,13 @@ void flush_server(nghttp2_session* session, int socket_fd) {
   }
 }
 
-void run_server(int listener, std::vector<std::byte> body) {
+nghttp2_ssize select_padding(nghttp2_session*, const nghttp2_frame* frame,
+                              size_t maximum, void*) {
+  return nghttp2_ssize(frame->hd.type == NGHTTP2_DATA
+      ? std::min(frame->hd.length + 7, maximum) : frame->hd.length);
+}
+
+void run_server(int listener, std::vector<std::byte> body, bool padded) {
   UniqueFd socket(::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC));
   assert(socket);
   nghttp2_session_callbacks* raw_callbacks = nullptr;
@@ -125,8 +133,13 @@ void run_server(int listener, std::vector<std::byte> body) {
       raw_callbacks);
   nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks.get(),
                                                         on_frame_recv);
+  if (padded) {
+    nghttp2_session_callbacks_set_select_padding_callback2(callbacks.get(),
+                                                           select_padding);
+  }
 
   ServerState state;
+  state.padded = padded;
   state.body = std::move(body);
   state.content_length = std::to_string(state.body.size());
   state.content_range =
@@ -185,8 +198,34 @@ class TestFileSink final : public RangeFileSink {
   bool completed = false;
 };
 
+class TestMemorySink final : public RangeMemorySink {
+ public:
+  explicit TestMemorySink(size_t size) : data(size) {}
+  std::span<std::byte> writable(size_t maximum) override {
+    const size_t length = std::min({maximum, data.size() - produced,
+                                     size_t(2 * 1024 * 1024) -
+                                         produced % (2 * 1024 * 1024)});
+    return std::span(data).subspan(produced, length);
+  }
+  void commit(size_t length) override { produced += length; }
+  bool receive_waitall() const noexcept override { return produced >= 64 * 1024; }
+  void progress(const Response& response, bool complete) override {
+    assert(response.body_bytes == produced);
+    ++calls;
+    completed |= complete;
+  }
+
+  std::vector<std::byte> data;
+  size_t calls = 0;
+  size_t produced = 0;
+  bool completed = false;
+};
+
 int main(int argc, char** argv) {
-  const bool asynchronous = argc == 2 && std::string_view(argv[1]) == "--async";
+  const std::string_view mode = argc == 2 ? argv[1] : "";
+  const bool memory = mode == "--async-memory" || mode == "--async-memory-padded";
+  const bool asynchronous = mode == "--async" || memory;
+  const bool padded = mode == "--async-memory-padded";
   UniqueFd listener(
       ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP));
   assert(listener);
@@ -206,12 +245,15 @@ int main(int argc, char** argv) {
     expected[i] = static_cast<std::byte>((i * 17U) & 0xffU);
   }
 
-  std::jthread server(run_server, listener.get(), expected);
+  std::jthread server(run_server, listener.get(), expected, padded);
   auto client = HttpClient::connect(
       "127.0.0.1", ntohs(address.sin_port), "mock-s3");
   UniqueFd file(::memfd_create("h2-range-file", MFD_CLOEXEC));
   assert(file);
   TestFileSink sink(file.get(), 0);
+  TestMemorySink memory_sink(expected.size());
+  const size_t& produced = memory ? memory_sink.produced : sink.produced;
+  const bool& completed = memory ? memory_sink.completed : sink.completed;
   Response response;
   if (asynchronous) {
     TestAsyncIoExecutor executor(4093);
@@ -219,7 +261,8 @@ int main(int argc, char** argv) {
     request.path = "/bucket/key";
     request.range = true;
     request.length = expected.size();
-    request.destination = &sink;
+    if (memory) request.memory_destination = &memory_sink;
+    else request.destination = &sink;
     request.capture_headers = false;
     request.measure_transport = true;
     struct Completion {
@@ -235,17 +278,17 @@ int main(int argc, char** argv) {
           completion.done = true;
         }, &completion);
     operation->start();
-    while (sink.produced < 64U * 1024U && !completion.done) {
+    while (produced < 64U * 1024U && !completion.done) {
       assert(executor.run_one());
     }
-    assert(sink.produced >= 64U * 1024U);
-    assert(sink.produced < expected.size());
-    assert(!sink.completed);
+    assert(produced >= 64U * 1024U);
+    assert(produced < expected.size());
+    assert(!completed);
     executor.run();
     assert(completion.done);
     if (completion.error) std::rethrow_exception(completion.error);
     assert(executor.parameters_preserved());
-    assert(executor.saw_background_file_write());
+    assert(executor.saw_background_file_write() == !memory);
   } else {
     auto download = client->begin_range_to_fd(
         "/bucket/key", 0, expected.size(), sink, {}, false, true);
@@ -257,18 +300,21 @@ int main(int argc, char** argv) {
   }
   assert(response.status == 206);
   assert(response.body_bytes == expected.size());
-  assert(response.externally_spliced_bytes == expected.size());
-  assert(response.fallback_copied_bytes == 0);
+  assert(response.externally_spliced_bytes == (memory ? 0 : expected.size()));
+  assert(padded ? response.fallback_copied_bytes > 0
+                : response.fallback_copied_bytes == 0);
+  assert(response.fallback_copied_bytes <= expected.size());
   assert(response.wire_start_ns != 0);
   assert(response.wire_last_data_ns >= response.wire_start_ns);
   assert(response.headers.empty());
   assert(sso_view(response.content_range) ==
          "bytes 0-8388607/8388608");
-  assert(sink.calls > 1);
-  assert(sink.completed);
+  assert((memory ? memory_sink.calls : sink.calls) > 1);
+  assert(completed);
 
   std::vector<std::byte> actual(expected.size());
-  read_all(file.get(), actual);
+  if (memory) actual = std::move(memory_sink.data);
+  else read_all(file.get(), actual);
   assert(actual == expected);
   return 0;
 }

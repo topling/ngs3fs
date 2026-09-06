@@ -2082,7 +2082,9 @@ int FuseReactor::run() noexcept {
     }
     io_uring_cqe* cqe = nullptr;
     size_t completion_count = 0;
-    while (io_uring_peek_cqe(&ring_, &cqe) == 0) {
+    constexpr size_t max_completions = 64;
+    while (completion_count < max_completions &&
+           io_uring_peek_cqe(&ring_, &cqe) == 0) {
       ++completion_count;
       void* data = io_uring_cqe_get_data(cqe);
       const int completion = cqe->res;
@@ -2176,6 +2178,16 @@ int FuseReactor::run() noexcept {
         } else {
           complete_reply(static_cast<Reply*>(data), completion);
         }
+      }
+      if (error_ != 0 || fuse_session_exited(session_)) {
+        break;
+      }
+      // A receive may make waiting FUSE reads ready. Reply before consuming
+      // the next network CQE; each callback pass has a bounded snapshot.
+      if ((callback_count_ != 0 ||
+           completion_pending_.load(std::memory_order_acquire)) &&
+          !run_ready_callbacks()) {
+        break;
       }
     }
     if (completion_count != 0) {

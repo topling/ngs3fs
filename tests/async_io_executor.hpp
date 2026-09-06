@@ -100,7 +100,8 @@ class TestAsyncIoExecutor final : public IoExecutor {
       queue_.push_back(pending);
       return true;
     }
-    if (pending.exact && pending.transferred < pending.length) {
+    if ((pending.exact || (pending.flags & MSG_WAITALL) != 0) &&
+        pending.transferred < pending.length) {
       queue_.push_back(pending);
       return true;
     }
@@ -152,7 +153,8 @@ class TestAsyncIoExecutor final : public IoExecutor {
 
   ssize_t execute(Pending& pending) noexcept {
     ++syscall_count_;
-    const size_t progress = pending.exact ? pending.transferred : 0;
+    const size_t progress = pending.exact || (pending.flags & MSG_WAITALL) != 0
+        ? pending.transferred : 0;
     const size_t remaining = pending.length - progress;
     const size_t length = std::min(remaining, fragment_size_);
     char* const data = static_cast<char*>(pending.data);

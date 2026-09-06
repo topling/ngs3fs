@@ -1,9 +1,296 @@
 # io_uring reactor execution contract
 
-Status: approved for classic-fusefd A+Patch execution. Caller-owned reactors
-use libfuse for protocol semantics while preserving fd-backed splice replies;
-FUSE-over-io-uring remains excluded until its payload UAPI avoids the extra
-copy.
+Status: the uncached receive-pool revision and cross-GET coverage joining are
+implemented. Final local CTest passes 86/86; runner performance validation
+remains pending. This is not a claim that latency improves at every core
+count. Caller-owned reactors
+use libfuse for classic-fusefd protocol semantics. FUSE-over-io-uring remains
+outside this revision.
+
+## Current contract: reusable uncached receive blocks (2026-09-06)
+
+This contract replaces the uncached memfd, anonymous donation, proactive
+`NOTIFY_STORE`, pipe, `splice`, and `vmsplice` designs recorded below. The new
+uncached path receives into reusable user-space blocks and replies through
+`fuse_reply_buf` or `fuse_reply_iov`. FUSE retains its ordinary buffered page
+cache. A reply may copy into that cache; the design makes no page-donation or
+zero-copy guarantee. Cached reads, upload pipes, upload checksums and write-side
+page-cache publication are outside this replacement.
+
+### Permanent mapping and block-lifetime rules
+
+- A receive block is exactly 2 MiB of anonymous mapped capacity. Allocate it
+  with `MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE` when the bounded pool grows,
+  and return it to a freelist for reuse. Neither `mmap` nor `munmap` belongs to
+  normal per-read allocation/recycling. Populate intentionally moves page
+  allocation and writable-page faults to pool growth.
+- Do not request `MAP_HUGETLB`. Do not add `MADV_NOHUGEPAGE`: an extra advice
+  syscall is not part of this design. A 2 MiB allocation unit is a pool size,
+  not a promise of huge-page backing or object-offset alignment.
+- Short replies reference slices of one block; long FUSE reads use
+  `fuse_reply_iov` across as many blocks as needed without coalescing payloads
+  into another buffer. Reply only after the entire requested interval is
+  available, except for a genuine EOF. Buffer lifetime ends at actual reply
+  transport completion, not merely admission to a deferred reply queue.
+- A block is reusable only after its receive operation, every reply source
+  reference, and other consumers have retired. Cancellation completion alone
+  does not retire the original receive's ownership. Received bytes and valid
+  coverage are separate from allocated capacity; unwritten bytes are never
+  exposed to FUSE.
+- Keep useful completed and in-progress prefetch coverage selectable. A
+  partially consumed block remains until its remaining coverage is served or
+  evicted. Only fully retired blocks enter the freelist; an overlapping READ
+  must attach to valid/in-progress coverage rather than duplicate the GET.
+
+### Fetch sizing and access-pattern policy
+
+- The upload part size defaults to 8 MiB and is independent of both the 2 MiB
+  allocation unit and HTTP Range GET sizing. An 8 MiB receive range requires
+  four blocks; an upload part boundary imposes no uncached read alignment.
+- Sequential GET lengths start at 8 MiB and double on continued sequential
+  access to the configured maximum, normally 128 MiB. Preserve the existing
+  `UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE` override; do not introduce a second
+  competing maximum. Clip requests at EOF and respect configured budgets.
+- A random GET starts at the requested object offset and normally covers
+  2 MiB forward, or enough to satisfy a longer FUSE request. Do not round its
+  start down to a 2 MiB or 8 MiB boundary. Pool blocks do not impose alignment
+  on Range GETs.
+- Prefetch normally extends only forward. A random forward range that reaches
+  EOF may extend its start backward by
+  `min(tail_read_ahead, offset, max(0, 2 MiB - forward_length))`.
+  `--tail-read-ahead` defaults to 64 KiB; zero disables backward extension.
+  Backward extension never raises a shorter random range above 2 MiB; a
+  longer demanded interval is not clipped to that size and receives no extra
+  backward coverage. This is coverage before the requested offset, not an
+  instruction merely to extend the request end to EOF. No Range extends
+  beyond the object size.
+- Adjacency and hits in already completed or in-progress coverage preserve
+  sequential state. Classify a request as random only when it is nonadjacent
+  and outside both forms of coverage. Interleaved independent readers must
+  not erase useful data or invalidate each other's active transfers.
+- A fetch window is a logical range, not an up-front allocation of its whole
+  maximum. Acquire receive blocks as transfer progress needs them; a 128 MiB
+  window must not eagerly reserve 64 populated blocks.
+
+### Reactor receives and demand latency
+
+All socket I/O on the new uncached reactor path uses io_uring. HTTP parsing
+stays on the owning reactor. There are no network continuation worker threads
+and no checksum worker for this path in the first implementation.
+
+While a FUSE request awaits bytes, submit ordinary asynchronous receives sized
+for its still-needed interval and handle short completions. As soon as that
+whole request is ready, reply without waiting for the rest of the prefetch.
+Continue receiving the speculative remainder on the same reactor, preferably
+with native io_uring `RECV` plus `MSG_WAITALL` to reduce short-receive completion
+traffic. Use ordinary asynchronous short receives if that operation is not
+supported. Never implement this policy as a blocking userspace `recv` or as a
+network worker handoff.
+
+Each speculative WAITALL covers at most the remaining space in one 2 MiB
+block. A new READ arriving during that receive waits for the existing
+completion; do not cancel WAITALL to expose its partial bytes. This explicitly
+accepted tradeoff avoids cancellation/reissue work on the intended
+high-bandwidth S3 network. At completion, satisfy waiting FUSE requests before
+continuing speculative receive. Do not infer valid byte counts by inspecting
+a buffer while an outstanding receive owns it. Short-return, error, timeout
+and original I/O cancellation retirement remain necessary even when WAITALL
+is supported; only demand-triggered cancellation is excluded.
+
+HTTP/1 framing and HTTP/2 DATA-frame boundaries, padding, and flow control
+remain authoritative. WAITALL may cover only an already identified payload
+span. It must not consume a following response or frame header as file data,
+and it must not block FUSE dispatch or other streams while waiting. Bound
+receive-completion processing so many ready network CQEs cannot starve FUSE
+requests on the same ring.
+
+### Out-of-order requests and shared coverage
+
+FUSE requests may arrive in any offset order, and different GETs may complete
+in any order. Only the received byte prefix **within one GET** is monotonic.
+Keep that GET's waiting reads with their required relative end offsets; wake
+each satisfied request independently. Never block CQ harvesting on an
+unsatisfied read, or use a single file-wide received offset to decide readiness.
+The current small intrusive waiter list does not assume insertion order.
+Replacing it with an end-offset min-heap requires evidence that scanning is a
+hotspot; an interval tree is not required for this readiness predicate.
+
+Coverage selection is separate from waiter notification. A FUSE read crossing
+GET boundaries holds ordered, pinned slices of those GETs, including their
+already received bytes and in-progress suffixes. Retired blocks are holes,
+not valid coverage merely because the enclosing GET once received them. Issue
+new GETs only for uncovered intervals and stop speculative extension at
+existing coverage. One read can wait on one unsatisfied slice at a time while
+all transfers continue independently; reply once, in file-offset order, when
+every slice is ready. Joining slices must not require a second payload buffer.
+
+Select and reserve the complete demand before starting newly created GETs.
+If admission fails, release this attempt's pins and unstarted reservations
+before asynchronously awaiting capacity. In particular, a 2 MiB mount budget
+must not deadlock on a request that itself pins the only reclaimable block.
+Normal eviction may remove old unpinned coverage before a subsequent attempt.
+
+### Memory admission and read integrity
+
+- Preserve a mount budget defaulting to 10% of physical RAM and a shared
+  per-file default of `min(file_size, 2 * maximum_prefetch_window)`. Existing
+  explicit limits remain caps. Explicit uncached uring/auto limits accept zero
+  for automatic sizing or a multiple of 2 MiB. Automatic per-file capacity is
+  rounded up to the physical block quantum, including tiny files. Account
+  consistently for those blocks; tiny files do not justify an uncharged full
+  block or an unfinishable admission wait. Legacy/cached limits retain their
+  page-aligned, at-least-256-KiB validation.
+- The mount pool cap counts all live mappings, including idle freelist
+  entries. Charge active, ready and reply-in-flight blocks; never report just
+  downloaded payload bytes as total mapped memory. Idle reusable mappings
+  remain bounded, and reassignment must not leave duplicate per-file charges.
+- Admit before allocation. Under pressure, evict unpinned speculative
+  coverage and reuse idle blocks, preserving demanded and outstanding-I/O
+  ownership. Await capacity asynchronously when demand cannot fit. A logical
+  large GET must not deadlock while holding blocks needed to service demand.
+  Rate-limit budget warnings to stderr using `fprintf`.
+- First implementation of this new uncached path skips read checksum
+  verification. Do not align a GET downward to an 8 MiB checksum unit, delay a
+  reply for a checksum, or silently claim read verification is active. Cached
+  read verification and upload checksum behavior remain unchanged. Retain
+  Range/status/length checks, object-generation pinning and transport errors.
+
+### Required evidence before completion
+
+Cover early initial FUSE reply with a paused speculative tail; a new demand
+waiting safely for its existing WAITALL completion; overlapping and
+cross-block/iovec reads; short/error/cancel paths;
+sequential doubling, random coverage and backward footer bounds; memory reuse,
+small-file rounding and pressure without starvation; and close/unmount while
+receives or replies still own blocks. Source and runtime checks must show no
+uncached STORE, splice, memfd, network worker handoff, or per-read mapping
+churn. Run appropriate full integration checks and kernel-inclusive A/B CPU
+and latency profiles before claiming improvement over legacy or competitors.
+
+### Receive-pool execution evidence (2026-09-06)
+
+- Focused real-FUSE tests passed 5/5 in 24.48 seconds: one-reactor pool
+  (1.01 s), two-reactor pool (1.08 s), configured 16 MiB window cap (1.03 s),
+  2 MiB mount/file budget with eight concurrent readers (20.89 s), and shutdown
+  during an active receive (0.46 s). The pool cases cover an initial 128 KiB
+  reply before a paused tail, new demand during the existing receive,
+  cross-handle sharing, an unaligned-to-2-MiB random range, cross-block data,
+  8/16/32 MiB growth (8/16/16 when capped), footer backward extension, and
+  `mincore` evidence that unrelated pages are not proactively STOREd.
+- These FUSE fixtures use an HTTP/2 peer. Their pending-demand gate allows
+  waiting for the existing receive, as approved; it does not claim an H1
+  WAITALL completion can expose partially filled memory or require cancellation.
+- The broader 29-case regression selection initially passed 28/29. Its one
+  failure was a test-registration mismatch: the legacy 1 MiB window assertions
+  launched `--io-engine auto`, which selected the new uring policy. Registering
+  that case explicitly as legacy preserved its original assertions; its
+  focused rerun passed in 1.26 s. Do not label auto-engine coverage as legacy.
+- Tail option parsing (64 KiB, zero, malformed and negative values) and both
+  explicit uring budget options (accept 2 MiB, reject 1 MiB and 3 MiB) passed
+  all ten new CLI tests. Together with the registration-fix rerun, 11/11 passed
+  in 1.30 s. These parser tests supplement, rather than replace, the mounted
+  concurrent budget test.
+- No CPU or latency improvement over legacy or competitors is claimed from
+  these correctness runs. Comparable benchmarks and kernel-inclusive profiles
+  are still required.
+
+### Final local review and runner handoff (2026-09-06)
+
+- Final CTest: 86/86 passed in 88.89 seconds. Added coverage crosses two GETs
+  without a duplicate download, completes those GETs out of order, refetches
+  only a retired hole, and crosses a window boundary under a 2 MiB mount cap.
+  The last case verifies rollback, active reclamation and eventual progress,
+  not merely releasing a pin and hoping another request reclaims it.
+- A close racing the final completed receive no longer discards a fully
+  drained reusable HTTP connection. Partial-body and explicit cancellation
+  continue to close it. H1/H2 regressions cover the distinction.
+- Explicit `--verify-read-checksum` produces a startup warning when the
+  uncached uring path actually starts. TLS/auto fallback to legacy and local
+  cache do not produce that warning.
+- Final 4000 Hz profile, binary SHA-256
+  `76488cede53f624258fdf88e4bd4bc3ceb0269ced55ed5f5ad57211fb524eaf2`:
+  4096 mixed pread/mmap operations, 16 files, eight application threads, one
+  reactor, no local cache. `tcp_recvmsg` accounts for 44.25% inclusive CPU,
+  `fuse_dev_do_write` 27.90%, llhttp 1.14%, and range selection 0.61%.
+  There are only 34 measured page faults; the populated pool removes repeated
+  mapping/fault work from the normal receive path. These inclusive percentages
+  describe call stacks and must not be summed indiscriminately.
+- A separate pre-cross-GET, unsampled two-round local A/B found substantial
+  daemon CPU savings. With only one CPU allowed to the daemon, uring's median
+  wall time was 2.665 s versus legacy's 4.989 s and goofys's 6.534 s. With CPU
+  affinity unrestricted, one reactor used 2.750 CPU s versus legacy's 6.215
+  CPU s, but its wall time was 2.892 s versus 2.119 s. Do not describe that
+  multicore latency regression as resolved, or attribute these measurements
+  to the later coverage fix. The benchmark opens/closes a file per operation;
+  it is not a persistent-open sequential throughput test.
+- Reserving one HTTP connection for metadata via `try_acquire_bulk()` did not
+  yield reproducible gains and was withdrawn. Ordinary `try_acquire()` remains.
+- Runner engine A/B uses 512 operations per application worker and five
+  repetitions. Its 4000 Hz profiles use basic counters, avoiding syscall
+  tracepoint inheritance overhead in the legacy thread-heavy path. Other
+  dedicated profiles retain syscall evidence. Uncached competitor comparisons
+  explicitly use uring/one reactor; cached comparisons keep legacy. Reports
+  identify these settings. Headline timings come from unsampled runs; only
+  analysis-ready logs, CSV, folded stacks and interactive graphs are uploaded,
+  never raw `perf.data` or `perf.script`.
+
+## Historical design and evidence: superseded uncached staging
+
+The remaining dated sections preserve earlier implementation decisions and
+measurements. Their uncached donation, STORE, memfd, checksum and staging
+directions are superseded by the current contract above, including text once
+labelled permanent or approved. Evidence below describes those earlier builds,
+not verification of the receive-pool revision. Nonconflicting filesystem and
+classic-fusefd ownership constraints still apply.
+
+### Historical mapping rule: populated anonymous donation chunks (2026-09-06)
+
+The uncached direct-receive design uses short-lived, page-aligned anonymous
+chunks as its staging source. Create every donation-eligible chunk with
+`MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE`; populate is intentional. It
+pre-pays writable PTE establishment and page allocation before socket body
+delivery, rather than making `recv` take a minor fault for every 4 KiB page.
+
+The normal chunk sizes are below 2 MiB. Do not use `MAP_HUGETLB`: the current
+FUSE move path rejects large folios, so an explicit huge mapping defeats page
+donation. Also do not add `MADV_NOHUGEPAGE` merely to defend against a
+theoretical transparent- or multi-size-THP fallback. That extra hot-path
+system call is not justified for the intended sub-2-MiB chunks. A future
+change to either rule requires an explicit user-approved spec revision backed
+by measurement showing an actual large-folio fallback and a net benefit.
+
+Before an eligible full-page chunk is handed to FUSE, advance its checksum in
+network byte order, `vmsplice` it to a private pipe with `SPLICE_F_GIFT`, and
+then `munmap` that exact range. The pipe owns the page after `vmsplice`; only
+after the unmap may libfuse consume the pipe as an FD-backed reply or
+`NOTIFY_STORE` source. This ordering gives the FUSE move path an unmapped,
+stealable page. A partial first/last page, a partial pipe buffer, or any
+failure of the kernel move attempt is correct but falls back to copying.
+
+### Historical donation-cost measurements (2026-09-06)
+
+`MAP_POPULATE` is not a free substitute for a copy. The supplied WSL
+microbenchmark, after warmup, measured `mmap + memcpy + munmap` P50s of
+84.3/129.9/248.3/496.0 us for 128/256/512/1024 KiB, versus
+`splice` P50s of 11.5/24.5/47.1/96.4 us. Those measurements are not a claim
+about every production kernel, but they are a permanent design constraint:
+do not introduce an anonymous mapping merely to handle a partial, unaligned,
+or otherwise copy-fallback reply. A mapping belongs to a pre-admitted
+prefetch window and is donated only as a full eligible chunk. It must be
+evaluated against the old memfd/shmem route with the same end-to-end workload,
+CPU profile, and latency distribution; a microbenchmark alone never justifies
+keeping a regression.
+
+Proactive `NOTIFY_STORE` for anonymous chunks is deliberately conservative.
+It requires a verified checksum when verification is configured, a complete
+download window, a complete page-aligned donation chunk, no overlapping
+admitted FUSE READ, and either
+the mount-wide or the file-local transient-memory use above one half of its
+configured limit. Below that pressure, completed chunks remain available to
+the reader's normal overlap/readahead selection and are released by its normal
+window eviction rather than being eagerly pushed into page cache. The final
+non-page tail remains a copy fallback or ordinary later cache miss; do not add
+a special anonymous mapping solely to publish it.
 
 ## Approved revision: explicit continuations, no fibers (2026-09-05)
 
@@ -17,35 +304,35 @@ Execution clarification (budget integration): explicit per-file limits are caps,
 not clamped to object length; the automatic default alone uses min(file size,
 two windows). Speculative windows shrink under pressure.
 
-**Latest user correction:** when read verification is enabled, proactively
+**Historical user correction:** when read verification is enabled, proactively
 STORE only a checksum unit that has passed verification. Do not STORE an
 unverified unit early. Normal READ replies may still complete early as already
-approved. An unpublished checksum unit can reuse its memfd for the one retry
+approved. An unpublished checksum unit can reuse its staging for the one retry
 after active source replies drain; pending READs wait on retry state. This
 supersedes the previous dual-generation staging/reservation design and the
 previous instruction that checksum work must not delay proactive STORE.
-Invalidation of already returned READ pages remains asynchronous, and retry
-does not wait for that invalidation. Publication after retry waits for both
-successful verification and invalidation. A partial range without a verifiable
+When a checksum mismatch is found, first pause publication and drain active
+source replies, then invalidate the affected page-cache range, and only then
+start the retry. Publication after retry waits for both successful verification
+and completion of that invalidation. A partial range without a verifiable
 checksum unit is not proactively STOREd; do not misrepresent the existing
 uncached full-object check as multipart-manifest verification.
 
-Published prefixes can be punched while the download continues. Admission
-pins conservatively protect a whole source window; any active READ delays a
-prefix punch. Checksum source ownership also delays punching. STORE completion
-advances the reclaimable prefix; a source-generation swap resets that prefix.
-Legacy publication runs on a separate bounded worker queue, never on the
-download/checksum workers. Tests must distinguish a server-send barrier from
-client checksum/publication completion. These are implementation tactics within
-the approved memory/early-reply requirements; review: approved with focused
-low-budget, retry, prefix-retirement, and shutdown gates still required.
+Anonymous donation chunks are not published incrementally while a window is
+still downloading. Once a complete, page-aligned chunk is eligible, publication
+is admitted only when mount-wide or per-file transient use exceeds one half of
+its configured limit, and only after checksum verification when configured.
+Overlapping READs delay publication. Legacy publication may retain its separate
+bounded worker queue, but it must not weaken these anonymous-path gates. Tests
+must distinguish a server-send barrier from client checksum/publication
+completion.
 
 This follow-up supersedes the retained-memfd prefetch cache and the earlier
 "no new mount options" restriction only for the two limits below. memfd is
 download/transfer staging, not a second completed-data cache. Already requested
-bytes still reply as soon as available. Without read verification, progressively
-publish complete prefetched pages during download. With verification, publish
-only completed, verified checksum units. Retire each published
+ bytes still reply as soon as available. With populated anonymous donation
+chunks, publication is pressure-triggered as specified above; with verification,
+publish only completed, verified checksum units. Retire each published
 staging interval only once dependent reads, checksum work, and actual
 notification I/O have finished.
 "Publish" is a logical handoff, not a guarantee of physical page stealing.
@@ -76,11 +363,11 @@ memfd cache; the remote object remains the source for a later cache miss.
 - Publish outside the reactor's blocking path, preserving stable inode/handle
   identity. Pending READ replies must be able to run while STORE waits on their
   locked pages. Never wait for STORE while withholding such a READ reply.
-- Batch currently available whole pages, targeting 256 KiB per STORE without
-  waiting for further network input to reach that target. Keep at most one
-  STORE in flight per download; its completion advances the next batch from
-  the then-current receive progress. EOF may publish the exact final partial
-  page, never bytes beyond the object's published size.
+- For anonymous storage, do not batch or progressively STORE merely because
+  pages are available. At pressure, publish only complete page-aligned chunks
+  from a fully received window, with no overlapping admitted READ; otherwise
+  leave chunks available to normal overlap/readahead selection. The final
+  non-page tail remains a copy fallback or later cache miss.
 - Overlapping in-flight READs pin their source interval atomically with range
   selection. Keep STORE-pending intervals selectable by READ, including READs
   from other handles of the same inode/generation. Never make READ completion
@@ -88,9 +375,9 @@ memfd cache; the remote object remains the source for a later cache miss.
   existing READ and checksum pins delay physical reclamation. A post-retirement
   kernel cache miss may fetch again, but cannot read a sparse zero-filled hole.
 - Already delivered READ data and STORE data must belong to the same immutable
-  generation. A checksum retry invalidates earlier READ data, drains only active
-  READ source replies, and reuses its unpublished staging. Retry must not wait
-  for invalidation: it can be needed to complete the READ blocking invalidation.
+  generation. A checksum retry pauses publication, drains active READ source
+  replies, invalidates earlier READ data, and reuses its unpublished staging.
+  The retry GET starts only after that invalidation has completed.
   Verified retry data can satisfy waiting READs; STORE waits for both retry
   verification and invalidation. Successful READs are not retroactively failed.
   Checksum work delays proactive STORE and reclamation, not an available READ.
@@ -102,10 +389,11 @@ memfd cache; the remote object remains the source for a later cache miss.
   occupy every worker needed by READ/checksum prerequisites. Generation changes
   close old-generation publication admission, asynchronously drain its STOREs,
   then invalidate, rather than checking an epoch only before a blocking STORE.
-- Keep memfd plus splice. The mmap/vmsplice comparison and mapped-RECV experiment
-  are deferred at the user's request. Implement and test budget accounting as
-  an isolated first gate before integrating memory admission and publication;
-  do not advertise mount options as effective before that integration passes.
+- The prior “keep memfd plus splice; defer mmap/vmsplice” direction is
+  superseded by the populated-anonymous donation-chunk rule above. Retain the
+  same admission, checksum, generation, and publication gates while replacing
+  memfd staging; do not advertise the new path or its memory limits as
+  effective before those gates pass.
 
 | Finding / decision | Contract change | Re-review |
 |---|---|---|
@@ -133,7 +421,7 @@ preceding invalidation. These are
 correctness gates, not benchmark-only scenarios. Review decision: executable
 with these gates; re-review implementation ordering before enabling publication.
 
-#### Current follow-up execution evidence
+#### Historical follow-up execution evidence
 
 - Cross-client namespace visibility is **best effort**, not a strong guarantee.
   Tests that directly mutate the server backing directory must not require a
@@ -268,6 +556,12 @@ with these gates; re-review implementation ordering before enabling publication.
   74/74 (81.32 s). The two removed tests asserted the withdrawn connection-busy
   downgrade policy, not filesystem correctness. All earlier correctness fixes
   and the demand-budget capacity regression remain in place.
+- Follow-up pressure experiment: only an already speculative new window may
+  shrink, using a relaxed pool-busy hint, to max(demand, preferred I/O size).
+  Do not expand the pending-disjoint demand-only branch. This keeps a useful
+  batch under connection pressure instead of degenerating into page-sized
+  GETs. No lease reservation, second notification queue, or extra mount knob;
+  ordinary request scheduling and budget fallback remain unchanged.
 
 - Mount and per-file budget admission now cover every production prefetch
   allocation. Limits are exposed and validated; explicit per-file limits are

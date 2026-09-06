@@ -25,6 +25,16 @@ def milliseconds(nanoseconds):
     return f"{nanoseconds / 1_000_000:.3f}"
 
 
+def io_label(row):
+    engine = row["ngs3fs_io_engine"]
+    if engine == "legacy":
+        return "legacy (threaded)"
+    if engine == "uring":
+        count = row["ngs3fs_reactors"]
+        return f"uring ({count} reactor{'s' if count != '1' else ''})"
+    return f"{engine} (requested reactors: {row['ngs3fs_reactors']})"
+
+
 def read_comparisons(input_dirs, data_dir):
     comparisons = []
     for input_dir in sorted(set(input_dirs)):
@@ -33,6 +43,13 @@ def read_comparisons(input_dirs, data_dir):
             continue
         with summary.open(newline="", encoding="utf-8") as source:
             rows = list(csv.DictReader(source))
+        system = input_dir / "system.txt"
+        settings = {}
+        if system.is_file():
+            for line in system.read_text(encoding="utf-8").splitlines():
+                name, separator, value = line.partition("=")
+                if separator and name in ("ngs3fs_io_engine", "ngs3fs_reactors"):
+                    settings[name] = value
         by_advice = {}
         for row in rows:
             by_advice.setdefault(row["advice"], {})[row["client"]] = row
@@ -53,6 +70,8 @@ def read_comparisons(input_dirs, data_dir):
                 "suite": input_dir.name,
                 "advice": advice,
                 "ngs3fs_cache": ngs3fs["cache_mode"],
+                "ngs3fs_io_engine": settings.get("ngs3fs_io_engine", "not recorded"),
+                "ngs3fs_reactors": settings.get("ngs3fs_reactors", "not recorded"),
                 "reference": reference["client"],
                 "reference_cache": reference["cache_mode"],
                 "samples": number(ngs3fs, "samples"),
@@ -68,7 +87,6 @@ def read_comparisons(input_dirs, data_dir):
                 "ngs3fs_get_over_reference": ratio(ng_get, ref_get),
             })
         shutil.copyfile(summary, data_dir / f"{input_dir.name}-summary.csv")
-        system = input_dir / "system.txt"
         if system.is_file():
             shutil.copyfile(system, data_dir / f"{input_dir.name}-system.txt")
     comparisons.sort(key=lambda row: (
@@ -102,13 +120,15 @@ def write_markdown(path, comparisons, generated, source_run):
         "CPU is aggregate daemon CPU time divided by completed read operations.",
         "The S3 endpoint is loopback VersityGW, so network first-byte latency is negligible.",
         "",
-        "| Advice | Cache (ngs3fs / reference) | Reference | CPU/op (ngs3fs / reference) | Reference / ngs3fs | CPU saved | S3 GET (ngs3fs / reference) |",
-        "|---|---|---|---:|---:|---:|---:|",
+        "The ngs3fs I/O column comes from each suite's recorded settings; legacy uses its threaded loop, independently of reactor count.",
+        "",
+        "| Advice | Cache (ngs3fs / reference) | ngs3fs I/O | Reference | CPU/op (ngs3fs / reference) | Reference / ngs3fs | CPU saved | S3 GET (ngs3fs / reference) |",
+        "|---|---|---|---|---:|---:|---:|---:|",
     ]
     for row in comparisons:
         lines.append(
             f"| {row['advice']} | {row['ngs3fs_cache']} / "
-            f"{row['reference_cache']} | {row['reference']} | "
+            f"{row['reference_cache']} | {io_label(row)} | {row['reference']} | "
             f"{milliseconds(row['ngs3fs_cpu_per_operation_ns'])} / "
             f"{milliseconds(row['reference_cpu_per_operation_ns'])} ms | "
             f"{row['reference_cpu_over_ngs3fs']:.2f}x | "
@@ -131,6 +151,7 @@ def write_html(path, comparisons, generated, source_run):
           <tr>
             <td>{html.escape(row['advice'])}</td>
             <td><span class="mode">{html.escape(row['ngs3fs_cache'])}</span> / <span class="mode">{html.escape(row['reference_cache'])}</span></td>
+            <td>{html.escape(io_label(row))}</td>
             <td>{html.escape(row['reference'])}</td>
             <td class="number">{milliseconds(row['ngs3fs_cpu_per_operation_ns'])}</td>
             <td class="number">{milliseconds(row['reference_cpu_per_operation_ns'])}</td>
@@ -174,6 +195,7 @@ def write_html(path, comparisons, generated, source_run):
     <table>
       <thead><tr>
         <th>Advice</th><th>Cache<br>ngs3fs / reference</th>
+        <th>ngs3fs I/O</th>
         <th>Reference</th>
         <th class="number">ngs3fs<br>CPU/op (ms)</th>
         <th class="number">Reference<br>CPU/op (ms)</th>
@@ -193,6 +215,9 @@ def write_html(path, comparisons, generated, source_run):
     <p><strong>cold</strong> and <strong>warm</strong> mean disk data caching is enabled
     independently for both ngs3fs and Mountpoint. The cache column makes asymmetric
     comparisons explicit. Each Evidence link opens its raw summary CSV.</p>
+    <p>The ngs3fs I/O column comes from each suite's recorded engine and reactor
+    settings. Legacy uses its threaded loop, independently of reactor count;
+    missing historical settings are not inferred from current defaults.</p>
     <p><a href="random-read-cpu-comparison.csv">Combined CSV</a> ·
     <a href="random-read-cpu-comparison.md">Markdown report</a></p>
   </div>

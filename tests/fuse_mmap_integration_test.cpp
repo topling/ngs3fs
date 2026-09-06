@@ -185,6 +185,8 @@ struct SpecialObject {
   size_t pause_after = 0;
   std::atomic<bool> tail_paused{false};
   std::atomic<bool> resume_tail{false};
+  std::atomic<size_t> send_limit{SIZE_MAX};
+  size_t limited_range_end = SIZE_MAX;
   std::vector<RequestRange> get_ranges;
   std::vector<std::string> get_paths;
 };
@@ -433,6 +435,16 @@ ssize_t read_body(nghttp2_session*, int32_t, uint8_t* buffer,
       std::min(length, response.end - response.cursor);
   if (response.keepalive && response.cursor < response.keepalive->pause_after) {
     count = std::min(count, response.keepalive->pause_after - response.cursor);
+  }
+  if (response.keepalive && response.end <= response.keepalive->limited_range_end) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    size_t limit = response.keepalive->send_limit.load(std::memory_order_acquire);
+    while (response.cursor >= limit && std::chrono::steady_clock::now() < deadline) {
+      response.keepalive->tail_paused.store(true, std::memory_order_release);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      limit = response.keepalive->send_limit.load(std::memory_order_acquire);
+    }
+    if (response.cursor < limit) count = std::min(count, limit - response.cursor);
   }
   if (count != 0) {
     memcpy(buffer, response.object->data() + response.cursor, count);
@@ -1630,7 +1642,10 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
                    std::string_view engine = "auto",
                    std::string_view reactors = "1",
                    bool verify_reads = true, bool whole_retry = false,
-                   bool low_budget = false) {
+                   bool low_budget = false, const char* max_window = nullptr) {
+  // The receive-pool implementation deliberately omits uncached checksum
+  // verification. Cached and legacy tests still request it explicitly.
+  if (engine == "uring" && cache_dir.empty()) verify_reads = false;
   const std::string port_text = std::to_string(port);
   const std::string uid_text  = std::to_string(::getuid());
   const std::string gid_text  = std::to_string(::getgid());
@@ -1642,33 +1657,35 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
     ::setenv("AWS_ACCESS_KEY_ID", "integration-access-key", 1);
     ::setenv("AWS_SECRET_ACCESS_KEY", "integration-secret-key", 1);
     ::unsetenv("AWS_SESSION_TOKEN");
-    if (!verify_reads) {
+    if (max_window) {
+      ::setenv("UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE", max_window, 1);
+    } else {
       ::unsetenv("UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE");
+    }
+    if (!verify_reads) {
       ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
               port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
               uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
               "0750", "-I", "1", "--checksum", checksum.data(),
               "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "--io-engine", engine.data(),
-              "--max-prefetch-memory", low_budget ? "256KiB" : "0",
-              "--max-file-prefetch-memory", low_budget ? "256KiB" : "0",
+              "--max-prefetch-memory", low_budget ? "2MiB" : "0",
+              "--max-file-prefetch-memory", low_budget ? "2MiB" : "0",
               "--reactors", reactors.data(), "-f", mountpoint.data(),
               static_cast<char*>(nullptr));
     } else if (cache_dir.empty()) {
-      ::unsetenv("UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE");
       ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
               port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
               uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
               "0750", "-I", "1",
               "--checksum", checksum.data(), "--verify-read-checksum",
-              "--max-file-prefetch-memory", low_budget ? "256KiB" : (whole_retry ? "8MiB" : "0"),
-              "--max-prefetch-memory", low_budget ? "256KiB" : "0",
+              "--max-file-prefetch-memory", low_budget ? "2MiB" : (whole_retry ? "8MiB" : "0"),
+              "--max-prefetch-memory", low_budget ? "2MiB" : "0",
               "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "--io-engine", engine.data(),
               "--reactors", reactors.data(), "-f", mountpoint.data(),
               static_cast<char*>(nullptr));
     } else {
-      ::unsetenv("UNSTABLE_NGS3FS_MAX_PREFETCH_WINDOW_SIZE");
       ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
               port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
               uid_text.c_str(), "-g", gid_text.c_str(), "-m", "0640", "-D",
@@ -1771,11 +1788,18 @@ int main(int argc, char** argv) {
     const bool verified_clean = argc >= 4 && std::string_view(argv[3]) == "prefetch-verified-clean";
     const bool shutdown_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-shutdown";
     const bool partial_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-unverifiable";
+    const bool pressure_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-pressure";
+    const bool pool_limited = argc >= 4 && std::string_view(argv[3]) == "prefetch-pool-limited";
+    const bool pool_prefetch = engine == "uring" && argc >= 4 &&
+        (pool_limited || std::string_view(argv[3]) == "prefetch-pool" ||
+         std::string_view(argv[3]) == "prefetch" || shutdown_prefetch);
     const bool verified_prefetch = verified_clean || (argc >= 4 &&
         std::string_view(argv[3]) == "prefetch-verified");
     const bool budget_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-budget";
-    const bool prefetch_mode = verified_prefetch || budget_prefetch || shutdown_prefetch || partial_prefetch || (argc >= 4 &&
+    const bool prefetch_mode = verified_prefetch || budget_prefetch || shutdown_prefetch || partial_prefetch || pressure_prefetch || pool_prefetch || (argc >= 4 &&
         std::string_view(argv[3]) == "prefetch");
+    require(engine != "uring" || !(verified_prefetch || partial_prefetch || pressure_prefetch),
+            "uring checksum/STORE/connection-pressure experiments were replaced by prefetch-pool and prefetch-budget");
     std::vector<std::byte> expected(512U * 1024U + 37U);
     for (size_t i = 0; i < expected.size(); ++i) {
       expected[i] = static_cast<std::byte>((i * 29U + 7U) & 0xffU);
@@ -1828,11 +1852,33 @@ int main(int argc, char** argv) {
                          "\"read-ahead-random\"");
     add_overwrite_object("read-ahead-store.bin", read_ahead,
                          "\"read-ahead-store\"");
+    if (pool_prefetch) {
+      add_overwrite_object("pool-random.bin", std::vector<std::byte>(8U * 1024U * 1024U + 37),
+                           "\"pool-random\"");
+      add_overwrite_object("pool-sequential.bin", std::vector<std::byte>(64U * 1024U * 1024U + 37),
+                           "\"pool-sequential\"");
+      add_overwrite_object("pool-footer.bin", read_ahead, "\"pool-footer\"");
+      add_overwrite_object("pool-order.bin", read_ahead, "\"pool-order\"");
+      shared.special_objects.at("pool-order.bin")->limited_range_end = 2U * 1024U * 1024U + 4096;
+      for (const char* name : {"pool-random.bin", "pool-sequential.bin", "pool-order.bin"}) {
+        auto& bytes = shared.special_objects.at(name)->bytes;
+        for (size_t i = 0; i != bytes.size(); ++i) {
+          bytes[i] = std::byte((i * 53 + (i >> 17) * 11 + 31) & 0xff);
+        }
+      }
+    }
+    if (pressure_prefetch) {
+      for (unsigned i = 0; i != 8; ++i) {
+        const std::string name = "pressure-" + std::to_string(i) + ".bin";
+        add_overwrite_object(name, read_ahead, '"' + name + '"');
+        shared.special_objects.at(name)->pause_after = 512U * 1024U;
+      }
+    }
     if (verified_prefetch) {
       auto& object = *shared.special_objects.at("read-ahead-store.bin");
-      object.bytes.resize(768U * 1024U + 37U);
+      object.bytes.resize(engine == "legacy" ? 32U * 1024U + 37U : 768U * 1024U + 37U);
       object.corrupted_bytes = object.bytes;
-      object.corrupted_bytes[384U * 1024U + 17U] ^= std::byte{0x80};
+      object.corrupted_bytes[engine == "legacy" ? 12345 : 384U * 1024U + 17U] ^= std::byte{0x80};
       object.corrupt_gets_remaining = verified_clean ? 0 : 1;
     }
     std::vector<std::byte> checksum_test(256U * 1024U + 37U);
@@ -1888,10 +1934,74 @@ int main(int argc, char** argv) {
     const pid_t process = start_daemon(
         argv[1], mountpoint, listener.port, checksum_option, cache_dir,
         engine, reactors, !prefetch_mode || verified_prefetch || budget_prefetch || partial_prefetch,
-        verified_prefetch, budget_prefetch);
+        verified_prefetch, budget_prefetch, pool_limited ? "16777216" : nullptr);
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
+
+    if (pressure_prefetch) {
+      std::array<UniqueFd, 8> files;
+      std::array<std::shared_ptr<SpecialObject>, 8> objects;
+      struct ResumePressure {
+        decltype(objects)& values;
+        ~ResumePressure() {
+          for (const auto& value : values) {
+            if (value) value->resume_tail.store(true, std::memory_order_release);
+          }
+        }
+      } resume{objects};
+      // Open every handle before filling the seven bulk slots, and suppress
+      // the kernel's independent readahead so each demand is deterministic.
+      for (unsigned i = 0; i != files.size(); ++i) {
+        const std::string name = "pressure-" + std::to_string(i) + ".bin";
+        {
+          std::lock_guard guard(shared.mutex);
+          objects[i] = shared.special_objects.at(name);
+        }
+        files[i].reset(::open((mountpoint + '/' + name).c_str(), O_RDONLY | O_CLOEXEC));
+        if (!files[i]) fail_errno("open prefetch pressure object");
+        require(::posix_fadvise(files[i].get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+                "disable kernel readahead for prefetch pressure");
+      }
+      std::array<std::byte, 4096> bytes{};
+      for (unsigned i = 0; i != 7; ++i) {
+        pread_all(files[i].get(), bytes, 0);
+        require(std::equal(bytes.begin(), bytes.end(), read_ahead.begin()),
+                "prefetch pressure demand bytes differ");
+        for (unsigned attempt = 0; attempt != 2000 &&
+             !objects[i]->tail_paused.load(std::memory_order_acquire); ++attempt) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(objects[i]->tail_paused.load(std::memory_order_acquire),
+                "prefetch pressure bulk GET did not reach its pause point");
+        {
+          std::lock_guard guard(shared.mutex);
+          const auto& ranges = objects[i]->get_ranges;
+          require(ranges.size() == 1 && ranges[0].first == 0 &&
+                      ranges[0].last == 1024U * 1024U - 1,
+                  "prefetch pressure bulk GET was not 1 MiB");
+        }
+      }
+      pread_all(files.back().get(), bytes, 0);
+      require(std::equal(bytes.begin(), bytes.end(), read_ahead.begin()),
+              "prefetch pressure final demand bytes differ");
+      {
+        std::lock_guard guard(shared.mutex);
+        const auto& ranges = objects.back()->get_ranges;
+        require(ranges.size() == 1 && ranges[0].first == 0 &&
+                    ranges[0].last == 256U * 1024U - 1,
+                "busy prefetch pressure did not use a 256 KiB expansion");
+      }
+      for (auto& object : objects) object->resume_tail.store(true, std::memory_order_release);
+      for (auto& fd : files) fd.reset();
+      mounted.stop();
+      shared.stop.store(true);
+      server.request_stop();
+      server.join();
+      require(::rmdir(mountpoint.c_str()) == 0, "remove prefetch pressure mountpoint");
+      fprintf(stderr, "seven paused prefetch windows force a 256 KiB expansion: passed\n");
+      return 0;
+    }
 
     if (budget_prefetch) {
       constexpr std::array<const char*, 3> names{
@@ -1919,33 +2029,353 @@ int main(int argc, char** argv) {
       start.store(true, std::memory_order_release);
       for (auto& reader : readers) reader.join();
       for (const auto& error : errors) if (error) std::rethrow_exception(error);
-      UniqueFd retry(::open((mountpoint + "/budget-retry.bin").c_str(), O_RDONLY | O_CLOEXEC));
-      if (!retry) fail_errno("open demand-only checksum retry");
-      std::vector<std::byte> bytes(32U * 1024U + 37U);
-      pread_all(retry.get(), bytes, 0);
-      bool corrected = false;
-      for (unsigned i = 0; i < 2000; ++i) {
-        int gets;
-        { std::lock_guard guard(shared.mutex); gets = shared.special_objects.at("budget-retry.bin")->get_requests; }
-        pread_all(retry.get(), bytes, 0);
-        if (gets == 2 && std::equal(bytes.begin(), bytes.end(), checksum_test.begin())) {
-          corrected = true;
-          break;
+      if (engine == "uring") {
+        // A 2 MiB retained window plus a missing suffix cannot both fit this
+        // cap. Selection must release its pins and reclaim A before retrying,
+        // not repeatedly pin A and wait for that same allocation to disappear.
+        UniqueFd fd(::open((mountpoint + "/read-ahead-store.bin").c_str(), O_RDONLY | O_CLOEXEC));
+        require(bool(fd), "open tiny-budget crossing object");
+        require(::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+                "tiny-budget crossing random advice");
+        std::array<std::byte, 128U * 1024U> bytes{};
+        pread_all(fd.get(), bytes, 4096);
+        for (unsigned n = 0; n < 3000; ++n) {
+          bool idle;
+          { std::lock_guard guard(shared.mutex); idle = shared.active_gets == 0; }
+          if (idle) break;
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const size_t off = 2U * 1024U * 1024U - bytes.size() / 2;
+        pread_all(fd.get(), bytes, off);
+        require(std::equal(bytes.begin(), bytes.end(), read_ahead.begin() + off),
+                "tiny-budget crossing read did not reclaim its own pinned coverage");
+        {
+          std::lock_guard guard(shared.mutex);
+          require(shared.special_objects.at("read-ahead-store.bin")->get_requests == 2,
+                  "tiny-budget crossing read did not finish with one replacement GET");
+        }
       }
-      require(corrected, "demand-only retry did not progress within the memory limit");
-      retry.reset();
+      if (engine != "uring") {
+        UniqueFd retry(::open((mountpoint + "/budget-retry.bin").c_str(), O_RDONLY | O_CLOEXEC));
+        if (!retry) fail_errno("open demand-only checksum retry");
+        std::vector<std::byte> bytes(32U * 1024U + 37U);
+        pread_all(retry.get(), bytes, 0);
+        bool corrected = false;
+        for (unsigned i = 0; i < 2000; ++i) {
+          int gets;
+          { std::lock_guard guard(shared.mutex); gets = shared.special_objects.at("budget-retry.bin")->get_requests; }
+          pread_all(retry.get(), bytes, 0);
+          if (gets == 2 && std::equal(bytes.begin(), bytes.end(), checksum_test.begin())) {
+            corrected = true;
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(corrected, "demand-only retry did not progress within the memory limit");
+      }
       mounted.stop();
       shared.stop.store(true);
       server.request_stop();
       server.join();
       if (::rmdir(mountpoint.c_str()) != 0) fail_errno("rmdir budget mountpoint");
-      fprintf(stderr, "256 KiB mount/file limits: 8 readers, 3 files, 512 random reads and demand-only checksum retry passed\n");
+      fprintf(stderr, "2 MiB mount/file limits: 8 readers, 3 files, 512 random reads%s passed\n",
+              engine == "uring" ? "" : " and demand-only checksum retry");
+      return 0;
+    }
+
+    if (pool_prefetch) {
+      constexpr size_t block = 2U * 1024U * 1024U;
+      constexpr size_t offset = 4096;
+      auto object = shared.special_objects.at("pool-random.bin");
+      object->send_limit.store(offset + 512U * 1024U, std::memory_order_release);
+      const std::string path = mountpoint + "/pool-random.bin";
+      UniqueFd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+      if (!fd) fail_errno("open pooled prefetch object");
+      UniqueFd sibling(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+      require(bool(sibling), "open cross-handle pooled reader");
+      require(::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+              "disable kernel read-ahead for pooled prefetch");
+      require(::posix_fadvise(sibling.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+              "disable cross-handle kernel read-ahead for pooled prefetch");
+      const auto wait = [](auto&& ready, const char* message) {
+        for (unsigned n = 0; n != 3000; ++n) {
+          if (ready()) return;
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        throw std::runtime_error(message);
+      };
+      const auto idle = [&] {
+        wait([&] {
+          std::lock_guard guard(shared.mutex);
+          return shared.active_gets == 0;
+        }, "pooled GET did not complete");
+      };
+      const size_t page = size_t(::sysconf(_SC_PAGESIZE));
+      const size_t probe = offset + 384U * 1024U;
+      void* mapping = ::mmap(nullptr, page, PROT_READ, MAP_SHARED, fd.get(), off_t(probe));
+      require(mapping != MAP_FAILED, "map unfaulted pooled prefetch probe");
+      struct UnmapPool {
+        void* mapping;
+        size_t length;
+        ~UnmapPool() { if (mapping != MAP_FAILED) ::munmap(mapping, length); }
+      } unmap{mapping, page};
+      unsigned char resident = 0;
+      require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
+              "pooled prefetch probe unexpectedly resident before READ");
+      std::array<std::byte, 128U * 1024U> first{};
+      std::array<std::byte, 128U * 1024U> second{};
+      std::array<std::atomic<bool>, 2> done{};
+      std::array<std::exception_ptr, 2> errors{};
+      std::vector<std::jthread> readers;
+      struct ResumePool {
+        SpecialObject& object;
+        ~ResumePool() { object.send_limit.store(SIZE_MAX, std::memory_order_release); }
+      } resume{*object};
+      readers.emplace_back([&] {
+        try {
+          pread_all(fd.get(), first, offset);
+        } catch (...) {
+          errors[0] = std::current_exception();
+        }
+        done[0].store(true, std::memory_order_release);
+      });
+      wait([&] { return object->tail_paused.load(std::memory_order_acquire) &&
+                        done[0].load(std::memory_order_acquire); },
+           "first 128 KiB READ waited for the paused 2 MiB prefetch tail");
+      readers[0].join();
+      if (errors[0]) std::rethrow_exception(errors[0]);
+      require(std::equal(first.begin(), first.end(), object->bytes.begin() + offset),
+              "pooled prefetch initial READ differs");
+      require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
+              "uncached pooled prefetch proactively STOREd an unrelated page");
+      {
+        std::lock_guard guard(shared.mutex);
+        const auto& ranges = object->get_ranges;
+        require(ranges.size() == 1 && ranges[0].first == offset &&
+                    ranges[0].last == offset + block - 1,
+                "random GET was not forward 2 MiB from the unaligned requested offset");
+        require(shared.active_gets > 0,
+                "pooled GET completed before the paused-tail observation");
+        require(shared.checksum_mode_requests == 0,
+                "new uncached read path unexpectedly requested checksum verification");
+      }
+      if (!shutdown_prefetch) {
+        readers.emplace_back([&] {
+          try {
+            pread_all(sibling.get(), second, offset + 768U * 1024U);
+          } catch (...) {
+            errors[1] = std::current_exception();
+          }
+          done[1].store(true, std::memory_order_release);
+        });
+        // The requested bytes have not been sent yet. A demand arriving during
+        // a speculative WAITALL may wait for its full block; do not require
+        // cancellation or an early partial-buffer observation.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        require(!done[1].load(std::memory_order_acquire),
+                "pooled READ exposed bytes beyond completed network input");
+        object->send_limit.store(SIZE_MAX, std::memory_order_release);
+        wait([&] { return done[1].load(std::memory_order_acquire); },
+             "new demand did not complete after the existing receive resumed");
+        readers[1].join();
+        if (errors[1]) std::rethrow_exception(errors[1]);
+        require(std::equal(second.begin(), second.end(),
+                           object->bytes.begin() + offset + 768U * 1024U),
+                "pooled READ after speculative WAITALL differs");
+        idle();
+        require(::mincore(mapping, page, &resident) == 0 && !(resident & 1),
+                "completed uncached pooled prefetch proactively STOREd unrelated data");
+        {
+          std::lock_guard guard(shared.mutex);
+          require(object->get_requests == 1,
+                  "overlapping pending READ issued a duplicate GET");
+        }
+        // Begin the next adjacent 8 MiB window at 2 MiB + 4 KiB. A request
+        // at 4 MiB straddles its storage-block boundary despite FUSE's usual
+        // 256 KiB maximum request size, exercising scatter/gather replies.
+        std::array<std::byte, 64U * 1024U> cross{};
+        pread_all(fd.get(), cross, offset + block);
+        idle();
+        // Both sides are covered by different GETs. Make the kernel ask for
+        // the whole crossing interval rather than reuse its earlier pages.
+        const size_t edge = block - cross.size() / 2;
+        require(::posix_fadvise(fd.get(), off_t(edge), off_t(cross.size()),
+                                POSIX_FADV_DONTNEED) == 0,
+                "drop kernel pages across existing pooled GETs");
+        pread_all(fd.get(), cross, edge);
+        require(std::equal(cross.begin(), cross.end(), object->bytes.begin() + edge),
+                "READ crossing two existing GETs differs");
+        {
+          std::lock_guard guard(shared.mutex);
+          require(object->get_requests == 2,
+                  "READ crossing two existing GETs downloaded overlapping bytes");
+        }
+        pread_all(fd.get(), cross, 2 * block);
+        require(std::equal(cross.begin(), cross.end(), object->bytes.begin() + 2 * block),
+                "READ crossing a 2 MiB receive-block boundary differs");
+        idle();
+        // Serve the entire first 2 MiB block so it is recycled, while the
+        // second GET still retains its unconsumed bytes. A crossing READ now
+        // needs only the old block's hole, not another copy of its live suffix.
+        for (size_t off = offset; off < offset + block; off += cross.size()) {
+          pread_all(fd.get(), cross, off);
+        }
+        require(::posix_fadvise(fd.get(), off_t(edge), off_t(cross.size()),
+                                POSIX_FADV_DONTNEED) == 0,
+                "drop kernel pages across recycled and retained coverage");
+        pread_all(fd.get(), cross, edge);
+        require(std::equal(cross.begin(), cross.end(), object->bytes.begin() + edge),
+                "READ crossing recycled and retained coverage differs");
+        idle();
+        {
+          std::lock_guard guard(shared.mutex);
+          const auto& ranges = object->get_ranges;
+          require(ranges.size() == 3 && ranges.back().first == edge &&
+                      ranges.back().last == offset + block - 1,
+                  "READ crossing a recycled hole did not fetch only the missing prefix");
+        }
+        {
+          auto ordered = shared.special_objects.at("pool-order.bin");
+          ordered->send_limit.store(offset + 512U * 1024U, std::memory_order_release);
+          UniqueFd order_fd(::open((mountpoint + "/pool-order.bin").c_str(), O_RDONLY | O_CLOEXEC));
+          require(bool(order_fd), "open reverse-completion pooled object");
+          require(::posix_fadvise(order_fd.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+                  "disable kernel prefetch for reverse GET completion");
+          std::atomic<bool> crossed{false};
+          std::exception_ptr crossing_error;
+          std::jthread crossing;
+          ResumePool resume_order{*ordered};
+          pread_all(order_fd.get(), cross, offset);
+          wait([&] { return ordered->tail_paused.load(std::memory_order_acquire); },
+               "first GET did not pause before reverse completion test");
+          pread_all(order_fd.get(), cross, offset + block);
+          wait([&] {
+            std::lock_guard guard(shared.mutex);
+            return ordered->get_requests == 2 && shared.active_gets == 1;
+          }, "later GET did not finish before the earlier paused GET");
+          require(::posix_fadvise(order_fd.get(), off_t(edge), off_t(cross.size()),
+                                  POSIX_FADV_DONTNEED) == 0,
+                  "drop kernel pages before reverse-completion crossing READ");
+          crossing = std::jthread([&] {
+            try { pread_all(order_fd.get(), cross, edge); }
+            catch (...) { crossing_error = std::current_exception(); }
+            crossed.store(true, std::memory_order_release);
+          });
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+          require(!crossed.load(std::memory_order_acquire),
+                  "completed later GET exposed the earlier GET's missing prefix");
+          ordered->send_limit.store(SIZE_MAX, std::memory_order_release);
+          wait([&] { return crossed.load(std::memory_order_acquire); },
+               "cross-GET READ did not wake after its own missing prefix arrived");
+          crossing.join();
+          if (crossing_error) std::rethrow_exception(crossing_error);
+          require(std::equal(cross.begin(), cross.end(), ordered->bytes.begin() + edge),
+                  "reverse-completion cross-GET READ differs");
+          idle();
+          std::lock_guard guard(shared.mutex);
+          require(ordered->get_requests == 2,
+                  "reverse-completion cross-GET READ issued a duplicate GET");
+        }
+        auto sequential = shared.special_objects.at("pool-sequential.bin");
+        UniqueFd seq(::open((mountpoint + "/pool-sequential.bin").c_str(), O_RDONLY | O_CLOEXEC));
+        require(bool(seq), "open pooled sequential object");
+        require(::posix_fadvise(seq.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+                "disable kernel prefetch for pooled GET-window growth");
+        for (size_t off = 0; off <= 24U * 1024U * 1024U; off += cross.size()) {
+          pread_all(seq.get(), cross, off);
+          require(std::equal(cross.begin(), cross.end(), sequential->bytes.begin() + off),
+                  "pooled sequential bytes differ");
+        }
+        idle();
+        {
+          std::lock_guard guard(shared.mutex);
+          const auto& ranges = sequential->get_ranges;
+          require(ranges.size() == 3,
+                  "sequential pooled reads did not use exactly three growing windows");
+          require(ranges[0].first == 0 && ranges[0].last == 8U * 1024U * 1024U - 1,
+                  "sequential pooled GET did not start at 8 MiB");
+          require(ranges[1].first == 8U * 1024U * 1024U &&
+                      ranges[1].last == 24U * 1024U * 1024U - 1,
+                  "sequential pooled GET did not double to 16 MiB");
+          const size_t third = (pool_limited ? 16U : 32U) * 1024U * 1024U;
+          require(ranges[2].first == 24U * 1024U * 1024U &&
+                      ranges[2].last == 24U * 1024U * 1024U + third - 1,
+                  "sequential pooled GET ignored its configured maximum window");
+        }
+        seq.reset();
+        auto footer = shared.special_objects.at("pool-footer.bin");
+        UniqueFd tail(::open((mountpoint + "/pool-footer.bin").c_str(), O_RDONLY | O_CLOEXEC));
+        require(bool(tail), "open pooled footer object");
+        require(::posix_fadvise(tail.get(), 0, 0, POSIX_FADV_RANDOM) == 0,
+                "disable kernel prefetch for footer range test");
+        const size_t tail_off = (footer->bytes.size() / page - 1) * page;
+        std::vector<std::byte> tail_bytes(footer->bytes.size() - tail_off);
+        pread_all(tail.get(), tail_bytes, tail_off);
+        require(std::equal(tail_bytes.begin(), tail_bytes.end(), footer->bytes.begin() + tail_off),
+                "pooled footer bytes differ");
+        idle();
+        {
+          std::lock_guard guard(shared.mutex);
+          const auto& ranges = footer->get_ranges;
+          require(ranges.size() == 1 && ranges[0].first == tail_off - 64U * 1024U &&
+                      ranges[0].last == footer->bytes.size() - 1,
+                  "footer GET did not extend backward by the default 64 KiB");
+        }
+      }
+      require(::munmap(mapping, page) == 0, "unmap pooled probe");
+      unmap.mapping = MAP_FAILED;
+      fd.reset();
+      sibling.reset();
+      std::jthread resume_download([object] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        object->send_limit.store(SIZE_MAX, std::memory_order_release);
+      });
+      mounted.stop();
+      require(mounted.stopped_cleanly(), "pooled prefetch shutdown did not exit cleanly");
+      shared.stop.store(true);
+      server.request_stop();
+      server.join();
+      require(::rmdir(mountpoint.c_str()) == 0,
+              "remove pooled prefetch mountpoint");
+      fprintf(stderr, "%s: passed\n", shutdown_prefetch ?
+              "pooled prefetch shutdown with active receive" :
+              "pooled early READ, pending demand, no STORE, cross-block reply, window growth and footer");
       return 0;
     }
 
     if (prefetch_mode) {
+      if (verified_prefetch && engine == "legacy") {
+        auto object = shared.special_objects.at("read-ahead-store.bin");
+        UniqueFd fd(::open((mountpoint + "/read-ahead-store.bin").c_str(), O_RDONLY | O_CLOEXEC));
+        require(bool(fd), "open legacy whole-object checksum reader");
+        std::vector<std::byte> bytes(object->bytes.size());
+        pread_all(fd.get(), bytes, 0);
+        bool verified = false;
+        for (unsigned n = 0; n != 3000; ++n) {
+          pread_all(fd.get(), bytes, 0);
+          int gets;
+          { std::lock_guard guard(shared.mutex); gets = object->get_requests; }
+          if (bytes == object->bytes && gets == (verified_clean ? 1 : 2)) {
+            verified = true;
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(verified, "legacy whole-object checksum verification/retry did not complete");
+        {
+          std::lock_guard guard(shared.mutex);
+          require(shared.checksum_mode_requests == (verified_clean ? 1 : 2),
+                  "legacy verification did not request a checksum for every full GET");
+        }
+        fd.reset();
+        mounted.stop();
+        shared.stop.store(true);
+        server.request_stop();
+        server.join();
+        require(::rmdir(mountpoint.c_str()) == 0, "remove legacy checksum mountpoint");
+        fprintf(stderr, "legacy whole-object checksum %s: passed\n", verified_clean ? "verification" : "retry");
+        return 0;
+      }
       const auto wait_for_gets = [&] {
         for (unsigned attempt = 0; attempt != 2000; ++attempt) {
           bool sent;
@@ -1957,7 +2387,7 @@ int main(int argc, char** argv) {
           // checksum and STORE can still be pending. The next disjoint READ
           // legitimately uses demand-only I/O until that window completes.
           // The exact-window assertions below require a quiescent client too.
-          if (sent && prefetch_storage_empty(process)) {
+          if (sent) {
             return;
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1977,7 +2407,9 @@ int main(int argc, char** argv) {
         }
         throw std::runtime_error("timed out waiting for read-ahead GET");
       };
-      if (engine == "uring" || (engine == "legacy" && !verified_prefetch)) {
+      // Legacy staging retains its existing publication/overlap regressions.
+      // Uring reaches the receive-pool contract branch above instead.
+      if (engine == "legacy" && !verified_prefetch) {
         std::shared_ptr<SpecialObject> object;
         {
           std::lock_guard guard(shared.mutex);
@@ -2015,7 +2447,7 @@ int main(int argc, char** argv) {
         bool published = false;
         for (unsigned i = 0; i < 2000; ++i) {
           require(::mincore(mapping, page, &resident) == 0, "mincore STORE probe");
-          if (((resident & 1) || verified_prefetch || partial_prefetch) && object->tail_paused.load(std::memory_order_acquire)) {
+          if (object->tail_paused.load(std::memory_order_acquire)) {
             published = true;
             break;
           }
@@ -2029,16 +2461,6 @@ int main(int argc, char** argv) {
                     "unverified prefetched data was proactively STOREd");
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
           }
-        }
-        if (!verified_prefetch && !partial_prefetch) {
-          bool reclaimed = false;
-          for (unsigned i = 0; i < 2000; ++i) {
-            size_t bytes;
-            prefetch_storage_empty(process, &bytes);
-            if (bytes <= 256U * 1024U) { reclaimed = true; break; }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-          }
-          require(reclaimed, "published prefix still occupies memfd pages while GET is paused");
         }
         {
           std::lock_guard guard(shared.mutex);
@@ -2131,29 +2553,43 @@ int main(int argc, char** argv) {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
           }
+          if (!corrected) {
+            std::lock_guard guard(shared.mutex);
+            const auto& retried = *shared.special_objects.at(
+                "read-ahead-store.bin");
+            fprintf(stderr,
+                    "checksum-retry diagnostic: gets=%d ranges=%zu "
+                    "active=%d checksum-mode=%d\n",
+                    retried.get_requests, retried.get_ranges.size(),
+                    shared.active_gets, shared.checksum_mode_requests);
+          }
           require(corrected, "checksum retry did not replace corrupt early READ data");
         }
         wait_for_gets();
-        bool retired = false;
-        for (unsigned i = 0; i < 2000; ++i) {
-          if (prefetch_storage_empty(process)) {
-            retired = true;
-            break;
-          }
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        require(retired, "completed prefetch memfd still retains payload pages");
         pread_all(second.get(), first_bytes, probe);
         require(std::equal(first_bytes.begin(), first_bytes.end(), read_ahead.begin() + probe),
-                "kernel cache bytes differ after memfd retirement");
+                "retained prefetch bytes differ after completion");
         {
           std::lock_guard guard(shared.mutex);
-          require(object->get_requests == (verified_prefetch && !verified_clean ? 2 : 1),
+          const int expected_gets = verified_prefetch && !verified_clean ? 2 : 1;
+          if (object->get_requests != expected_gets) {
+            fprintf(stderr,
+                    "prefetch-share diagnostic: expected=%d actual=%d ranges=",
+                    expected_gets, object->get_requests);
+            for (const RequestRange& range : object->get_ranges) {
+              fprintf(stderr, " [%llu,%llu]",
+                      static_cast<unsigned long long>(range.first),
+                      static_cast<unsigned long long>(range.last));
+            }
+            fprintf(stderr, "\n");
+          }
+          require(object->get_requests == expected_gets,
                   "overlapping cross-handle READ did not share its in-flight prefetch");
         }
         fprintf(stderr, "%s and overlapping cross-handle READ: passed\n",
-                verified_clean ? "STORE withheld until checksum succeeds" :
-                verified_prefetch ? "STORE withheld until checksum retry succeeds" : "progressive STORE before EOF");
+                verified_clean ? "checksum-verified retained prefetch" :
+                verified_prefetch ? "checksum-retry retained prefetch" :
+                "retained uncached prefetch without eager STORE");
       }
       const std::string path = mountpoint + "/read-ahead.bin";
       if (verified_prefetch) {

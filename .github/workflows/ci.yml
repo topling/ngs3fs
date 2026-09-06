@@ -315,8 +315,12 @@ jobs:
       - name: Compare concurrent random reads
         run: |
           for mode in none cold warm; do
+            io_engine=legacy
+            if [[ "$mode" = none ]]; then io_engine=uring; fi
             sudo env \
               GOOFYS_BIN="$GITHUB_WORKSPACE/build/tools/goofys" \
+              NGS3FS_IO_ENGINE="$io_engine" \
+              NGS3FS_REACTORS=1 \
               BENCHMARK_REPETITIONS=4 \
               CACHE_MODE="$mode" \
               DROP_CACHES_AFTER_WARMUP=1 \
@@ -329,9 +333,12 @@ jobs:
           for advice in random normal; do
             sudo env \
               BENCHMARK_REPETITIONS=5 \
+              RANDOM_READ_OPERATIONS=512 \
               RANDOM_READ_ADVICE="$advice" \
               ./scripts/benchmark_io_engine.sh \
               "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-$advice"
+            printf '\nHeadline CPU and wall-time comparisons use these unsampled A/B runs (512 operations per worker). Separate 4000 Hz profiles identify hotspots; their instrumented CPU and wall times are not headline results.\n' \
+              >> "build/benchmarks/github-io-engine-$advice/summary.md"
             printf '\n## I/O engines: %s advice\n\n' "$advice" >> "$GITHUB_STEP_SUMMARY"
             cat "build/benchmarks/github-io-engine-$advice/summary.md" >> "$GITHUB_STEP_SUMMARY"
           done
@@ -347,12 +354,14 @@ jobs:
               NGS3FS_IO_ENGINE="$engine" \
               NGS3FS_REACTORS="$reactors" \
               WORKLOAD=random-read \
+              RANDOM_READ_OPERATIONS=512 \
               RANDOM_READ_ADVICE=normal \
               CACHE_MODE=none \
               PERF_BIN="$(command -v perf)" \
               PERF_LIB_DIR= \
               PERF_EVENT=cpu-clock \
               PERF_FREQUENCY=4000 \
+              PERF_STAT_EVENTS=task-clock,context-switches,cpu-migrations,page-faults \
               PORT="$port" \
               ./scripts/profile_ngs3fs.sh \
               "$GITHUB_WORKSPACE/build/profiles/github-io-engine-$engine-$reactors"
@@ -362,9 +371,13 @@ jobs:
       - name: Compare Mountpoint concurrent random reads
         run: |
           for mode in none cold warm; do
+            io_engine=legacy
+            if [[ "$mode" = none ]]; then io_engine=uring; fi
             sudo env \
               REFERENCE_CLIENT=mountpoint-s3 \
               MOUNTPOINT_S3_BIN="$GITHUB_WORKSPACE/build/tools/mount-s3" \
+              NGS3FS_IO_ENGINE="$io_engine" \
+              NGS3FS_REACTORS=1 \
               BENCHMARK_REPETITIONS=3 \
               CACHE_MODE="$mode" \
               DROP_CACHES_AFTER_WARMUP=1 \

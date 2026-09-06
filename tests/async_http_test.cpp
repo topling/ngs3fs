@@ -136,6 +136,10 @@ class QueueExecutor final : public IoExecutor {
     pending.flags = request.flags;
     pending.exact = request.exact;
     pending.force_async = request.force_async;
+    if (request.kind == AsyncIoRequest::RECEIVE) {
+      saw_waitall_ |= (request.flags & MSG_WAITALL) != 0;
+      check(!request.force_async, "network receive was forced onto io-wq");
+    }
     pending.processor = request.processor;
     pending.processor_context = request.processor_context;
     pending.complete = request.complete;
@@ -168,6 +172,11 @@ class QueueExecutor final : public IoExecutor {
       return true;
     }
     ++pending.operations;
+    if (reject_waitall && (pending.flags & MSG_WAITALL) != 0) {
+      ++rejected_waitalls;
+      complete(pending, -EOPNOTSUPP);
+      return true;
+    }
     const ssize_t result = execute(pending);
     if (result == -EINTR) {
       queue_.push_back(pending);
@@ -197,7 +206,8 @@ class QueueExecutor final : public IoExecutor {
       queue_.push_back(pending);
       return true;
     }
-    if (pending.exact && pending.transferred < pending.length) {
+    if ((pending.exact || (pending.flags & MSG_WAITALL) != 0) &&
+        pending.transferred < pending.length) {
       queue_.push_back(pending);
       return true;
     }
@@ -216,6 +226,19 @@ class QueueExecutor final : public IoExecutor {
   }
   [[nodiscard]] size_t syscall_count() const noexcept { return syscall_count_; }
   [[nodiscard]] bool saw_connect() const noexcept { return saw_connect_; }
+  [[nodiscard]] bool saw_waitall() const noexcept { return saw_waitall_; }
+  [[nodiscard]] size_t partial_waitall() const noexcept {
+    for (const auto& pending : queue_) {
+      if ((pending.flags & MSG_WAITALL) != 0 && !pending.cancelled) {
+        return pending.transferred;
+      }
+    }
+    return 0;
+  }
+  bool reject_waitall = false;
+  size_t rejected_waitalls = 0;
+  void (*before_complete)(void*, const AsyncIoRequest&, ssize_t) = nullptr;
+  void* before_complete_context = nullptr;
 
  private:
   struct Pending {
@@ -249,7 +272,8 @@ class QueueExecutor final : public IoExecutor {
 
   ssize_t execute(Pending& pending) noexcept {
     ++syscall_count_;
-    const size_t progress = pending.exact ? pending.transferred : 0;
+    const size_t progress = pending.exact || (pending.flags & MSG_WAITALL) != 0
+        ? pending.transferred : 0;
     const size_t remaining = pending.length - progress;
     const size_t length = std::min(remaining, kFragmentSize);
     char* const data = static_cast<char*>(pending.data);
@@ -331,6 +355,9 @@ class QueueExecutor final : public IoExecutor {
     void* const context = pending.context;
     request->transferred = pending.transferred;
     request->operations = pending.operations;
+    if (before_complete != nullptr) {
+      before_complete(before_complete_context, *request, result);
+    }
     const auto active = std::find(active_.begin(), active_.end(), request);
     check(active != active_.end(), "completed request was not active");
     active_.erase(active);
@@ -342,11 +369,13 @@ class QueueExecutor final : public IoExecutor {
   bool parameters_preserved_ = true;
   bool saw_background_file_write_ = false;
   bool saw_connect_ = false;
+  bool saw_waitall_ = false;
   size_t syscall_count_ = 0;
 };
 
 enum class ServerCase {
-  RANGE, HEAD, BODYLESS_KEEP_ALIVE, EARLY_EOF, RECONNECT, CANCEL
+  RANGE, CHUNKED_RANGE, MEMORY_CLOSE_FINAL, MEMORY_CLOSE_PARTIAL,
+  HEAD, BODYLESS_KEEP_ALIVE, EARLY_EOF, RECONNECT, CANCEL
 };
 
 struct ServerInput {
@@ -397,11 +426,25 @@ void run_server(ServerInput input) {
               "HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n");
     return;
   }
-  if (input.scenario == ServerCase::RANGE) {
+  if (input.scenario == ServerCase::RANGE ||
+      input.scenario == ServerCase::CHUNKED_RANGE ||
+      input.scenario == ServerCase::MEMORY_CLOSE_FINAL ||
+      input.scenario == ServerCase::MEMORY_CLOSE_PARTIAL) {
     check(request.starts_with("GET /range HTTP/1.1\r\n"),
           "unexpected range request line");
     check(request.find("range: bytes=5-101\r\n") != std::string::npos,
           "range request omitted its exact byte interval");
+    if (input.scenario == ServerCase::CHUNKED_RANGE) {
+      send_text(socket.get(),
+                "HTTP/1.1 206 Partial Content\r\n"
+                "transfer-encoding: chunked\r\n"
+                "content-range: bytes 5-101/1000\r\n\r\n31\r\n");
+      write_exact(socket.get(), input.body.data(), 49);
+      send_text(socket.get(), "\r\n30\r\n");
+      write_exact(socket.get(), input.body.data() + 49, 48);
+      send_text(socket.get(), "\r\n0\r\n\r\n");
+      return;
+    }
     const std::string header =
         "HTTP/1.1 206 Partial Content\r\n"
         "content-length: 97\r\n"
@@ -419,6 +462,24 @@ void run_server(ServerInput input) {
     memcpy(coalesced.data() + coalesced_header_bytes,
            input.body.data(), input.body.size());
     write_exact(socket.get(), coalesced.data(), coalesced.size());
+    if (input.scenario == ServerCase::MEMORY_CLOSE_PARTIAL) {
+      char byte;
+      ssize_t received;
+      do { received = ::recv(socket.get(), &byte, 1, 0); }
+      while (received < 0 && errno == EINTR);
+      check(received == 0 || (received < 0 && errno == ECONNRESET),
+            "cancelled partial response reused its connection");
+      socket.reset();
+      socket = accept_one(input.listener);
+    }
+    if (input.scenario == ServerCase::MEMORY_CLOSE_FINAL ||
+        input.scenario == ServerCase::MEMORY_CLOSE_PARTIAL) {
+      const std::string head = read_request_head(socket.get());
+      check(head.starts_with("HEAD /after-memory-close HTTP/1.1\r\n"),
+            "unexpected request after memory sink close");
+      send_text(socket.get(),
+                "HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n");
+    }
     return;
   }
   if (input.scenario == ServerCase::HEAD) {
@@ -495,6 +556,31 @@ class TestFileSink final : public RangeFileSink {
 
   size_t progress_calls = 0;
   bool completed = false;
+};
+
+class TestMemorySink final : public RangeMemorySink {
+ public:
+  std::span<std::byte> writable(size_t maximum) override {
+    size_t available = std::min({maximum, bytes.size() - committed,
+                                  size_t(31) - committed % 31});
+    if (committed < demand_end) available = std::min(available, demand_end - committed);
+    return std::span(bytes).subspan(committed, available);
+  }
+  void commit(size_t size) override { committed += size; }
+  bool receive_waitall() const noexcept override { return committed >= demand_end; }
+  bool cancelled() const noexcept override { return closed; }
+  void progress(const Response& response, bool complete) override {
+    check(response.body_bytes == committed, "memory sink byte count mismatch");
+    ++progress_calls;
+    completed |= complete;
+  }
+
+  std::array<std::byte, 97> bytes{};
+  size_t committed = 0;
+  size_t demand_end = 13;
+  size_t progress_calls = 0;
+  bool completed = false;
+  bool closed = false;
 };
 
 struct CompletionState {
@@ -590,6 +676,122 @@ void test_range_to_fd() {
                    actual.end(),
                    sentinel.begin() + destination_offset + expected.size()),
         "range write changed the file suffix");
+}
+
+void test_range_to_memory(bool chunked, bool reject_waitall, bool new_demand) {
+  std::vector<std::byte> expected(97);
+  for (size_t i = 0; i < expected.size(); ++i)
+    expected[i] = std::byte((i * 29 + 11) & 0xff);
+  TestServer server(chunked ? ServerCase::CHUNKED_RANGE : ServerCase::RANGE,
+                    expected);
+  auto client = connect_client(server.port());
+  TestMemorySink destination;
+  AsyncHttpRequest request;
+  request.path = "/range";
+  request.range = true;
+  request.offset = 5;
+  request.length = expected.size();
+  request.memory_destination = &destination;
+  QueueExecutor executor;
+  executor.reject_waitall = reject_waitall;
+  CompletionState completion;
+  completion.operation = client->make_async_request(
+      executor, std::move(request), complete_http, &completion);
+  completion.operation->start();
+  if (new_demand) {
+    while (executor.partial_waitall() == 0) {
+      check(executor.run_one(), "memory tail never entered WAITALL");
+      check(completion.calls == 0, "memory request completed before tail wait");
+    }
+    const size_t before = destination.committed;
+    const size_t partial = executor.partial_waitall();
+    destination.demand_end = before + partial;
+    check(executor.run_one(), "memory tail was not queued");
+    check(destination.committed == before,
+          "new demand changed the in-flight WAITALL completion policy");
+  }
+  executor.run();
+  print_error(completion.error);
+  check(completion.calls == 1 && !completion.error,
+        "memory range did not finish successfully");
+  check(destination.completed && destination.progress_calls > 1,
+        "memory range did not publish incremental progress");
+  check(std::equal(expected.begin(), expected.end(), destination.bytes.begin()),
+        "memory range data was corrupted");
+  check(completion.response.transport_splice_calls == 0,
+        "memory receive used splice");
+  check(!executor.saw_background_file_write(),
+        "memory receive used a background file write");
+  check(executor.parameters_preserved(), "executor changed memory parameters");
+  if (!chunked) check(executor.saw_waitall(), "memory tail did not use WAITALL");
+  if (reject_waitall) check(executor.rejected_waitalls == 1,
+                            "unsupported WAITALL was retried repeatedly");
+}
+
+void test_memory_close_at_completion(bool final_receive, bool explicit_cancel) {
+  const bool reusable = final_receive && !explicit_cancel;
+  std::vector<std::byte> expected(97, std::byte{0x5a});
+  TestServer server(reusable ? ServerCase::MEMORY_CLOSE_FINAL
+                             : ServerCase::MEMORY_CLOSE_PARTIAL, expected);
+  auto client = connect_client(server.port());
+  TestMemorySink destination;
+  QueueExecutor executor;
+  CompletionState completion;
+  struct CloseState {
+    TestMemorySink& destination;
+    CompletionState& completion;
+    bool final_receive;
+    bool explicit_cancel;
+    bool called = false;
+  } close{destination, completion, final_receive, explicit_cancel};
+  executor.before_complete_context = &close;
+  executor.before_complete = [](void* context, const AsyncIoRequest& io,
+                                ssize_t result) {
+    auto& close = *static_cast<CloseState*>(context);
+    if (close.called || result <= 0 || io.kind != AsyncIoRequest::RECEIVE ||
+        (io.flags & MSG_WAITALL) == 0) return;
+    const uintptr_t begin = uintptr_t(close.destination.bytes.data());
+    const uintptr_t end = begin + close.destination.bytes.size();
+    const uintptr_t received_end = uintptr_t(io.data) + size_t(result);
+    if (uintptr_t(io.data) < begin || received_end > end ||
+        (close.final_receive && received_end != end)) return;
+    close.called = true;
+    close.destination.closed = true;
+    if (close.explicit_cancel) close.completion.operation->cancel();
+  };
+  AsyncHttpRequest request;
+  request.path = "/range";
+  request.range = true;
+  request.offset = 5;
+  request.length = expected.size();
+  request.memory_destination = &destination;
+  completion.operation = client->make_async_request(
+      executor, std::move(request), complete_http, &completion);
+  completion.operation->start();
+  executor.run();
+  check(close.called, "memory close did not race the receive completion");
+  check(completion.calls == 1 && bool(completion.error) == !reusable,
+        "memory close handled a drained response incorrectly");
+  if (reusable) {
+    check(destination.committed == expected.size() && destination.completed,
+          "drained memory receive was not accounted");
+    check(std::equal(expected.begin(), expected.end(), destination.bytes.begin()),
+          "drained memory response was corrupted");
+  }
+  executor.before_complete = nullptr;
+  AsyncHttpRequest head;
+  head.method = "HEAD";
+  head.path = "/after-memory-close";
+  CompletionState next;
+  next.operation = client->make_async_request(
+      executor, std::move(head), complete_http, &next);
+  next.operation->start();
+  executor.run();
+  check(next.calls == 1 && !next.error && next.response.status == 204,
+        "request after memory close failed");
+  check(executor.saw_connect() == !reusable,
+        "memory close kept or discarded the wrong connection");
+  check(executor.parameters_preserved(), "memory close mutated pending I/O");
 }
 
 void test_head_without_destination() {
@@ -752,6 +954,13 @@ void test_queued_cancel() {
 
 int main() {
   test_range_to_fd();
+  test_range_to_memory(false, false, false);
+  test_range_to_memory(false, false, true);
+  test_range_to_memory(false, true, false);
+  test_range_to_memory(true, false, false);
+  test_memory_close_at_completion(true, false);
+  test_memory_close_at_completion(false, false);
+  test_memory_close_at_completion(true, true);
   test_head_without_destination();
   test_bodyless_keep_alive();
   test_early_eof();

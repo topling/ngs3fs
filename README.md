@@ -7,6 +7,48 @@ buffered Linux I/O, especially mmap-heavy applications.
 The filesystem mounts an S3 bucket, or an optional key prefix within it, as a
 multi-file namespace. It remains experimental rather than production-ready.
 
+## Uncached io_uring reads
+
+The uncached io_uring implementation uses reusable 2 MiB anonymous receive blocks,
+populated once when the bounded pool grows and recycled through a freelist.
+Socket I/O and HTTP parsing run on the io_uring reactor. A pending FUSE read
+uses short receives and replies as soon as its full requested interval is
+ready; `fuse_reply_buf` or `fuse_reply_iov` references the block slices without
+assembling a second userspace buffer. Speculative reception then prefers
+io_uring `RECV | MSG_WAITALL`, falling back to ordinary asynchronous receives.
+A speculative receive covers at most one 2 MiB block; new demand waits for
+that completion without cancelling it, then receives priority over continued
+prefetch.
+
+This path has no memfd, pipe/splice/vmsplice transfer, proactive
+`NOTIFY_STORE`, or network continuation worker. Its first iteration skips
+uncached read checksum verification; cached verification and upload checksums
+keep their existing behavior. Mappings remain alive through actual receive
+and FUSE reply completion, and unconsumed prefetched data remains available
+until served or evicted. Idle freelist mappings count toward the bounded pool.
+Block recycling uses the freelist; it does not map/unmap per read or request
+`MAP_HUGETLB` or `MADV_NOHUGEPAGE`.
+
+Sequential Range GETs start at 8 MiB and double to the configured maximum,
+normally 128 MiB. Random GETs start at the requested offset and read forward
+2 MiB (or enough for a longer FUSE request), without rounding the offset down.
+Random tail/footer reads reaching EOF may additionally extend backward by at
+most `--tail-read-ahead` (default 64 KiB, zero disables it), without growing a
+shorter random range beyond 2 MiB. A longer demanded interval is not clipped
+and gets no extra backward coverage. The 8 MiB default upload part size is
+independent of these GET lengths and the 2 MiB allocation blocks.
+
+All 86 local tests pass, including one/two reactors, a configured window cap,
+a 2 MiB memory budget with concurrent reads, and active-receive shutdown.
+They verify early reply, cross-GET and cross-block reuse, out-of-order GET
+completion, retired-hole refetch, no proactive STORE, growth and footer bounds.
+Final runner performance comparison remains pending; local CPU savings do not
+imply lower latency at every core count.
+The [reactor contract](docs/io-uring-reactor-plan.md) records the lifetime,
+memory-budget, WAITALL requirements and detailed evidence. Established
+legacy and cached behavior is described below; their transport details do not
+define the new uncached implementation.
+
 ## What works now
 
 - Stock libnghttp2 v1.70.0 is used without a local fork or patch. After an
@@ -38,7 +80,7 @@ multi-file namespace. It remains experimental rather than production-ready.
   to select autotuning directly.
   Chunked and EOF-delimited responses are strictly parsed by llhttp and use a
   bounded copied fallback.
-- Range GET payload path:
+- Established legacy Range GET payload path:
 
   ```text
   socket -> splice -> worker-local reused pipe -> fuse_reply_data -> page cache -> mmap
@@ -77,8 +119,9 @@ multi-file namespace. It remains experimental rather than production-ready.
 - Read verification is off by default. `--verify-read-checksum` enables
   background best-effort verification when a complete independently
   verifiable object is available (or a multipart unit on the cached path).
-  Uncached reads currently verify full objects only. The first read or mmap
-  fault may complete before verification. Arbitrary Range GETs are not treated
+  Legacy uncached reads verify full objects only; the approved uncached
+  receive-pool replacement initially omits read checksum verification. The
+  first read or mmap fault may complete before verification. Arbitrary Range GETs are not treated
   as whole-object checksums. With local caching, multipart ObjectParts
   checksums are loaded lazily with GetObjectAttributes; a missing, unsupported,
   or unusable manifest skips part verification. A mismatch triggers one exact
@@ -86,11 +129,9 @@ multi-file namespace. It remains experimental rather than production-ready.
   ngs3fs fail with `EIO`. After the active FUSE reply completes, a background
   worker invalidates the affected inode range so later mmap faults also reach
   the BAD state without racing the request's locked folio.
-  Verification-enabled uncached reads never proactively issue `FUSE_NOTIFY_STORE` for a
-  unit before it passes verification. Partial ranges without a verifiable unit
-  remain best effort and are not proactively STOREd. An unpublished whole-file
-  retry reuses staging after active replies drain; STORE waits for successful
-  verification and completion of the earlier READ invalidation.
+  The former uncached verification/STORE experiment is superseded by the
+  receive-pool contract above; do not infer proactive read publication or
+  checksum support for the replacement from that earlier implementation.
 - FUSE remains in cached mode; `direct_io` is never enabled.
 - The FUSE transport can be selected with `--io-engine auto|legacy|uring`.
   `legacy` remains the default while the uring engine is experimental and its
@@ -99,11 +140,10 @@ multi-file namespace. It remains experimental rather than production-ready.
   caller-owned io_uring reactor for the classic `/dev/fuse` transport while
   libfuse continues to own request decoding, dispatch and reply semantics.
   Cleartext HTTP connect, send, receive and splice operations issued by FUSE
-  callbacks, upload workers and uncached-prefetch continuation workers are
-  submitted to the callback's reactor. Read and cache-fill operations use one
-  asynchronous task handoff and then suspend reactor-local fibers directly on
-  io_uring completions; they do not synchronously hand each socket operation
-  back and forth across threads. The reactor wait uses the nearest active I/O
+  callbacks and upload workers are submitted to the callback's reactor.
+  Operation-specific continuations advance on io_uring completions; the
+  approved uncached receive-pool path also continues speculative network reads
+  directly on that reactor. The reactor wait uses the nearest active I/O
   deadline, and submits `ASYNC_CANCEL` only when an operation actually times
   out, avoiding a linked-timeout CQE on every successful operation.
   `--reactors` selects the reactor count. Each reactor owns one ring and one
@@ -118,7 +158,7 @@ multi-file namespace. It remains experimental rather than production-ready.
   callback, so the dispatch worker neither copies the payload nor waits for a
   worker-to-reactor I/O rendezvous. Cache maintenance, write-side
   durability work, and work without a reactor scope remain threaded. Read
-  checksum verification currently retains a worker fallback because its
+  checksum verification on existing paths retains a worker fallback because its
   shared verification state still has blocking waits; the uring engine does
   not yet claim a complete all-FD event loop.
 - After each upload succeeds, `FUSE_NOTIFY_STORE` consumes the retained
@@ -436,28 +476,27 @@ and recreates the socket without locking its receive-buffer size.
 `--verify-read-checksum` is intentionally independent of the upload checksum
 selection and is disabled unless explicitly requested. It accepts AWS checksum
 headers, Alibaba OSS CRC64, and Google XML API `x-goog-hash` CRC32C/MD5.
-Without a local cache, a miss starts an asynchronous 1 MiB Range read into a
-bounded anonymous fd. The foreground returns as soon as its requested bytes
-arrive while the remainder continues in the background. Sequential reads
-double later windows up to 128 MiB. Non-adjacent reads that hit either an
-in-progress or completed window reuse it and do not count as random; misses
-use an independent exact Range request without discarding prefetched bytes.
-The current and retained historical windows share the configured bound; only
-making room for a new window evicts the oldest completed region. After three
-such misses, that handle stops opening new prefetch windows. This path is
-disabled by `--verify-read-checksum`, which retains exact complete-unit
-verification semantics.
-The experimental `--max-prefetch-memory SIZE` and
-`--max-file-prefetch-memory SIZE` controls are documented here ahead of full
-runtime rollout and remain gated by focused tests: explicit values must be
-page-aligned and at least 256 KiB. Both default to 0 (automatic); the process
-budget resolves to 10% of physical RAM, rounded down to a page, while the
-per-file budget defaults to the smaller of file size and twice the maximum
-prefetch window. An explicit per-file value is a cap and is not clamped to
-file size. Under pressure, speculative windows shrink to fit the available
-budget; a rate-limited stderr warning reports budget pressure. These limits
-bound speculative prefetch memory and do not change an individual READ's
-negotiated maximum.
+The uncached io_uring path described above uses sequential GET lengths
+of `8 -> 16 -> 32 -> 64 -> 128 MiB` and 2 MiB forward random GETs. Adjacent
+requests and hits in completed or in-progress coverage preserve sequential
+state; only a nonadjacent miss resets it. A fetch window is logical coverage,
+so extending it does not eagerly populate every 2 MiB block in that window.
+Useful unconsumed bytes are retained within the budget and shared by
+overlapping reads, including while reception continues. Tail/footer backward
+coverage is configured by `--tail-read-ahead` and defaults to 64 KiB.
+
+The receive-pool revision preserves `--max-prefetch-memory SIZE` and
+`--max-file-prefetch-memory SIZE` as mount-wide and shared per-inode limits.
+Automatic defaults resolve to 10% of physical RAM for the mount and
+`min(file_size, 2 * maximum_prefetch_window)` per file. An explicit per-file
+value is a cap, not clamped to file size. The revised accounting must include
+the physical 2 MiB allocation quantum, all active/ready/reply-owned blocks,
+and idle freelist mappings in the total mount pool cap. Explicit uncached
+uring/auto budgets must be zero or multiples of 2 MiB; automatic per-file
+capacity rounds up to a whole block, including for tiny files. Legacy/cached
+budgets retain the page-aligned minimum of 256 KiB. Pool reuse and eviction allow demanded
+reads to progress under pressure; budget warnings remain rate-limited stderr
+messages. These limits do not change a READ's negotiated maximum.
 `-L/--cache-dir` enables the persistent sparse local cache. Each S3 key maps to
 a sparse data file plus mmap-backed metadata with a two-bit state per host
 page. Clean hits are returned from the cache FD; misses fetch adaptively from

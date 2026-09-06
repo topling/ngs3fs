@@ -24,6 +24,7 @@ class PrefetchBudget {
  public:
   struct Snapshot {
     size_t used;
+    size_t capacity;
     size_t peak;
     size_t files;
     uint64_t revision;
@@ -81,6 +82,9 @@ class PrefetchBudget {
   bool wait(uint64_t revision);
   int begin_async_wait(uint64_t revision);
   void end_async_wait() noexcept;
+  // A retained window became evictable without releasing its reservation.
+  // Wake admission waiters so they retry eviction, preserving usage counters.
+  void notify_reclaimable() noexcept;
   void stop() noexcept;
 
  private:
@@ -125,8 +129,42 @@ class UniqueFd {
   int fd_ = -1;
 };
 
-// Reuse descriptors, never retired download data. Active Storage owns its
-// mapping and pages; release drops both before admitting an fd to the pool.
+inline constexpr size_t kReceiveBlockSize = 2 * 1024 * 1024;
+
+// Mappings stay populated while idle. The limit includes both leased blocks
+// and the intrusive freelist; mappings are allocated only on a pool miss.
+class ReceiveBlockPool {
+ public:
+  struct Snapshot {
+    size_t mapped;
+    size_t idle;
+    size_t capacity;
+  };
+
+  explicit ReceiveBlockPool(size_t capacity);
+  ~ReceiveBlockPool();
+  ReceiveBlockPool(const ReceiveBlockPool&) = delete;
+  ReceiveBlockPool& operator=(const ReceiveBlockPool&) = delete;
+  // Populate up to count total mappings before serving requests. Existing
+  // leased mappings are never touched; count is clamped to the pool limit.
+  void preallocate(size_t count);
+  void* acquire();
+  void release(void* block) noexcept;
+  Snapshot snapshot() const noexcept;
+
+ private:
+  void* allocate_block();
+  mutable std::mutex mutex_;
+  void* free_      = nullptr;
+  size_t mapped_   = 0;
+  size_t idle_     = 0;
+  size_t capacity_ = 0;
+};
+
+class AnonymousRangeStorage;
+
+// Legacy fd storage returns emptied descriptors. Anonymous storage returns
+// completed receive blocks to a separately bounded, persistent mapping pool.
 class ReadAheadStoragePool {
  public:
   struct Storage {
@@ -134,6 +172,7 @@ class ReadAheadStoragePool {
     void* mapping = nullptr;
     size_t size   = 0;
     PrefetchBudget::Reservation charge;
+    std::unique_ptr<AnonymousRangeStorage> anonymous_storage;
 
     Storage() = default;
     Storage(const Storage&) = delete;
@@ -145,15 +184,20 @@ class ReadAheadStoragePool {
     bool discard(size_t offset, size_t length) noexcept;
   };
 
-  explicit ReadAheadStoragePool(size_t max_idle_fds = 16);
+  explicit ReadAheadStoragePool(size_t max_idle_fds = 16,
+                               size_t max_receive_bytes = 32 * 1024 * 1024);
   Storage acquire(size_t size);
   Storage acquire(size_t size, PrefetchBudget::Reservation charge);
+  Storage acquire_anonymous(size_t size, PrefetchBudget::Reservation charge);
+  void preallocate_receive_blocks(size_t count);
+  ReceiveBlockPool::Snapshot receive_snapshot() const noexcept;
   void release(Storage storage) noexcept;
 
  private:
   std::mutex mutex_;
   std::vector<UniqueFd> entries_;
   size_t max_idle_fds_;
+  std::shared_ptr<ReceiveBlockPool> receive_blocks_;
 };
 
 // Short native waits for legacy workers, or try/recheck/eventfd waits for
@@ -311,6 +355,51 @@ class Pipe {
   UniqueFd read_end_;
   UniqueFd write_end_;
   size_t capacity_ = 0;
+};
+
+// Receive blocks for the uring uncached-read path. The network cursor is
+// contiguous; replies may borrow arbitrary completed spans. Callers must
+// retire every reply/receive reference before discarding a block or storage.
+class AnonymousRangeStorage {
+ public:
+  AnonymousRangeStorage(std::shared_ptr<ReceiveBlockPool> pool, size_t size,
+                        PrefetchBudget::Reservation charge);
+  ~AnonymousRangeStorage();
+
+  AnonymousRangeStorage(const AnonymousRangeStorage&) = delete;
+  AnonymousRangeStorage& operator=(const AnonymousRangeStorage&) = delete;
+
+  [[nodiscard]] size_t size() const noexcept { return size_; }
+  [[nodiscard]] size_t produced() const noexcept { return produced_; }
+  [[nodiscard]] bool available(size_t offset, size_t length) const noexcept;
+  [[nodiscard]] std::span<std::byte> writable(size_t maximum);
+  void commit(size_t bytes);
+  [[nodiscard]] bool copy_to(size_t offset, std::span<std::byte> output) const;
+  [[nodiscard]] std::vector<std::span<const std::byte>> spans(
+      size_t offset, size_t length) const;
+  // Recycle only complete blocks wholly covered by this served interval.
+  // Returns their logical byte count (a final tail may be shorter than 2MiB)
+  // and releases one 2MiB reservation quantum for each recycled mapping.
+  size_t discard(size_t offset, size_t length) noexcept;
+  // Return mappings to the pool while transferring the remaining charge.
+  [[nodiscard]] PrefetchBudget::Reservation release_for_retry() noexcept;
+
+ private:
+  struct Chunk {
+    void* mapping = nullptr;
+    size_t offset = 0;
+    size_t length = 0;
+    size_t used = 0;
+  };
+
+  void release() noexcept;
+  void allocate_next();
+
+  std::shared_ptr<ReceiveBlockPool> pool_;
+  size_t size_ = 0;
+  size_t produced_ = 0;
+  PrefetchBudget::Reservation charge_;
+  std::vector<Chunk> chunks_;
 };
 
 size_t splice_exact(int source_fd, int destination_fd,

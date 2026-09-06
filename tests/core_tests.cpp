@@ -657,6 +657,121 @@ void test_prefetch_storage() {
   assert(rejected);
 }
 
+void test_receive_block_pool() {
+  const size_t b = kReceiveBlockSize;
+  {
+    ReadAheadStoragePool warmed(0, 3 * b);
+    warmed.preallocate_receive_blocks(0);
+    assert(warmed.receive_snapshot().mapped == 0);
+    warmed.preallocate_receive_blocks(2);
+    assert(warmed.receive_snapshot().mapped == 2 * b);
+    assert(warmed.receive_snapshot().idle == 2 * b);
+    auto active = warmed.acquire_anonymous(8, {});
+    auto bytes = active.anonymous_storage->writable(8);
+    memset(bytes.data(), 'p', bytes.size());
+    active.anonymous_storage->commit(bytes.size());
+    assert(warmed.receive_snapshot().mapped == 2 * b);
+    assert(warmed.receive_snapshot().idle == b);
+    warmed.preallocate_receive_blocks(SIZE_MAX); // Clamp, including with a leased block.
+    assert(warmed.receive_snapshot().mapped == 3 * b);
+    assert(warmed.receive_snapshot().idle == 2 * b);
+    assert(active.anonymous_storage->spans(0, 8)[0][7] == std::byte('p'));
+    auto next = warmed.acquire_anonymous(b, {});
+    assert(next.anonymous_storage->writable(b).size() == b);
+    assert(warmed.receive_snapshot().mapped == 3 * b);
+    warmed.release(std::move(next));
+    warmed.release(std::move(active));
+    assert(warmed.receive_snapshot().idle == 3 * b);
+  }
+  PrefetchBudget budget(4 * b, b, b);
+  ReadAheadStoragePool pool(0, 2 * b);
+  auto charge = budget.try_reserve(1, 4 * b, 3 * b, 3 * b, true);
+  auto storage = pool.acquire_anonymous(2 * b + 123, std::move(charge));
+  auto& data = *storage.anonymous_storage;
+  assert(pool.receive_snapshot().mapped == 0); // Logical windows allocate lazily.
+  assert(!data.available(0, 1));
+  auto first = data.writable(17);
+  assert(first.size() == 17 && pool.receive_snapshot().mapped == b);
+  void* first_address = first.data();
+  memset(first.data(), 'a', first.size());
+  data.commit(first.size());
+  assert(data.available(0, 17) && !data.available(0, 18));
+  assert_throws([&] { (void)data.spans(0, 18); });
+  auto rest = data.writable(2 * b);
+  assert(rest.size() == b - 17 && rest.data() == first.data() + 17);
+  memset(rest.data(), 'a', rest.size());
+  data.commit(rest.size());
+  auto second = data.writable(2 * b);
+  assert(second.size() == b && second.data() != first_address);
+  memset(second.data(), 'b', second.size());
+  data.commit(second.size());
+  assert(pool.receive_snapshot().mapped == 2 * b);
+  auto spans = data.spans(b - 16, 32);
+  assert(spans.size() == 2 && spans[0].size() == 16 && spans[1].size() == 16);
+  assert(spans[0][0] == std::byte('a') && spans[1][0] == std::byte('b'));
+  spans.clear(); // The borrower has retired before recycling its block.
+  assert(data.discard(0, b - 1) == 0);
+  assert(data.discard(1, b - 1) == 0);
+  assert_throws([&] { (void)data.writable(b); }); // Physical cap includes active mappings.
+  assert(data.discard(0, b) == b);
+  assert(!data.available(0, 1) && data.available(b, b));
+  assert(budget.snapshot().used == 2 * b);
+  assert(pool.receive_snapshot().idle == b);
+  auto tail = data.writable(b);
+  assert(tail.size() == 123 && tail.data() == first_address);
+  memset(tail.data(), 'c', tail.size());
+  data.commit(tail.size());
+  assert(data.produced() == 2 * b + 123 && data.writable(1).empty());
+  assert(data.discard(2 * b, 122) == 0);
+  assert(data.discard(2 * b, 123) == 123);
+  assert(budget.snapshot().used == b); // Short tail still owned a full block.
+  pool.release(std::move(storage));
+  assert(budget.snapshot().used == 0);
+  assert(pool.receive_snapshot().mapped == 2 * b);
+  assert(pool.receive_snapshot().idle == 2 * b);
+
+  auto reused = pool.acquire_anonymous(1, {});
+  assert(!reused.anonymous_storage->available(0, 1));
+  assert_throws([&] { (void)reused.anonymous_storage->spans(0, 1); });
+  auto byte = reused.anonymous_storage->writable(1);
+  assert(pool.receive_snapshot().mapped == 2 * b);
+  byte[0] = std::byte('x');
+  reused.anonymous_storage->commit(1);
+  assert(reused.anonymous_storage->spans(0, 1)[0][0] == std::byte('x'));
+  pool.release(std::move(reused));
+
+  ReadAheadStoragePool::Storage survivor;
+  {
+    ReadAheadStoragePool temporary(0, b);
+    survivor = temporary.acquire_anonymous(7, {});
+    auto bytes = survivor.anonymous_storage->writable(7);
+    memset(bytes.data(), 's', bytes.size());
+    survivor.anonymous_storage->commit(bytes.size());
+  }
+  assert(survivor.anonymous_storage->spans(0, 7)[0][6] == std::byte('s'));
+  assert(survivor.anonymous_storage->discard(0, 7) == 7);
+}
+
+void test_receive_block_pool_concurrent() {
+  const size_t b = kReceiveBlockSize;
+  auto pool = std::make_shared<ReceiveBlockPool>(4 * b);
+  std::array<std::thread, 4> threads;
+  for (size_t n = 0; n != threads.size(); ++n) {
+    threads[n] = std::thread([&, n] {
+      for (size_t i = 0; i != 1000; ++i) {
+        AnonymousRangeStorage data(pool, 16, {});
+        auto bytes = data.writable(16);
+        memset(bytes.data(), int(n + 1), bytes.size());
+        data.commit(bytes.size());
+        assert(data.spans(0, 16)[0][15] == std::byte(n + 1));
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  const auto status = pool->snapshot();
+  assert(status.mapped <= 4 * b && status.idle == status.mapped);
+}
+
 void test_prefetch_storage_budget() {
   const size_t p = size_t(::sysconf(_SC_PAGESIZE));
   PrefetchBudget budget(8 * p, 2 * p, p);
@@ -818,6 +933,46 @@ void test_prefetch_budget_async_wait() {
   budget.end_async_wait();
   assert(budget.snapshot().stopped);
   assert(budget.begin_async_wait(budget.snapshot().revision) == -1);
+}
+
+void test_prefetch_budget_reclaimable() {
+  constexpr size_t p = 4096;
+  PrefetchBudget budget(p, p, p);
+  auto charge = budget.try_reserve(1, p, p, p, true);
+  assert(charge && !budget.try_reserve(2, p, p, p, true));
+  const auto before = budget.snapshot();
+  struct Wake {
+    PrefetchBudget* budget;
+    unsigned calls = 0;
+  } wake{&budget};
+  PrefetchBudget::Waiter waiter;
+  waiter.context = &wake;
+  waiter.ready = [](void* value) noexcept {
+    auto& w = *static_cast<Wake*>(value);
+    assert(w.budget->snapshot().used == p); // No lock held, no charge released.
+    ++w.calls;
+  };
+  assert(budget.subscribe(waiter, before.revision));
+  const int fd = budget.begin_async_wait(before.revision);
+  assert(fd >= 0);
+  std::thread blocked([&] { assert(budget.wait(before.revision)); });
+  budget.notify_reclaimable();
+  blocked.join();
+  const auto after = budget.snapshot();
+  assert(after.used == before.used && after.files == before.files);
+  assert(after.revision == before.revision + 1 && wake.calls == 1);
+  assert(!waiter.linked && !budget.subscribe(waiter, before.revision));
+  assert(!budget.try_reserve(2, p, p, p, true));
+  uint64_t value = 0;
+  assert(::read(fd, &value, sizeof(value)) == ssize_t(sizeof(value)) && value == 1);
+  budget.end_async_wait();
+  budget.notify_reclaimable();
+  pollfd ready{fd, POLLIN, 0};
+  assert(::poll(&ready, 1, 0) == 0); // No eventfd write without async waiters.
+  budget.stop();
+  const auto stopped = budget.snapshot();
+  budget.notify_reclaimable();
+  assert(budget.snapshot().revision == stopped.revision);
 }
 
 void test_prefetch_storage_budget_event_stress() {
@@ -1034,11 +1189,14 @@ void test_prefetch_budget_concurrent() {
 
 int main() {
   test_prefetch_storage();
+  test_receive_block_pool();
+  test_receive_block_pool_concurrent();
   test_prefetch_storage_concurrent();
   test_prefetch_storage_discard();
   test_prefetch_budget();
   test_prefetch_storage_budget();
   test_prefetch_budget_async_wait();
+  test_prefetch_budget_reclaimable();
   test_prefetch_storage_budget_event_stress();
   test_prefetch_budget_concurrent();
   test_prefetch_budget_demand_capacity();

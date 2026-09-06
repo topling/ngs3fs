@@ -724,6 +724,7 @@ class Http2Client final : public HttpClient {
   int callback_errno = 0;
   bool reconnect_required = false;
   bool file_splice_supported = true;
+  bool receive_waitall_supported = true;
   bool tls = false;
   uint64_t tls_upload_request_id = 0;
 
@@ -2605,6 +2606,7 @@ class Http1Client final : public HttpClient {
   bool request_active        = false;
   bool upload_chunked        = false;
   bool file_splice_supported = true;
+  bool receive_waitall_supported = true;
   uint64_t tls_upload_request_id = 0;
   size_t upload_sent = 0;
   size_t upload_length = kUnknownBodyLength;
@@ -3308,9 +3310,11 @@ UniqueFd http_reconnect_socket(const sockaddr_storage& peer,
 class HttpAsyncOperation : public AsyncHttpOperation {
  public:
   HttpAsyncOperation(IoExecutor& executor, AsyncHttpRequest request,
-                     Complete complete, void* context, int timeout_ms)
+                     Complete complete, void* context, int timeout_ms,
+                     bool& receive_waitall_supported)
       : executor_(executor), request_(std::move(request)),
-        complete_(complete), context_(context), timeout_ms_(timeout_ms) {
+        complete_(complete), context_(context), timeout_ms_(timeout_ms),
+        receive_waitall_supported_(receive_waitall_supported) {
     if (complete == nullptr) {
       throw std::invalid_argument("missing HTTP completion");
     }
@@ -3343,12 +3347,16 @@ class HttpAsyncOperation : public AsyncHttpOperation {
  protected:
   virtual void begin() = 0;
   virtual void advance(ssize_t result) = 0;
+  virtual void resume_memory_receive() = 0;
+  [[nodiscard]] virtual bool received_body_end(size_t bytes) const noexcept = 0;
   virtual Response& mutable_response() noexcept = 0;
   virtual void close_request(bool failed) noexcept = 0;
 
   void check_cancelled() const {
-    if (cancelled_ || (request_.destination != nullptr &&
-                       request_.destination->cancelled())) {
+    if (cancelled_ || (!body_drained_ &&
+        ((request_.destination != nullptr && request_.destination->cancelled()) ||
+         (request_.memory_destination != nullptr &&
+          request_.memory_destination->cancelled())))) {
       throw std::system_error(ECANCELED, std::generic_category(),
                               "HTTP request cancelled");
     }
@@ -3381,6 +3389,16 @@ class HttpAsyncOperation : public AsyncHttpOperation {
       throw std::system_error(errno, std::generic_category(),
                               "submit HTTP I/O");
     }
+  }
+
+  void post_memory_receive(int fd, std::span<std::byte> destination) {
+    if (destination.empty()) {
+      throw std::runtime_error("asynchronous memory range sink is full");
+    }
+    const unsigned flags = receive_waitall_supported_ &&
+        request_.memory_destination->receive_waitall() ? MSG_WAITALL : 0;
+    post(AsyncIoRequest::RECEIVE, fd, destination.data(), destination.size(),
+         false, -1, -1, -1, false, flags);
   }
 
   static size_t require_bytes(ssize_t result, const char* operation) {
@@ -3434,6 +3452,9 @@ class HttpAsyncOperation : public AsyncHttpOperation {
     }
     if (request_.destination != nullptr && response.status < 300) {
       request_.destination->progress(response, complete);
+    }
+    if (request_.memory_destination != nullptr && response.status < 300) {
+      request_.memory_destination->progress(response, complete);
     }
     check_cancelled();
   }
@@ -3497,6 +3518,7 @@ class HttpAsyncOperation : public AsyncHttpOperation {
   void* context_;
   int timeout_ms_;
   size_t upload_length_ = 0;
+  bool& receive_waitall_supported_;
 
  private:
   size_t source_index_ = 0;
@@ -3506,7 +3528,20 @@ class HttpAsyncOperation : public AsyncHttpOperation {
     self.pending_ = false;
     self.advancing_ = true;
     try {
+      // The final receive may have drained the body before its reader closed.
+      // Account that completed I/O and retain the reusable connection. Explicit
+      // operation cancellation still wins; no additional body is drained here.
+      if (result > 0 && self.received_body_end(size_t(result))) {
+        self.body_drained_ = true;
+      }
       self.check_cancelled();
+      if (self.io_.kind == AsyncIoRequest::RECEIVE &&
+          (self.io_.flags & MSG_WAITALL) != 0 && self.io_.transferred == 0 &&
+          (result == -EINVAL || result == -EOPNOTSUPP || result == -ENOSYS)) {
+        self.receive_waitall_supported_ = false;
+        self.resume_memory_receive();
+        return;
+      }
       if (result >= 0 && self.io_.exact && size_t(result) != self.io_.length) {
         throw std::system_error(ECONNRESET, std::generic_category(),
                                 "incomplete asynchronous HTTP I/O");
@@ -3530,6 +3565,7 @@ class HttpAsyncOperation : public AsyncHttpOperation {
   bool advancing_ = false;
   bool cancelled_ = false;
   bool done_ = false;
+  bool body_drained_ = false;
 };
 
 class Http1AsyncOperation final : public HttpAsyncOperation {
@@ -3538,14 +3574,16 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
                       AsyncHttpRequest request, Complete complete,
                       void* context)
       : HttpAsyncOperation(executor, std::move(request), complete, context,
-                            client.io_timeout_ms), client_(client) {}
+                            client.io_timeout_ms, client.receive_waitall_supported),
+        client_(client) {}
 
   const Response& response() const noexcept override { return response_; }
 
  private:
   enum Stage {
     CONNECT, SEND_HEAD, SEND_BODY, UPLOAD_PIPE, UPLOAD_SEND,
-    RECEIVE_HEADER, RECEIVE_BODY, SOCKET_PIPE, PIPE_FILE, PIPE_COPY, WRITE_FILE
+    RECEIVE_HEADER, RECEIVE_BODY, RECEIVE_MEMORY, SOCKET_PIPE, PIPE_FILE,
+    PIPE_COPY, WRITE_FILE
   } stage_ = SEND_HEAD;
 
   Response& mutable_response() noexcept override { return response_; }
@@ -3586,8 +3624,10 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
     std::array<Header, 2> generated;
     size_t generated_count = 0;
     if (request_.range) {
-      if (request_.length == 0 || request_.destination == nullptr ||
-          request_.destination->fd() < 0 ||
+      if (request_.length == 0 ||
+          (request_.destination == nullptr && request_.memory_destination == nullptr) ||
+          (request_.destination != nullptr && request_.memory_destination != nullptr) ||
+          (request_.destination != nullptr && request_.destination->fd() < 0) ||
           request_.offset > UINT64_MAX - (request_.length - 1)) {
         throw std::invalid_argument("invalid asynchronous GET range");
       }
@@ -3721,6 +3761,10 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
         if (begin != length) {
           buffered_ = length - begin;
           if (request_.range && response_.status < 300) {
+            if (request_.memory_destination != nullptr) {
+              write_memory(buffer_.data() + begin, buffered_, false);
+              return;
+            }
             write_file(buffer_.data() + begin, buffered_, false);
             return;
           }
@@ -3754,12 +3798,44 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
           request_.destination->background_write());
   }
 
+  void write_memory(const std::byte* data, size_t length, bool accounted) {
+    size_t copied = 0;
+    while (copied != length) {
+      std::span<std::byte> destination = request_.memory_destination->writable(
+          length - copied);
+      if (destination.empty()) {
+        throw std::runtime_error("asynchronous memory range sink is full");
+      }
+      const size_t count = std::min(destination.size(), length - copied);
+      memcpy(destination.data(), data + copied, count);
+      request_.memory_destination->commit(count);
+      copied += count;
+    }
+    if (!accounted) {
+      response_.body_bytes += length;
+      response_.fallback_copied_bytes += length;
+      *fixed_remaining_ -= length;
+    } else {
+      copied_.clear();
+    }
+    publish(false);
+    if (!fixed_remaining_ && parser_->message_complete()) {
+      complete_response();
+    } else {
+      body_next();
+    }
+  }
+
   void parse_body(std::span<const std::byte> bytes) {
     const size_t consumed = parser_->execute(bytes);
     if (consumed != bytes.size()) {
       throw std::runtime_error("bytes after completed HTTP response");
     }
     if (!copied_.empty()) {
+      if (request_.memory_destination != nullptr) {
+        write_memory(copied_.data(), copied_.size(), true);
+        return;
+      }
       write_file(copied_.data(), copied_.size(), true);
       return;
     }
@@ -3776,6 +3852,16 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
       return;
     }
     if (fixed_remaining_ && request_.range && response_.status < 300) {
+      if (request_.memory_destination != nullptr) {
+        std::span<std::byte> destination = request_.memory_destination->writable(
+            *fixed_remaining_);
+        if (destination.empty()) {
+          throw std::runtime_error("asynchronous memory range sink is full");
+        }
+        stage_ = RECEIVE_MEMORY;
+        post_memory_receive(client_.socket.get(), destination);
+        return;
+      }
       ensure_pipe(*fixed_remaining_);
       stage_ = SOCKET_PIPE;
       post(AsyncIoRequest::SPLICE, client_.socket.get(), nullptr,
@@ -3788,6 +3874,13 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
             fixed_remaining_ ? std::min(*fixed_remaining_, buffer_.size())
                              : buffer_.size());
     }
+  }
+
+  void resume_memory_receive() override { body_next(); }
+
+  bool received_body_end(size_t bytes) const noexcept override {
+    return stage_ == RECEIVE_MEMORY && fixed_remaining_ &&
+        bytes == *fixed_remaining_;
   }
 
   void complete_response() {
@@ -3857,6 +3950,13 @@ class Http1AsyncOperation final : public HttpAsyncOperation {
         response_.body_bytes += n;
         response_.fallback_copied_bytes += n;
         *fixed_remaining_ -= n;
+        body_next();
+        return;
+      case RECEIVE_MEMORY:
+        request_.memory_destination->commit(n);
+        response_.body_bytes += n;
+        *fixed_remaining_ -= n;
+        publish(false);
         body_next();
         return;
       case SOCKET_PIPE:
@@ -3931,7 +4031,8 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
                       AsyncHttpRequest request, Complete complete,
                       void* context)
       : HttpAsyncOperation(executor, std::move(request), complete, context,
-                            client.io_timeout_ms), client_(client) {}
+                            client.io_timeout_ms, client.receive_waitall_supported),
+        client_(client) {}
 
   const Response& response() const noexcept override {
     return active_.response;
@@ -3940,7 +4041,8 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
  private:
   enum Stage {
     CONNECT, SEND_CONTROL, FRAME_HEADER, FRAME_PAYLOAD, SOCKET_PIPE, PIPE_FILE,
-    PIPE_COPY, WRITE_FILE, UPLOAD_HEADER, UPLOAD_PIPE, UPLOAD_BODY
+    PIPE_COPY, WRITE_FILE, RECEIVE_MEMORY, UPLOAD_HEADER, UPLOAD_PIPE,
+    UPLOAD_BODY
   } stage_ = SEND_CONTROL;
 
   Response& mutable_response() noexcept override { return active_.response; }
@@ -3983,8 +4085,10 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
 
   void start_request() {
     if (request_.range &&
-        (request_.length == 0 || request_.destination == nullptr ||
-         request_.destination->fd() < 0 ||
+        (request_.length == 0 ||
+         (request_.destination == nullptr && request_.memory_destination == nullptr) ||
+         (request_.destination != nullptr && request_.memory_destination != nullptr) ||
+         (request_.destination != nullptr && request_.destination->fd() < 0) ||
          request_.offset > UINT64_MAX - (request_.length - 1))) {
       throw std::invalid_argument("invalid asynchronous HTTP/2 GET range");
     }
@@ -4140,6 +4244,8 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
       frame_remaining_ = frame_.length;
       if (frame_remaining_ == 0) {
         flush();
+      } else if (request_.memory_destination != nullptr) {
+        socket_to_memory();
       } else {
         socket_to_pipe();
       }
@@ -4164,6 +4270,23 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
           SPLICE_F_MOVE | SPLICE_F_MORE);
   }
 
+  void socket_to_memory() {
+    std::span<std::byte> destination = request_.memory_destination->writable(
+        frame_remaining_);
+    if (destination.empty()) {
+      throw std::runtime_error("asynchronous memory range sink is full");
+    }
+    stage_ = RECEIVE_MEMORY;
+    post_memory_receive(client_.socket.get(), destination);
+  }
+
+  void resume_memory_receive() override { socket_to_memory(); }
+
+  bool received_body_end(size_t bytes) const noexcept override {
+    return stage_ == RECEIVE_MEMORY && bytes == frame_remaining_ &&
+        (frame_.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+  }
+
   void return_credit(size_t size) {
     const int result = nghttp2_session_consume(
         client_.session.get(), active_.stream_id, size);
@@ -4172,24 +4295,34 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
     }
   }
 
-  void commit_shadow(size_t size, bool copied) {
+  enum BodyTransfer { BODY_SPLICED, BODY_COPIED, BODY_DIRECT };
+
+  void commit_shadow(size_t size, BodyTransfer transfer) {
     const size_t before = active_.shadow_callback_bytes;
     client_.ingress.advance_shadow_payload(client_.session.get(), size);
     if (active_.shadow_callback_bytes - before != size) {
       throw std::runtime_error("nghttp2 rejected asynchronous DATA");
     }
     active_.response.body_bytes += size;
-    if (copied) {
+    if (transfer == BODY_COPIED) {
       active_.response.fallback_copied_bytes += size;
-    } else {
+    } else if (transfer == BODY_SPLICED) {
       active_.response.externally_spliced_bytes += size;
     }
     frame_remaining_ -= size;
-    request_.destination->advance(size);
+    if (request_.memory_destination != nullptr) {
+      request_.memory_destination->commit(size);
+    } else {
+      request_.destination->advance(size);
+    }
     return_credit(size);
     publish(false);
     if (frame_remaining_ != 0) {
-      socket_to_pipe();
+      if (request_.memory_destination != nullptr) {
+        socket_to_memory();
+      } else {
+        socket_to_pipe();
+      }
     } else {
       flush();
     }
@@ -4203,6 +4336,24 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
     }
     const size_t size = copied_.size();
     if (request_.range && active_.response.status < 300) {
+      if (request_.memory_destination != nullptr) {
+        size_t copied = 0;
+        while (copied != size) {
+          const auto destination = request_.memory_destination->writable(size - copied);
+          if (destination.empty()) {
+            throw std::runtime_error("asynchronous memory range sink is full");
+          }
+          const size_t count = std::min(destination.size(), size - copied);
+          memcpy(destination.data(), copied_.data() + copied, count);
+          request_.memory_destination->commit(count);
+          copied += count;
+        }
+        copied_.clear();
+        return_credit(size);
+        publish(false);
+        flush();
+        return;
+      }
       write_shadow_ = false;
       stage_ = WRITE_FILE;
       post(AsyncIoRequest::PWRITE, request_.destination->fd(),
@@ -4310,7 +4461,10 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
         }
         return;
       case PIPE_FILE:
-        commit_shadow(n, false);
+        commit_shadow(n, BODY_SPLICED);
+        return;
+      case RECEIVE_MEMORY:
+        commit_shadow(n, BODY_DIRECT);
         return;
       case PIPE_COPY:
         write_shadow_ = true;
@@ -4323,7 +4477,7 @@ class Http2AsyncOperation final : public HttpAsyncOperation {
       case WRITE_FILE:
         copied_.clear();
         if (write_shadow_) {
-          commit_shadow(n, true);
+          commit_shadow(n, BODY_COPIED);
         } else {
           request_.destination->advance(n);
           return_credit(n);

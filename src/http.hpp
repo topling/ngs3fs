@@ -119,6 +119,28 @@ class RangeFileSink {
   bool background_write_;
 };
 
+// An asynchronous range receiver can write directly into caller-owned,
+// writable memory. The caller keeps each span valid until commit(), or until
+// operation completion when the receive fails. commit() publishes its prefix.
+class RangeMemorySink {
+ public:
+  virtual ~RangeMemorySink() = default;
+
+  RangeMemorySink(const RangeMemorySink&) = delete;
+  RangeMemorySink& operator=(const RangeMemorySink&) = delete;
+
+  [[nodiscard]] virtual std::span<std::byte> writable(size_t maximum) = 0;
+  virtual void commit(size_t bytes) = 0;
+  // Choose WAITALL when submitting a speculative receive without waiting
+  // readers. Readers arriving afterward wait for that receive to complete.
+  [[nodiscard]] virtual bool receive_waitall() const noexcept { return false; }
+  [[nodiscard]] virtual bool cancelled() const noexcept { return false; }
+  virtual void progress(const Response& response, bool complete) = 0;
+
+ protected:
+  RangeMemorySink() = default;
+};
+
 class RangeDownload {
  public:
   virtual ~RangeDownload() = default;
@@ -149,6 +171,7 @@ struct AsyncHttpRequest {
   ssostr<248> path;
   std::vector<Header> headers;
   RangeFileSink* destination = nullptr;
+  RangeMemorySink* memory_destination = nullptr;
   uint64_t offset = 0;
   size_t length = 0;
   size_t max_response_body = kPreferredIoSize;

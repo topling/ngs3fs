@@ -31,22 +31,26 @@
 ReadAheadStoragePool::Storage::Storage(Storage&& other) noexcept
     : fd(std::move(other.fd)),
       mapping(std::exchange(other.mapping, nullptr)),
-      size(std::exchange(other.size, 0)), charge(std::move(other.charge)) {}
+      size(std::exchange(other.size, 0)), charge(std::move(other.charge)),
+      anonymous_storage(std::move(other.anonymous_storage)) {}
 
 ReadAheadStoragePool::Storage& ReadAheadStoragePool::Storage::operator=(
     Storage&& other) noexcept {
   if (this != &other) {
+    anonymous_storage.reset();
     unmap();
     fd      = std::move(other.fd);
     // The old fd is closed before its reservation wakes another allocator.
     charge  = std::move(other.charge);
     mapping = std::exchange(other.mapping, nullptr);
     size    = std::exchange(other.size, 0);
+    anonymous_storage = std::move(other.anonymous_storage);
   }
   return *this;
 }
 
 ReadAheadStoragePool::Storage::~Storage() {
+  anonymous_storage.reset();
   unmap();
   fd.reset();
   charge.reset();
@@ -73,8 +77,83 @@ bool ReadAheadStoragePool::Storage::discard(size_t offset, size_t length) noexce
   return true;
 }
 
-ReadAheadStoragePool::ReadAheadStoragePool(size_t max_idle_fds)
-    : max_idle_fds_(max_idle_fds) {
+ReceiveBlockPool::ReceiveBlockPool(size_t capacity)
+    : capacity_(capacity / kReceiveBlockSize * kReceiveBlockSize) {
+  if (capacity_ == 0) {
+    throw std::invalid_argument("receive buffer budget must hold a 2MiB block");
+  }
+}
+
+ReceiveBlockPool::~ReceiveBlockPool() {
+  assert(mapped_ == idle_);
+  while (free_ != nullptr) {
+    void* block = free_;
+    free_ = *static_cast<void**>(block);
+    ::munmap(block, kReceiveBlockSize);
+  }
+}
+
+void ReceiveBlockPool::preallocate(size_t count) {
+  const size_t target = std::min(count, capacity_ / kReceiveBlockSize) * kReceiveBlockSize;
+  for (;;) {
+    {
+      std::lock_guard guard(mutex_);
+      if (mapped_ >= target) return;
+      mapped_ += kReceiveBlockSize;
+    }
+    release(allocate_block());
+  }
+}
+
+void* ReceiveBlockPool::acquire() {
+  {
+    std::lock_guard guard(mutex_);
+    if (free_ != nullptr) {
+      void* block = free_;
+      free_ = *static_cast<void**>(block);
+      idle_ -= kReceiveBlockSize;
+      return block;
+    }
+    if (mapped_ == capacity_) {
+      throw std::system_error(ENOMEM, std::generic_category(),
+                              "receive buffer pool budget exhausted");
+    }
+    mapped_ += kReceiveBlockSize;
+  }
+  return allocate_block();
+}
+
+void* ReceiveBlockPool::allocate_block() {
+  void* block = ::mmap(nullptr, kReceiveBlockSize, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+  if (block == MAP_FAILED) {
+    const int error = errno;
+    std::lock_guard guard(mutex_);
+    mapped_ -= kReceiveBlockSize;
+    throw std::system_error(error, std::generic_category(),
+                            "mmap(populated receive block)");
+  }
+  return block;
+}
+
+void ReceiveBlockPool::release(void* block) noexcept {
+  if (block == nullptr) return;
+  std::lock_guard guard(mutex_);
+  *static_cast<void**>(block) = free_;
+  free_ = block;
+  idle_ += kReceiveBlockSize;
+  assert(idle_ <= mapped_);
+}
+
+ReceiveBlockPool::Snapshot ReceiveBlockPool::snapshot() const noexcept {
+  std::lock_guard guard(mutex_);
+  return {mapped_, idle_, capacity_};
+}
+
+ReadAheadStoragePool::ReadAheadStoragePool(size_t max_idle_fds,
+                                          size_t max_receive_bytes)
+    : max_idle_fds_(max_idle_fds),
+      receive_blocks_(std::make_shared<ReceiveBlockPool>(max_receive_bytes)) {
   entries_.reserve(max_idle_fds);
 }
 
@@ -120,7 +199,31 @@ ReadAheadStoragePool::Storage ReadAheadStoragePool::acquire(
   return storage;
 }
 
+ReadAheadStoragePool::Storage ReadAheadStoragePool::acquire_anonymous(
+    size_t size, PrefetchBudget::Reservation charge) {
+  if (size == 0 || size > uint64_t(INT64_MAX)) {
+    throw std::invalid_argument("invalid anonymous read-ahead storage size");
+  }
+  if (charge && size > charge.bytes()) {
+    throw std::invalid_argument("anonymous read-ahead storage exceeds reservation");
+  }
+  Storage storage;
+  storage.size = size;
+  storage.anonymous_storage = std::make_unique<AnonymousRangeStorage>(
+      receive_blocks_, size, std::move(charge));
+  return storage;
+}
+
+ReceiveBlockPool::Snapshot ReadAheadStoragePool::receive_snapshot() const noexcept {
+  return receive_blocks_->snapshot();
+}
+
+void ReadAheadStoragePool::preallocate_receive_blocks(size_t count) {
+  receive_blocks_->preallocate(count);
+}
+
 void ReadAheadStoragePool::release(Storage storage) noexcept {
+  if (storage.anonymous_storage) return;
   if (!storage.fd || max_idle_fds_ == 0) return;
   storage.unmap();
   // Truncate outside the pool lock. Other owners must have retired before
@@ -134,6 +237,166 @@ void ReadAheadStoragePool::release(Storage storage) noexcept {
   }
   // Storage's destructor releases its charge outside the pool lock, after
   // truncation (or close). Budget callbacks may immediately reuse this pool.
+}
+
+AnonymousRangeStorage::AnonymousRangeStorage(
+    std::shared_ptr<ReceiveBlockPool> pool, size_t size,
+    PrefetchBudget::Reservation charge)
+    : pool_(std::move(pool)), size_(size),
+      charge_(std::move(charge)) {
+  if (!pool_ || size == 0 || size > SIZE_MAX - (kReceiveBlockSize - 1)) {
+    throw std::invalid_argument("invalid anonymous range storage");
+  }
+  const size_t blocks = (size + kReceiveBlockSize - 1) / kReceiveBlockSize;
+  if (charge_ && (charge_.bytes() != blocks * kReceiveBlockSize ||
+                  kReceiveBlockSize % charge_.page_size() != 0)) {
+    throw std::invalid_argument("receive storage needs a 2MiB-rounded reservation");
+  }
+  chunks_.reserve(blocks);
+}
+
+AnonymousRangeStorage::~AnonymousRangeStorage() {
+  release();
+}
+
+void AnonymousRangeStorage::release() noexcept {
+  for (Chunk& chunk : chunks_) {
+    pool_->release(std::exchange(chunk.mapping, nullptr));
+  }
+  chunks_.clear();
+  charge_.reset();
+}
+
+void AnonymousRangeStorage::allocate_next() {
+  if (produced_ >= size_) {
+    throw std::runtime_error("anonymous range storage is full");
+  }
+  const size_t target = std::min(kReceiveBlockSize, size_ - produced_);
+  void* mapping = pool_->acquire();
+  // Descriptor capacity was reserved before the first mapping was acquired.
+  chunks_.push_back({mapping, produced_, target, 0});
+}
+
+std::span<std::byte> AnonymousRangeStorage::writable(size_t maximum) {
+  if (maximum == 0 || produced_ == size_) return {};
+  if (chunks_.empty() ||
+      produced_ >= chunks_.back().offset + chunks_.back().length) {
+    allocate_next();
+  }
+  Chunk& chunk = chunks_.back();
+  if (chunk.mapping == nullptr || produced_ < chunk.offset ||
+      produced_ > chunk.offset + chunk.length) {
+    throw std::logic_error("anonymous range storage write cursor");
+  }
+  const size_t used = produced_ - chunk.offset;
+  return std::span(static_cast<std::byte*>(chunk.mapping) + used,
+                   std::min(maximum, chunk.length - used));
+}
+
+void AnonymousRangeStorage::commit(size_t bytes) {
+  if (bytes == 0 || chunks_.empty()) {
+    throw std::invalid_argument("invalid anonymous range storage commit");
+  }
+  Chunk& chunk = chunks_.back();
+  if (chunk.mapping == nullptr || produced_ != chunk.offset + chunk.used ||
+      bytes > chunk.length - chunk.used) {
+    throw std::invalid_argument("anonymous range storage commit range");
+  }
+  chunk.used += bytes;
+  produced_ += bytes;
+}
+
+bool AnonymousRangeStorage::available(size_t offset, size_t length) const noexcept {
+  if (offset > produced_ || length > produced_ - offset) return false;
+  if (length == 0) return true;
+  size_t position = offset;
+  size_t remaining = length;
+  for (size_t i = offset / kReceiveBlockSize; i < chunks_.size(); ++i) {
+    const Chunk& chunk = chunks_[i];
+    if (position < chunk.offset || position >= chunk.offset + chunk.used) continue;
+    if (chunk.mapping == nullptr) return false;
+    const size_t count = std::min(remaining, chunk.used - (position - chunk.offset));
+    position += count;
+    remaining -= count;
+    if (remaining == 0) return true;
+  }
+  return false;
+}
+
+bool AnonymousRangeStorage::copy_to(
+    size_t offset, std::span<std::byte> output) const {
+  if (offset > produced_ || output.size() > produced_ - offset) return false;
+  if (output.empty()) return true;
+  size_t position = offset;
+  size_t copied = 0;
+  for (size_t i = offset / kReceiveBlockSize; i < chunks_.size(); ++i) {
+    const Chunk& chunk = chunks_[i];
+    if (position < chunk.offset || position >= chunk.offset + chunk.used) continue;
+    if (chunk.mapping == nullptr) return false;
+    const size_t local = position - chunk.offset;
+    const size_t count = std::min(output.size() - copied, chunk.used - local);
+    memcpy(output.data() + copied,
+           static_cast<const std::byte*>(chunk.mapping) + local, count);
+    position += count;
+    copied += count;
+    if (copied == output.size()) return true;
+  }
+  return false;
+}
+
+std::vector<std::span<const std::byte>> AnonymousRangeStorage::spans(
+    size_t offset, size_t length) const {
+  if (offset > produced_ || length > produced_ - offset) {
+    throw std::out_of_range("anonymous range storage span");
+  }
+  if (length == 0) return {};
+  std::vector<std::span<const std::byte>> result;
+  result.reserve((offset % kReceiveBlockSize + length - 1) / kReceiveBlockSize + 1);
+  size_t position = offset;
+  size_t remaining = length;
+  for (size_t i = offset / kReceiveBlockSize; i < chunks_.size(); ++i) {
+    const Chunk& chunk = chunks_[i];
+    if (position < chunk.offset || position >= chunk.offset + chunk.used) continue;
+    if (chunk.mapping == nullptr) {
+      throw std::runtime_error("anonymous range storage span was recycled");
+    }
+    const size_t local = position - chunk.offset;
+    const size_t count = std::min(remaining, chunk.used - local);
+    result.emplace_back(static_cast<const std::byte*>(chunk.mapping) + local,
+                        count);
+    position += count;
+    remaining -= count;
+    if (remaining == 0) return result;
+  }
+  throw std::runtime_error("anonymous range storage span is discontinuous");
+}
+
+PrefetchBudget::Reservation
+AnonymousRangeStorage::release_for_retry() noexcept {
+  for (Chunk& chunk : chunks_) {
+    pool_->release(std::exchange(chunk.mapping, nullptr));
+  }
+  chunks_.clear();
+  produced_ = 0;
+  return std::move(charge_);
+}
+
+size_t AnonymousRangeStorage::discard(size_t offset, size_t length) noexcept {
+  if (offset > produced_ || length > produced_ - offset) return 0;
+  const size_t end = offset + length;
+  size_t bytes = 0;
+  size_t released = 0;
+  for (size_t i = offset / kReceiveBlockSize; i < chunks_.size(); ++i) {
+    Chunk& chunk = chunks_[i];
+    if (chunk.offset >= end) break;
+    if (chunk.mapping == nullptr || chunk.used != chunk.length ||
+        chunk.offset < offset || chunk.offset + chunk.length > end) continue;
+    pool_->release(std::exchange(chunk.mapping, nullptr));
+    bytes += chunk.length;
+    released += kReceiveBlockSize;
+  }
+  if (charge_ && released != 0) charge_.split(released).reset();
+  return bytes;
 }
 
 struct PrefetchBudget::State {
@@ -321,8 +584,9 @@ void PrefetchBudget::end_async_wait() noexcept {
 
 PrefetchBudget::Snapshot PrefetchBudget::snapshot() const noexcept {
   std::lock_guard guard(state_->mutex);
-  return {state_->used.demand + state_->used.speculative, state_->peak,
-          state_->files.size(), state_->revision, state_->stopped, state_->file_peak};
+  return {state_->used.demand + state_->used.speculative, state_->capacity,
+          state_->peak, state_->files.size(), state_->revision,
+          state_->stopped, state_->file_peak};
 }
 
 size_t PrefetchBudget::file_used(uintptr_t file) const noexcept {
@@ -361,6 +625,19 @@ bool PrefetchBudget::wait(uint64_t revision) {
     return state_->stopped || state_->revision != revision;
   });
   return !state_->stopped;
+}
+
+void PrefetchBudget::notify_reclaimable() noexcept {
+  Waiter* ready;
+  {
+    std::lock_guard guard(state_->mutex);
+    if (state_->stopped) return;
+    ++state_->revision;
+    ready = state_->detach_waiters();
+  }
+  state_->condition.notify_all();
+  state_->wake_event();
+  State::wake(ready);
 }
 
 void PrefetchBudget::stop() noexcept {
