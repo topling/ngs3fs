@@ -529,149 +529,6 @@ struct ReactorIoTest {
     return 0;
   }
 
-  static int msg_ring_batch_case(bool fail, bool shutdown) {
-    ReactorIoTest test;
-    if (!test.initialize(false)) return test.failed ? 1 : 77;
-    const auto require = [](bool condition, const char* message) {
-      if (!condition) throw std::runtime_error(message);
-    };
-    FuseReactor& source = test.reactor();
-    require(::pipe2(source.return_pipe_, O_CLOEXEC | O_NONBLOCK) == 0,
-            "create batch return pipe");
-    auto value = std::make_unique<FuseReactor>();
-    FuseReactor* target = value.get();
-    std::string error;
-    require(target->initialize(&test.group, test.session, test.fake_fuse.get(),
-                               false, false, 8, 0, false, error),
-            "initialize MSG_RING batch target");
-    test.group.reactors_.push_back(std::move(value));
-    require(io_uring_enable_rings(&source.ring_) == 0 &&
-            io_uring_enable_rings(&target->ring_) == 0,
-            "enable MSG_RING batch rings");
-    source.ring_enabled_ = true;
-    target->ring_enabled_ = true;
-
-    constexpr size_t count = 16;
-    std::array<FuseReactor::Dispatch*, count> nodes{};
-    std::vector<size_t> order;
-    order.reserve(count);
-    struct Probe {
-      FuseReactor::Dispatch* dispatch;
-      std::vector<size_t>* order;
-      size_t index;
-    };
-    std::array<Probe, count> probes{};
-    for (size_t i = 0; i < count; ++i) {
-      nodes[i] = new FuseReactor::Dispatch;
-      require(::pipe2(nodes[i]->pipe, O_CLOEXEC | O_NONBLOCK) == 0,
-              "create batch input pipe");
-      nodes[i]->owner = &source;
-      if (i != 0) nodes[i - 1]->next_remote = nodes[i];
-      probes[i] = {nodes[i], &order, i};
-    }
-    source.dispatch_count_.store(count, std::memory_order_relaxed);
-    const unsigned sqes = io_uring_sq_ready(&source.ring_);
-    require(!source.start_remote_dispatch_batch(
-                nodes.front(), nodes.back(), target, count - 1) &&
-            !source.start_remote_dispatch_batch(
-                nodes.front(), nodes[count - 2], target, count),
-            "malformed batch count or tail was accepted");
-    require(target->task_count_.load() == 0 &&
-            io_uring_sq_ready(&source.ring_) == sqes,
-            "rejected batch changed target admission or SQEs");
-    for (auto* node : nodes) {
-      require(node->target == nullptr && node->input_tasks.load() == 0 &&
-              node->task.run == nullptr,
-              "rejected batch partially prepared its nodes");
-    }
-    // Prepare an invalid destination SQE without closing/reusing the target
-    // ring fd. Its failure CQE must own and roll back the whole batch.
-    const int fd = target->ring_.ring_fd;
-    if (fail) target->ring_.ring_fd = -1;
-    const bool accepted = source.start_remote_dispatch_batch(
-        nodes.front(), nodes.back(), target, count);
-    target->ring_.ring_fd = fd;
-    require(accepted && target->task_count_.load() == count,
-            "batch admission did not retain every request");
-    require(source.remote_dispatch_batches_ == 1 &&
-            source.remote_dispatch_requests_ == count,
-            "batch emitted one message per request instead of one per owner");
-    for (size_t i = 0; i < count; ++i) {
-      nodes[i]->task.context = &probes[i];
-      nodes[i]->task.run = [](void* context) noexcept {
-        auto* probe = static_cast<Probe*>(context);
-        probe->order->push_back(probe->index);
-        probe->dispatch->processing_complete = true;
-      };
-    }
-    if (shutdown) {
-      test.group.shutting_down_.store(true, std::memory_order_release);
-      require(!test.group.dispatch_admission_closed_.load(),
-              "shutdown closed ingress before its admitted batch was submitted");
-    }
-    require(io_uring_submit(&source.ring_) == 1,
-            "batch did not use exactly one MSG_RING SQE");
-    if (shutdown) {
-      test.group.dispatch_admission_closed_.store(true, std::memory_order_release);
-    }
-    io_uring* ring = fail ? &source.ring_ : &target->ring_;
-    io_uring_cqe* cqe = nullptr;
-    __kernel_timespec timeout{.tv_sec = 2, .tv_nsec = 0};
-    require(io_uring_wait_cqe_timeout(ring, &cqe, &timeout) == 0,
-            "batch completion timed out");
-    const uintptr_t tagged = uintptr_t(io_uring_cqe_get_data(cqe));
-    const int result = cqe->res;
-    io_uring_cqe_seen(ring, cqe);
-    require((tagged & 7) == (fail ? 4 : 3) &&
-            reinterpret_cast<FuseReactor::Dispatch*>(tagged & ~uintptr_t(7)) ==
-                nodes.front(),
-            "batch CQE did not retain its FIFO head");
-    struct CurrentScope {
-      FuseReactor*& slot;
-      FuseReactor* previous;
-      ~CurrentScope() { slot = previous; }
-    } current{FuseReactor::current_, FuseReactor::current_};
-    FuseReactor::current_ = fail ? &source : target;
-    if (fail) {
-      require(result == -EBADF, "invalid batch target did not fail");
-      source.fail_remote_dispatch(nodes.front(), result);
-      require(source.error_ == -EBADF && order.empty(),
-              "failed batch executed a request or lost its error");
-    } else {
-      require(result == 0 && target->complete_remote_dispatch(nodes.front()),
-              "batch receiver rejected admitted requests");
-      for (size_t pass = 0; pass < count && order.size() != count; ++pass) {
-        require(target->run_ready_callbacks(), "run MSG_RING batch callbacks");
-      }
-      require(order.size() == count, "batch omitted request callbacks");
-      for (size_t i = 0; i < count; ++i) {
-        require(order[i] == i, "batch reordered same-owner requests");
-      }
-    }
-    require(target->task_count_.load(std::memory_order_acquire) == 0,
-            "batch leaked target admission");
-    require(io_uring_peek_cqe(ring, &cqe) == -EAGAIN,
-            "batch emitted extra completion messages");
-    require(source.drain_return_pipe() && source.dispatch_count_.load() == 0,
-            "batch leaked ingress admission");
-    std::array<bool, count> recycled{};
-    for (size_t i = 0; i < count; ++i) {
-      auto* node = source.pop_returned_dispatch();
-      if (node == nullptr) node = source.pop_dispatch();
-      const auto found = std::find(nodes.begin(), nodes.end(), node);
-      require(found != nodes.end(), "batch lost or returned an unknown Dispatch");
-      const size_t index = size_t(found - nodes.begin());
-      require(!recycled[index] && node->next_remote == nullptr,
-              "batch returned a duplicate Dispatch or retained its chain");
-      recycled[index] = true;
-    }
-    require(source.pop_returned_dispatch() == nullptr &&
-            source.pop_dispatch() == nullptr,
-            "batch recycled more requests than admitted");
-    for (auto* node : nodes) source.recycle_dispatch(node);
-    return 0;
-  }
-
   static int metadata_io_case() {
     ReactorIoTest test;
     if (!test.initialize(false)) return test.failed ? 1 : 77;
@@ -865,6 +722,233 @@ struct ReactorIoTest {
     return 0;
   }
 
+  static int fd_reply_case(bool use_sqpoll) {
+    const auto require = [](bool condition, const char* message) {
+      if (!condition) throw std::runtime_error(message);
+    };
+    struct Result {
+      int value = -EINPROGRESS;
+      unsigned calls = 0;
+      static void complete(void* context, int value) noexcept {
+        auto* self = static_cast<Result*>(context);
+        self->value = value;
+        ++self->calls;
+      }
+    };
+
+    ReactorIoTest test;
+    if (!test.initialize(use_sqpoll)) return test.failed ? 1 : 77;
+    FuseReactor& owner = test.reactor();
+    require(io_uring_enable_rings(&owner.ring_) == 0,
+            "enable fd-reply ring");
+    owner.ring_enabled_ = true;
+    FuseReactor::current_ = &owner;
+
+    const auto pump = [&](const auto& complete) {
+      for (unsigned waits = 0; !complete() && waits < 32; ++waits) {
+        require(io_uring_submit_and_wait(&owner.ring_, 1) >= 0,
+                "submit/wait fd-reply I/O");
+        io_uring_cqe* cqe = nullptr;
+        while (io_uring_peek_cqe(&owner.ring_, &cqe) == 0) {
+          const uintptr_t tagged = cqe->user_data;
+          const int result = cqe->res;
+          io_uring_cqe_seen(&owner.ring_, cqe);
+          if ((tagged & 7) == 1) {
+            owner.complete_io(reinterpret_cast<FuseReactor::IoRequest*>(
+                tagged & ~uintptr_t(7)), result);
+          } else if ((tagged & 7) == 5) {
+            owner.complete_async_cancel(
+                reinterpret_cast<FuseReactor::IoRequest*>(
+                    tagged & ~uintptr_t(7)), result);
+          } else {
+            require(false, "fd-reply returned an unexpected CQ tag");
+          }
+        }
+      }
+      require(complete(), "fd-reply did not complete");
+    };
+    const auto make_socket = [&] {
+      std::array<int, 2> sockets{-1, -1};
+      require(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                         sockets.data()) == 0,
+              "create fd-reply socket");
+      return std::array<UniqueFd, 2>{
+          UniqueFd(sockets[0]), UniqueFd(sockets[1])};
+    };
+    const auto start = [&](int output_fd, int source_fd, off_t offset,
+                           size_t length, int mode, Result& result,
+                           std::string_view header_text = "hdr:") {
+      FuseReactor::Reply* reply = owner.acquire_reply();
+      require(reply != nullptr, "acquire fd-reply state");
+      const iovec iov{
+          const_cast<char*>(header_text.data()), header_text.size()};
+      reply->notify_done = Result::complete;
+      reply->notify_context = &result;
+      if (!owner.begin_fd_reply(reply, output_fd, &iov, 1, source_fd,
+                                offset, length, 0, mode)) {
+        owner.release_reply(reply);
+        require(false, "begin fd-reply source I/O");
+      }
+      ++owner.fd_reply_count_;
+      return reply;
+    };
+    const auto expect_output = [&](UniqueFd& peer, std::string_view payload,
+                                   std::string_view header = "hdr:") {
+      std::string output(header.size() + payload.size(), '\0');
+      read_all(peer.get(), std::span<std::byte>(
+          reinterpret_cast<std::byte*>(output.data()), output.size()));
+      require(output.substr(0, header.size()) == header &&
+              output.substr(header.size()) == payload,
+              "fd-reply changed header or payload bytes");
+    };
+
+    constexpr std::string_view source =
+        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    require(::pwrite(test.file.get(), source.data(), source.size(), 0) ==
+                ssize_t(source.size()),
+            "write fd-reply source fixture");
+    auto rejected_socket = make_socket();
+    Result rejected;
+    FuseReactor::Reply* rejected_reply = owner.acquire_reply();
+    require(rejected_reply != nullptr, "acquire rejected fd-reply state");
+    const char rejected_header[] = "rejected:";
+    const iovec rejected_iov{
+        const_cast<char*>(rejected_header), sizeof(rejected_header) - 1};
+    rejected_reply->notify_done = Result::complete;
+    rejected_reply->notify_context = &rejected;
+    test.group.shutting_down_.store(true, std::memory_order_release);
+    errno = 0;
+    require(!owner.begin_fd_reply(
+                rejected_reply, rejected_socket[0].get(), &rejected_iov, 1,
+                test.file.get(), 0, 8, 0, FUSE_FD_REPLY_SPLICE) &&
+            errno == ENOTCONN && rejected.calls == 0 &&
+            owner.fd_reply_count_ == 0 &&
+            rejected_reply->fd_pipe[0] == -1 &&
+            rejected_reply->fd_pipe[1] == -1,
+            "rejected source admission retained a dirty reply pipe");
+    test.group.shutting_down_.store(false, std::memory_order_release);
+    owner.release_reply(rejected_reply);
+
+    auto small_socket = make_socket();
+    Result small;
+    const uint64_t small_io_before = owner.io_operations_;
+    FuseReactor::Reply* small_reply = start(
+        small_socket[0].get(), test.file.get(), 7, 19,
+        FUSE_FD_REPLY_PREAD, small);
+    pump([&] { return small.calls == 1; });
+    require(small.value == 0 && small.calls == 1,
+            "small fd-reply did not complete exactly once");
+    io_uring_cqe* unexpected = nullptr;
+    require(owner.io_operations_ == small_io_before + 1 &&
+            owner.async_pending_ == 0 &&
+            io_uring_peek_cqe(&owner.ring_, &unexpected) == -EAGAIN,
+            "small fd-reply queued a final transport CQ");
+    expect_output(small_socket[1], source.substr(7, 19));
+    FuseReactor::Reply* reused = owner.acquire_reply();
+    require(reused == small_reply, "pooled fd-reply was not reused");
+    owner.release_reply(reused);
+
+    std::string large_payload(16 * 1024, '\0');
+    for (size_t i = 0; i < large_payload.size(); ++i) {
+      large_payload[i] = char('a' + i % 23);
+    }
+    require(::pwrite(test.file.get(), large_payload.data(),
+                     large_payload.size(), 8192) ==
+                ssize_t(large_payload.size()),
+            "write large fd-reply source fixture");
+    auto first_socket = make_socket();
+    auto second_socket = make_socket();
+    Result first;
+    Result second;
+    FuseReactor::Reply* first_reply = start(
+        first_socket[0].get(), test.file.get(), 8192,
+        large_payload.size(), FUSE_FD_REPLY_SPLICE, first);
+    FuseReactor::Reply* second_reply = start(
+        second_socket[0].get(), test.file.get(), 8192,
+        large_payload.size(), FUSE_FD_REPLY_SPLICE, second);
+    require(first_reply != second_reply && first_reply->fd_pipe[0] >= 0 &&
+            second_reply->fd_pipe[0] >= 0 &&
+            first_reply->fd_pipe[0] != second_reply->fd_pipe[0],
+            "concurrent large replies shared a persistent pipe");
+    pump([&] { return first.calls == 1 && second.calls == 1; });
+    require(first.value == 0 && second.value == 0,
+            "large fd-reply transport failed");
+    expect_output(first_socket[1], large_payload);
+    expect_output(second_socket[1], large_payload);
+
+    auto unaligned_socket = make_socket();
+    Result unaligned;
+    std::string large_header(4097, 'H');
+    start(unaligned_socket[0].get(), test.file.get(), 8193, 8191,
+          FUSE_FD_REPLY_SPLICE, unaligned, large_header);
+    pump([&] { return unaligned.calls == 1; });
+    require(unaligned.value == 0,
+            "unaligned multi-page-header reply failed");
+    expect_output(unaligned_socket[1],
+                  std::string_view(large_payload).substr(1, 8191),
+                  large_header);
+    FuseReactor::Reply* retained_pipe = owner.acquire_reply();
+    require(retained_pipe->fd_pipe[0] >= 0,
+            "completed large reply discarded its reusable pipe");
+    const int retained_pipe_fd = retained_pipe->fd_pipe[0];
+    owner.release_reply(retained_pipe);
+    FuseReactor::Reply* retained_again = owner.acquire_reply();
+    require(retained_again == retained_pipe &&
+            retained_again->fd_pipe[0] == retained_pipe_fd,
+            "reply-pool reuse replaced the persistent pipe");
+    owner.release_reply(retained_again);
+
+    auto short_socket = make_socket();
+    Result short_read;
+    start(short_socket[0].get(), test.file.get(),
+          off_t(8192 + large_payload.size() - 3),
+          12, FUSE_FD_REPLY_PREAD, short_read);
+    pump([&] { return short_read.calls == 1; });
+    require(short_read.value == -EIO && short_read.calls == 1 &&
+            owner.error_ == 0,
+            "short source read was not a request-local EIO");
+
+    auto bad_socket = make_socket();
+    Result bad_read;
+    start(bad_socket[0].get(), INT_MAX, 0, 8,
+          FUSE_FD_REPLY_PREAD, bad_read);
+    pump([&] { return bad_read.calls == 1; });
+    require(bad_read.value == -EBADF && bad_read.calls == 1 &&
+            owner.error_ == 0,
+            "source read error became a reactor-fatal error");
+
+    auto cancel_socket = make_socket();
+    Result cancelled;
+    FuseReactor::Reply* cancel_reply = start(
+        cancel_socket[0].get(), test.file.get(), 8192,
+        large_payload.size(), FUSE_FD_REPLY_SPLICE, cancelled);
+    require(owner.cancel(cancel_reply->fd_source_io),
+            "cancel fd-reply source I/O");
+    pump([&] {
+      return cancelled.calls == 1 && owner.async_pending_ == 0;
+    });
+    require(cancelled.calls == 1 &&
+            (cancelled.value == 0 || cancelled.value == -ECANCELED),
+            "fd-reply cancel race completed incorrectly");
+    require(owner.fd_reply_count_ == 0,
+            "fd-reply completion leaked shutdown admission");
+
+    UniqueFd invalid_output(eventfd(0, EFD_CLOEXEC));
+    require(bool(invalid_output), "create invalid final splice output");
+    Result transport_failure;
+    const uint64_t transport_io_before = owner.io_operations_;
+    start(invalid_output.get(), test.file.get(), 8192,
+          large_payload.size(), FUSE_FD_REPLY_SPLICE, transport_failure);
+    pump([&] { return transport_failure.calls == 1; });
+    require(transport_failure.value < 0 &&
+            transport_failure.calls == 1 && owner.error_ != 0 &&
+            owner.fd_reply_count_ == 0 && owner.async_pending_ == 0 &&
+            owner.io_operations_ == transport_io_before + 1,
+            "final transport failure retried or was not reactor-fatal");
+    FuseReactor::current_ = nullptr;
+    return 0;
+  }
+
   bool check(bool condition, const char* message) noexcept {
     if (!condition) {
       fprintf(stderr, "reactor_io_test: %s\n", message);
@@ -942,6 +1026,7 @@ struct ReactorIoTest {
     custom_io.read              = FuseReactor::sync_read;
     custom_io.writev_async      = FuseReactor::async_writev;
     custom_io.splice_send_async = FuseReactor::async_splice;
+    custom_io.fd_reply_async    = FuseReactor::fd_reply_async;
     custom_io.async_userdata    = &group;
     custom_io.async_wakeup      = FuseReactor::async_wakeup;
     custom_io.clear_receive     = FuseReactor::clear_receive;
@@ -1703,19 +1788,12 @@ int main(int argc, char** argv) {
   try {
     if (dispatch) return ReactorIoTest::dispatch_case();
     if (dispatch_freelist) {
-      int result = ReactorIoTest::dispatch_freelist_case();
-      if (result != 0) return result;
-      result = ReactorIoTest::shutdown_msg_ring_case();
-      if (result != 0) return result;
-      for (bool shutdown : {false, true}) {
-        for (bool fail : {false, true}) {
-          result = ReactorIoTest::msg_ring_batch_case(fail, shutdown);
-          if (result != 0) return result;
-        }
-      }
-      return 0;
+      const int result = ReactorIoTest::dispatch_freelist_case();
+      return result != 0 ? result : ReactorIoTest::shutdown_msg_ring_case();
     }
     if (metadata_io) return ReactorIoTest::metadata_io_case();
+    const int fd_reply = ReactorIoTest::fd_reply_case(sqpoll);
+    if (fd_reply != 0) return fd_reply;
     ReactorIoTest test;
     if (!test.initialize(sqpoll)) return test.failed ? 1 : 77;
     return test.run();

@@ -68,18 +68,56 @@ class SummarizeIoEngineTest(unittest.TestCase):
             ("current", 4): (3, 150, 240),
         }}
         text = MODULE.report(data)
-        self.assertIn("Matched four-reactor delta", text)
+        self.assertIn("Matched four-reactor delta (current versus baseline)", text)
         self.assertIn("daemon -25.00%; total -20.00%", text)
         rendered = MODULE.html(data)
-        self.assertIn("Matched four-reactor delta", rendered)
+        self.assertIn("Matched four-reactor delta (current versus baseline)", rendered)
         self.assertIn("daemon -25.00%; total -20.00%", rendered)
-        provenance = ("Baseline: unbatched owner-complete execution. Current: "
-                      "batched owner-complete execution.")
+        provenance = ("Baseline: owner-complete-unbatched. Current: "
+                      "cached-source-owner-ring-unbatched.")
         titled = MODULE.html(data, title="Matched four-reactor CPU comparison",
                              provenance=provenance)
         self.assertIn("<h1>Matched four-reactor CPU comparison</h1>", titled)
-        self.assertIn("Baseline: unbatched owner-complete", titled)
-        self.assertIn("Current: batched owner-complete", titled)
+        self.assertIn("Baseline: owner-complete-unbatched", titled)
+        self.assertIn("Current: cached-source-owner-ring-unbatched", titled)
+
+    def test_manifest_provenance_overrides_historical_descriptions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            suite = Path(temporary) / "github-io-engine-affinity-normal"
+            suite.mkdir()
+            (suite / "system.txt").write_text(
+                "benchmark_variant_revisions="
+                "baseline=a3009ab3998e7cdad6e7c2321ecf2219dbade5e6 "
+                "current=deadbeef\n"
+                "benchmark_variant_descriptions="
+                "baseline=owner-complete-unbatched "
+                "current=cached-source-owner-ring-unbatched\n",
+                encoding="utf-8")
+            provenance = MODULE.owner_complete_provenance([suite])
+            self.assertIn(
+                "Baseline: owner-complete-unbatched "
+                "(a3009ab3998e7cdad6e7c2321ecf2219dbade5e6)",
+                provenance)
+            self.assertIn(
+                "Current: cached-source-owner-ring-unbatched (deadbeef)",
+                provenance)
+            self.assertNotIn("batched owner-complete execution", provenance)
+
+    def test_rejects_inconsistent_manifest_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directories = []
+            for index, current in enumerate(("first", "second")):
+                suite = Path(temporary) / f"suite-{index}"
+                suite.mkdir()
+                (suite / "system.txt").write_text(
+                    "benchmark_variant_revisions=baseline=base "
+                    f"current={current}\n"
+                    "benchmark_variant_descriptions=baseline=old "
+                    "current=new\n",
+                    encoding="utf-8")
+                directories.append(suite)
+            with self.assertRaisesRegex(ValueError, "inconsistent"):
+                MODULE.owner_complete_provenance(directories)
 
     def test_even_number_of_samples_uses_median(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -15,19 +15,31 @@ require their own fresh runner validation.
   Dispatch containers. Stable mixed-inode routing selects workers 1 through
   N-1. INIT and session-control transport remain ingress responsibilities.
   For N == 1, ingress and execution remain combined.
-- A bounded ingress receive batch may group its already-received requests by
-  target worker and publish one MSG_RING carrying a FIFO Dispatch chain per
-  target. Do not wait for more requests to fill a batch, introduce a persistent
-  pending queue, or add an empty/armed notification handshake. Each request
-  retains its own admission and input-buffer lifetime; only the forward message
-  is shared. The receiving worker unlinks each node before executing callbacks.
-  Failure and shutdown must retire every admitted node exactly once, and ingress
-  must never dereference a batch after publication. Preserve same-owner receive
-  order. Record message and request counts separately to measure actual batching.
+- Forward each admitted Dispatch directly with MSG_RING. The receive-drain
+  batching experiment at `34016f8` reduced messages substantially, but runner
+  `34263310963` showed less than 1% total-CPU benefit and a small normal-read
+  regression. Prefer the simpler one-request publication and failure lifetime;
+  keep the fixed-size pools and direct Dispatch return stack/pipe unchanged.
 - A worker owns the request state machine through completion: HTTP connection
   use, network and local-cache I/O, parsing, checksum work and local state
   publication. Replies go directly to FUSE from that worker. Do not bounce
   replies through ingress or offload work to a second application thread pool.
+- Cached replies also submit their source-file read through the owner ring,
+  including cache hits, recovered data and newly downloaded clean ranges.
+  A CLEAN bitmap means valid data, not guaranteed local-pagecache residency.
+  Preserve libfuse's small-read PREAD plus direct writev copy count; do not
+  turn small reads into extra pipe operations merely to make them asynchronous.
+  For larger replies, use a reusable pipe embedded in the pooled Reply:
+  source-file-to-pipe through io_uring, then the existing direct pipe-to-FUSE
+  fast path. There remain two splice operations, not an extra staging pipe.
+  A narrow libfuse custom-I/O entry point encodes the reply header and owns
+  deferred-request bookkeeping; ngs3fs does not reconstruct the wire header.
+  Keep concurrent source reads independent of the ordinary reply FIFO.
+  Retain the range pin, handle and request context through the real completion
+  or cancellation CQE. A source read failure, unexpected EOF or admission
+  failure sends an error for that request; only a final FUSE transport failure
+  follows the existing fatal-transport policy. Pipe-capacity or splice-support
+  fallback uses owner-ring PREAD, never a hidden synchronous file read.
 - Multi-reactor request work must not call UploadScheduler to run a blocking
   function on another thread. Convert file operations and composite metadata
   transactions into resumable asynchronous steps on the owner's io_uring.

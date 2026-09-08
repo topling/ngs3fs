@@ -255,7 +255,7 @@ jobs:
       - name: Check out ngs3fs
         uses: actions/checkout@v7
 
-      - name: Check out pre-batched owner-complete baseline
+      - name: Check out owner-complete baseline
         uses: actions/checkout@v7
         with:
           ref: a3009ab3998e7cdad6e7c2321ecf2219dbade5e6
@@ -301,7 +301,7 @@ jobs:
           python3 scripts/download_reference_binaries.py \
             build/tools build/tools/reference-binaries.json
 
-      - name: Build pre-batched owner-complete baseline
+      - name: Build owner-complete baseline
         run: |
           test "$(git -C build/baseline-src rev-parse HEAD)" = \
             a3009ab3998e7cdad6e7c2321ecf2219dbade5e6
@@ -364,12 +364,12 @@ jobs:
             cat "build/benchmarks/github-io-engine-$advice/summary.md" >> "$GITHUB_STEP_SUMMARY"
           done
 
-      - name: A/B test owner-complete worker model
+      - name: A/B test cached-source owner-ring worker model
         env:
           BENCHMARK_REPETITIONS: 3
           BENCHMARK_VARIANTS: baseline=${{ github.workspace }}/build/baseline/ngs3fs current=${{ github.workspace }}/build/dev/ngs3fs
           BENCHMARK_VARIANT_REVISIONS: baseline=a3009ab3998e7cdad6e7c2321ecf2219dbade5e6 current=${{ github.sha }}
-          BENCHMARK_VARIANT_DESCRIPTIONS: baseline=owner-complete-unbatched current=owner-complete-batched
+          BENCHMARK_VARIANT_DESCRIPTIONS: baseline=owner-complete-unbatched current=cached-source-owner-ring-unbatched
           MAX_CONNECTIONS: 8
           NGS3FS_IO_ENGINE: uring
           NGS3FS_REACTORS: 4
@@ -405,7 +405,7 @@ jobs:
               "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-affinity-cache-$mode"
           done
 
-      - name: Profile pre-batched owner-complete baseline
+      - name: Profile owner-complete baseline
         if: always()
         run: |
           sudo env \
@@ -506,7 +506,7 @@ jobs:
             port=$((port + 1))
           done
 
-      - name: Profile cached owner-complete worker model
+      - name: Profile cached-source owner-ring worker model
         if: always()
         run: |
           port=17680
@@ -630,6 +630,8 @@ jobs:
         run: |
           sudo install -d -o "$USER" -g "$(id -gn)" \
             build/benchmarks/random-read-report
+          cp docs/reactor-batching-results.md \
+            build/reactor-batching-results.md
           python3 scripts/summarize_io_engine.py \
             build/benchmarks/random-read-report \
             build/benchmarks/github-io-engine-*
@@ -712,6 +714,7 @@ jobs:
             build/benchmarks/github-mountpoint-random-read-*/*/mountpoint-logs/*
             build/benchmarks/github-mountpoint-random-read-*/*/versity.log
             build/benchmarks/random-read-report/**
+            build/reactor-batching-results.md
             build/tools/reference-binaries.json
             build/benchmarks/github-socket-buffer/system.txt
             build/benchmarks/github-socket-buffer/samples.csv

@@ -10988,15 +10988,18 @@ bool content_range_matches(const Response& response,
 
 class CacheReadSink final : public RangeFileSink {
  public:
+  using ReplyFunction = int (*)(void*) noexcept;
+
   CacheReadSink(CacheEntry& entry, const CacheFetchClaim& claim,
                 fuse_req_t request,
-                uint64_t wanted_offset, size_t wanted_length)
+                uint64_t wanted_offset, size_t wanted_length,
+                ReplyFunction reply = nullptr, void* context = nullptr)
       : RangeFileSink(entry.data_fd(), claim.offset),
         entry_(entry),
         claim_(claim),
         request_(request),
         wanted_offset_(wanted_offset),
-        wanted_length_(wanted_length) {}
+        wanted_length_(wanted_length), reply_(reply), context_(context) {}
 
   void progress(const Response& response, bool complete) override {
     if (!content_range_matches(response, claim_.offset, claim_.length,
@@ -11012,7 +11015,7 @@ class CacheReadSink final : public RangeFileSink {
     published_ = std::max(published_, response.body_bytes);
     if (!replied_ && entry_.pin_clean(wanted_offset_, wanted_length_)) {
       replied_ = true;
-      result_ = reply_pinned_cached_range(
+      result_ = reply_ ? reply_(context_) : reply_pinned_cached_range(
           request_, entry_, wanted_offset_, wanted_length_);
     }
   }
@@ -11026,6 +11029,8 @@ class CacheReadSink final : public RangeFileSink {
   fuse_req_t request_;
   uint64_t wanted_offset_;
   size_t wanted_length_;
+  ReplyFunction reply_;
+  void* context_;
   size_t published_ = 0;
   bool replied_ = false;
   int result_   = 0;
@@ -14181,6 +14186,40 @@ struct AsyncUncachedReadTask final : AsyncReadTask {
 struct AsyncCachedReadTask final : AsyncReadTask {
   using AsyncReadTask::AsyncReadTask;
 
+  // HTTP completion and a reply's local-file CQE may arrive in either order.
+  // Both run on this owner; retain the original handle/identity and range pin
+  // without a second lock or an atomic reference count.
+  unsigned refs = 1;
+  void release() noexcept {
+    if (--refs == 0) delete this;
+  }
+  struct Release {
+    void operator()(AsyncCachedReadTask* task) const noexcept { task->release(); }
+  };
+  using Owner = std::unique_ptr<AsyncCachedReadTask, Release>;
+
+  static void reply_done(void* context, int result) noexcept {
+    auto* task = static_cast<AsyncCachedReadTask*>(context);
+    task->handle->cache_entry->unpin(uint64_t(task->offset), task->wanted);
+    if (result != 0) {
+      fprintf(stderr, "asynchronous cache reply failed: %s\n", strerror(-result));
+    }
+    task->release();
+  }
+
+  // The caller already holds the cache range pin. Even admission failure
+  // consumes the FUSE request; only a deferred reply owns this extra reference.
+  static int reply_pinned(void* context) noexcept {
+    auto* task = static_cast<AsyncCachedReadTask*>(context);
+    ++task->refs;
+    bool deferred = false;
+    const int result = task->reactor->reply_fd_async(
+        task->request, task->handle->cache_entry->data_fd(), task->offset,
+        task->wanted, FUSE_BUF_SPLICE_MOVE, reply_done, task, deferred);
+    if (!deferred) reply_done(task, result);
+    return result;
+  }
+
   size_t expansion = 0;
   CacheFetchClaim cache_claim;
   HttpPool::Lease cache_lease;
@@ -14231,7 +14270,7 @@ struct AsyncCachedReadTask final : AsyncReadTask {
   }
 
   static void cancel(void* context) noexcept {
-    std::unique_ptr<AsyncCachedReadTask> task(static_cast<AsyncCachedReadTask*>(context));
+    Owner task(static_cast<AsyncCachedReadTask*>(context));
     if (task->cache_claim) {
       if (task->cache_sink) task->handle->cache_entry->fail_fetch(task->cache_claim);
       else task->handle->cache_entry->rollback_fetch(task->cache_claim);
@@ -14254,7 +14293,7 @@ struct AsyncCachedReadTask final : AsyncReadTask {
 
   static void cache_received(void* context, Response&& response,
                               std::exception_ptr error) noexcept {
-    std::unique_ptr<AsyncCachedReadTask> task(static_cast<AsyncCachedReadTask*>(context));
+    Owner task(static_cast<AsyncCachedReadTask*>(context));
     CacheEntry& entry = *task->handle->cache_entry;
     try {
       if (error) std::rethrow_exception(error);
@@ -14317,7 +14356,8 @@ struct AsyncCachedReadTask final : AsyncReadTask {
           !task->state->config.directory_bucket);
       task->cache_sink = std::make_unique<CacheReadSink>(
           *task->handle->cache_entry, task->cache_claim, task->request,
-          uint64_t(task->offset), task->wanted);
+          uint64_t(task->offset), task->wanted,
+          task->reactor->is_multi_worker() ? reply_pinned : nullptr, task);
       AsyncHttpRequest args;
       args.method.assign("GET");
       args.path.assign(range.path().data(), range.path().size());
@@ -14358,9 +14398,15 @@ struct AsyncCachedReadTask final : AsyncReadTask {
     }
     if (handle->recovery_read) {
       try {
-        reply_cached_range(request, *handle->cache_entry, uint64_t(offset), wanted);
+        if (reactor->is_multi_worker()) {
+          handle->cache_entry->pin(uint64_t(offset), wanted);
+          handle->cache_entry->touch(uint64_t(offset), wanted);
+          reply_pinned(this);
+        } else {
+          reply_cached_range(request, *handle->cache_entry, uint64_t(offset), wanted);
+        }
       } catch (...) { reply_callback_error(request); }
-      delete this;
+      release();
       return;
     }
     try {
@@ -14397,6 +14443,11 @@ struct AsyncCachedReadTask final : AsyncReadTask {
           start_cached_checksums(*checksums, uint64_t(offset), wanted);
         }
         if (entry.pin_clean(uint64_t(offset), wanted)) {
+          if (reactor->is_multi_worker()) {
+            reply_pinned(this);
+            release();
+            return;
+          }
           const int result = reply_pinned_cached_range(
               request, entry, uint64_t(offset), wanted);
           if (result != 0) {

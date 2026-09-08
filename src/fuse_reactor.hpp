@@ -69,6 +69,14 @@ class FuseReactor : public IoExecutor {
   bool notify_inval_inode(fuse_ino_t inode, off_t offset, off_t length,
                            NotifyFunction done, void* context) noexcept;
 
+  // Owner-only. The libfuse encoder consumes req on every return path.
+  // Accepted replies set deferred and invoke done exactly once, never inline,
+  // after source I/O and final FUSE transport have completed or cancelled.
+  // Rejected replies leave deferred false and do not invoke done.
+  int reply_fd_async(fuse_req_t req, int fd, off_t offset, size_t length,
+                     unsigned flags, NotifyFunction done, void* context,
+                     bool& deferred) noexcept;
+
   using TaskFunction = void (*)(void*) noexcept;
   struct ReactorTask {
     TaskFunction run    = nullptr;
@@ -108,9 +116,16 @@ class FuseReactor : public IoExecutor {
   enum ReplyKind {
     REPLY_WRITE,
     REPLY_SPLICE,
+    REPLY_WRITEV,
   };
 
   struct Reply {
+    Reply() = default;
+    ~Reply();
+
+    Reply(const Reply&) = delete;
+    Reply& operator=(const Reply&) = delete;
+
     Reply* next    = nullptr;
     fuse_req_t req = nullptr;
     ReplyKind kind = REPLY_WRITE;
@@ -125,9 +140,21 @@ class FuseReactor : public IoExecutor {
     bool notification = false;
     NotifyFunction notify_done = nullptr;
     void* notify_context = nullptr;
+    FuseReactor* fd_reply_owner = nullptr;
+    AsyncIoRequest fd_source_io{};
+    std::vector<u_char> fd_source_data;
+    std::array<iovec, 2> fd_output_iov{};
+    int fd_pipe[2] = {-1, -1};
+    size_t fd_pipe_capacity = 0;
+    size_t fd_header_length = 0;
+    size_t fd_payload_length = 0;
+    unsigned fd_final_splice_flags = 0;
+    int fd_mode = 0;
+    bool fd_reply = false;
 
     u_char* data() noexcept {
-      return length <= sizeof(inline_data) ? inline_data :
+      const size_t stored_length = fd_reply ? fd_header_length : length;
+      return stored_length <= sizeof(inline_data) ? inline_data :
           overflow_data.data();
     }
   };
@@ -197,8 +224,7 @@ class FuseReactor : public IoExecutor {
   };
 
   struct Dispatch {
-    Dispatch* next_free   = nullptr;
-    Dispatch* next_remote = nullptr;
+    Dispatch* next_free = nullptr;
     fuse_buf buffer = {};
     struct {
       fuse_in_header in;
@@ -230,6 +256,11 @@ class FuseReactor : public IoExecutor {
   static ssize_t async_splice(int input_fd, int output_fd, size_t length,
                               unsigned flags, fuse_req_t req,
                               void* userdata) noexcept;
+  static ssize_t fd_reply_async(
+      int output_fd, const iovec* header, int header_count,
+      int source_fd, off_t source_offset, size_t payload_length,
+      unsigned final_splice_flags, int mode, fuse_req_t req,
+      void* userdata) noexcept;
   static void async_wakeup(void* userdata) noexcept;
   static void clear_receive(void* userdata) noexcept;
 
@@ -252,6 +283,19 @@ class FuseReactor : public IoExecutor {
   Reply* acquire_reply() noexcept;
   void release_reply(Reply* reply) noexcept;
   bool submit_reply(Reply* reply) noexcept;
+  bool begin_fd_reply(Reply* reply, int output_fd,
+                      const iovec* header, int header_count,
+                      int source_fd, off_t source_offset,
+                      size_t payload_length,
+                      unsigned final_splice_flags, int mode) noexcept;
+  bool prepare_fd_reply_pipe(Reply* reply) noexcept;
+  bool start_fd_reply_source(Reply* reply, int mode) noexcept;
+  ssize_t send_fd_reply_final(Reply* reply) noexcept;
+  static void fd_reply_source_done(void* context, ssize_t result) noexcept;
+  void complete_fd_reply_source(Reply* reply, ssize_t result) noexcept;
+  void complete_fd_reply(Reply* reply, ssize_t result) noexcept;
+  void fail_fd_reply(Reply* reply, int result,
+                     bool send_request_error) noexcept;
   void retire_reply(Reply* reply, int result) noexcept;
   void complete_reply(Reply* reply, int result) noexcept;
   void fail_replies(int result) noexcept;
@@ -264,7 +308,6 @@ class FuseReactor : public IoExecutor {
   bool cancel_expired_io(uint64_t now) noexcept;
   void refresh_io_deadline() noexcept;
   void drain_shutdown() noexcept;
-  bool complete_remote_dispatch(Dispatch* dispatch) noexcept;
   void fail_remote_dispatch(Dispatch* dispatch, int result) noexcept;
   Dispatch* pop_dispatch() noexcept;
   Dispatch* pop_returned_dispatch() noexcept;
@@ -278,9 +321,6 @@ class FuseReactor : public IoExecutor {
   static int read_dispatch_prefix(Dispatch* dispatch) noexcept;
   bool start_remote_dispatch(
       Dispatch* dispatch, FuseReactor* target) noexcept;
-  bool start_remote_dispatch_batch(
-      Dispatch* head, Dispatch* tail, FuseReactor* target,
-      size_t count) noexcept;
   bool run_ready_callbacks() noexcept;
   void release_input_dispatch(Dispatch* dispatch,
                               bool drain_input = true) noexcept;
@@ -294,6 +334,9 @@ class FuseReactor : public IoExecutor {
   NotifyFunction pending_notify_  = nullptr;
   void* pending_notify_context_    = nullptr;
   bool notify_accepted_            = false;
+  NotifyFunction pending_fd_reply_done_ = nullptr;
+  void* pending_fd_reply_context_       = nullptr;
+  bool fd_reply_accepted_               = false;
   int external_pipe_[2]            = {-1, -1};
   int task_pipe_[2]                = {-1, -1};
   int return_pipe_[2]              = {-1, -1};
@@ -329,20 +372,19 @@ class FuseReactor : public IoExecutor {
   int wake_fd_                     = -1;
   int error_                       = 0;
   size_t reply_count_              = 0;
+  size_t fd_reply_count_           = 0;
   size_t max_reply_count_          = 0;
   unsigned receive_concurrency_    = 1;
   size_t reactor_index_            = 0;
-  uint64_t received_requests_        = 0;
-  uint64_t dispatched_requests_      = 0;
-  uint64_t remote_dispatch_batches_  = 0;
-  uint64_t remote_dispatch_requests_ = 0;
-  uint64_t completed_replies_        = 0;
-  uint64_t external_replies_         = 0;
-  uint64_t io_operations_            = 0;
-  uint64_t background_file_writes_   = 0;
-  uint64_t wait_calls_               = 0;
-  uint64_t completion_batches_       = 0;
-  uint64_t completions_              = 0;
+  uint64_t received_requests_      = 0;
+  uint64_t dispatched_requests_    = 0;
+  uint64_t completed_replies_      = 0;
+  uint64_t external_replies_       = 0;
+  uint64_t io_operations_          = 0;
+  uint64_t background_file_writes_ = 0;
+  uint64_t wait_calls_             = 0;
+  uint64_t completion_batches_     = 0;
+  uint64_t completions_            = 0;
   size_t completion_batch_high_water_ = 0;
   std::atomic<uint64_t> receive_drains_{0};
   std::atomic<size_t> dispatch_count_{0};
@@ -363,6 +405,7 @@ class FuseReactor : public IoExecutor {
   bool wake_pending_               = false;
   bool first_receive_              = true;
   bool receive_active_             = false;
+  bool fd_reply_splice_warning_    = false;
   alignas(8) u_char external_token_ = 0;
   alignas(8) u_char task_token_     = 0;
   alignas(8) u_char return_token_   = 0;

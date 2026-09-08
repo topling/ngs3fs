@@ -5,6 +5,7 @@
 
 #include <array>
 #include <chrono>
+#include <filesystem>
 #include <span>
 
 void require(bool condition, const char* message) {
@@ -120,18 +121,25 @@ struct ReactorIoTest {
     return reactor.reply_count_;
   }
 
+  static size_t fd_reply_count(FuseReactor& reactor) {
+    return reactor.fd_reply_count_;
+  }
+
   static void fail_replies(FuseReactor& reactor, int result) {
     set_current(&reactor);
     reactor.fail_replies(result);
     set_current(nullptr);
   }
 
-  bool initialize() {
+  bool initialize(const fuse_lowlevel_ops* supplied_operations = nullptr,
+                  void* userdata = nullptr, bool fd_reply = true) {
     char name[] = "fuse_owner_test";
     char* argv[]{name};
     fuse_args args = FUSE_ARGS_INIT(1, argv);
-    fuse_lowlevel_ops operations{};
-    session = fuse_session_new(&args, &operations, sizeof(operations), nullptr);
+    fuse_lowlevel_ops empty_operations{};
+    const fuse_lowlevel_ops* operations = supplied_operations != nullptr ?
+        supplied_operations : &empty_operations;
+    session = fuse_session_new(&args, operations, sizeof(*operations), userdata);
     fuse_opt_free_args(&args);
     if (session == nullptr) return false;
 
@@ -160,6 +168,7 @@ struct ReactorIoTest {
     custom_io.async_userdata    = &group;
     custom_io.async_wakeup      = FuseReactor::async_wakeup;
     custom_io.clear_receive     = FuseReactor::clear_receive;
+    if (fd_reply) custom_io.fd_reply_async = FuseReactor::fd_reply_async;
     UniqueFd session_io(::dup(fuse_fd.get()));
     if (!session_io ||
         fuse_session_custom_io(session, &custom_io, sizeof(custom_io),
@@ -188,6 +197,44 @@ struct ReactorIoTest {
   }
 
   FuseReactor& reactor() { return *group.reactors_[0]; }
+
+  void drive_replies() {
+    FuseReactor& owner = reactor();
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(5);
+    while (owner.async_pending_ != 0 || owner.fd_reply_count_ != 0 ||
+           owner.reply_count_ != 0) {
+      require(std::chrono::steady_clock::now() < deadline,
+              "owner reply completion timed out");
+      set_current(&owner);
+      require(owner.run_ready_callbacks(), "run owner reply callback");
+      require(io_uring_submit(&owner.ring_) >= 0, "submit owner reply I/O");
+      set_current(nullptr);
+
+      io_uring_cqe* cqe = nullptr;
+      __kernel_timespec timeout{.tv_sec = 0, .tv_nsec = 100000000};
+      const int waited = io_uring_wait_cqe_timeout(&owner.ring_, &cqe, &timeout);
+      require(waited == 0 || waited == -ETIME, "wait for owner reply I/O");
+      while (io_uring_peek_cqe(&owner.ring_, &cqe) == 0) {
+        const uintptr_t tagged = uintptr_t(io_uring_cqe_get_data(cqe));
+        const int completion = cqe->res;
+        io_uring_cqe_seen(&owner.ring_, cqe);
+        set_current(&owner);
+        if ((tagged & 7) == 1) {
+          owner.complete_io(reinterpret_cast<FuseReactor::IoRequest*>(
+                                tagged & ~uintptr_t(7)), completion);
+        } else if ((tagged & 7) == 6) {
+          owner.complete_fd_reply(reinterpret_cast<FuseReactor::Reply*>(
+                                      tagged & ~uintptr_t(7)), completion);
+        } else {
+          require((tagged & 7) == 0, "unexpected owner reply CQ tag");
+          owner.complete_reply(reinterpret_cast<FuseReactor::Reply*>(tagged),
+                               completion);
+        }
+        set_current(nullptr);
+      }
+    }
+  }
 
   void drive(ChecksumResult& result) {
     FuseReactor& owner = reactor();
@@ -538,6 +585,201 @@ void test_cache_reclaim_busy_mutation() {
           "completed listing invalidation leaked its inode pin");
 }
 
+void test_cached_reply_lifetime() {
+  char pattern[] = "/tmp/ngs3fs-cached-reply-XXXXXX";
+  char* path = ::mkdtemp(pattern);
+  require(path != nullptr, "create cached reply fixture");
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() { std::filesystem::remove_all(path); }
+  } cleanup{path};
+  CacheConfig cache_config;
+  cache_config.root             = path;
+  cache_config.namespace_id     = "cached-reply-unit";
+  cache_config.block_size       = kCacheBitmapUnit;
+  cache_config.reserve_percent  = 0;
+  LocalCache cache(std::move(cache_config));
+  MountConfig config;
+  config.io_engine       = IO_ENGINE_LEGACY;
+  config.max_connections = 0;
+  State state(std::move(config));
+  FuseReactor reactor;
+
+  for (bool reply_first : {false, true}) {
+    OpenHandle handle;
+    handle.cache_entry = cache.open({"object", "etag", "", 4096, 0});
+    auto* task = new AsyncCachedReadTask(
+        state, handle, nullptr, 0, 4096, 0, reactor);
+    task->wanted = 4096;
+    task->identity.lock();
+    handle.cache_entry->pin(0, 4096);
+    ++task->refs; // The accepted source-file operation's completion ownership.
+    require(handle.request_state.load() == 2,
+            "cached reply admitted a second application read");
+
+    if (reply_first) AsyncCachedReadTask::reply_done(task, 0);
+    else task->release(); // HTTP finished, but source-file CQE is still pending.
+
+    require(handle.request_state.load() == 2 &&
+                !handle.identity_mutex.try_lock(),
+            "first completion released handle or identity too early");
+    if (reply_first) task->release();
+    else AsyncCachedReadTask::reply_done(task, 0);
+
+    require(handle.request_state.load() == 1 &&
+                handle.identity_mutex.try_lock(),
+            "final completion leaked handle or identity ownership");
+    handle.identity_mutex.unlock();
+  }
+}
+
+struct CachedReplyRequest {
+  State* state = nullptr;
+  OpenHandle* handle = nullptr;
+  FuseReactor* reactor = nullptr;
+  std::exception_ptr error;
+  int result = -1;
+  unsigned callbacks = 0;
+
+  static void read(fuse_req_t request, fuse_ino_t inode, size_t size,
+                   off_t offset, fuse_file_info*) noexcept {
+    auto* fixture = static_cast<CachedReplyRequest*>(fuse_req_userdata(request));
+    ++fixture->callbacks;
+    try {
+      auto* task = new AsyncCachedReadTask(
+          *fixture->state, *fixture->handle, request, inode, size, offset,
+          *fixture->reactor);
+      task->wanted = size;
+      task->identity.lock();
+      if (!fixture->handle->cache_entry->pin_clean(uint64_t(offset), size)) {
+        delete task;
+        throw std::runtime_error("cached reply fixture could not pin clean range");
+      }
+      fixture->result = AsyncCachedReadTask::reply_pinned(task);
+      task->release();
+    } catch (...) {
+      fixture->error = std::current_exception();
+      fuse_reply_err(request, EIO);
+    }
+  }
+};
+
+void test_cached_reply_connection() {
+  constexpr size_t payload_size = 4096;
+  std::array<char, payload_size> payload{};
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = char((i * 17 + 5) & 0xff);
+  }
+
+  for (bool accepted : {true, false}) {
+    char pattern[] = "/tmp/ngs3fs-cached-wire-XXXXXX";
+    char* path = ::mkdtemp(pattern);
+    require(path != nullptr, "create cached wire fixture");
+    struct Cleanup {
+      std::filesystem::path path;
+      ~Cleanup() { std::filesystem::remove_all(path); }
+    } cleanup{path};
+
+    CacheConfig cache_config;
+    cache_config.root            = path;
+    cache_config.namespace_id    = accepted ? "cached-wire-accepted" :
+                                              "cached-wire-rejected";
+    cache_config.block_size      = kCacheBitmapUnit;
+    cache_config.reserve_percent = 0;
+    LocalCache cache(std::move(cache_config));
+    const CacheIdentity identity{
+        "cached-wire-object", accepted ? "accepted" : "rejected", "",
+        payload_size, 0};
+    OpenHandle handle;
+    handle.cache_entry = cache.open(identity);
+    const CacheFetchClaim claim = handle.cache_entry->claim_fetch(
+        0, payload_size, payload_size);
+    require(claim && handle.cache_entry->prepare_read(0, payload_size),
+            "prepare cached wire fixture");
+    require(::pwrite(handle.cache_entry->data_fd(), payload.data(),
+                     payload.size(), 0) == ssize_t(payload.size()),
+            "write cached wire fixture");
+    handle.cache_entry->publish_clean(claim, 0, payload_size, true);
+    handle.cache_entry->finish_fetch(claim);
+
+    MountConfig config;
+    config.io_engine       = IO_ENGINE_LEGACY;
+    config.max_connections = 0;
+    State state(std::move(config));
+    CachedReplyRequest fixture;
+    fixture.state  = &state;
+    fixture.handle = &handle;
+    fuse_lowlevel_ops operations{};
+    operations.read = CachedReplyRequest::read;
+    ReactorIoTest test;
+    require(test.initialize(&operations, &fixture, accepted),
+            "initialize cached reply reactor");
+    fixture.reactor = &test.reactor();
+
+    struct ReadRequest {
+      fuse_in_header header{};
+      fuse_read_in body{};
+    } request;
+    request.header.len    = sizeof(request);
+    request.header.opcode = FUSE_READ;
+    request.header.unique = accepted ? 101 : 102;
+    request.header.nodeid = 2;
+    request.body.size     = uint32_t(payload_size);
+    fuse_buf buffer{};
+    buffer.size = sizeof(request);
+    buffer.mem  = &request;
+    ReactorIoTest::set_current(&test.reactor());
+    fuse_session_process_buf(test.session, &buffer);
+    ReactorIoTest::set_current(nullptr);
+    if (fixture.error) std::rethrow_exception(fixture.error);
+    require(fixture.callbacks == 1 && fixture.result == 0,
+            "cached reply request was not consumed exactly once");
+
+    const auto retiring = cache.retiring_entry(identity.key);
+    if (accepted) {
+      require(retiring.get() == handle.cache_entry.get() &&
+                  handle.request_state.load() == 2 &&
+                  !handle.identity_mutex.try_lock() &&
+                  ReactorIoTest::fd_reply_count(test.reactor()) == 1,
+              "accepted cached reply released ownership before source CQE");
+      const int wait_fd = handle.cache_entry->begin_retire_wait();
+      require(wait_fd >= 0, "accepted cached reply did not retain range pin");
+      test.drive_replies();
+      handle.cache_entry->end_async_wait();
+      require(handle.cache_entry->begin_retire_wait() == -1,
+              "accepted cached reply leaked range pin");
+    } else {
+      require(!retiring && handle.request_state.load() == 1 &&
+                  handle.identity_mutex.try_lock() &&
+                  ReactorIoTest::fd_reply_count(test.reactor()) == 0,
+              "rejected cached reply retained task or source callback");
+      handle.identity_mutex.unlock();
+      test.drive_replies();
+    }
+
+    require(handle.request_state.load() == 1 &&
+                handle.identity_mutex.try_lock(),
+            "cached reply final completion leaked handle or identity");
+    handle.identity_mutex.unlock();
+    const size_t wire_size = sizeof(fuse_out_header) +
+        (accepted ? payload_size : 0);
+    std::vector<char> wire(wire_size);
+    require(::recv(test.fuse_peer.get(), wire.data(), wire.size(), MSG_WAITALL) ==
+                ssize_t(wire.size()),
+            "read cached reply wire result");
+    const auto* header = reinterpret_cast<const fuse_out_header*>(wire.data());
+    require(header->unique == request.header.unique &&
+                header->len == wire.size() &&
+                header->error == (accepted ? 0 : -EOPNOTSUPP),
+            "cached reply wire header mismatch");
+    if (accepted) {
+      require(memcmp(wire.data() + sizeof(*header), payload.data(),
+                     payload.size()) == 0,
+              "cached reply wire payload mismatch");
+    }
+  }
+}
+
 
 int main() {
   try {
@@ -546,6 +788,8 @@ int main() {
     test_reactor_checksum();
     test_page_cache_invalidation_pin();
     test_cache_reclaim_busy_mutation();
+    test_cached_reply_lifetime();
+    test_cached_reply_connection();
     return 0;
   } catch (const std::system_error& error) {
     if (error.code().value() == ENOTSUP || error.code().value() == EPERM) {

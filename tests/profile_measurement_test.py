@@ -218,7 +218,7 @@ class ProfileMeasurementTest(unittest.TestCase):
         source = CI_WORKFLOW.read_text(encoding="utf-8")
         names = (
             "Profile cached block reads on one and four reactors and SQPOLL",
-            "Profile cached owner-complete worker model",
+            "Profile cached-source owner-ring worker model",
         )
         with tempfile.TemporaryDirectory() as temporary:
             harness = Path(temporary) / "profile-matrix.sh"

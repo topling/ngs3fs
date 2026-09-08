@@ -5,18 +5,13 @@ import argparse
 import csv
 from html import escape
 import re
+import shlex
 from pathlib import Path
 from statistics import median
 
 SUITES = ("normal", "random", "cache-cold", "cache-warm", "cache-unlimited")
 OWNER_COMPLETE_SUITES = ("affinity-normal", "affinity-random",
                          "affinity-cache-cold", "affinity-cache-warm")
-OWNER_COMPLETE_BASELINE = (
-    "owner-complete worker execution with one MSG_RING notification per "
-    "remote request (a3009ab3998e7cdad6e7c2321ecf2219dbade5e6)")
-OWNER_COMPLETE_CURRENT = (
-    "owner-complete worker execution with bounded same-receive per-worker "
-    "FIFO MSG_RING batching")
 NAME = re.compile(r"^(?P<engine>.+)-(?P<reactors>[0-9]+)-r[0-9]+$")
 
 def rows(path: Path):
@@ -65,6 +60,51 @@ def pct(value, baseline):
         return "n/a (zero baseline)"
     return f"{(value / baseline - 1) * 100:+.2f}%"
 
+def parse_variant_values(value):
+    result = {}
+    for field in shlex.split(value):
+        if "=" not in field:
+            raise ValueError(f"invalid benchmark variant field: {field}")
+        label, item = field.split("=", 1)
+        if not label or not item or label in result:
+            raise ValueError(f"invalid benchmark variant field: {field}")
+        result[label] = item
+    return result
+
+def load_variant_manifest(directory: Path):
+    path = directory / "system.txt"
+    if not path.is_file():
+        return None
+    fields = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in ("benchmark_variant_revisions",
+                                 "benchmark_variant_descriptions"):
+            fields[key] = parse_variant_values(value)
+    if not fields:
+        return None
+    revisions = fields.get("benchmark_variant_revisions", {})
+    descriptions = fields.get("benchmark_variant_descriptions", {})
+    if set(revisions) != {"baseline", "current"} or set(descriptions) != {
+            "baseline", "current"}:
+        raise ValueError(f"incomplete benchmark variant provenance in {path}")
+    return revisions, descriptions
+
+def owner_complete_provenance(directories):
+    manifests = [manifest for directory in directories
+                 if (manifest := load_variant_manifest(directory)) is not None]
+    if not manifests:
+        return ""
+    if any(manifest != manifests[0] for manifest in manifests[1:]):
+        raise ValueError("inconsistent benchmark variant provenance across suites")
+    revisions, descriptions = manifests[0]
+    return (
+        f"Baseline: {descriptions['baseline']} ({revisions['baseline']}). "
+        f"Current: {descriptions['current']} ({revisions['current']}). "
+        "Both CI variants use four total reactors (one ingress and three "
+        "workers), a mount-wide limit of eight HTTP connections, identical "
+        "workloads, and alternating sample order on the same runner.")
+
 def report(data_by_suite, title="I/O-engine CPU comparison", provenance=""):
     out = [f"# {title}", ""]
     if provenance:
@@ -83,7 +123,7 @@ def report(data_by_suite, title="I/O-engine CPU comparison", provenance=""):
         baseline = data.get(("baseline", 4))
         current = data.get(("current", 4))
         if baseline and current:
-            out += ["", "Matched four-reactor delta (current batched versus baseline unbatched):", "",
+            out += ["", "Matched four-reactor delta (current versus baseline):", "",
                     f"- daemon {pct(current[1], baseline[1])}; total {pct(current[2], baseline[2])}"]
         out.append("")
     return "\n".join(out)
@@ -114,7 +154,7 @@ def html(data_by_suite, missing=(), title="I/O-engine CPU comparison",
         baseline = data.get(("baseline", 4))
         current = data.get(("current", 4))
         if baseline and current:
-            out.append("<p>Matched four-reactor delta (current batched versus baseline unbatched): "
+            out.append("<p>Matched four-reactor delta (current versus baseline): "
                        f"daemon {pct(current[1], baseline[1])}; "
                        f"total {pct(current[2], baseline[2])}</p>")
     if missing:
@@ -131,6 +171,7 @@ def main():
     else:
         directories = [args.output_dir / f"github-io-engine-{suite}" for suite in SUITES]
     data = {}
+    suite_directories = {}
     missing = []
     for directory in directories:
         suite = directory.name.removeprefix("github-io-engine-")
@@ -138,6 +179,7 @@ def main():
             missing.append(suite)
             continue
         data[suite] = load_suite_directory(directory)
+        suite_directories[suite] = directory
     if not data:
         raise SystemExit("no complete I/O-engine suites found")
     destination_dir = args.output_dir
@@ -154,13 +196,8 @@ def main():
             suite for suite in OWNER_COMPLETE_SUITES
             if suite not in owner_complete]
         owner_complete_title = "Matched four-reactor CPU comparison"
-        provenance = (
-            f"Baseline: {OWNER_COMPLETE_BASELINE}. "
-            f"Current: {OWNER_COMPLETE_CURRENT}. "
-            "Both CI variants use four total reactors (one ingress and three "
-            "workers), a mount-wide limit of "
-            "eight HTTP connections, identical workloads, and alternating "
-            "sample order on the same runner.")
+        provenance = owner_complete_provenance([
+            suite_directories[suite] for suite in owner_complete])
         owner_complete_text = report(
             owner_complete, owner_complete_title, provenance)
         if owner_complete_missing:
