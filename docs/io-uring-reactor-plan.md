@@ -27,16 +27,21 @@ require their own fresh runner validation.
 - Cached replies also submit their source-file read through the owner ring,
   including cache hits, recovered data and newly downloaded clean ranges.
   A CLEAN bitmap means valid data, not guaranteed local-pagecache residency.
-  The pending runner trial uses owner-ring PREAD plus the existing direct
-  writev transport for every cached-reply size. This is an experiment, not a
-  performance-success claim: it avoids regular-file SPLICE io-wq handoff and
-  pipe bookkeeping, but large replies gain one cache-to-userspace payload copy.
+  The current implementation uses owner-ring PREAD plus the existing direct
+  writev transport for every cached-reply size. This avoids regular-file
+  SPLICE io-wq handoff and pipe bookkeeping, but uses two payload copies:
+  cache file to userspace, then userspace to FUSE. The prior file-to-pipe splice
+  path used zero copies when FUSE page stealing succeeded, or one on fallback.
+  This requires CPU/latency/memory validation, not a zero-copy claim.
   Each used pooled Reply also retains its largest PREAD buffer. With queue depth
-  256, retained capacity is bounded by 256 times the negotiated maximum read
-  per worker (at most about 64 MiB per worker for a 256 KiB maximum read), so
-  runner CPU and RSS evidence must decide whether to keep this policy. Preserve
-  the generic SPLICE implementation and public libfuse API until that evidence
-  exists; do not add a size threshold or mount option for this trial.
+  256, logical payload size is bounded by 256 times the negotiated maximum read
+  per worker (64 MiB per worker for a 256 KiB maximum read). Vector capacity is
+  not the same bound: current libstdc++ growth can retain nearly twice that
+  amount, before allocator overhead. Standard C++ does not specify a growth
+  factor; runner RSS must be measured rather than claimed from logical sizes.
+  Runner CPU and RSS evidence must decide whether to keep this policy. Preserve
+  the generic SPLICE implementation and public libfuse API for direct
+  comparisons; do not add a size threshold or mount option for this policy.
   A narrow libfuse custom-I/O entry point encodes the reply header and owns
   deferred-request bookkeeping; ngs3fs does not reconstruct the wire header.
   Keep concurrent source reads independent of the ordinary reply FIFO.

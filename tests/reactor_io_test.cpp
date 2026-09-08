@@ -1705,8 +1705,21 @@ struct ReactorIoTest {
     }
     if (!check(io_uring_sq_space_left(&owner.ring_) == 0,
                "SQ was not full before retry")) return false;
+    errno = 0;
     io_uring_sqe* sqe = owner.acquire_sqe();
-    if (!check(sqe != nullptr, "full SQ retry failed to obtain a slot")) return false;
+    if (sqe == nullptr) {
+      const int saved_errno = errno;
+      const io_uring_sq& ring = owner.ring_.sq;
+      fprintf(stderr,
+              "reactor_io_test: full SQ diagnostic: errno=%d (%s) "
+              "shared_head=%u shared_tail=%u local_head=%u local_tail=%u "
+              "space=%u ring_flags=0x%x setup_flags=0x%x ring_enabled=%d\n",
+              saved_errno, strerror(saved_errno), *ring.khead, *ring.ktail,
+              ring.sqe_head, ring.sqe_tail,
+              io_uring_sq_space_left(&owner.ring_), owner.ring_.flags,
+              owner.setup_flags_, int(owner.ring_enabled_));
+      return check(false, "full SQ retry failed to obtain a slot");
+    }
     io_uring_prep_nop(sqe);
     io_uring_sqe_set_data64(sqe, count);
     std::vector<bool> seen(count + 1, false);

@@ -880,9 +880,9 @@ ssize_t FuseReactor::fd_reply_async(
   reply->req = req;
   reply->notify_done = reactor->pending_fd_reply_done_;
   reply->notify_context = reactor->pending_fd_reply_context_;
-  // Pending runner trial: keep every cached-file source read on the owner ring
-  // as PREAD, then use the existing direct writev transport.  The generic
-  // fd-reply API and begin_fd_reply() retain their SPLICE implementation.
+  // A cached PREAD may complete inline; regular-file ring SPLICE requires
+  // io-wq. Use the existing direct writev transport after the source read.
+  // The generic fd-reply API retains its SPLICE implementation for comparison.
   const int effective_mode = FUSE_FD_REPLY_PREAD;
   if (!reactor->begin_fd_reply(
           reply, output_fd, header, header_count, source_fd, source_offset,
@@ -1725,15 +1725,21 @@ io_uring_sqe* FuseReactor::acquire_sqe() noexcept {
   }
   if ((setup_flags_ & IORING_SETUP_SQPOLL) != 0 && ring_enabled_) {
     // Publishing the tail does not mean the SQPOLL thread has consumed it.
-    // Wait for SQ space, not for the submitted I/O itself to complete.
-    int result;
+    // Wait for SQ space, not for the submitted I/O itself to complete.  After
+    // each successful SQ_WAIT, re-observe the shared head and loop until
+    // get_sqe exposes a slot, matching liburing's canonical state predicate.
     do {
-      result = io_uring_sqring_wait(&ring_);
-    } while (result == -EINTR);
-    if (result < 0) {
-      errno = -result;
-      return nullptr;
-    }
+      int result;
+      do {
+        result = io_uring_sqring_wait(&ring_);
+      } while (result == -EINTR);
+      if (result < 0) {
+        errno = -result;
+        return nullptr;
+      }
+      sqe = io_uring_get_sqe(&ring_);
+    } while (sqe == nullptr);
+    return sqe;
   }
   sqe = io_uring_get_sqe(&ring_);
   if (sqe == nullptr) {
