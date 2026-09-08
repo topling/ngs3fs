@@ -258,7 +258,7 @@ jobs:
       - name: Check out owner-complete baseline
         uses: actions/checkout@v7
         with:
-          ref: 3be78f4a7168b9289bd856c5472b20eb92d981e0
+          ref: 0f645c4b40215ae209418bd031fd240c94959d52
           path: build/baseline-src
 
       - name: Check out FlameGraph
@@ -304,7 +304,7 @@ jobs:
       - name: Build owner-complete baseline
         run: |
           test "$(git -C build/baseline-src rev-parse HEAD)" = \
-            3be78f4a7168b9289bd856c5472b20eb92d981e0
+            0f645c4b40215ae209418bd031fd240c94959d52
           cmake -S build/baseline-src -B build/baseline -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DNGS3FS_BUILD_TESTS=OFF \
@@ -368,8 +368,8 @@ jobs:
         env:
           BENCHMARK_REPETITIONS: 3
           BENCHMARK_VARIANTS: baseline=${{ github.workspace }}/build/baseline/ngs3fs current=${{ github.workspace }}/build/dev/ngs3fs
-          BENCHMARK_VARIANT_REVISIONS: baseline=3be78f4a7168b9289bd856c5472b20eb92d981e0 current=${{ github.sha }}
-          BENCHMARK_VARIANT_DESCRIPTIONS: baseline=cached-source-ring-splice current=cached-source-ring-pread
+          BENCHMARK_VARIANT_REVISIONS: baseline=0f645c4b40215ae209418bd031fd240c94959d52 current=${{ github.sha }}
+          BENCHMARK_VARIANT_DESCRIPTIONS: baseline=cached-source-forced-pread current=cached-source-libfuse-policy
           MAX_CONNECTIONS: 8
           NGS3FS_IO_ENGINE: uring
           NGS3FS_REACTORS: 4

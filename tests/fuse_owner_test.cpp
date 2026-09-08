@@ -125,14 +125,16 @@ struct ReactorIoTest {
     return reactor.fd_reply_count_;
   }
 
-  static bool fd_reply_is_pread_without_pipe(FuseReactor& reactor) {
+  static bool fd_reply_uses_mode(FuseReactor& reactor, int expected_mode) {
     size_t active = 0;
     for (size_t index = 0; index < reactor.reply_pool_size_; ++index) {
       const FuseReactor::Reply& reply = reactor.reply_pool_[index];
       if (!reply.fd_reply) continue;
       ++active;
-      if (reply.fd_mode != FUSE_FD_REPLY_PREAD ||
-          reply.fd_pipe[0] >= 0 || reply.fd_pipe[1] >= 0) {
+      const bool pipe_matches = expected_mode == FUSE_FD_REPLY_SPLICE ?
+          reply.fd_pipe[0] >= 0 && reply.fd_pipe[1] >= 0 :
+          reply.fd_pipe[0] < 0 && reply.fd_pipe[1] < 0;
+      if (reply.fd_mode != expected_mode || !pipe_matches) {
         return false;
       }
     }
@@ -668,6 +670,11 @@ struct CachedReplyRequest {
   int result = -1;
   unsigned callbacks = 0;
 
+  static void init(void*, fuse_conn_info* connection) noexcept {
+    fuse_set_feature_flag(connection, FUSE_CAP_SPLICE_WRITE);
+    fuse_set_feature_flag(connection, FUSE_CAP_SPLICE_MOVE);
+  }
+
   static void read(fuse_req_t request, fuse_ino_t inode, size_t size,
                    off_t offset, fuse_file_info*) noexcept {
     auto* fixture = static_cast<CachedReplyRequest*>(fuse_req_userdata(request));
@@ -757,6 +764,7 @@ void test_cached_reply_connection() {
     fixture.state  = &state;
     fixture.handle = &handle;
     fuse_lowlevel_ops operations{};
+    operations.init = CachedReplyRequest::init;
     operations.read = CachedReplyRequest::read;
     ReactorIoTest test;
     require(test.initialize(&operations, &fixture, accepted),
@@ -789,11 +797,14 @@ void test_cached_reply_connection() {
 
     const auto retiring = cache.retiring_entry(identity.key);
     if (accepted) {
+      const int expected_mode = scenario == CACHED_REPLY_LARGE_SUCCESS ?
+          FUSE_FD_REPLY_SPLICE : FUSE_FD_REPLY_PREAD;
       require(retiring.get() == handle.cache_entry.get() &&
                   handle.request_state.load() == 2 &&
                   !handle.identity_mutex.try_lock() &&
                   ReactorIoTest::fd_reply_count(test.reactor()) == 1 &&
-                  ReactorIoTest::fd_reply_is_pread_without_pipe(test.reactor()),
+                  ReactorIoTest::fd_reply_uses_mode(
+                      test.reactor(), expected_mode),
               "accepted cached reply released ownership before source CQE");
       const int wait_fd = handle.cache_entry->begin_retire_wait();
       require(wait_fd >= 0, "accepted cached reply did not retain range pin");

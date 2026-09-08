@@ -880,13 +880,9 @@ ssize_t FuseReactor::fd_reply_async(
   reply->req = req;
   reply->notify_done = reactor->pending_fd_reply_done_;
   reply->notify_context = reactor->pending_fd_reply_context_;
-  // A cached PREAD may complete inline; regular-file ring SPLICE requires
-  // io-wq. Use the existing direct writev transport after the source read.
-  // The generic fd-reply API retains its SPLICE implementation for comparison.
-  const int effective_mode = FUSE_FD_REPLY_PREAD;
   if (!reactor->begin_fd_reply(
           reply, output_fd, header, header_count, source_fd, source_offset,
-          payload_length, final_splice_flags, effective_mode)) {
+          payload_length, final_splice_flags, mode)) {
     const int saved_errno = errno != 0 ? errno : EIO;
     reply->req = nullptr;
     reply->notify_done = nullptr;

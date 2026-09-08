@@ -27,21 +27,18 @@ require their own fresh runner validation.
 - Cached replies also submit their source-file read through the owner ring,
   including cache hits, recovered data and newly downloaded clean ranges.
   A CLEAN bitmap means valid data, not guaranteed local-pagecache residency.
-  The current implementation uses owner-ring PREAD plus the existing direct
-  writev transport for every cached-reply size. This avoids regular-file
-  SPLICE io-wq handoff and pipe bookkeeping, but uses two payload copies:
-  cache file to userspace, then userspace to FUSE. The prior file-to-pipe splice
-  path used zero copies when FUSE page stealing succeeded, or one on fallback.
-  This requires CPU/latency/memory validation, not a zero-copy claim.
-  Each used pooled Reply also retains its largest PREAD buffer. With queue depth
-  256, logical payload size is bounded by 256 times the negotiated maximum read
-  per worker (64 MiB per worker for a 256 KiB maximum read). Vector capacity is
-  not the same bound: current libstdc++ growth can retain nearly twice that
-  amount, before allocator overhead. Standard C++ does not specify a growth
-  factor; runner RSS must be measured rather than claimed from logical sizes.
-  Runner CPU and RSS evidence must decide whether to keep this policy. Preserve
-  the generic SPLICE implementation and public libfuse API for direct
-  comparisons; do not add a size threshold or mount option for this policy.
+  Libfuse selects owner-ring PREAD plus direct writev for small replies or when
+  splice support is unavailable, and owner-ring file-to-pipe SPLICE plus direct
+  pipe-to-FUSE splice for larger supported replies. Only the PREAD path retains
+  a userspace payload buffer; the SPLICE path retains its per-Reply pipe.
+  An all-PREAD trial was rejected because matched runner results reversed by
+  host: daemon CPU versus this split-mode baseline was -1.62% cold and -7.98%
+  warm on run `34276881366` (AMD EPYC 9V74), but +11.31% cold and +6.02% warm on
+  run `34278830151` (AMD EPYC 7763), with roughly 8--9 MiB additional RSS.
+  These results neither isolate hardware as the cause nor establish all-PREAD
+  as a stable optimization. Preserve
+  both source modes and the public libfuse API; do not add a size threshold or
+  mount option beyond libfuse's existing selection without new evidence.
   A narrow libfuse custom-I/O entry point encodes the reply header and owns
   deferred-request bookkeeping; ngs3fs does not reconstruct the wire header.
   Keep concurrent source reads independent of the ordinary reply FIFO.
