@@ -110,6 +110,7 @@ perf_ack_fifo=
 perf_control_timeout_seconds=${PERF_CONTROL_TIMEOUT_SECONDS:-10}
 perf_startup_timeout_seconds=${PERF_STARTUP_TIMEOUT_SECONDS:-30}
 perf_record_log=
+perf_diagnostic_log=
 profile_first_line=0
 profile_last_line=0
 profile_get_requests=0
@@ -150,19 +151,22 @@ control_perf_record() {
   fi
   if ! IFS= read -r -t "$timeout_seconds" acknowledgement \
       <&"$perf_ack_fd"; then
-    echo "timed out waiting for perf record $command acknowledgement" >&2
-    printf 'perf_record_pid=%s\n' "${perf_pid:-unavailable}" >&2
-    if [[ -n "$perf_pid" ]] && kill -0 "$perf_pid" 2>/dev/null; then
-      printf 'perf_record_alive=yes\n' >&2
-      ps -o pid,stat,wchan,comm -p "$perf_pid" >&2 || true
-    else
-      printf 'perf_record_alive=no\n' >&2
-    fi
-    printf 'perf_record_stderr=%s\n' \
-      "${perf_record_log:-inherited standard error}" >&2
-    if [[ -n "$perf_record_log" && -s "$perf_record_log" ]]; then
-      tail -n 20 "$perf_record_log" >&2 || true
-    fi
+    {
+      echo "timed out waiting for perf record $command acknowledgement"
+      printf 'perf_record_pid=%s\n' "${perf_pid:-unavailable}"
+      if [[ -n "$perf_pid" ]] && kill -0 "$perf_pid" 2>/dev/null; then
+        printf 'perf_record_alive=yes\n'
+        ps -o pid,stat,wchan,comm -p "$perf_pid" 2>&1 || true
+      else
+        printf 'perf_record_alive=no\n'
+      fi
+      printf 'perf_record_stderr=%s\n' \
+        "${perf_record_log:-inherited standard error}"
+      if [[ -n "$perf_record_log" && -s "$perf_record_log" ]]; then
+        tail -n 20 "$perf_record_log" 2>&1 || true
+      fi
+    } >"$perf_diagnostic_log"
+    cat "$perf_diagnostic_log" >&2
     return 1
   fi
   if [[ "$acknowledgement" != ack ]]; then
@@ -171,11 +175,41 @@ control_perf_record() {
   fi
 }
 
+stop_perf_record() {
+  local report_status=${1:-0}
+  local record_pid=${perf_pid:-}
+  local interrupted=no
+  local wait_status
+  if [[ -z "$record_pid" ]]; then
+    return
+  fi
+  if kill -0 "$record_pid" 2>/dev/null; then
+    if kill -INT "$record_pid" 2>/dev/null; then
+      interrupted=yes
+    fi
+  fi
+  if wait "$record_pid" 2>/dev/null; then
+    wait_status=0
+  else
+    wait_status=$?
+  fi
+  perf_pid=
+  if [[ -n "$perf_diagnostic_log" ]]; then
+    {
+      printf 'perf_record_interrupted_by_harness=%s\n' "$interrupted"
+      printf 'perf_record_exit_status=%s\n' "$wait_status"
+    } >>"$perf_diagnostic_log"
+  fi
+  if ((report_status)); then
+    printf 'perf_record_interrupted_by_harness=%s\n' "$interrupted" >&2
+    printf 'perf_record_exit_status=%s\n' "$wait_status" >&2
+  fi
+}
+
 cleanup() {
   set +e
   if [[ -n "$perf_pid" ]]; then
-    kill -INT "$perf_pid" 2>/dev/null
-    wait "$perf_pid" 2>/dev/null
+    stop_perf_record 1
   fi
   close_perf_control
   if mountpoint -q "$mount_dir"; then
@@ -231,6 +265,11 @@ capture_thread_census() {
   local count=0
   local sqpoll_count=0
   local io_wq_count=0
+  local status_key
+  local status_value
+  local status_unit
+  local vm_rss_kib=
+  local vm_hwm_kib=
 
   if ! {
     printf 'process_pid=%s\n' "$pid"
@@ -256,6 +295,17 @@ capture_thread_census() {
     printf 'task_count=%s\n' "$count"
     printf 'sqpoll_task_count=%s\n' "$sqpoll_count"
     printf 'io_wq_task_count=%s\n' "$io_wq_count"
+    if [[ -r "/proc/$pid/status" ]]; then
+      while read -r status_key status_value status_unit _; do
+        case "$status_key" in
+          VmRSS:) vm_rss_kib=$status_value ;;
+          VmHWM:) vm_hwm_kib=$status_value ;;
+        esac
+      done <"/proc/$pid/status"
+    fi
+    printf 'memory_source=/proc/%s/status\n' "$pid"
+    printf 'vm_rss_kib=%s\n' "${vm_rss_kib:-unavailable}"
+    printf 'vm_hwm_kib=%s\n' "${vm_hwm_kib:-unavailable}"
   } >"$output" 2>/dev/null; then
     printf 'process_pid=%s\nthread_census=unavailable\n' "$pid" \
       >"$output" 2>/dev/null || true
@@ -447,6 +497,9 @@ run_profile_measurement() {
   perf_control_fifo="$run_dir/perf-control-$attempt.fifo"
   perf_ack_fifo="$run_dir/perf-ack-$attempt.fifo"
   perf_record_log="$run_dir/perf-record-$attempt.log"
+  perf_diagnostic_log="$run_dir/perf-diagnostic-$attempt.txt"
+  : >"$perf_record_log"
+  : >"$perf_diagnostic_log"
   mkfifo "$perf_control_fifo" "$perf_ack_fifo"
   exec {perf_control_fd}<>"$perf_control_fifo"
   exec {perf_ack_fd}<>"$perf_ack_fifo"
@@ -456,12 +509,10 @@ run_profile_measurement() {
     --control "fifo:$perf_control_fifo,$perf_ack_fifo" \
     -p "$ngs3fs_pid" \
     -o "$run_dir/perf.data" -- sleep 3600 \
-    2> >(tee "$perf_record_log" >&2) &
+    2>"$perf_record_log" &
   perf_pid=$!
   if ! control_perf_record enable "$perf_startup_timeout_seconds"; then
-    kill -INT "$perf_pid" 2>/dev/null || true
-    wait "$perf_pid" 2>/dev/null || true
-    perf_pid=
+    stop_perf_record 1
     close_perf_control
     return 1
   fi
@@ -538,9 +589,7 @@ run_profile_measurement() {
     printf 's3_complete_requests=%s\n' "$profile_complete_requests"
     printf 'elapsed_ns=%s\n' "$profile_elapsed_ns"
   } >"$run_dir/profile-metadata.txt"
-  kill -INT "$perf_pid" 2>/dev/null || true
-  wait "$perf_pid" 2>/dev/null || true
-  perf_pid=
+  stop_perf_record
   close_perf_control
   if ((control_failed)); then
     return 1

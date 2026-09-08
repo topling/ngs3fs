@@ -13,8 +13,8 @@ COMPARE_SCRIPT = PROJECT_DIR / "scripts" / "compare_goofys.sh"
 CI_WORKFLOW = PROJECT_DIR / ".github" / "workflows" / "ci.yml"
 
 
-def extract_shell_function(name):
-    lines = PROFILE_SCRIPT.read_text(encoding="utf-8").splitlines(keepends=True)
+def extract_shell_function(name, script=PROFILE_SCRIPT):
+    lines = script.read_text(encoding="utf-8").splitlines(keepends=True)
     start = lines.index(f"{name}() {{\n")
     for end in range(start + 1, len(lines)):
         if lines[end] == "}\n":
@@ -25,7 +25,7 @@ def extract_shell_function(name):
 MEASUREMENT_FUNCTIONS = "\n".join(
     extract_shell_function(name)
     for name in ("close_perf_control", "control_perf_record",
-                 "run_profile_measurement")
+                 "stop_perf_record", "run_profile_measurement")
 )
 
 
@@ -53,6 +53,7 @@ perf_ack_fifo=
 perf_control_timeout_seconds=${PERF_CONTROL_TIMEOUT_SECONDS:-0.2}
 perf_startup_timeout_seconds=${PERF_STARTUP_TIMEOUT_SECONDS:-0.2}
 perf_record_log=
+perf_diagnostic_log=
 bench=mmap_bench_stub
 random_bench=random_bench_stub
 iterations=7
@@ -105,11 +106,17 @@ sleep() {
 }
 
 kill() {
+  if [[ "$1" = -0 && "${PERF_STUB_NOT_ALIVE:-}" = 1 ]]; then
+    return 1
+  fi
+  if [[ "$1" = -INT && "${PERF_STUB_INTERRUPT_FAIL:-}" = 1 ]]; then
+    return 1
+  fi
   return 0
 }
 
 wait() {
-  return 0
+  return "${PERF_STUB_WAIT_STATUS:-0}"
 }
 
 emit_requests() {
@@ -214,6 +221,69 @@ perf_stub() {
 
 
 class ProfileMeasurementTest(unittest.TestCase):
+    def test_thread_census_records_process_resident_memory(self):
+        for script in (PROFILE_SCRIPT, COMPARE_SCRIPT):
+            with self.subTest(script=script.name), \
+                    tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "threads.txt"
+                harness = Path(temporary) / "census-harness.sh"
+                harness.write_text(
+                    "#!/usr/bin/env bash\nset -euo pipefail\n"
+                    + extract_shell_function("capture_thread_census", script)
+                    + f'capture_thread_census $$ "{output}"\n',
+                    encoding="utf-8")
+                subprocess.run(
+                    ["/usr/bin/bash", str(harness)], check=True,
+                    cwd=PROJECT_DIR,
+                    env={**os.environ, "PATH": "/usr/bin:/bin"})
+                evidence = output.read_text(encoding="utf-8")
+                self.assertIn("memory_source=/proc/", evidence)
+                self.assertRegex(evidence, r"(?m)^vm_rss_kib=[0-9]+$")
+                self.assertRegex(evidence, r"(?m)^vm_hwm_kib=[0-9]+$")
+
+    def test_independent_benchmark_evidence_runs_after_profile_failure(self):
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+        for name in ("Compare Mountpoint concurrent random reads",
+                     "A/B test socket receive buffer"):
+            start = source.index(f"      - name: {name}\n")
+            run = source.index("        run: |\n", start)
+            step_header = source[start:run]
+            self.assertIn("        if: always()\n", step_header)
+
+    def test_stop_records_unsent_interrupt_and_cleanup_uses_it(self):
+        cleanup = extract_shell_function("cleanup")
+        self.assertIn("stop_perf_record 1", cleanup)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness = root / "stop-harness.sh"
+            harness.write_text(
+                textwrap.dedent(HARNESS).lstrip()
+                + "\n"
+                + extract_shell_function("stop_perf_record")
+                + "\nperf_pid=123\n"
+                + 'perf_diagnostic_log="$run_dir/perf-diagnostic.txt"\n'
+                + "stop_perf_record 1\n",
+                encoding="utf-8")
+            result = subprocess.run(
+                ["/usr/bin/bash", str(harness), str(root / "run"), "mmap"],
+                check=True, cwd=PROJECT_DIR,
+                env={**os.environ, "PATH": "/usr/bin:/bin",
+                     "PERF_STUB_INTERRUPT_FAIL": "1",
+                     "PERF_STUB_WAIT_STATUS": "42"},
+                capture_output=True, text=True)
+            self.assertIn("perf_record_interrupted_by_harness=no",
+                          result.stderr)
+            self.assertIn("perf_record_exit_status=42", result.stderr)
+
+    def test_workflow_retains_perf_startup_diagnostics(self):
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+        for directory in ("github-io-engine-*", "github-*-advice",
+                          "github-cached-write"):
+            self.assertIn(
+                f"build/profiles/{directory}/perf-record-*.log", source)
+            self.assertIn(
+                f"build/profiles/{directory}/perf-diagnostic-*.txt", source)
+
     def test_cached_profile_matrix_includes_owner_workers(self):
         source = CI_WORKFLOW.read_text(encoding="utf-8")
         names = (
@@ -387,6 +457,8 @@ class ProfileMeasurementTest(unittest.TestCase):
                 cwd=PROJECT_DIR,
                 env={**os.environ, "PATH": "/usr/bin:/bin",
                      "PERF_STUB_MISSING_ACK": "enable",
+                     "PERF_STUB_NOT_ALIVE": "1",
+                     "PERF_STUB_WAIT_STATUS": "42",
                      "PERF_STARTUP_TIMEOUT_SECONDS": "0.05",
                      "PERF_CONTROL_TIMEOUT_SECONDS": "0.05"},
                 stdout=subprocess.PIPE,
@@ -400,6 +472,16 @@ class ProfileMeasurementTest(unittest.TestCase):
             self.assertIn("perf_record_alive=", result.stderr)
             self.assertIn("perf_record_stderr=", result.stderr)
             self.assertIn("perf record stub started", result.stderr)
+            self.assertIn("perf_record_interrupted_by_harness=no", result.stderr)
+            self.assertIn("perf_record_exit_status=42", result.stderr)
+            diagnostic = (run_dir / "perf-diagnostic-1.txt").read_text(
+                encoding="utf-8")
+            self.assertIn("timed out waiting for perf record enable", diagnostic)
+            self.assertIn("perf_record_alive=no", diagnostic)
+            self.assertIn("perf_record_exit_status=42", diagnostic)
+            self.assertIn("perf record stub started",
+                          (run_dir / "perf-record-1.log").read_text(
+                              encoding="utf-8"))
             timeouts = (run_dir / "perf-control-timeouts.txt").read_text(
                 encoding="utf-8").splitlines()
             self.assertEqual(timeouts, ["0.05"])

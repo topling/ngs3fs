@@ -174,6 +174,11 @@ capture_thread_census() {
   local count=0
   local sqpoll_count=0
   local io_wq_count=0
+  local status_key
+  local status_value
+  local status_unit
+  local vm_rss_kib=
+  local vm_hwm_kib=
 
   if ! {
     printf 'process_pid=%s\n' "$pid"
@@ -199,6 +204,17 @@ capture_thread_census() {
     printf 'task_count=%s\n' "$count"
     printf 'sqpoll_task_count=%s\n' "$sqpoll_count"
     printf 'io_wq_task_count=%s\n' "$io_wq_count"
+    if [[ -r "/proc/$pid/status" ]]; then
+      while read -r status_key status_value status_unit _; do
+        case "$status_key" in
+          VmRSS:) vm_rss_kib=$status_value ;;
+          VmHWM:) vm_hwm_kib=$status_value ;;
+        esac
+      done <"/proc/$pid/status"
+    fi
+    printf 'memory_source=/proc/%s/status\n' "$pid"
+    printf 'vm_rss_kib=%s\n' "${vm_rss_kib:-unavailable}"
+    printf 'vm_hwm_kib=%s\n' "${vm_hwm_kib:-unavailable}"
   } >"$output" 2>/dev/null; then
     printf 'process_pid=%s\nthread_census=unavailable\n' "$pid" \
       >"$output" 2>/dev/null || true

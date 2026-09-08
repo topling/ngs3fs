@@ -258,7 +258,7 @@ jobs:
       - name: Check out owner-complete baseline
         uses: actions/checkout@v7
         with:
-          ref: a3009ab3998e7cdad6e7c2321ecf2219dbade5e6
+          ref: 3be78f4a7168b9289bd856c5472b20eb92d981e0
           path: build/baseline-src
 
       - name: Check out FlameGraph
@@ -304,7 +304,7 @@ jobs:
       - name: Build owner-complete baseline
         run: |
           test "$(git -C build/baseline-src rev-parse HEAD)" = \
-            a3009ab3998e7cdad6e7c2321ecf2219dbade5e6
+            3be78f4a7168b9289bd856c5472b20eb92d981e0
           cmake -S build/baseline-src -B build/baseline -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DNGS3FS_BUILD_TESTS=OFF \
@@ -368,8 +368,8 @@ jobs:
         env:
           BENCHMARK_REPETITIONS: 3
           BENCHMARK_VARIANTS: baseline=${{ github.workspace }}/build/baseline/ngs3fs current=${{ github.workspace }}/build/dev/ngs3fs
-          BENCHMARK_VARIANT_REVISIONS: baseline=a3009ab3998e7cdad6e7c2321ecf2219dbade5e6 current=${{ github.sha }}
-          BENCHMARK_VARIANT_DESCRIPTIONS: baseline=owner-complete-unbatched current=cached-source-owner-ring-unbatched
+          BENCHMARK_VARIANT_REVISIONS: baseline=3be78f4a7168b9289bd856c5472b20eb92d981e0 current=${{ github.sha }}
+          BENCHMARK_VARIANT_DESCRIPTIONS: baseline=cached-source-ring-splice current=cached-source-ring-pread
           MAX_CONNECTIONS: 8
           NGS3FS_IO_ENGINE: uring
           NGS3FS_REACTORS: 4
@@ -534,6 +534,7 @@ jobs:
           done
 
       - name: Compare Mountpoint concurrent random reads
+        if: always()
         run: |
           for mode in none cold warm; do
             sudo env \
@@ -549,6 +550,7 @@ jobs:
           done
 
       - name: A/B test socket receive buffer
+        if: always()
         run: |
           sudo env \
             BENCHMARK_REPETITIONS=8 \
@@ -696,6 +698,8 @@ jobs:
             build/profiles/github-io-engine-*/random-read.txt
             build/profiles/github-io-engine-*/ngs3fs.log
             build/profiles/github-io-engine-*/versity.log
+            build/profiles/github-io-engine-*/perf-record-*.log
+            build/profiles/github-io-engine-*/perf-diagnostic-*.txt
             build/profiles/github-io-engine-*/perf.folded
             build/profiles/github-io-engine-*/perf-stat.csv
             build/profiles/github-io-engine-*/perf-self.txt
@@ -730,6 +734,8 @@ jobs:
             build/profiles/github-*-advice/random-read.txt
             build/profiles/github-*-advice/ngs3fs.log
             build/profiles/github-*-advice/versity.log
+            build/profiles/github-*-advice/perf-record-*.log
+            build/profiles/github-*-advice/perf-diagnostic-*.txt
             build/profiles/github-*-advice/perf.folded
             build/profiles/github-*-advice/perf-stat.csv
             build/profiles/github-*-advice/perf-self.txt
@@ -743,6 +749,8 @@ jobs:
             build/profiles/github-cached-write/system.txt
             build/profiles/github-cached-write/ngs3fs.log
             build/profiles/github-cached-write/versity.log
+            build/profiles/github-cached-write/perf-record-*.log
+            build/profiles/github-cached-write/perf-diagnostic-*.txt
             build/profiles/github-cached-write/perf.folded
             build/profiles/github-cached-write/perf-stat.csv
             build/profiles/github-cached-write/perf-self.txt
