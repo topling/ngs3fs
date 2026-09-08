@@ -170,8 +170,13 @@ perf_stub() {
     printf 'perf record stub started\n' >&2
     local control_spec=
     local delayed=0
+    local verbose=0
     while (($#)); do
       case "$1" in
+        -vvv)
+          verbose=1
+          shift
+          ;;
         --control)
           control_spec=$2
           shift 2
@@ -183,7 +188,7 @@ perf_stub() {
         *) shift ;;
       esac
     done
-    [[ "$delayed" = 1 && "$control_spec" = fifo:*,* ]] || return 2
+    [[ "$verbose" = 1 && "$delayed" = 1 && "$control_spec" = fifo:*,* ]] || return 2
     local fifo_spec=${control_spec#fifo:}
     local control_fifo=${fifo_spec%%,*}
     local ack_fifo=${fifo_spec#*,}
@@ -266,14 +271,44 @@ class ProfileMeasurementTest(unittest.TestCase):
                 encoding="utf-8")
             result = subprocess.run(
                 ["/usr/bin/bash", str(harness), str(root / "run"), "mmap"],
-                check=True, cwd=PROJECT_DIR,
+                cwd=PROJECT_DIR,
                 env={**os.environ, "PATH": "/usr/bin:/bin",
                      "PERF_STUB_INTERRUPT_FAIL": "1",
                      "PERF_STUB_WAIT_STATUS": "42"},
                 capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
             self.assertIn("perf_record_interrupted_by_harness=no",
                           result.stderr)
             self.assertIn("perf_record_exit_status=42", result.stderr)
+
+    def test_unexpected_perf_exit_rejects_measurement_and_closes_fifos(self):
+        cases = (("255", "1", False), ("130", "1", False),
+                 ("130", "0", True), ("0", "1", True))
+        for status, not_alive, success in cases:
+            with self.subTest(status=status, not_alive=not_alive), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                harness = root / "measurement-harness.sh"
+                harness.write_text(
+                    textwrap.dedent(HARNESS).lstrip() + "\n"
+                    + MEASUREMENT_FUNCTIONS
+                    + "\nrun_profile_measurement 1 1\n",
+                    encoding="utf-8")
+                run_dir = root / "run"
+                result = subprocess.run(
+                    ["/usr/bin/bash", str(harness), str(run_dir), "mmap"],
+                    cwd=PROJECT_DIR,
+                    env={**os.environ, "PATH": "/usr/bin:/bin",
+                         "PERF_STUB_WAIT_STATUS": status,
+                         "PERF_STUB_NOT_ALIVE": not_alive},
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, success)
+                self.assertEqual(list(run_dir.glob("perf-*.fifo")), [])
+                diagnostic = (run_dir / "perf-diagnostic-1.txt").read_text(
+                    encoding="utf-8")
+                self.assertIn(f"perf_record_exit_status={status}", diagnostic)
+                if not success:
+                    self.assertIn("perf record failed:", result.stderr)
 
     def test_workflow_retains_perf_startup_diagnostics(self):
         source = CI_WORKFLOW.read_text(encoding="utf-8")

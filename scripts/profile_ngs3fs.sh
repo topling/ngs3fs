@@ -204,6 +204,13 @@ stop_perf_record() {
     printf 'perf_record_interrupted_by_harness=%s\n' "$interrupted" >&2
     printf 'perf_record_exit_status=%s\n' "$wait_status" >&2
   fi
+  if ((wait_status != 0)) &&
+      [[ "$interrupted:$wait_status" != yes:130 ]]; then
+    printf 'perf record failed: exit_status=%s interrupted_by_harness=%s\n' \
+      "$wait_status" "$interrupted" >&2
+    return 1
+  fi
+  return 0
 }
 
 cleanup() {
@@ -398,6 +405,7 @@ fi
   printf 'cache_drop_requested=%s\n' "$drop_after_warmup"
   printf 'perf_event=%s\nperf_frequency=%s\n' "$perf_event" "$perf_frequency"
   printf 'perf_mmap_size=%s\n' "$perf_mmap_size"
+  printf 'perf_record_verbosity=3 (temporary startup diagnostics)\n'
   printf 'ngs3fs_io_engine=%s\nngs3fs_reactors=%s\n' \
     "${io_engine:-legacy}" "${reactors:-1}"
 } >"$run_dir/system.txt"
@@ -503,7 +511,9 @@ run_profile_measurement() {
   mkfifo "$perf_control_fifo" "$perf_ack_fifo"
   exec {perf_control_fd}<>"$perf_control_fifo"
   exec {perf_ack_fd}<>"$perf_ack_fifo"
-  LD_LIBRARY_PATH=$perf_lib "$perf" record -F "$perf_frequency" \
+  # Temporary startup diagnostics: perf's initialization stage markers use
+  # pr_debug3; the observed silent exit 255 precedes the enable acknowledgement.
+  LD_LIBRARY_PATH=$perf_lib "$perf" record -vvv -F "$perf_frequency" \
     -e "$perf_event" -m "$perf_mmap_size" \
     --call-graph dwarf,16384 --delay -1 \
     --control "fifo:$perf_control_fifo,$perf_ack_fifo" \
@@ -512,7 +522,7 @@ run_profile_measurement() {
     2>"$perf_record_log" &
   perf_pid=$!
   if ! control_perf_record enable "$perf_startup_timeout_seconds"; then
-    stop_perf_record 1
+    stop_perf_record 1 || true
     close_perf_control
     return 1
   fi
@@ -589,7 +599,9 @@ run_profile_measurement() {
     printf 's3_complete_requests=%s\n' "$profile_complete_requests"
     printf 'elapsed_ns=%s\n' "$profile_elapsed_ns"
   } >"$run_dir/profile-metadata.txt"
-  stop_perf_record
+  if ! stop_perf_record; then
+    control_failed=1
+  fi
   close_perf_control
   if ((control_failed)); then
     return 1
