@@ -197,7 +197,8 @@ class FuseReactor : public IoExecutor {
   };
 
   struct Dispatch {
-    Dispatch* next_free = nullptr;
+    Dispatch* next_free   = nullptr;
+    Dispatch* next_remote = nullptr;
     fuse_buf buffer = {};
     struct {
       fuse_in_header in;
@@ -263,6 +264,7 @@ class FuseReactor : public IoExecutor {
   bool cancel_expired_io(uint64_t now) noexcept;
   void refresh_io_deadline() noexcept;
   void drain_shutdown() noexcept;
+  bool complete_remote_dispatch(Dispatch* dispatch) noexcept;
   void fail_remote_dispatch(Dispatch* dispatch, int result) noexcept;
   Dispatch* pop_dispatch() noexcept;
   Dispatch* pop_returned_dispatch() noexcept;
@@ -276,6 +278,9 @@ class FuseReactor : public IoExecutor {
   static int read_dispatch_prefix(Dispatch* dispatch) noexcept;
   bool start_remote_dispatch(
       Dispatch* dispatch, FuseReactor* target) noexcept;
+  bool start_remote_dispatch_batch(
+      Dispatch* head, Dispatch* tail, FuseReactor* target,
+      size_t count) noexcept;
   bool run_ready_callbacks() noexcept;
   void release_input_dispatch(Dispatch* dispatch,
                               bool drain_input = true) noexcept;
@@ -327,15 +332,17 @@ class FuseReactor : public IoExecutor {
   size_t max_reply_count_          = 0;
   unsigned receive_concurrency_    = 1;
   size_t reactor_index_            = 0;
-  uint64_t received_requests_      = 0;
-  uint64_t dispatched_requests_    = 0;
-  uint64_t completed_replies_      = 0;
-  uint64_t external_replies_       = 0;
-  uint64_t io_operations_          = 0;
-  uint64_t background_file_writes_ = 0;
-  uint64_t wait_calls_             = 0;
-  uint64_t completion_batches_     = 0;
-  uint64_t completions_            = 0;
+  uint64_t received_requests_        = 0;
+  uint64_t dispatched_requests_      = 0;
+  uint64_t remote_dispatch_batches_  = 0;
+  uint64_t remote_dispatch_requests_ = 0;
+  uint64_t completed_replies_        = 0;
+  uint64_t external_replies_         = 0;
+  uint64_t io_operations_            = 0;
+  uint64_t background_file_writes_   = 0;
+  uint64_t wait_calls_               = 0;
+  uint64_t completion_batches_       = 0;
+  uint64_t completions_              = 0;
   size_t completion_batch_high_water_ = 0;
   std::atomic<uint64_t> receive_drains_{0};
   std::atomic<size_t> dispatch_count_{0};

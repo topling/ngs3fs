@@ -529,6 +529,149 @@ struct ReactorIoTest {
     return 0;
   }
 
+  static int msg_ring_batch_case(bool fail, bool shutdown) {
+    ReactorIoTest test;
+    if (!test.initialize(false)) return test.failed ? 1 : 77;
+    const auto require = [](bool condition, const char* message) {
+      if (!condition) throw std::runtime_error(message);
+    };
+    FuseReactor& source = test.reactor();
+    require(::pipe2(source.return_pipe_, O_CLOEXEC | O_NONBLOCK) == 0,
+            "create batch return pipe");
+    auto value = std::make_unique<FuseReactor>();
+    FuseReactor* target = value.get();
+    std::string error;
+    require(target->initialize(&test.group, test.session, test.fake_fuse.get(),
+                               false, false, 8, 0, false, error),
+            "initialize MSG_RING batch target");
+    test.group.reactors_.push_back(std::move(value));
+    require(io_uring_enable_rings(&source.ring_) == 0 &&
+            io_uring_enable_rings(&target->ring_) == 0,
+            "enable MSG_RING batch rings");
+    source.ring_enabled_ = true;
+    target->ring_enabled_ = true;
+
+    constexpr size_t count = 16;
+    std::array<FuseReactor::Dispatch*, count> nodes{};
+    std::vector<size_t> order;
+    order.reserve(count);
+    struct Probe {
+      FuseReactor::Dispatch* dispatch;
+      std::vector<size_t>* order;
+      size_t index;
+    };
+    std::array<Probe, count> probes{};
+    for (size_t i = 0; i < count; ++i) {
+      nodes[i] = new FuseReactor::Dispatch;
+      require(::pipe2(nodes[i]->pipe, O_CLOEXEC | O_NONBLOCK) == 0,
+              "create batch input pipe");
+      nodes[i]->owner = &source;
+      if (i != 0) nodes[i - 1]->next_remote = nodes[i];
+      probes[i] = {nodes[i], &order, i};
+    }
+    source.dispatch_count_.store(count, std::memory_order_relaxed);
+    const unsigned sqes = io_uring_sq_ready(&source.ring_);
+    require(!source.start_remote_dispatch_batch(
+                nodes.front(), nodes.back(), target, count - 1) &&
+            !source.start_remote_dispatch_batch(
+                nodes.front(), nodes[count - 2], target, count),
+            "malformed batch count or tail was accepted");
+    require(target->task_count_.load() == 0 &&
+            io_uring_sq_ready(&source.ring_) == sqes,
+            "rejected batch changed target admission or SQEs");
+    for (auto* node : nodes) {
+      require(node->target == nullptr && node->input_tasks.load() == 0 &&
+              node->task.run == nullptr,
+              "rejected batch partially prepared its nodes");
+    }
+    // Prepare an invalid destination SQE without closing/reusing the target
+    // ring fd. Its failure CQE must own and roll back the whole batch.
+    const int fd = target->ring_.ring_fd;
+    if (fail) target->ring_.ring_fd = -1;
+    const bool accepted = source.start_remote_dispatch_batch(
+        nodes.front(), nodes.back(), target, count);
+    target->ring_.ring_fd = fd;
+    require(accepted && target->task_count_.load() == count,
+            "batch admission did not retain every request");
+    require(source.remote_dispatch_batches_ == 1 &&
+            source.remote_dispatch_requests_ == count,
+            "batch emitted one message per request instead of one per owner");
+    for (size_t i = 0; i < count; ++i) {
+      nodes[i]->task.context = &probes[i];
+      nodes[i]->task.run = [](void* context) noexcept {
+        auto* probe = static_cast<Probe*>(context);
+        probe->order->push_back(probe->index);
+        probe->dispatch->processing_complete = true;
+      };
+    }
+    if (shutdown) {
+      test.group.shutting_down_.store(true, std::memory_order_release);
+      require(!test.group.dispatch_admission_closed_.load(),
+              "shutdown closed ingress before its admitted batch was submitted");
+    }
+    require(io_uring_submit(&source.ring_) == 1,
+            "batch did not use exactly one MSG_RING SQE");
+    if (shutdown) {
+      test.group.dispatch_admission_closed_.store(true, std::memory_order_release);
+    }
+    io_uring* ring = fail ? &source.ring_ : &target->ring_;
+    io_uring_cqe* cqe = nullptr;
+    __kernel_timespec timeout{.tv_sec = 2, .tv_nsec = 0};
+    require(io_uring_wait_cqe_timeout(ring, &cqe, &timeout) == 0,
+            "batch completion timed out");
+    const uintptr_t tagged = uintptr_t(io_uring_cqe_get_data(cqe));
+    const int result = cqe->res;
+    io_uring_cqe_seen(ring, cqe);
+    require((tagged & 7) == (fail ? 4 : 3) &&
+            reinterpret_cast<FuseReactor::Dispatch*>(tagged & ~uintptr_t(7)) ==
+                nodes.front(),
+            "batch CQE did not retain its FIFO head");
+    struct CurrentScope {
+      FuseReactor*& slot;
+      FuseReactor* previous;
+      ~CurrentScope() { slot = previous; }
+    } current{FuseReactor::current_, FuseReactor::current_};
+    FuseReactor::current_ = fail ? &source : target;
+    if (fail) {
+      require(result == -EBADF, "invalid batch target did not fail");
+      source.fail_remote_dispatch(nodes.front(), result);
+      require(source.error_ == -EBADF && order.empty(),
+              "failed batch executed a request or lost its error");
+    } else {
+      require(result == 0 && target->complete_remote_dispatch(nodes.front()),
+              "batch receiver rejected admitted requests");
+      for (size_t pass = 0; pass < count && order.size() != count; ++pass) {
+        require(target->run_ready_callbacks(), "run MSG_RING batch callbacks");
+      }
+      require(order.size() == count, "batch omitted request callbacks");
+      for (size_t i = 0; i < count; ++i) {
+        require(order[i] == i, "batch reordered same-owner requests");
+      }
+    }
+    require(target->task_count_.load(std::memory_order_acquire) == 0,
+            "batch leaked target admission");
+    require(io_uring_peek_cqe(ring, &cqe) == -EAGAIN,
+            "batch emitted extra completion messages");
+    require(source.drain_return_pipe() && source.dispatch_count_.load() == 0,
+            "batch leaked ingress admission");
+    std::array<bool, count> recycled{};
+    for (size_t i = 0; i < count; ++i) {
+      auto* node = source.pop_returned_dispatch();
+      if (node == nullptr) node = source.pop_dispatch();
+      const auto found = std::find(nodes.begin(), nodes.end(), node);
+      require(found != nodes.end(), "batch lost or returned an unknown Dispatch");
+      const size_t index = size_t(found - nodes.begin());
+      require(!recycled[index] && node->next_remote == nullptr,
+              "batch returned a duplicate Dispatch or retained its chain");
+      recycled[index] = true;
+    }
+    require(source.pop_returned_dispatch() == nullptr &&
+            source.pop_dispatch() == nullptr,
+            "batch recycled more requests than admitted");
+    for (auto* node : nodes) source.recycle_dispatch(node);
+    return 0;
+  }
+
   static int metadata_io_case() {
     ReactorIoTest test;
     if (!test.initialize(false)) return test.failed ? 1 : 77;
@@ -1560,8 +1703,17 @@ int main(int argc, char** argv) {
   try {
     if (dispatch) return ReactorIoTest::dispatch_case();
     if (dispatch_freelist) {
-      const int result = ReactorIoTest::dispatch_freelist_case();
-      return result != 0 ? result : ReactorIoTest::shutdown_msg_ring_case();
+      int result = ReactorIoTest::dispatch_freelist_case();
+      if (result != 0) return result;
+      result = ReactorIoTest::shutdown_msg_ring_case();
+      if (result != 0) return result;
+      for (bool shutdown : {false, true}) {
+        for (bool fail : {false, true}) {
+          result = ReactorIoTest::msg_ring_batch_case(fail, shutdown);
+          if (result != 0) return result;
+        }
+      }
+      return 0;
     }
     if (metadata_io) return ReactorIoTest::metadata_io_case();
     ReactorIoTest test;

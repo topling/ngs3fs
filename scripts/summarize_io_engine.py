@@ -12,12 +12,11 @@ SUITES = ("normal", "random", "cache-cold", "cache-warm", "cache-unlimited")
 OWNER_COMPLETE_SUITES = ("affinity-normal", "affinity-random",
                          "affinity-cache-cold", "affinity-cache-warm")
 OWNER_COMPLETE_BASELINE = (
-    "pre-owner-complete execution with inode-hash routing and direct shared "
-    "lock-free Dispatch recycling "
-    "(38d78ac41636199d8964cd264acdc07aa5b946bf)")
+    "owner-complete worker execution with one MSG_RING notification per "
+    "remote request (a3009ab3998e7cdad6e7c2321ecf2219dbade5e6)")
 OWNER_COMPLETE_CURRENT = (
-    "owner-complete worker execution; four total reactors are one ingress "
-    "reactor plus three workers")
+    "owner-complete worker execution with bounded same-receive per-worker "
+    "FIFO MSG_RING batching")
 NAME = re.compile(r"^(?P<engine>.+)-(?P<reactors>[0-9]+)-r[0-9]+$")
 
 def rows(path: Path):
@@ -84,7 +83,7 @@ def report(data_by_suite, title="I/O-engine CPU comparison", provenance=""):
         baseline = data.get(("baseline", 4))
         current = data.get(("current", 4))
         if baseline and current:
-            out += ["", "Owner-complete delta (current versus pre-owner-complete baseline):", "",
+            out += ["", "Matched four-reactor delta (current batched versus baseline unbatched):", "",
                     f"- daemon {pct(current[1], baseline[1])}; total {pct(current[2], baseline[2])}"]
         out.append("")
     return "\n".join(out)
@@ -115,7 +114,7 @@ def html(data_by_suite, missing=(), title="I/O-engine CPU comparison",
         baseline = data.get(("baseline", 4))
         current = data.get(("current", 4))
         if baseline and current:
-            out.append("<p>Owner-complete delta (current versus pre-owner-complete baseline): "
+            out.append("<p>Matched four-reactor delta (current batched versus baseline unbatched): "
                        f"daemon {pct(current[1], baseline[1])}; "
                        f"total {pct(current[2], baseline[2])}</p>")
     if missing:
@@ -154,11 +153,12 @@ def main():
         owner_complete_missing = [
             suite for suite in OWNER_COMPLETE_SUITES
             if suite not in owner_complete]
-        owner_complete_title = "Owner-complete worker CPU comparison"
+        owner_complete_title = "Matched four-reactor CPU comparison"
         provenance = (
             f"Baseline: {OWNER_COMPLETE_BASELINE}. "
             f"Current: {OWNER_COMPLETE_CURRENT}. "
-            "Both CI variants use four total reactors, a mount-wide limit of "
+            "Both CI variants use four total reactors (one ingress and three "
+            "workers), a mount-wide limit of "
             "eight HTTP connections, identical workloads, and alternating "
             "sample order on the same runner.")
         owner_complete_text = report(

@@ -2,16 +2,28 @@
 
 ## Current implementation target: ingress and owner-complete workers (2026-09-08)
 
-This section supersedes the earlier multi-reactor execution and notification
-rules below. The implementation passes compilation and all 98 non-mounted
-unit checks locally (2026-09-09). Fresh runner integration, stress and matched
-performance validation remain required; this is not a measured CPU-win claim.
+This section supersedes the historical execution and notification rules below.
+The owner-complete implementation at `c8caf6f` passes all 98 local non-mounted
+checks and all seven jobs in runner CI `34256675693`, including mounted
+correctness, stress and sanitizers. Matched four-reactor medians versus
+`38d78ac` show about 2–3% less uncached daemon CPU but about 2–3% more cached
+daemon CPU; this is not a blanket performance-win claim. Later optimizations
+require their own fresh runner validation.
 
 - `--reactors N` remains the total number of application reactors. For N > 1,
   reactor 0 only receives FUSE messages, dispatches them and owns the recycled
   Dispatch containers. Stable mixed-inode routing selects workers 1 through
   N-1. INIT and session-control transport remain ingress responsibilities.
   For N == 1, ingress and execution remain combined.
+- A bounded ingress receive batch may group its already-received requests by
+  target worker and publish one MSG_RING carrying a FIFO Dispatch chain per
+  target. Do not wait for more requests to fill a batch, introduce a persistent
+  pending queue, or add an empty/armed notification handshake. Each request
+  retains its own admission and input-buffer lifetime; only the forward message
+  is shared. The receiving worker unlinks each node before executing callbacks.
+  Failure and shutdown must retire every admitted node exactly once, and ingress
+  must never dereference a batch after publication. Preserve same-owner receive
+  order. Record message and request counts separately to measure actual batching.
 - A worker owns the request state machine through completion: HTTP connection
   use, network and local-cache I/O, parsing, checksum work and local state
   publication. Replies go directly to FUSE from that worker. Do not bounce
@@ -79,7 +91,7 @@ only on GitHub runners. Compare equal total reactor and connection counts;
 retain readable evidence, not perf.data. Audit source and runtime evidence for
 remaining offload paths before claiming the no-extra-worker target complete.
 
-## Direct Dispatch freelist (2026-09-08)
+## Historical: direct Dispatch freelist (2026-09-08)
 
 `Dispatch` allocation and reclamation use one intrusive lock-free LIFO stack.
 Only the ingress reactor pops; execution reactors push directly when the final
@@ -115,7 +127,7 @@ compilation and non-mounted unit tests only. Runner CI executes mounted tests,
 stress, sanitizers, and CPU A/B against the pre-stack inode-hash implementation,
 with ordinary one/four-reactor comparisons and readable flamegraph evidence.
 
-## Stable inode dispatch (2026-09-08)
+## Historical: stable inode dispatch (2026-09-08)
 
 Multi-reactor mounts route requests by a fixed 64-bit mix of the FUSE inode
 number, modulo the reactor count. The input pipe is a recycled request
@@ -1470,9 +1482,9 @@ A+Patch.
 | normal receive cleanup | patched libfuse asks the reactor to drain its receive pipe only after an error or a short consumer; normal integration and benchmark runs report `receive_drains=0`, eliminating one `FIONREAD` per request | pass |
 | interruption and clean unmount with queued replies | session exit wakes every reactor through its eventfd; complete fault-injection coverage remains pending | partial |
 
-### Current implementation boundary
+### Historical prototype implementation boundary
 
-The production implementation now covers tasks 1 and 2, the FUSE-transport
+At this prototype stage, the implementation covered tasks 1 and 2, the FUSE-transport
 part of task 3, external completion routing, multi-reactor clone-fd sharding,
 startup engine selection, and cleartext HTTP socket submission. FUSE callbacks
 run in a bounded dispatch pool. Hot read and cache-fill callbacks submit one

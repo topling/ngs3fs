@@ -62,24 +62,24 @@ class SummarizeIoEngineTest(unittest.TestCase):
     def test_zero_baseline_is_reported_as_not_available(self):
         self.assertEqual(MODULE.pct(10, 0), "n/a (zero baseline)")
 
-    def test_emits_owner_complete_delta(self):
+    def test_emits_matched_four_reactor_delta(self):
         data = {"affinity-normal": {
             ("baseline", 4): (3, 200, 300),
             ("current", 4): (3, 150, 240),
         }}
         text = MODULE.report(data)
-        self.assertIn("Owner-complete delta", text)
+        self.assertIn("Matched four-reactor delta", text)
         self.assertIn("daemon -25.00%; total -20.00%", text)
         rendered = MODULE.html(data)
-        self.assertIn("Owner-complete delta", rendered)
+        self.assertIn("Matched four-reactor delta", rendered)
         self.assertIn("daemon -25.00%; total -20.00%", rendered)
-        provenance = ("Baseline: pre-owner-complete execution. Current: four "
-                      "total reactors are one ingress plus three workers.")
-        titled = MODULE.html(data, title="Owner-complete worker CPU comparison",
+        provenance = ("Baseline: unbatched owner-complete execution. Current: "
+                      "batched owner-complete execution.")
+        titled = MODULE.html(data, title="Matched four-reactor CPU comparison",
                              provenance=provenance)
-        self.assertIn("<h1>Owner-complete worker CPU comparison</h1>", titled)
-        self.assertIn("Baseline: pre-owner-complete", titled)
-        self.assertIn("four total reactors are one ingress plus three workers", titled)
+        self.assertIn("<h1>Matched four-reactor CPU comparison</h1>", titled)
+        self.assertIn("Baseline: unbatched owner-complete", titled)
+        self.assertIn("Current: batched owner-complete", titled)
 
     def test_even_number_of_samples_uses_median(self):
         with tempfile.TemporaryDirectory() as temporary:
