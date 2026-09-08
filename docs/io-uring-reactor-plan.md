@@ -53,6 +53,11 @@ performance validation remain required; this is not a measured CPU-win claim.
 - Periodic maintenance belongs to bounded worker-reactor tasks. Keep legacy
   and explicitly supported TLS fallback separate; do not silently fall back
   the new multi-reactor plaintext path to the old worker pool.
+  Best-effort CLOCK reclamation must try, not wait for, namespace mutation
+  gates: an asynchronous mutation can hold the gate while awaiting a CQE on
+  that same owner. Skip a busy directory and revisit it on a later pass.
+  Deferred inode invalidations retain their inode pin through notification
+  completion or cancellation, not merely until the notification is queued.
   Existing dynamic credential-provider refresh is a separate compatibility
   boundary, not an object-I/O offload path. It may still use its existing
   refresh thread for credential_process, file reload, metadata services or

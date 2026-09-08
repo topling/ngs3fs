@@ -1393,15 +1393,17 @@ struct AsyncPageCacheInvalidation {
   fuse_ino_t inode;
   off_t offset;
   off_t length;
+  std::shared_ptr<InodeFile> item;
   FuseReactor::NotifyFunction done;
   void* context;
   FuseReactor::ReactorTask task;
 
   AsyncPageCacheInvalidation(FuseReactor& r, fuse_ino_t ino,
                              off_t off, off_t len,
-                             FuseReactor::NotifyFunction fn, void* ctx)
+                             FuseReactor::NotifyFunction fn, void* ctx,
+                             std::shared_ptr<InodeFile> pin = {})
       : reactor(r), inode(ino), offset(off), length(len),
-        done(fn), context(ctx) {
+        item(std::move(pin)), done(fn), context(ctx) {
     task = {start, cancel, this};
   }
   static void finish(void* context, int result) noexcept {
@@ -1427,10 +1429,11 @@ struct AsyncPageCacheInvalidation {
 bool async_invalidate_page_cache(FuseReactor& reactor,
                                  fuse_ino_t inode, off_t offset, off_t length,
                                  FuseReactor::NotifyFunction done,
-                                 void* context) noexcept {
+                                 void* context,
+                                 std::shared_ptr<InodeFile> item = {}) noexcept {
   try {
     auto task = std::make_unique<AsyncPageCacheInvalidation>(
-        reactor, inode, offset, length, done, context);
+        reactor, inode, offset, length, done, context, std::move(item));
     if (!reactor.post(&task->task)) return false;
     task.release();
     return true;
@@ -1450,10 +1453,12 @@ void invalidated_page_cache(void* context, int result) noexcept {
 }
 
 void invalidate_page_cache(State& state, fuse_ino_t inode,
-                           off_t offset = 0, off_t length = 0) noexcept {
+                           off_t offset = 0, off_t length = 0,
+                           std::shared_ptr<InodeFile> item = {}) noexcept {
   if (auto* reactor = current_fuse_reactor()) {
     if (!async_invalidate_page_cache(*reactor, inode, offset, length,
-                                     invalidated_page_cache, &state)) {
+                                     invalidated_page_cache, &state,
+                                     std::move(item))) {
       invalidated_page_cache(&state, -errno);
     }
     return;
@@ -5639,6 +5644,7 @@ fuse_ino_t install_item(State& state, fuse_ino_t parent,
   InodeBase* item      = nullptr;
   bool allocated       = false;
   fuse_ino_t invalidate_inode = 0;
+  std::shared_ptr<InodeFile> invalidate_pin;
   {
     std::unique_lock guard(children.mutex);
     if (mutation_epoch && children.remote_mutations) throw DirectoryListingDeferred{};
@@ -5706,6 +5712,13 @@ fuse_ino_t install_item(State& state, fuse_ino_t parent,
           (file.mtime.load(std::memory_order_relaxed) != child.mtime ||
            file.fsize.load(std::memory_order_relaxed) != child.size);
       if (changed) {
+        // Retain under the directory lock: after unlocking, a concurrent
+        // removal may detach this inode before its notification runs.
+        retain_inode_count(file.open_count, "pin listing invalidation");
+        invalidate_pin = std::shared_ptr<InodeFile>(
+            &file, [](InodeFile* value) {
+              release_inode_count(value->open_count);
+            });
         file.set_page_cache_valid(false);
         invalidate_inode = item_inode(item);
       }
@@ -5714,7 +5727,8 @@ fuse_ino_t install_item(State& state, fuse_ino_t parent,
     }
   }
   if (invalidate_inode != 0) {
-    invalidate_page_cache(state, invalidate_inode);
+    invalidate_page_cache(state, invalidate_inode, 0, 0,
+                           std::move(invalidate_pin));
   }
   if (allocated) {
     cache_inode_allocated(state);
@@ -6172,7 +6186,12 @@ double remaining_inode_timeout(State& state,
 }
 
 size_t reclaim_cached_children(State& state, InodeDir& item) {
-  std::lock_guard mutation_guard(item.children.mutation_mutex);
+  // A namespace mutation can hold this gate while awaiting network I/O on
+  // this same reactor. CLOCK reclamation is best effort: never block the
+  // owner needed to finish the mutation and release its gate.
+  std::unique_lock mutation_guard(
+      item.children.mutation_mutex, std::try_to_lock);
+  if (!mutation_guard.owns_lock()) return 0;
   if (item.detached() ||
       item.children.refreshing.load(std::memory_order_acquire) ||
       item.open_count.load(std::memory_order_acquire) != 1 ||
@@ -6245,14 +6264,15 @@ void cache_reclaim_tick(State& state, size_t invalidation_limit,
       scan_limit = std::min(maximum_scan, available);
     }
   }
-  for (const State::PendingInvalidation& pending : invalidations) {
+  for (State::PendingInvalidation& pending : invalidations) {
       if (pending.generation_epoch != 0 &&
           (pending.item->generation_epoch.load(std::memory_order_acquire) &
            ((1ULL << 63) - 1)) != pending.generation_epoch) {
         continue;
       }
       invalidate_page_cache(state, pending.inode,
-                            pending.offset, pending.length);
+                            pending.offset, pending.length,
+                            std::move(pending.item));
   }
   if (!invalidations.empty()) {
     invalidations.clear();

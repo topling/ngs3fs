@@ -36,6 +36,11 @@ struct AdmissionResult {
   unsigned callbacks = 0;
 };
 
+struct InvalidationResult {
+  int result = 0;
+  unsigned callbacks = 0;
+};
+
 void activate_admission(void* context) noexcept {
   static_cast<AdmissionResult*>(context)->activated = true;
 }
@@ -43,6 +48,12 @@ void activate_admission(void* context) noexcept {
 void run_admission(void* context) noexcept {
   auto* result = static_cast<AdmissionResult*>(context);
   if (result->activated) ++result->callbacks;
+}
+
+void invalidation_complete(void* context, int result) noexcept {
+  auto* completion = static_cast<InvalidationResult*>(context);
+  completion->result = result;
+  ++completion->callbacks;
 }
 
 void checksum_complete(void* context, ChecksumValue value,
@@ -101,6 +112,20 @@ struct ReactorIoTest {
     return result;
   }
 
+  static bool drain_tasks(FuseReactor& reactor) {
+    return reactor.drain_task_pipe();
+  }
+
+  static size_t reply_count(FuseReactor& reactor) {
+    return reactor.reply_count_;
+  }
+
+  static void fail_replies(FuseReactor& reactor, int result) {
+    set_current(&reactor);
+    reactor.fail_replies(result);
+    set_current(nullptr);
+  }
+
   bool initialize() {
     char name[] = "fuse_owner_test";
     char* argv[]{name};
@@ -127,7 +152,39 @@ struct ReactorIoTest {
     group.reactors_.push_back(std::move(reactor));
     if (io_uring_enable_rings(&group.reactors_[0]->ring_) != 0) return false;
     group.reactors_[0]->ring_enabled_ = true;
-    return true;
+    fuse_custom_io custom_io{};
+    custom_io.writev            = FuseReactor::sync_writev;
+    custom_io.read              = FuseReactor::sync_read;
+    custom_io.writev_async      = FuseReactor::async_writev;
+    custom_io.splice_send_async = FuseReactor::async_splice;
+    custom_io.async_userdata    = &group;
+    custom_io.async_wakeup      = FuseReactor::async_wakeup;
+    custom_io.clear_receive     = FuseReactor::clear_receive;
+    UniqueFd session_io(::dup(fuse_fd.get()));
+    if (!session_io ||
+        fuse_session_custom_io(session, &custom_io, sizeof(custom_io),
+                               session_io.get()) != 0) return false;
+    session_io.release();
+    struct InitRequest {
+      fuse_in_header header{};
+      fuse_init_in body{};
+    } request;
+    request.header.len = sizeof(request);
+    request.header.opcode = FUSE_INIT;
+    request.header.unique = 1;
+    request.header.nodeid = FUSE_ROOT_ID;
+    request.body.major = FUSE_KERNEL_VERSION;
+    request.body.minor = FUSE_KERNEL_MINOR_VERSION;
+    request.body.max_readahead = 1024 * 1024;
+    fuse_buf buffer{};
+    buffer.size = sizeof(request);
+    buffer.mem = &request;
+    set_current(group.reactors_[0].get());
+    fuse_session_process_buf(session, &buffer);
+    set_current(nullptr);
+    std::array<char, 512> reply{};
+    return ::recv(fuse_peer.get(), reply.data(), reply.size(), 0) >=
+        ssize_t(sizeof(fuse_out_header));
   }
 
   FuseReactor& reactor() { return *group.reactors_[0]; }
@@ -386,12 +443,109 @@ void test_reactor_checksum() {
                 "retained owner checksum differs from synchronous checksum");
 }
 
+void test_page_cache_invalidation_pin() {
+  ReactorIoTest test;
+  if (!test.initialize()) throw std::system_error(
+      ENOTSUP, std::generic_category(), "io_uring unavailable");
+  FuseReactor& owner = test.reactor();
+  InodeFile item;
+  item.open_count.store(1, std::memory_order_relaxed);
+  std::shared_ptr<InodeFile> pin(&item, [](InodeFile* value) {
+    release_inode_count(value->open_count);
+  });
+  std::weak_ptr<InodeFile> retained = pin;
+  InvalidationResult completion;
+
+  require(async_invalidate_page_cache(
+              owner, fuse_ino_t(uintptr_t(&item)), 0, 0,
+              invalidation_complete, &completion, std::move(pin)),
+          "post pinned page-cache invalidation");
+  require(!retained.expired() &&
+              item.open_count.load(std::memory_order_relaxed) == 1,
+          "posted invalidation released its inode pin");
+
+  require(ReactorIoTest::drain_tasks(owner),
+          "drain pinned invalidation task");
+  require(ReactorIoTest::run_ready(owner), "start pinned invalidation");
+  require(!retained.expired() && ReactorIoTest::reply_count(owner) == 1 &&
+              item.open_count.load(std::memory_order_relaxed) == 1,
+          "in-flight invalidation released its inode pin");
+
+  ReactorIoTest::fail_replies(owner, -ECANCELED);
+  require(retained.expired() && ReactorIoTest::reply_count(owner) == 0 &&
+              item.open_count.load(std::memory_order_relaxed) == 0 &&
+              completion.callbacks == 1 && completion.result == -ECANCELED,
+          "cancelled invalidation retained its inode pin");
+}
+
+void test_cache_reclaim_busy_mutation() {
+  // This fixture exercises only in-memory inode state. Never consult the
+  // developer's credential profile or a cloud instance metadata endpoint.
+  require(setenv("AWS_ACCESS_KEY_ID", "unit-test", 1) == 0 &&
+              setenv("AWS_SECRET_ACCESS_KEY", "unit-test", 1) == 0,
+          "set local-only fixture credentials");
+  MountConfig config;
+  config.io_engine = IO_ENGINE_LEGACY;
+  config.max_connections = 0;
+  State state(std::move(config));
+  InodeDir& directory = *state.root_item;
+  directory.open_count.store(1, std::memory_order_relaxed);
+  ListedChild child;
+  child.name.assign("reclaim-child");
+  install_item(state, FUSE_ROOT_ID, std::move(child));
+  require(directory.children.size() == 1,
+          "reclaim fixture did not install its child");
+
+  std::unique_lock mutation_guard(directory.children.mutation_mutex);
+  const auto started = std::chrono::steady_clock::now();
+  require(reclaim_cached_children(state, directory) == 0,
+          "reclaim entered a busy namespace mutation");
+  require(std::chrono::steady_clock::now() - started <
+              std::chrono::milliseconds(100) &&
+              directory.children.size() == 1,
+          "busy namespace reclaim blocked or changed children");
+  mutation_guard.unlock();
+
+  require(reclaim_cached_children(state, directory) == 1 &&
+              directory.children.empty(),
+          "idle namespace reclaim did not resume normally");
+
+  ReactorIoTest test;
+  if (!test.initialize()) throw std::system_error(
+      ENOTSUP, std::generic_category(), "io_uring unavailable");
+  FuseReactor& owner = test.reactor();
+  ListedChild original;
+  original.name.assign("changed-child");
+  const fuse_ino_t inode = install_item(state, FUSE_ROOT_ID, std::move(original));
+  ListedChild changed;
+  changed.name.assign("changed-child");
+  changed.mtime = 1;
+  ReactorIoTest::set_current(&owner);
+  require(install_item(state, FUSE_ROOT_ID, std::move(changed)) == inode,
+          "listing update replaced a stable inode");
+  ReactorIoTest::set_current(nullptr);
+  require(reclaim_cached_children(state, directory) == 0 &&
+              inode_item(state, inode).open_count.load(std::memory_order_relaxed) == 1,
+          "queued listing invalidation did not pin its inode");
+  require(ReactorIoTest::run_ready(owner) &&
+              ReactorIoTest::reply_count(owner) == 1,
+          "start listing invalidation");
+  require(reclaim_cached_children(state, directory) == 0,
+          "in-flight listing invalidation lost its inode pin");
+  ReactorIoTest::fail_replies(owner, -ECANCELED);
+  require(reclaim_cached_children(state, directory) == 1 &&
+              directory.children.empty(),
+          "completed listing invalidation leaked its inode pin");
+}
+
 
 int main() {
   try {
     test_http_pool_affinity();
     test_owner_upload_admission();
     test_reactor_checksum();
+    test_page_cache_invalidation_pin();
+    test_cache_reclaim_busy_mutation();
     return 0;
   } catch (const std::system_error& error) {
     if (error.code().value() == ENOTSUP || error.code().value() == EPERM) {
