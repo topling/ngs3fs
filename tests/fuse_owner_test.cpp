@@ -125,6 +125,19 @@ struct ReactorIoTest {
     return reactor.fd_reply_count_;
   }
 
+  static bool cancel_fd_reply_source(FuseReactor& reactor) {
+    for (FuseReactor::IoRequest* request : reactor.io_requests_) {
+      if (request->async != nullptr &&
+          request->async->complete == FuseReactor::fd_reply_source_done) {
+        set_current(&reactor);
+        const bool result = reactor.cancel(*request->async);
+        set_current(nullptr);
+        return result;
+      }
+    }
+    return false;
+  }
+
   static void fail_replies(FuseReactor& reactor, int result) {
     set_current(&reactor);
     reactor.fail_replies(result);
@@ -202,8 +215,8 @@ struct ReactorIoTest {
     FuseReactor& owner = reactor();
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::seconds(5);
-    while (owner.async_pending_ != 0 || owner.fd_reply_count_ != 0 ||
-           owner.reply_count_ != 0) {
+    while (!owner.io_requests_.empty() || owner.async_pending_ != 0 ||
+           owner.fd_reply_count_ != 0 || owner.reply_count_ != 0) {
       require(std::chrono::steady_clock::now() < deadline,
               "owner reply completion timed out");
       set_current(&owner);
@@ -223,9 +236,9 @@ struct ReactorIoTest {
         if ((tagged & 7) == 1) {
           owner.complete_io(reinterpret_cast<FuseReactor::IoRequest*>(
                                 tagged & ~uintptr_t(7)), completion);
-        } else if ((tagged & 7) == 6) {
-          owner.complete_fd_reply(reinterpret_cast<FuseReactor::Reply*>(
-                                      tagged & ~uintptr_t(7)), completion);
+        } else if ((tagged & 7) == 5) {
+          owner.complete_async_cancel(reinterpret_cast<FuseReactor::IoRequest*>(
+                                          tagged & ~uintptr_t(7)), completion);
         } else {
           require((tagged & 7) == 0, "unexpected owner reply CQ tag");
           owner.complete_reply(reinterpret_cast<FuseReactor::Reply*>(tagged),
@@ -664,6 +677,13 @@ struct CachedReplyRequest {
   }
 };
 
+enum CachedReplyScenario {
+  CACHED_REPLY_SUCCESS,
+  CACHED_REPLY_REJECTED,
+  CACHED_REPLY_SHORT_SOURCE,
+  CACHED_REPLY_CANCEL_SOURCE,
+};
+
 void test_cached_reply_connection() {
   constexpr size_t payload_size = 4096;
   std::array<char, payload_size> payload{};
@@ -671,7 +691,10 @@ void test_cached_reply_connection() {
     payload[i] = char((i * 17 + 5) & 0xff);
   }
 
-  for (bool accepted : {true, false}) {
+  for (CachedReplyScenario scenario : {
+           CACHED_REPLY_SUCCESS, CACHED_REPLY_REJECTED,
+           CACHED_REPLY_SHORT_SOURCE, CACHED_REPLY_CANCEL_SOURCE}) {
+    const bool accepted = scenario != CACHED_REPLY_REJECTED;
     char pattern[] = "/tmp/ngs3fs-cached-wire-XXXXXX";
     char* path = ::mkdtemp(pattern);
     require(path != nullptr, "create cached wire fixture");
@@ -682,8 +705,11 @@ void test_cached_reply_connection() {
 
     CacheConfig cache_config;
     cache_config.root            = path;
-    cache_config.namespace_id    = accepted ? "cached-wire-accepted" :
-                                              "cached-wire-rejected";
+    cache_config.namespace_id    =
+        scenario == CACHED_REPLY_SUCCESS ? "cached-wire-accepted" :
+        scenario == CACHED_REPLY_REJECTED ? "cached-wire-rejected" :
+        scenario == CACHED_REPLY_SHORT_SOURCE ? "cached-wire-short" :
+                                                 "cached-wire-cancel";
     cache_config.block_size      = kCacheBitmapUnit;
     cache_config.reserve_percent = 0;
     LocalCache cache(std::move(cache_config));
@@ -701,6 +727,10 @@ void test_cached_reply_connection() {
             "write cached wire fixture");
     handle.cache_entry->publish_clean(claim, 0, payload_size, true);
     handle.cache_entry->finish_fetch(claim);
+    if (scenario == CACHED_REPLY_SHORT_SOURCE) {
+      require(::ftruncate(handle.cache_entry->data_fd(), 0) == 0,
+              "truncate cached reply source fixture");
+    }
 
     MountConfig config;
     config.io_engine       = IO_ENGINE_LEGACY;
@@ -722,7 +752,7 @@ void test_cached_reply_connection() {
     } request;
     request.header.len    = sizeof(request);
     request.header.opcode = FUSE_READ;
-    request.header.unique = accepted ? 101 : 102;
+    request.header.unique = 101 + unsigned(scenario);
     request.header.nodeid = 2;
     request.body.size     = uint32_t(payload_size);
     fuse_buf buffer{};
@@ -734,6 +764,11 @@ void test_cached_reply_connection() {
     if (fixture.error) std::rethrow_exception(fixture.error);
     require(fixture.callbacks == 1 && fixture.result == 0,
             "cached reply request was not consumed exactly once");
+
+    if (scenario == CACHED_REPLY_CANCEL_SOURCE) {
+      require(ReactorIoTest::cancel_fd_reply_source(test.reactor()),
+              "cancel cached reply source CQ");
+    }
 
     const auto retiring = cache.retiring_entry(identity.key);
     if (accepted) {
@@ -761,22 +796,47 @@ void test_cached_reply_connection() {
                 handle.identity_mutex.try_lock(),
             "cached reply final completion leaked handle or identity");
     handle.identity_mutex.unlock();
-    const size_t wire_size = sizeof(fuse_out_header) +
-        (accepted ? payload_size : 0);
-    std::vector<char> wire(wire_size);
-    require(::recv(test.fuse_peer.get(), wire.data(), wire.size(), MSG_WAITALL) ==
-                ssize_t(wire.size()),
-            "read cached reply wire result");
-    const auto* header = reinterpret_cast<const fuse_out_header*>(wire.data());
-    require(header->unique == request.header.unique &&
-                header->len == wire.size() &&
-                header->error == (accepted ? 0 : -EOPNOTSUPP),
-            "cached reply wire header mismatch");
-    if (accepted) {
-      require(memcmp(wire.data() + sizeof(*header), payload.data(),
-                     payload.size()) == 0,
-              "cached reply wire payload mismatch");
+    fuse_out_header header{};
+    require(::recv(test.fuse_peer.get(), &header, sizeof(header), MSG_WAITALL) ==
+                ssize_t(sizeof(header)) &&
+                header.len >= sizeof(header) &&
+                header.len <= sizeof(header) + payload_size,
+            "read cached reply wire header");
+    std::vector<char> wire_payload(header.len - sizeof(header));
+    if (!wire_payload.empty()) {
+      require(::recv(test.fuse_peer.get(), wire_payload.data(),
+                     wire_payload.size(), MSG_WAITALL) ==
+                  ssize_t(wire_payload.size()),
+              "read cached reply wire payload");
     }
+    const bool error_matches =
+        scenario == CACHED_REPLY_SUCCESS ? header.error == 0 :
+        scenario == CACHED_REPLY_REJECTED ? header.error == -EOPNOTSUPP :
+        scenario == CACHED_REPLY_SHORT_SOURCE ? header.error == -EIO :
+        header.error == 0 || header.error == -ECANCELED;
+    require(header.unique == request.header.unique &&
+                error_matches,
+            "cached reply wire header mismatch");
+    if (scenario == CACHED_REPLY_SUCCESS ||
+        (scenario == CACHED_REPLY_CANCEL_SOURCE && header.error == 0)) {
+      require(wire_payload.size() == payload.size(),
+              "successful cached reply wire size mismatch");
+      require(memcmp(wire_payload.data(), payload.data(), payload.size()) == 0,
+              "cached reply wire payload mismatch");
+    } else {
+      require(wire_payload.empty() &&
+                  (scenario != CACHED_REPLY_CANCEL_SOURCE ||
+                   header.error == -ECANCELED),
+              "failed cached reply wire errno mismatch");
+    }
+    require(fixture.callbacks == 1 &&
+                ReactorIoTest::fd_reply_count(test.reactor()) == 0,
+            "cached reply completed more than once or leaked admission");
+    char extra = 0;
+    errno = 0;
+    require(::recv(test.fuse_peer.get(), &extra, 1, MSG_DONTWAIT) == -1 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK),
+            "cached reply emitted extra wire data");
   }
 }
 
