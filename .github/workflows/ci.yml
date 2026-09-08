@@ -411,9 +411,12 @@ jobs:
         if: always()
         run: |
           for mode in cold warm; do
+            drop=0
+            if [[ "$mode" == warm ]]; then drop=1; fi
             sudo env NGS3FS_IO_ENGINE=uring NGS3FS_REACTORS=1 \
               WORKLOAD=random-read RANDOM_READ_OPERATIONS=512 \
               RANDOM_READ_ADVICE=normal CACHE_MODE="$mode" \
+              DROP_CACHES_AFTER_WARMUP="$drop" \
               PERF_BIN="$(command -v perf)" PERF_LIB_DIR= \
               PERF_EVENT=cpu-clock PERF_FREQUENCY=4000 \
               PERF_STAT_EVENTS=task-clock,context-switches,cpu-migrations,page-faults \
@@ -429,6 +432,7 @@ jobs:
             sudo env NGS3FS_IO_ENGINE="$engine" NGS3FS_REACTORS=1 \
               WORKLOAD=random-read RANDOM_READ_OPERATIONS=512 \
               RANDOM_READ_ADVICE=random CACHE_MODE=warm \
+              DROP_CACHES_AFTER_WARMUP=1 \
               PERF_BIN="$(command -v perf)" PERF_LIB_DIR= \
               PERF_EVENT=cpu-clock PERF_FREQUENCY=4000 \
               PERF_STAT_EVENTS=task-clock,context-switches,cpu-migrations,page-faults \
@@ -467,6 +471,7 @@ jobs:
             WORKLOAD=random-read \
             RANDOM_READ_ADVICE=random \
             CACHE_MODE=warm \
+            DROP_CACHES_AFTER_WARMUP=1 \
             PERF_BIN="$(command -v perf)" \
             PERF_LIB_DIR= \
             PERF_EVENT=cpu-clock \
@@ -482,6 +487,7 @@ jobs:
             WORKLOAD=random-read \
             RANDOM_READ_ADVICE=normal \
             CACHE_MODE=warm \
+            DROP_CACHES_AFTER_WARMUP=1 \
             PERF_BIN="$(command -v perf)" \
             PERF_LIB_DIR= \
             PERF_EVENT=cpu-clock \

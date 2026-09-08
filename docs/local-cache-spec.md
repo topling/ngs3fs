@@ -285,6 +285,15 @@ use a bounded copy. Fixed-length body data that remains on the socket is
 spliced into the cache file. HTTP/2 flow-control credit is returned as file
 progress is published.
 
+### Cached-hit measurements
+
+CLEAN means the data is available in the local file, not necessarily in RAM.
+Measure disk-cache hits with both warm and cold kernel pagecache; flamegraph
+runs must use the same cache conditions as the benchmark they explain.
+`DROP_CACHES_AFTER_WARMUP=1` requests the cold-kernel warm-disk case in the
+profiling script. Record whether cache dropping actually succeeded, and do
+not treat a failed drop as a matched cold-kernel profile.
+
 ### Bounded metadata reuse
 
 Closing a read handle need not destroy its current `CacheEntry`. Keep a small
@@ -722,6 +731,10 @@ Errors use stable meanings:
   outcome that cannot be resolved.
 
 ## Required validation
+
+Local development runs compilation checks and unit tests only. Run mounted
+integration, stress, performance comparisons, and flamegraph sampling on the
+GitHub runner; retain analysis-ready evidence there for review.
 
 The implementation is not complete until the following pass:
 

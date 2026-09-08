@@ -181,6 +181,9 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME random_read_memory_test
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/random_read_memory_test.py)
+  add_test(NAME profile_measurement_test
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/profile_measurement_test.py)
   add_test(NAME summarize_random_read_test
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/summarize_random_read_test.py)
