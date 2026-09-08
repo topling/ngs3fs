@@ -1,0 +1,4 @@
+# Unified-diff context lines require a leading space, including blank lines
+# and lines whose source indentation begins with a tab. Check the patched
+# libfuse source separately; do not strip the patch's required context marker.
+scripts/libfuse-3.18.2-async-reply.patch whitespace=-blank-at-eol,-space-before-tab

@@ -24,6 +24,9 @@ struct Test {
   unsigned clear_calls = 0;
   unsigned write_calls = 0;
   unsigned setxattr_calls = 0;
+  fuse_req_t pending_reply = nullptr;
+  unsigned fd_calls = 0;
+  unsigned fd_case = 0;
   bool failed = false;
 
   ~Test() {
@@ -49,6 +52,40 @@ struct Test {
 
   static void clear_receive(void* userdata) {
     ++static_cast<Test*>(userdata)->clear_calls;
+  }
+
+  static ssize_t fd_reply(int fd, const iovec* header, int count,
+                          int source_fd, off_t offset, size_t length,
+                          unsigned flags, int mode, fuse_req_t req,
+                          void* userdata) {
+    auto& test = *static_cast<Test*>(userdata);
+    ++test.fd_calls;
+    test.check(fd == fuse_session_fd(test.session) && source_fd == 17 &&
+                   offset == 31 && length == 123,
+               "fd reply source or destination changed");
+    test.check(count == 1 && header[0].iov_len == sizeof(fuse_out_header) &&
+                   mode == FUSE_FD_REPLY_PREAD && flags == 0,
+               "small fd reply changed header or transfer mode");
+    const auto* out = static_cast<const fuse_out_header*>(header[0].iov_base);
+    test.check(out->len == sizeof(*out) + length && out->error == 0 &&
+                   out->unique == 10 + test.fd_case,
+               "fd reply header does not match request");
+    if (test.fd_case == 1) {
+      errno = EAGAIN;
+      return -1;
+    }
+    test.pending_reply = req;
+    return FUSE_CUSTOM_IO_DEFERRED;
+  }
+
+  static void read_file(fuse_req_t req, fuse_ino_t, size_t, off_t,
+                         fuse_file_info*) {
+    auto& test = *static_cast<Test*>(fuse_req_userdata(req));
+    const off_t offset = test.fd_case == 3 ? INT64_MAX : 31;
+    const size_t length = test.fd_case == 2 ? 0 : 123;
+    test.check(fuse_reply_fd_async(req, 17, offset, length,
+                                   FUSE_BUF_SPLICE_MOVE) == 0,
+               "fd reply entry did not accept or send its error reply");
   }
 
   static void write_buf(fuse_req_t req, fuse_ino_t nodeid,
@@ -89,6 +126,7 @@ struct Test {
     fuse_lowlevel_ops operations{};
     operations.write_buf = write_buf;
     operations.setxattr = setxattr;
+    operations.read = read_file;
     char name[] = "libfuse_prefix_test";
     char* argv[]{name};
     fuse_args args = FUSE_ARGS_INIT(1, argv);
@@ -105,6 +143,7 @@ struct Test {
     io.read = read_callback;
     io.async_userdata = this;
     io.clear_receive = clear_receive;
+    io.fd_reply_async = fd_reply;
     if (!check(fuse_session_custom_io(session, &io, sizeof(io), sockets[0]) == 0,
                "fuse_session_custom_io failed")) {
       close(sockets[0]);
@@ -229,12 +268,54 @@ struct Test {
     return check(clear_calls == 1, "malformed prefix did not clear input") &&
            check(write_calls == 1, "malformed prefix reached WRITE callback");
   }
+
+  bool fd_reply_cases() {
+    for (fd_case = 0; fd_case != 5; ++fd_case) {
+      struct ReadRequest {
+        fuse_in_header header{};
+        fuse_read_in body{};
+      } request;
+      request.header.len    = sizeof(request);
+      request.header.opcode = FUSE_READ;
+      request.header.unique = 10 + fd_case;
+      request.header.nodeid = 0x1234;
+      request.body.size     = 123;
+      fuse_buf buffer{};
+      buffer.size = sizeof(request);
+      buffer.mem  = &request;
+      fuse_session_process_buf(session, &buffer);
+      fuse_out_header reply{};
+      if (fd_case == 0 || fd_case == 4) {
+        if (!check(pending_reply != nullptr, "fd reply was not deferred")) return false;
+        const ssize_t early = recv(reply_peer, &reply, sizeof(reply), MSG_DONTWAIT);
+        if (!check(early == -1 && (errno == EAGAIN || errno == EWOULDBLOCK),
+                   "deferred source emitted a premature reply")) return false;
+        fuse_req_t req = pending_reply;
+        pending_reply = nullptr;
+        if (fd_case == 4) {
+          return check(fuse_reply_async_complete(req, -EPIPE) == 0 &&
+                           fuse_session_exited(session),
+                       "final transport failure did not exit the session") &&
+                 check(fd_calls == 3, "invalid source ranges reached the hook");
+        }
+        if (!check(fuse_reply_async_error(req, EIO) == 0,
+                   "source error did not send a normal reply")) return false;
+      }
+      const int error = fd_case == 0 ? EIO : fd_case == 1 ? EAGAIN : EINVAL;
+      if (!check(recv(reply_peer, &reply, sizeof(reply), MSG_WAITALL) == sizeof(reply) &&
+                     reply.len == sizeof(reply) && reply.unique == 10 + fd_case &&
+                     reply.error == -error && !fuse_session_exited(session),
+                 "source/admission error changed session or reply semantics")) return false;
+    }
+    return false;
+  }
 };
 
 int main() {
   Test test;
   if (!test.initialize() || !test.write_case() ||
-      !test.large_control_case() || !test.malformed_case()) {
+      !test.large_control_case() || !test.malformed_case() ||
+      !test.fd_reply_cases()) {
     return 1;
   }
   return test.failed ? 1 : 0;

@@ -1,5 +1,5 @@
 diff --git a/include/fuse_lowlevel.h b/include/fuse_lowlevel.h
-index 6be0295b..2a133695 100644
+index 6be0295b..cd253dc2 100644
 --- a/include/fuse_lowlevel.h
 +++ b/include/fuse_lowlevel.h
 @@ -23,6 +23,7 @@
@@ -10,7 +10,7 @@ index 6be0295b..2a133695 100644
  
  #include <stddef.h>
  #include <utime.h>
-@@ -141,8 +142,25 @@ struct fuse_custom_io {
+@@ -141,8 +142,42 @@ struct fuse_custom_io {
  				     off_t *offout, size_t len,
  			           unsigned int flags, void *userdata);
  	int (*clone_fd)(int master_fd);
@@ -22,6 +22,20 @@ index 6be0295b..2a133695 100644
 +	void *async_userdata;
 +	void (*async_wakeup)(void *userdata);
 +	void (*clear_receive)(void *userdata);
++	/*
++	 * Copy header before returning and never complete req inline.
++	 * FUSE_CUSTOM_IO_DEFERRED transfers req ownership; -1 with errno set
++	 * rejects it without retaining any argument.
++	 */
++	ssize_t (*fd_reply_async)(int fdout, const struct iovec *header,
++				  int header_count, int fdin, off_t offin,
++				  size_t payload_len, unsigned int flags,
++				  int mode, fuse_req_t req, void *userdata);
++};
++
++enum fuse_fd_reply_mode {
++	FUSE_FD_REPLY_PREAD,
++	FUSE_FD_REPLY_SPLICE,
  };
  
 +/** Result returned by an async custom-I/O hook after taking reply ownership. */
@@ -30,13 +44,33 @@ index 6be0295b..2a133695 100644
 +/** Complete and release a deferred reply exactly once. */
 +int fuse_reply_async_complete(fuse_req_t req, int result);
 +
++/** Send a normal error reply for a deferred request without exiting session. */
++int fuse_reply_async_error(fuse_req_t req, int error);
++
 +/** Return the current receive-buffer requirement for a session. */
 +size_t fuse_session_bufsize(struct fuse_session *se);
 +
  /**
   * Flags for fuse_lowlevel_notify_entry()
   * 0 = invalidate entry
-@@ -2337,6 +2355,17 @@ void fuse_session_destroy(struct fuse_session *se);
+@@ -1542,6 +1577,16 @@ int fuse_reply_buf(fuse_req_t req, const char *buf, size_t size);
+ int fuse_reply_data(fuse_req_t req, struct fuse_bufvec *bufv,
+ 		    enum fuse_buf_copy_flags flags);
+ 
++/**
++ * Reply from one fd range through the configured asynchronous custom-I/O hook.
++ * This function always consumes req. A hook returning
++ * FUSE_CUSTOM_IO_DEFERRED accepts ownership and completes it later without an
++ * inline completion.  Setup and admission failures send an ordinary FUSE
++ * error reply.  This function returns zero when the hook accepts ownership.
++ */
++int fuse_reply_fd_async(fuse_req_t req, int source_fd, off_t source_offset,
++			size_t length, enum fuse_buf_copy_flags flags);
++
+ /**
+  * Reply with data vector
+  *
+@@ -2337,6 +2382,17 @@ void fuse_session_destroy(struct fuse_session *se);
   */
  int fuse_session_fd(struct fuse_session *se);
  
@@ -54,7 +88,7 @@ index 6be0295b..2a133695 100644
  /**
   * Process a raw request supplied in a generic buffer
   *
-@@ -2348,6 +2377,25 @@ int fuse_session_fd(struct fuse_session *se);
+@@ -2348,6 +2404,25 @@ int fuse_session_fd(struct fuse_session *se);
  void fuse_session_process_buf(struct fuse_session *se,
  			      const struct fuse_buf *buf);
  
@@ -127,7 +161,7 @@ index ec4bb0b2..5cff29ab 100644
  }
 -
 diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
-index d420b257..a1f1ba4a 100644
+index d420b257..909bef03 100644
 --- a/lib/fuse_lowlevel.c
 +++ b/lib/fuse_lowlevel.c
 @@ -207,6 +207,8 @@ void fuse_free_req(fuse_req_t req)
@@ -193,7 +227,7 @@ index d420b257..a1f1ba4a 100644
  
  	trace_request_reply(out->unique, out->len, out->error, err);
  	return err;
-@@ -320,10 +338,33 @@ static int send_reply_iov(fuse_req_t req, int error, struct iovec *iov,
+@@ -320,10 +338,51 @@ static int send_reply_iov(fuse_req_t req, int error, struct iovec *iov,
  	int res;
  
  	res = fuse_send_reply_iov_nofree(req, error, iov, count);
@@ -219,6 +253,24 @@ index d420b257..a1f1ba4a 100644
 +	return 0;
 +}
 +
++int fuse_reply_async_error(fuse_req_t req, int error)
++{
++	struct fuse_session *se;
++	int res;
++
++	if (req == NULL || error <= 0)
++		return -EINVAL;
++	if (!atomic_exchange_explicit(&req->async_reply_pending, 0,
++				      memory_order_acq_rel))
++		return -EALREADY;
++
++	se = req->se;
++	res = fuse_reply_err(req, error);
++	if (res < 0 && res != -ENOENT && !fuse_session_exited(se))
++		fuse_session_exit(se);
++	return res;
++}
++
 +size_t fuse_session_bufsize(struct fuse_session *se)
 +{
 +	return se == NULL ? 0 : se->bufsize;
@@ -227,7 +279,7 @@ index d420b257..a1f1ba4a 100644
  static int send_reply(fuse_req_t req, int error, const void *arg,
  		      size_t argsize)
  {
-@@ -746,6 +787,16 @@ static void fuse_ll_clear_pipe(struct fuse_session *se)
+@@ -746,6 +805,16 @@ static void fuse_ll_clear_pipe(struct fuse_session *se)
  	}
  }
  
@@ -244,7 +296,7 @@ index d420b257..a1f1ba4a 100644
  #if defined(HAVE_SPLICE) && defined(HAVE_VMSPLICE)
  static int read_back(int fd, char *buf, size_t len)
  {
-@@ -865,7 +916,18 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
+@@ -865,7 +934,18 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
  	}
  
  
@@ -264,7 +316,7 @@ index d420b257..a1f1ba4a 100644
  	if (res == -1)
  		goto fallback;
  
-@@ -974,7 +1036,29 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
+@@ -974,7 +1054,29 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
  	    (se->conn.want_ext & FUSE_CAP_SPLICE_MOVE))
  		splice_flags |= SPLICE_F_MOVE;
  
@@ -295,7 +347,7 @@ index d420b257..a1f1ba4a 100644
  		res = se->io->splice_send(llp->pipe[0], NULL,
  						  ch ? ch->fd : se->fd, NULL, out->len,
  					  	  splice_flags, se->userdata);
-@@ -1033,6 +1117,8 @@ int fuse_reply_data(fuse_req_t req, struct fuse_bufvec *bufv,
+@@ -1033,6 +1135,8 @@ int fuse_reply_data(fuse_req_t req, struct fuse_bufvec *bufv,
  
  	res = fuse_send_data_iov(req->se, req->ch, iov, 1, bufv, flags, req);
  	if (res <= 0) {
@@ -304,7 +356,80 @@ index d420b257..a1f1ba4a 100644
  		fuse_free_req(req);
  		return res;
  	} else {
-@@ -1822,7 +1908,7 @@ static void do_write_buf(fuse_req_t req, const fuse_ino_t nodeid,
+@@ -1040,6 +1144,72 @@ int fuse_reply_data(fuse_req_t req, struct fuse_bufvec *bufv,
+ 	}
+ }
+ 
++static int fuse_reply_fd_error(fuse_req_t req, int error)
++{
++	struct fuse_session *se = req->se;
++	int res = fuse_reply_err(req, error);
++
++	if (res < 0 && res != -ENOENT && !fuse_session_exited(se))
++		fuse_session_exit(se);
++	return res;
++}
++
++int fuse_reply_fd_async(fuse_req_t req, int source_fd, off_t source_offset,
++			size_t length, enum fuse_buf_copy_flags flags)
++{
++	struct fuse_out_header out;
++	struct iovec header;
++	struct fuse_session *se;
++	ssize_t res;
++	unsigned int splice_flags = 0;
++	int mode;
++	int saved_errno;
++	int output_fd;
++
++	if (req == NULL)
++		return -EINVAL;
++	se = req->se;
++	if (source_fd < 0 || source_offset < 0 || length == 0 ||
++	    length > UINT32_MAX - sizeof(out) ||
++	    (uint64_t)source_offset > (uint64_t)OFFSET_MAX - length ||
++	    (flags & ~FUSE_BUF_SPLICE_MOVE) != 0)
++		return fuse_reply_fd_error(req, EINVAL);
++	if (req->flags.is_uring || se->io == NULL ||
++	    se->io->fd_reply_async == NULL)
++		return fuse_reply_fd_error(req, EOPNOTSUPP);
++
++	mode = length < 2 * pagesize || se->broken_splice_nonblock ||
++	       se->conn.proto_minor < 14 ||
++	       !(se->conn.want_ext & FUSE_CAP_SPLICE_WRITE) ?
++		FUSE_FD_REPLY_PREAD : FUSE_FD_REPLY_SPLICE;
++	if (mode == FUSE_FD_REPLY_SPLICE &&
++	    (flags & FUSE_BUF_SPLICE_MOVE) &&
++	    (se->conn.want_ext & FUSE_CAP_SPLICE_MOVE))
++		splice_flags |= SPLICE_F_MOVE;
++
++	out.len = (uint32_t)(sizeof(out) + length);
++	out.error = 0;
++	out.unique = req->unique;
++	header.iov_base = &out;
++	header.iov_len = sizeof(out);
++	output_fd = req->custom_reply_fd >= 0 ? req->custom_reply_fd :
++		(req->ch ? req->ch->fd : se->fd);
++
++	atomic_store_explicit(&req->async_reply_pending, 1,
++			      memory_order_release);
++	errno = 0;
++	res = se->io->fd_reply_async(output_fd, &header, 1, source_fd,
++				     source_offset, length, splice_flags, mode,
++				     req, se->io->async_userdata);
++	if (res == FUSE_CUSTOM_IO_DEFERRED)
++		return 0;
++
++	saved_errno = errno != 0 ? errno : EIO;
++	atomic_store_explicit(&req->async_reply_pending, 0,
++			      memory_order_relaxed);
++	return fuse_reply_fd_error(req, saved_errno);
++}
++
+ int fuse_reply_statfs(fuse_req_t req, const struct statvfs *stbuf)
+ {
+ 	struct fuse_statfs_out arg;
+@@ -1822,7 +1992,7 @@ static void do_write_buf(fuse_req_t req, const fuse_ino_t nodeid,
  out:
  	/* Need to reset the pipe if ->write_buf() didn't consume all data */
  	if ((ibuf->flags & FUSE_BUF_IS_FD) && bufv.idx < bufv.count)
@@ -313,7 +438,7 @@ index d420b257..a1f1ba4a 100644
  }
  
  static void _do_flush(fuse_req_t req, const fuse_ino_t nodeid,
-@@ -2754,7 +2840,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
+@@ -2754,7 +2924,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
  	if (se->conn.proto_minor >= 14) {
  #ifdef HAVE_SPLICE
  #ifdef HAVE_VMSPLICE
@@ -323,7 +448,7 @@ index d420b257..a1f1ba4a 100644
  			se->conn.capable_ext |= FUSE_CAP_SPLICE_WRITE |
  						FUSE_CAP_SPLICE_MOVE;
  		}
-@@ -3071,7 +3158,8 @@ static int send_notify_iov(struct fuse_session *se, int notify_code,
+@@ -3071,7 +3242,8 @@ static int send_notify_iov(struct fuse_session *se, int notify_code,
  	iov[0].iov_base = &out;
  	iov[0].iov_len = sizeof(struct fuse_out_header);
  
@@ -333,7 +458,7 @@ index d420b257..a1f1ba4a 100644
  }
  
  int fuse_lowlevel_notify_poll(struct fuse_pollhandle *ph)
-@@ -3248,6 +3336,8 @@ int fuse_lowlevel_notify_store(struct fuse_session *se, fuse_ino_t ino,
+@@ -3248,6 +3420,8 @@ int fuse_lowlevel_notify_store(struct fuse_session *se, fuse_ino_t ino,
  	iov[1].iov_len = sizeof(outarg);
  
  	res = fuse_send_data_iov(se, NULL, iov, 2, bufv, flags, req);
@@ -342,7 +467,7 @@ index d420b257..a1f1ba4a 100644
  	if (res > 0)
  		res = -res;
  
-@@ -3593,9 +3683,47 @@ void fuse_session_process_buf(struct fuse_session *se,
+@@ -3593,9 +3767,47 @@ void fuse_session_process_buf(struct fuse_session *se,
  	fuse_session_process_buf_internal(se, buf, NULL);
  }
  
@@ -390,7 +515,7 @@ index d420b257..a1f1ba4a 100644
  {
  	const size_t write_header_size = sizeof(struct fuse_in_header) +
  		sizeof(struct fuse_write_in);
-@@ -3608,7 +3736,28 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
+@@ -3608,7 +3820,28 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
  	int err;
  	int res;
  
@@ -420,7 +545,7 @@ index d420b257..a1f1ba4a 100644
  		if (buf->size < tmpbuf.buf[0].size)
  			tmpbuf.buf[0].size = buf->size;
  
-@@ -3689,7 +3838,13 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
+@@ -3689,7 +3922,13 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
  		void *newmbuf;
  
  		err = ENOMEM;
@@ -435,7 +560,7 @@ index d420b257..a1f1ba4a 100644
  		if (newmbuf == NULL)
  			goto reply_err;
  		mbuf = newmbuf;
-@@ -3721,7 +3876,7 @@ reply_err:
+@@ -3721,7 +3960,7 @@ reply_err:
  	fuse_reply_err(req, err);
  clear_pipe:
  	if (buf->flags & FUSE_BUF_IS_FD)
@@ -444,7 +569,7 @@ index d420b257..a1f1ba4a 100644
  	goto out_free;
  }
  
-@@ -4472,6 +4627,8 @@ void fuse_session_exit(struct fuse_session *se)
+@@ -4472,6 +4711,8 @@ void fuse_session_exit(struct fuse_session *se)
  {
  	atomic_store_explicit(&se->mt_exited, 1, memory_order_relaxed);
  	sem_post(&se->mt_finish);
@@ -454,14 +579,16 @@ index d420b257..a1f1ba4a 100644
  
  __attribute__((no_sanitize_thread))
 diff --git a/lib/fuse_versionscript b/lib/fuse_versionscript
-index b58360fe..6d4f1d31 100644
+index b58360fe..8a7430d2 100644
 --- a/lib/fuse_versionscript
 +++ b/lib/fuse_versionscript
-@@ -220,6 +220,11 @@ FUSE_3.18 {
+@@ -220,6 +220,13 @@ FUSE_3.18 {
  
  		fuse_reply_statx;
  		fuse_fs_statx;
 +		fuse_reply_async_complete;
++		fuse_reply_async_error;
++		fuse_reply_fd_async;
 +		fuse_session_bufsize;
 +		fuse_session_clone_fd;
 +		fuse_session_process_buf_fd;
