@@ -864,7 +864,8 @@ ssize_t FuseReactor::fd_reply_async(
   auto* group = static_cast<FuseReactorGroup*>(userdata);
   FuseReactor* reactor = group ? group->callback_reactor() : nullptr;
   if (reactor == nullptr || current_ != reactor || req == nullptr ||
-      reactor->pending_fd_reply_done_ == nullptr) {
+      reactor->pending_fd_reply_done_ == nullptr ||
+      (mode != FUSE_FD_REPLY_PREAD && mode != FUSE_FD_REPLY_SPLICE)) {
     errno = EINVAL;
     return -1;
   }
@@ -879,9 +880,13 @@ ssize_t FuseReactor::fd_reply_async(
   reply->req = req;
   reply->notify_done = reactor->pending_fd_reply_done_;
   reply->notify_context = reactor->pending_fd_reply_context_;
+  // Pending runner trial: keep every cached-file source read on the owner ring
+  // as PREAD, then use the existing direct writev transport.  The generic
+  // fd-reply API and begin_fd_reply() retain their SPLICE implementation.
+  const int effective_mode = FUSE_FD_REPLY_PREAD;
   if (!reactor->begin_fd_reply(
           reply, output_fd, header, header_count, source_fd, source_offset,
-          payload_length, final_splice_flags, mode)) {
+          payload_length, final_splice_flags, effective_mode)) {
     const int saved_errno = errno != 0 ? errno : EIO;
     reply->req = nullptr;
     reply->notify_done = nullptr;

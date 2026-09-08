@@ -27,11 +27,16 @@ require their own fresh runner validation.
 - Cached replies also submit their source-file read through the owner ring,
   including cache hits, recovered data and newly downloaded clean ranges.
   A CLEAN bitmap means valid data, not guaranteed local-pagecache residency.
-  Preserve libfuse's small-read PREAD plus direct writev copy count; do not
-  turn small reads into extra pipe operations merely to make them asynchronous.
-  For larger replies, use a reusable pipe embedded in the pooled Reply:
-  source-file-to-pipe through io_uring, then the existing direct pipe-to-FUSE
-  fast path. There remain two splice operations, not an extra staging pipe.
+  The pending runner trial uses owner-ring PREAD plus the existing direct
+  writev transport for every cached-reply size. This is an experiment, not a
+  performance-success claim: it avoids regular-file SPLICE io-wq handoff and
+  pipe bookkeeping, but large replies gain one cache-to-userspace payload copy.
+  Each used pooled Reply also retains its largest PREAD buffer. With queue depth
+  256, retained capacity is bounded by 256 times the negotiated maximum read
+  per worker (at most about 64 MiB per worker for a 256 KiB maximum read), so
+  runner CPU and RSS evidence must decide whether to keep this policy. Preserve
+  the generic SPLICE implementation and public libfuse API until that evidence
+  exists; do not add a size threshold or mount option for this trial.
   A narrow libfuse custom-I/O entry point encodes the reply header and owns
   deferred-request bookkeeping; ngs3fs does not reconstruct the wire header.
   Keep concurrent source reads independent of the ordinary reply FIFO.

@@ -125,6 +125,20 @@ struct ReactorIoTest {
     return reactor.fd_reply_count_;
   }
 
+  static bool fd_reply_is_pread_without_pipe(FuseReactor& reactor) {
+    size_t active = 0;
+    for (size_t index = 0; index < reactor.reply_pool_size_; ++index) {
+      const FuseReactor::Reply& reply = reactor.reply_pool_[index];
+      if (!reply.fd_reply) continue;
+      ++active;
+      if (reply.fd_mode != FUSE_FD_REPLY_PREAD ||
+          reply.fd_pipe[0] >= 0 || reply.fd_pipe[1] >= 0) {
+        return false;
+      }
+    }
+    return active == 1;
+  }
+
   static bool cancel_fd_reply_source(FuseReactor& reactor) {
     for (FuseReactor::IoRequest* request : reactor.io_requests_) {
       if (request->async != nullptr &&
@@ -679,22 +693,24 @@ struct CachedReplyRequest {
 
 enum CachedReplyScenario {
   CACHED_REPLY_SUCCESS,
+  CACHED_REPLY_LARGE_SUCCESS,
   CACHED_REPLY_REJECTED,
   CACHED_REPLY_SHORT_SOURCE,
   CACHED_REPLY_CANCEL_SOURCE,
 };
 
 void test_cached_reply_connection() {
-  constexpr size_t payload_size = 4096;
-  std::array<char, payload_size> payload{};
-  for (size_t i = 0; i < payload.size(); ++i) {
-    payload[i] = char((i * 17 + 5) & 0xff);
-  }
-
   for (CachedReplyScenario scenario : {
-           CACHED_REPLY_SUCCESS, CACHED_REPLY_REJECTED,
+           CACHED_REPLY_SUCCESS, CACHED_REPLY_LARGE_SUCCESS,
+           CACHED_REPLY_REJECTED,
            CACHED_REPLY_SHORT_SOURCE, CACHED_REPLY_CANCEL_SOURCE}) {
     const bool accepted = scenario != CACHED_REPLY_REJECTED;
+    const size_t payload_size = scenario == CACHED_REPLY_LARGE_SUCCESS ?
+        16U * 1024U : 4096U;
+    std::vector<char> payload(payload_size);
+    for (size_t i = 0; i < payload.size(); ++i) {
+      payload[i] = char((i * 17 + 5) & 0xff);
+    }
     char pattern[] = "/tmp/ngs3fs-cached-wire-XXXXXX";
     char* path = ::mkdtemp(pattern);
     require(path != nullptr, "create cached wire fixture");
@@ -707,6 +723,7 @@ void test_cached_reply_connection() {
     cache_config.root            = path;
     cache_config.namespace_id    =
         scenario == CACHED_REPLY_SUCCESS ? "cached-wire-accepted" :
+        scenario == CACHED_REPLY_LARGE_SUCCESS ? "cached-wire-large" :
         scenario == CACHED_REPLY_REJECTED ? "cached-wire-rejected" :
         scenario == CACHED_REPLY_SHORT_SOURCE ? "cached-wire-short" :
                                                  "cached-wire-cancel";
@@ -775,7 +792,8 @@ void test_cached_reply_connection() {
       require(retiring.get() == handle.cache_entry.get() &&
                   handle.request_state.load() == 2 &&
                   !handle.identity_mutex.try_lock() &&
-                  ReactorIoTest::fd_reply_count(test.reactor()) == 1,
+                  ReactorIoTest::fd_reply_count(test.reactor()) == 1 &&
+                  ReactorIoTest::fd_reply_is_pread_without_pipe(test.reactor()),
               "accepted cached reply released ownership before source CQE");
       const int wait_fd = handle.cache_entry->begin_retire_wait();
       require(wait_fd >= 0, "accepted cached reply did not retain range pin");
@@ -810,7 +828,8 @@ void test_cached_reply_connection() {
               "read cached reply wire payload");
     }
     const bool error_matches =
-        scenario == CACHED_REPLY_SUCCESS ? header.error == 0 :
+        (scenario == CACHED_REPLY_SUCCESS ||
+         scenario == CACHED_REPLY_LARGE_SUCCESS) ? header.error == 0 :
         scenario == CACHED_REPLY_REJECTED ? header.error == -EOPNOTSUPP :
         scenario == CACHED_REPLY_SHORT_SOURCE ? header.error == -EIO :
         header.error == 0 || header.error == -ECANCELED;
@@ -818,6 +837,7 @@ void test_cached_reply_connection() {
                 error_matches,
             "cached reply wire header mismatch");
     if (scenario == CACHED_REPLY_SUCCESS ||
+        scenario == CACHED_REPLY_LARGE_SUCCESS ||
         (scenario == CACHED_REPLY_CANCEL_SOURCE && header.error == 0)) {
       require(wire_payload.size() == payload.size(),
               "successful cached reply wire size mismatch");
