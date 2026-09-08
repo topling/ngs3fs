@@ -170,18 +170,13 @@ perf_stub() {
     printf 'perf record stub started\n' >&2
     local control_spec=
     local delayed=0
-    local verbose=0
     while (($#)); do
       case "$1" in
         --)
           # Recording attaches to ngs3fs; no dummy workload is permitted.
           return 2
           ;;
-        -v)
-          verbose=1
-          shift
-          ;;
-        -vvv)
+        -v|-vv|-vvv|--verbose)
           return 2
           ;;
         --control)
@@ -195,7 +190,7 @@ perf_stub() {
         *) shift ;;
       esac
     done
-    [[ "$verbose" = 1 && "$delayed" = 1 && "$control_spec" = fifo:*,* ]] || return 2
+    [[ "$delayed" = 1 && "$control_spec" = fifo:*,* ]] || return 2
     local fifo_spec=${control_spec#fifo:}
     local control_fifo=${fifo_spec%%,*}
     local ack_fifo=${fifo_spec#*,}

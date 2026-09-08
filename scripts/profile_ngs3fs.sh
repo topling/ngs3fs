@@ -405,7 +405,7 @@ fi
   printf 'cache_drop_requested=%s\n' "$drop_after_warmup"
   printf 'perf_event=%s\nperf_frequency=%s\n' "$perf_event" "$perf_frequency"
   printf 'perf_mmap_size=%s\n' "$perf_mmap_size"
-  printf 'perf_record_verbosity=1 (startup diagnostics)\n'
+  printf 'perf_record_verbosity=0\n'
   printf 'ngs3fs_io_engine=%s\nngs3fs_reactors=%s\n' \
     "${io_engine:-legacy}" "${reactors:-1}"
 } >"$run_dir/system.txt"
@@ -511,11 +511,11 @@ run_profile_measurement() {
   mkfifo "$perf_control_fifo" "$perf_ack_fifo"
   exec {perf_control_fd}<>"$perf_control_fifo"
   exec {perf_ack_fd}<>"$perf_ack_fifo"
-  # Verbosity one retains the startup missing-TID diagnostic without emitting
-  # the per-buffer trace produced by higher debug levels.
+  # Even verbosity one emits large per-frame unwind/symbol traces. Keep normal
+  # stderr, control-timeout diagnostics and the recorder's exit status instead.
   # Attach only to ngs3fs. A dummy workload would replace perf's exit status
   # with the signal used to terminate that child during cleanup.
-  LD_LIBRARY_PATH=$perf_lib "$perf" record -v -F "$perf_frequency" \
+  LD_LIBRARY_PATH=$perf_lib "$perf" record -F "$perf_frequency" \
     -e "$perf_event" -m "$perf_mmap_size" \
     --call-graph dwarf,16384 --delay -1 \
     --control "fifo:$perf_control_fifo,$perf_ack_fifo" \
