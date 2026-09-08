@@ -173,6 +173,10 @@ perf_stub() {
     local verbose=0
     while (($#)); do
       case "$1" in
+        --)
+          # Recording attaches to ngs3fs; no dummy workload is permitted.
+          return 2
+          ;;
         -vvv)
           verbose=1
           shift
@@ -283,7 +287,8 @@ class ProfileMeasurementTest(unittest.TestCase):
 
     def test_unexpected_perf_exit_rejects_measurement_and_closes_fifos(self):
         cases = (("255", "1", False), ("130", "1", False),
-                 ("130", "0", True), ("0", "1", True))
+                 ("143", "1", False), ("130", "0", True),
+                 ("143", "0", False), ("0", "1", True))
         for status, not_alive, success in cases:
             with self.subTest(status=status, not_alive=not_alive), \
                     tempfile.TemporaryDirectory() as temporary:

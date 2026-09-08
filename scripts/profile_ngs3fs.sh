@@ -513,12 +513,14 @@ run_profile_measurement() {
   exec {perf_ack_fd}<>"$perf_ack_fifo"
   # Temporary startup diagnostics: perf's initialization stage markers use
   # pr_debug3; the observed silent exit 255 precedes the enable acknowledgement.
+  # Attach only to ngs3fs. A dummy workload would replace perf's exit status
+  # with the signal used to terminate that child during cleanup.
   LD_LIBRARY_PATH=$perf_lib "$perf" record -vvv -F "$perf_frequency" \
     -e "$perf_event" -m "$perf_mmap_size" \
     --call-graph dwarf,16384 --delay -1 \
     --control "fifo:$perf_control_fifo,$perf_ack_fifo" \
     -p "$ngs3fs_pid" \
-    -o "$run_dir/perf.data" -- sleep 3600 \
+    -o "$run_dir/perf.data" \
     2>"$perf_record_log" &
   perf_pid=$!
   if ! control_perf_record enable "$perf_startup_timeout_seconds"; then
