@@ -2074,8 +2074,8 @@ int main(int argc, char** argv) {
       throw std::invalid_argument("unknown integration-test io engine");
     }
     const std::string_view reactors = argc >= 6 ? argv[5] : "1";
-    if (reactors != "1" && reactors != "2") {
-      throw std::invalid_argument("integration-test reactors must be 1 or 2");
+    if (reactors != "1" && reactors != "2" && reactors != "4") {
+      throw std::invalid_argument("integration-test reactors must be 1, 2, or 4");
     }
     const std::string_view mode = argc >= 4 ? argv[3] : "plain";
     const bool hardlink_copy =
@@ -4815,6 +4815,7 @@ int main(int argc, char** argv) {
     renamed.reset();
 
     const std::string copied_path = mountpoint + "/copied.bin";
+    fprintf(stderr, "integration phase: CopyObject rename\n");
     retry_after_fuse_release(
         "rename mounted object with CopyObject fallback", [&] {
           return ::rename(renamed_path.c_str(), copied_path.c_str());
@@ -4828,9 +4829,11 @@ int main(int argc, char** argv) {
       fail_errno("open CopyObject-renamed object");
     }
     copied.reset();
+    fprintf(stderr, "integration phase: CopyObject rename completed\n");
 
     std::vector<std::byte> recovery_expected;
     if (!cache_dir.empty()) {
+      fprintf(stderr, "integration phase: cached crash recovery\n");
       recovery_expected.resize(192U * 1024U + 19U);
       for (size_t i = 0; i < recovery_expected.size(); ++i) {
         recovery_expected[i] = std::byte((i * 43U + 3U) & 255U);
@@ -4983,6 +4986,7 @@ int main(int argc, char** argv) {
     }
 
     size_t puts_before_truncate;
+    fprintf(stderr, "integration phase: standalone truncate\n");
     {
       std::lock_guard state_guard(shared.mutex);
       puts_before_truncate = shared.put_requests;
@@ -4996,6 +5000,7 @@ int main(int argc, char** argv) {
     }
     require(truncated_status.st_size == 0,
             "standalone truncate did not update the inode size");
+    fprintf(stderr, "integration phase: standalone truncate completed\n");
     {
       std::lock_guard state_guard(shared.mutex);
       require(shared.put_requests == puts_before_truncate + 1 &&
@@ -5253,6 +5258,7 @@ int main(int argc, char** argv) {
 
     const std::string invalid_range_path =
         mountpoint + "/invalid-content-range.bin";
+    fprintf(stderr, "integration phase: invalid range read\n");
     UniqueFd invalid_range(
         ::open(invalid_range_path.c_str(), O_RDONLY | O_CLOEXEC));
     if (!invalid_range) {
@@ -5265,7 +5271,9 @@ int main(int argc, char** argv) {
             "inconsistent S3 Content-Range did not fail with EIO");
     invalid_range.reset();
 
+    fprintf(stderr, "integration phase: final unmount\n");
     mounted.stop();
+    fprintf(stderr, "integration phase: final unmount completed\n");
     shared.stop.store(true);
     server.request_stop();
     server.join();

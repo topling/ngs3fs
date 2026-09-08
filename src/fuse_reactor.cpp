@@ -2039,6 +2039,7 @@ void FuseReactor::drain_shutdown() noexcept {
   io_uring_sqe* cancel = acquire_sqe();
   bool cancel_pending = cancel != nullptr;
   bool wake_cancel_submitted = false;
+  uint64_t next_drain_warning = reactor_monotonic_ns() + 5'000'000'000;
   if (cancel != nullptr) {
     io_uring_prep_cancel64(
         cancel, 0, IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_ALL);
@@ -2113,6 +2114,19 @@ void FuseReactor::drain_shutdown() noexcept {
         task_count_.load(std::memory_order_acquire) == 0 &&
         dispatch_count_.load(std::memory_order_acquire) == 0 && receive_count_ == 0 &&
         callback_count_ == 0;
+    const uint64_t now = reactor_monotonic_ns();
+    if (!drained && now >= next_drain_warning) {
+      fprintf(stderr,
+          "warning: reactor shutdown still draining: reactor=%zu admission_closed=%d "
+          "io=%zu async=%zu tasks=%zu dispatches=%zu receives=%zu callbacks=%zu "
+          "reply=%d notify=%d cancel=%d\n",
+          reactor_index_, int(admission_closed), io_requests_.size(),
+          async_pending_, task_count_.load(std::memory_order_acquire),
+          dispatch_count_.load(std::memory_order_acquire), receive_count_,
+          callback_count_, int(reply_queues_[0].pending),
+          int(reply_queues_[1].pending), int(cancel_pending));
+      next_drain_warning = now + 5'000'000'000;
+    }
     if (drained) {
       if (!wake_pending_) break;
       if (!wake_cancel_submitted) {

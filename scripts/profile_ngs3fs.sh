@@ -172,6 +172,7 @@ capture_thread_census() {
   local kind
   local count=0
   local sqpoll_count=0
+  local io_wq_count=0
 
   if ! {
     printf 'process_pid=%s\n' "$pid"
@@ -187,12 +188,16 @@ capture_thread_census() {
       if [[ "$comm" = iou-sqp-* ]]; then
         kind=kernel-sqpoll
         ((++sqpoll_count))
+      elif [[ "$comm" = iou-wrk-* ]]; then
+        kind=kernel-io-wq
+        ((++io_wq_count))
       fi
       printf '%s\t%s\t%s\n' "$tid" "$kind" "$comm"
       ((++count))
     done
     printf 'task_count=%s\n' "$count"
     printf 'sqpoll_task_count=%s\n' "$sqpoll_count"
+    printf 'io_wq_task_count=%s\n' "$io_wq_count"
   } >"$output" 2>/dev/null; then
     printf 'process_pid=%s\nthread_census=unavailable\n' "$pid" \
       >"$output" 2>/dev/null || true

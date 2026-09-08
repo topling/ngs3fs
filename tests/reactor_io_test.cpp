@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <barrier>
+#include <chrono>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fuse.h>
@@ -75,6 +76,8 @@ struct ReactorIoTest {
   unsigned blocked_reply_callbacks = 0;
   unsigned fairness_iterations = 0;
   unsigned fairness_completion_iteration = 0;
+  bool fairness_cqe_observed_ready = false;
+  std::chrono::steady_clock::time_point fairness_deadline{};
   unsigned burst_completions = 0;
   unsigned burst_replies = 0;
   bool burst_reply_pending = false;
@@ -920,12 +923,33 @@ struct ReactorIoTest {
   static void fairness_callback(void* context) noexcept {
     auto& test = *static_cast<ReactorIoTest*>(context);
     ++test.fairness_iterations;
-    if (test.fairness_iterations == 64 &&
-        !test.check(::write(test.fairness_peer.get(), "f", 1) == 1,
-                    "feed fairness receive")) return;
+    if (test.fairness_iterations == 64) {
+      test.fairness_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      if (!test.check(::write(test.fairness_peer.get(), "f", 1) == 1,
+                      "feed fairness receive")) return;
+    }
     if (!test.fairness_completion_iteration) {
-      if (!test.check(test.fairness_iterations < 1024,
-                      "continuously ready callbacks starved an I/O CQE")) return;
+      unsigned head;
+      io_uring_cqe* cqe;
+      bool cqe_ready = false;
+      io_uring_for_each_cqe(&test.reactor().ring_, head, cqe) {
+        if (cqe->user_data == (uintptr_t(&test.fairness_io) | 1)) {
+          cqe_ready = true;
+          break;
+        }
+      }
+      if (!test.check(!cqe_ready || !test.fairness_cqe_observed_ready,
+                      "continuously ready callbacks starved a ready I/O CQE")) {
+        return;
+      }
+      test.fairness_cqe_observed_ready = cqe_ready;
+      if (!test.check(test.fairness_iterations < 64 ||
+                          std::chrono::steady_clock::now() <
+                              test.fairness_deadline,
+                      "fairness I/O missed its monotonic completion deadline")) {
+        return;
+      }
       test.check(test.reactor().post(&test.tasks[1]),
                  "requeue continuously ready callback");
     }
@@ -933,6 +957,10 @@ struct ReactorIoTest {
 
   static void fairness_done(void* context, ssize_t result) noexcept {
     auto& test = *static_cast<ReactorIoTest*>(context);
+    if (!test.check(std::chrono::steady_clock::now() < test.fairness_deadline,
+                    "fairness I/O completed after its monotonic deadline")) {
+      return;
+    }
     test.check(result == 1 && test.fairness_data == 'f' &&
                std::this_thread::get_id() == test.owner &&
                io_executor() == &test.reactor() &&
@@ -1509,8 +1537,7 @@ struct ReactorIoTest {
     check(notification_callbacks == 4 && queued_reply_callbacks == 2 &&
           blocked_reply_callbacks == 1,
           "accepted notifications did not each complete exactly once");
-    check(fairness_completion_iteration >= 64 &&
-          fairness_completion_iteration < 1024,
+    check(fairness_completion_iteration >= 64,
           "continuously ready callbacks starved an asynchronous CQE");
     check(burst_completions == burst_io.size() &&
           burst_replies == burst_io.size() && !burst_reply_pending,
