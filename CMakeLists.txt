@@ -203,12 +203,27 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME reactor_inode_dispatch_test COMMAND reactor_io_test --dispatch)
   add_test(NAME reactor_dispatch_freelist_test
     COMMAND reactor_io_test --dispatch-freelist)
+  add_test(NAME reactor_metadata_io_test
+    COMMAND reactor_io_test --metadata-io)
   set_tests_properties(reactor_inode_dispatch_test reactor_dispatch_freelist_test
+    reactor_metadata_io_test
     PROPERTIES TIMEOUT 10)
-  set_tests_properties(reactor_dispatch_freelist_test
+  set_tests_properties(reactor_dispatch_freelist_test reactor_metadata_io_test
     PROPERTIES SKIP_RETURN_CODE 77)
   set_tests_properties(reactor_io_test reactor_sqpoll_io_test
     PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+
+  add_executable(fuse_owner_test
+    tests/fuse_owner_test.cpp src/fuse_reactor.cpp)
+  target_link_libraries(fuse_owner_test PRIVATE
+    ngs3fs_core FUSE3::fuse3 LIBURING::uring)
+  target_compile_definitions(fuse_owner_test PRIVATE
+    FUSE_USE_VERSION=318 NGS3FS_FUSE_OWNER_TEST=1)
+  target_compile_options(fuse_owner_test PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+  add_test(NAME fuse_owner_test COMMAND fuse_owner_test)
+  set_tests_properties(fuse_owner_test PROPERTIES
+    TIMEOUT 20 SKIP_RETURN_CODE 77)
 
   add_executable(libfuse_prefix_test tests/libfuse_prefix_test.cpp)
   target_link_libraries(libfuse_prefix_test PRIVATE FUSE3::fuse3)
@@ -374,6 +389,11 @@ if(NGS3FS_BUILD_TESTS)
             xxhash128 cache uring 2)
   set_tests_properties(fuse_multi_reactor_cached_integration_test PROPERTIES
     TIMEOUT 60)
+  add_test(NAME fuse_four_reactor_cached_integration_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 cache uring 4)
+  set_tests_properties(fuse_four_reactor_cached_integration_test PROPERTIES
+    TIMEOUT 90 RESOURCE_LOCK fuse_mounts)
   add_test(NAME fuse_crc64nvme_integration_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs> crc64nvme)
   set_tests_properties(fuse_crc64nvme_integration_test PROPERTIES TIMEOUT 60)

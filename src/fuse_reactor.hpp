@@ -91,6 +91,9 @@ class FuseReactor : public IoExecutor {
   // complete is thread-safe, cannot fail, and never invokes run inline.
   bool reserve_completion(ReactorTask* task) noexcept;
   void complete(ReactorTask* task) noexcept;
+  bool is_multi_worker() const noexcept;
+  unsigned worker_index() const noexcept;
+  unsigned worker_count() const noexcept;
   // Retain FD-backed FUSE input beyond the initial callback. Release on the
   // same reactor after consuming it, or with consumed=false on failure.
   void* retain_input() noexcept;
@@ -145,6 +148,16 @@ class FuseReactor : public IoExecutor {
     IO_PWRITE,
     IO_SPLICE,
     IO_CONNECT,
+    IO_OPENAT,
+    IO_CLOSE,
+    IO_STATX,
+    IO_FALLOCATE,
+    IO_FSYNC,
+    IO_FTRUNCATE,
+    IO_RENAMEAT,
+    IO_UNLINKAT,
+    IO_MKDIRAT,
+    IO_MADVISE,
   };
 
   struct alignas(8) IoRequest {
@@ -154,10 +167,14 @@ class FuseReactor : public IoExecutor {
     void* data                = nullptr;
     const sockaddr* address   = nullptr;
     socklen_t address_length  = 0;
+    const char* path          = nullptr;
+    const char* path2         = nullptr;
     size_t length             = 0;
     size_t transferred        = 0;
     size_t operations         = 0;
     int flags                 = 0;
+    unsigned mode             = 0;
+    unsigned mask             = 0;
     int timeout_ms            = 0;
     off_t input_offset        = -1;
     off_t output_offset       = -1;
@@ -221,12 +238,14 @@ class FuseReactor : public IoExecutor {
   bool submit_wakeup() noexcept;
   bool submit_external_receive() noexcept;
   bool submit_task_receive() noexcept;
+  bool submit_return_receive() noexcept;
   bool submit_external_reply(Reply* reply) noexcept;
   io_uring_sqe* acquire_sqe() noexcept;
   bool submit_io_request(IoRequest* request) noexcept;
   static bool drain_receive_pipe(int fd) noexcept;
   bool drain_external_pipe() noexcept;
   bool drain_task_pipe() noexcept;
+  bool drain_return_pipe() noexcept;
   bool resume_receive() noexcept;
   bool enqueue_reply(Reply* reply) noexcept;
   Reply* acquire_reply() noexcept;
@@ -246,6 +265,7 @@ class FuseReactor : public IoExecutor {
   void drain_shutdown() noexcept;
   void fail_remote_dispatch(Dispatch* dispatch, int result) noexcept;
   Dispatch* pop_dispatch() noexcept;
+  Dispatch* pop_returned_dispatch() noexcept;
   Dispatch* acquire_dispatch() noexcept;
   void finish_dispatch(Dispatch* dispatch) noexcept;
   void recycle_dispatch(Dispatch* dispatch) noexcept;
@@ -271,7 +291,9 @@ class FuseReactor : public IoExecutor {
   bool notify_accepted_            = false;
   int external_pipe_[2]            = {-1, -1};
   int task_pipe_[2]                = {-1, -1};
+  int return_pipe_[2]              = {-1, -1};
   std::atomic<Dispatch*> free_dispatches_{nullptr};
+  Dispatch* returned_dispatches_ = nullptr;
   std::vector<Dispatch*> receiving_;
   std::vector<ReactorTask*> ready_callbacks_;
   size_t callback_head_ = 0;
@@ -281,6 +303,8 @@ class FuseReactor : public IoExecutor {
   std::atomic<bool> completion_pending_{false};
   ReactorTask* completion_head_ = nullptr;
   ReactorTask* completion_tail_ = nullptr;
+  ReactorTask* local_completion_head_ = nullptr;
+  ReactorTask* local_completion_tail_ = nullptr;
   std::unique_ptr<Reply[]> reply_pool_;
   Reply* reply_free_                = nullptr;
   std::atomic<uint64_t> external_submitted_{0};
@@ -328,11 +352,13 @@ class FuseReactor : public IoExecutor {
   bool initialization_complete_    = false;
   bool external_pending_           = false;
   bool task_pending_               = false;
+  bool return_pending_             = false;
   bool wake_pending_               = false;
   bool first_receive_              = true;
   bool receive_active_             = false;
   alignas(8) u_char external_token_ = 0;
   alignas(8) u_char task_token_     = 0;
+  alignas(8) u_char return_token_   = 0;
   alignas(8) u_char cancel_token_   = 0;
   alignas(8) u_char wake_token_     = 0;
   alignas(8) u_char receive_handoff_token_ = 0;
@@ -355,6 +381,7 @@ class FuseReactorGroup {
   bool initialize(fuse_session* session, unsigned count, unsigned depth,
                   int io_timeout_ms, bool sqpoll,
                   std::string& error);
+  bool post_to_worker(FuseReactor::ReactorTask* task) noexcept;
   int run();
   void report_stats() const noexcept;
   void shutdown() noexcept;

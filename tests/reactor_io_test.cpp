@@ -1,6 +1,7 @@
 #include "fuse_reactor.hpp"
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <barrier>
@@ -10,14 +11,27 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <thread>
 
 struct ReactorIoTest {
+  struct IoResult {
+    ssize_t value = -EINPROGRESS;
+    bool completed = false;
+
+    static void complete(void* context, ssize_t result) noexcept {
+      auto* self = static_cast<IoResult*>(context);
+      self->value = result;
+      self->completed = true;
+    }
+  };
+
   FuseReactorGroup group;
   fuse_session* session = nullptr;
   UniqueFd fake_fuse;
@@ -124,15 +138,73 @@ struct ReactorIoTest {
         require(slot < count, "inode affinity selected an invalid target");
         ++counts[slot];
       }
-      for (size_t i = 0; i < count; ++i) {
-        require(counts[i] > 16384 / count * 8 / 10 &&
-                counts[i] < 16384 / count * 12 / 10,
-                "aligned pointer inodes produced an imbalanced hash");
+      if (count == 1) {
+        require(counts[0] == 16384,
+                "single reactor did not execute its own requests");
+      } else {
+        require(counts[0] == 0,
+                "multi-reactor ingress executed an ordinary inode request");
+        const size_t workers = count - 1;
+        for (size_t i = 1; i < count; ++i) {
+          require(counts[i] > 16384 / workers * 8 / 10 &&
+                  counts[i] < 16384 / workers * 12 / 10,
+                  "aligned pointer inodes produced an imbalanced worker hash");
+        }
       }
       require(group.dispatch_reactor(0) == first, "inode-less control routing");
       FuseReactor* root = group.dispatch_reactor(FUSE_ROOT_ID);
       require(root == group.dispatch_reactor(FUSE_ROOT_ID), "root inode routing");
+      require(count == 1 || root != first,
+              "multi-reactor root inode routed to ingress");
     }
+
+    group.reactors_.resize(4);
+    for (size_t i = 0; i < group.reactors_.size(); ++i) {
+      if (!group.reactors_[i]) {
+        group.reactors_[i] = std::make_unique<FuseReactor>();
+      }
+      group.reactors_[i]->group_ = &group;
+      group.reactors_[i]->reactor_index_ = i;
+    }
+    require(!group.reactors_[0]->is_multi_worker() &&
+            group.reactors_[0]->worker_count() == 3 &&
+            group.reactors_[0]->worker_index() == 0,
+            "ingress worker identity is inconsistent");
+    for (size_t i = 1; i < group.reactors_.size(); ++i) {
+      require(group.reactors_[i]->is_multi_worker() &&
+              group.reactors_[i]->worker_count() == 3 &&
+              group.reactors_[i]->worker_index() == i - 1,
+              "multi-reactor worker identity is inconsistent");
+    }
+
+    FuseReactor& local = *group.reactors_[1];
+    local.ready_callbacks_.resize(4, nullptr);
+    local.max_task_count_ = 4;
+    local.wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    require(local.wake_fd_ >= 0, "create owner-local completion wake eventfd");
+    unsigned local_callbacks = 0;
+    FuseReactor::ReactorTask local_completion{
+        [](void* context) noexcept { ++*static_cast<unsigned*>(context); },
+        nullptr, &local_callbacks};
+    local_completion.completion_owner = &local;
+    local.task_count_.store(1, std::memory_order_relaxed);
+    FuseReactor::current_ = &local;
+    local.complete(&local_completion);
+    FuseReactor::current_ = nullptr;
+    uint64_t wake = 0;
+    errno = 0;
+    require(local.local_completion_head_ == &local_completion &&
+            !local.completion_pending_.load(std::memory_order_relaxed) &&
+            ::read(local.wake_fd_, &wake, sizeof(wake)) < 0 && errno == EAGAIN,
+            "owner-local completion used cross-thread notification");
+    FuseReactor::current_ = &local;
+    require(local.run_ready_callbacks(),
+            "owner-local completion callback failed");
+    FuseReactor::current_ = nullptr;
+    require(local_callbacks == 1 &&
+            local.task_count_.load(std::memory_order_relaxed) == 0 &&
+            local.local_completion_head_ == nullptr,
+            "owner-local completion did not run exactly once");
 
     Pipe pipe = Pipe::create(4096);
     FuseReactor::Dispatch dispatch;
@@ -194,6 +266,8 @@ struct ReactorIoTest {
     owner->max_dispatch_count_ = 4;
     owner->wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     require(owner->wake_fd_ >= 0, "create dispatch free-list wake eventfd");
+    require(::pipe2(owner->return_pipe_, O_CLOEXEC | O_NONBLOCK) == 0,
+            "create dispatch return pipe");
     group.reactors_.push_back(std::move(owner_value));
 
     std::array<FuseReactor::Dispatch*, node_count> nodes{};
@@ -307,14 +381,16 @@ struct ReactorIoTest {
     target.task_count_.store(1, std::memory_order_relaxed);
     require(::write(retained_write_fd, &sent, 1) == 1,
             "write failed MSG_RING input fixture");
+    FuseReactor::current_ = owner;
     owner->fail_remote_dispatch(retained, -EBADF);
+    FuseReactor::current_ = nullptr;
     require(owner->pop_dispatch() == retained &&
             owner->dispatch_count_.load(std::memory_order_relaxed) ==
                 owner->max_dispatch_count_ - 1 &&
             target.task_count_.load(std::memory_order_relaxed) == 0 &&
             retained->input_tasks.load(std::memory_order_relaxed) == 0,
             "MSG_RING failure did not restore dispatch admission");
-    expect_wake(1, "MSG_RING failure did not wake saturated ingress");
+    expect_no_wake("owner-local MSG_RING failure woke its own ingress");
     errno = 0;
     require(::read(retained_read_fd, &received, 1) < 0 && errno == EAGAIN,
             "MSG_RING failure left request input in the retained pipe");
@@ -331,9 +407,17 @@ struct ReactorIoTest {
     owner->dispatch_count_.store(owner->max_dispatch_count_,
                                  std::memory_order_relaxed);
     owner->dispatch_complete(nodes[1]);
-    require(owner->pop_dispatch() == nodes[1],
-            "saturated completion did not publish its dispatch");
-    expect_wake(1, "saturated-to-available completion did not wake the owner");
+    require(owner->pop_dispatch() == nullptr &&
+            owner->dispatch_count_.load(std::memory_order_relaxed) ==
+                owner->max_dispatch_count_,
+            "saturated return escaped its pointer-pipe ownership");
+    require(owner->drain_return_pipe() &&
+            owner->pop_dispatch() == nullptr &&
+            owner->pop_returned_dispatch() == nodes[1] &&
+            owner->dispatch_count_.load(std::memory_order_relaxed) ==
+                owner->max_dispatch_count_ - 1,
+            "saturated pointer return touched the shared freelist");
+    expect_no_wake("pointer return also wrote the control eventfd");
 
     group.shutting_down_.store(true, std::memory_order_release);
     owner->dispatch_count_.store(2, std::memory_order_relaxed);
@@ -343,9 +427,26 @@ struct ReactorIoTest {
     expect_no_wake("non-final shutdown completion woke the owner");
     owner->dispatch_count_.store(1, std::memory_order_relaxed);
     owner->dispatch_complete(nodes[1]);
-    require(owner->pop_dispatch() == nodes[1],
-            "final shutdown completion did not publish its dispatch");
-    expect_wake(1, "final shutdown completion did not wake the owner");
+    require(owner->pop_dispatch() == nullptr &&
+            owner->dispatch_count_.load(std::memory_order_relaxed) == 1,
+            "final shutdown return escaped its pointer-pipe ownership");
+    require(owner->drain_return_pipe() &&
+            owner->pop_dispatch() == nullptr &&
+            owner->pop_returned_dispatch() == nodes[1] &&
+            owner->dispatch_count_.load(std::memory_order_relaxed) == 0,
+            "final shutdown pointer touched the shared freelist");
+    expect_no_wake("final pointer return also wrote the control eventfd");
+
+    ::close(owner->return_pipe_[1]);
+    owner->return_pipe_[1] = -1;
+    owner->dispatch_count_.store(owner->max_dispatch_count_,
+                                 std::memory_order_relaxed);
+    owner->dispatch_complete(nodes[1]);
+    require(owner->pop_dispatch() == nodes[1] &&
+            owner->dispatch_count_.load(std::memory_order_relaxed) ==
+                owner->max_dispatch_count_ - 1,
+            "unavailable return pipe lost its fallback dispatch");
+    expect_wake(1, "return-pipe fallback did not preserve control wake");
 
     for (FuseReactor::Dispatch* node : nodes) owner->recycle_dispatch(node);
     return 0;
@@ -359,6 +460,8 @@ struct ReactorIoTest {
     };
 
     FuseReactor& source = test.reactor();
+    require(::pipe2(source.return_pipe_, O_CLOEXEC | O_NONBLOCK) == 0,
+            "create shutdown MSG_RING return pipe");
     auto target_value = std::make_unique<FuseReactor>();
     FuseReactor* target = target_value.get();
     std::string error;
@@ -408,11 +511,211 @@ struct ReactorIoTest {
 
     require(test.group.dispatch_admission_closed_.load(
                 std::memory_order_acquire) &&
-            target->task_count_.load(std::memory_order_acquire) == 0 &&
+            target->task_count_.load(std::memory_order_acquire) == 0,
+            "shutdown target did not retire its dispatch task");
+    require(source.dispatch_count_.load(std::memory_order_acquire) == 1,
+            "shutdown pointer return decremented ingress before acquisition");
+    require(source.pop_dispatch() == nullptr,
+            "shutdown pointer return entered the shared freelist");
+    require(source.drain_return_pipe() &&
             source.dispatch_count_.load(std::memory_order_acquire) == 0 &&
-            source.pop_dispatch() == dispatch,
+            source.pop_dispatch() == nullptr &&
+            source.pop_returned_dispatch() == dispatch,
             "shutdown did not drain the admitted MSG_RING dispatch");
     source.recycle_dispatch(dispatch);
+    return 0;
+  }
+
+  static int metadata_io_case() {
+    ReactorIoTest test;
+    if (!test.initialize(false)) return test.failed ? 1 : 77;
+    const auto require = [](bool condition, const char* message) {
+      if (!condition) throw std::runtime_error(message);
+    };
+    FuseReactor& owner = test.reactor();
+    require(io_uring_enable_rings(&owner.ring_) == 0,
+            "enable metadata I/O ring");
+    owner.ring_enabled_ = true;
+    FuseReactor::current_ = &owner;
+
+    bool cancel_completed_operation = false;
+    const auto perform = [&](AsyncIoRequest& request) {
+      const bool byte_operation =
+          request.kind == AsyncIoRequest::PREAD ||
+          request.kind == AsyncIoRequest::PWRITE;
+      IoResult result;
+      request.complete = IoResult::complete;
+      request.context = &result;
+      require(owner.submit(request), "submit metadata I/O");
+      require(io_uring_submit_and_wait(&owner.ring_, 1) >= 0,
+              "wait for metadata I/O");
+      io_uring_cqe* cqe = nullptr;
+      require(io_uring_peek_cqe(&owner.ring_, &cqe) == 0,
+              "metadata I/O produced no completion");
+      const uintptr_t tagged = uintptr_t(io_uring_cqe_get_data(cqe));
+      const int completion = cqe->res;
+      io_uring_cqe_seen(&owner.ring_, cqe);
+      require((tagged & 7) == 1,
+              "metadata I/O used an incorrect completion tag");
+      auto* internal = reinterpret_cast<FuseReactor::IoRequest*>(
+          tagged & ~uintptr_t(7));
+      if (cancel_completed_operation) {
+        internal->cancelled = true;
+        cancel_completed_operation = false;
+      }
+      owner.complete_io(internal, completion);
+      require(result.completed, "metadata I/O callback did not complete");
+      if (byte_operation) {
+        require(result.value < 0 ||
+                    request.transferred == size_t(result.value),
+                "positioned I/O did not retain its byte count");
+      } else {
+        require(request.transferred == 0,
+                "metadata completion was treated as a byte count");
+      }
+      return result.value;
+    };
+
+    char temporary[] = "/tmp/ngs3fs-reactor-XXXXXX";
+    require(::mkdtemp(temporary) != nullptr,
+            "create metadata I/O directory");
+    UniqueFd directory(::open(temporary, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    require(bool(directory), "open metadata I/O directory");
+    struct Cleanup {
+      int directory;
+      const char* path;
+      ~Cleanup() {
+        ::unlinkat(directory, "renamed", 0);
+        ::unlinkat(directory, "child", AT_REMOVEDIR);
+        ::rmdir(path);
+      }
+    } cleanup{directory.get(), temporary};
+
+    AsyncIoRequest operation{};
+    operation.kind = AsyncIoRequest::MKDIRAT;
+    operation.fd = directory.get();
+    operation.path = "child";
+    operation.mode = 0700;
+    require(perform(operation) == 0, "io_uring mkdirat failed");
+
+    operation = {};
+    operation.kind = AsyncIoRequest::OPENAT;
+    operation.fd = directory.get();
+    operation.path = "file";
+    operation.flags = O_CREAT | O_RDWR | O_CLOEXEC;
+    operation.mode = 0600;
+    const ssize_t opened = perform(operation);
+    require(opened >= 0, "io_uring openat failed");
+
+    operation = {};
+    operation.kind = AsyncIoRequest::FALLOCATE;
+    operation.fd = int(opened);
+    operation.input_offset = 0;
+    operation.length = 4096;
+    require(perform(operation) == 0, "io_uring fallocate failed");
+
+    operation = {};
+    operation.kind = AsyncIoRequest::FSYNC;
+    operation.fd = int(opened);
+    require(perform(operation) == 0, "io_uring fsync failed");
+
+    struct statx metadata{};
+    operation = {};
+    operation.kind = AsyncIoRequest::STATX;
+    operation.fd = directory.get();
+    operation.path = "file";
+    operation.data = &metadata;
+    operation.mask = STATX_SIZE;
+    require(perform(operation) == 0 && metadata.stx_size == 4096,
+            "io_uring statx failed");
+
+    char payload[] = "positioned-write";
+    operation = {};
+    operation.kind = AsyncIoRequest::PWRITE;
+    operation.fd = int(opened);
+    operation.data = payload;
+    operation.length = sizeof(payload);
+    operation.output_offset = 17;
+    require(perform(operation) == sizeof(payload), "io_uring positioned write failed");
+    std::array<char, sizeof(payload)> copied{};
+    operation = {};
+    operation.kind = AsyncIoRequest::PREAD;
+    operation.fd = int(opened);
+    operation.data = copied.data();
+    operation.length = copied.size();
+    operation.input_offset = 17;
+    require(perform(operation) == ssize_t(copied.size()) &&
+            memcmp(copied.data(), payload, copied.size()) == 0,
+            "positioned I/O used the wrong offset field");
+
+    operation = {};
+    operation.kind = AsyncIoRequest::FALLOCATE;
+    operation.fd = int(opened);
+    operation.input_offset = 4096;
+    operation.length = 4096;
+    operation.flags = FALLOC_FL_KEEP_SIZE;
+    require(perform(operation) == 0, "io_uring keep-size allocation failed");
+    struct stat allocation{};
+    require(::fstat(int(opened), &allocation) == 0 && allocation.st_size == 4096,
+            "io_uring fallocate lost KEEP_SIZE");
+
+    operation = {};
+    operation.kind = AsyncIoRequest::FALLOCATE;
+    operation.fd = int(opened);
+    operation.input_offset = 0;
+    operation.length = 4096;
+    operation.flags = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+    require(perform(operation) == 0, "io_uring hole punch failed");
+    copied.fill('x');
+    require(::pread(int(opened), copied.data(), copied.size(), 17) == ssize_t(copied.size()),
+            "read punched data");
+    require(std::all_of(copied.begin(), copied.end(), [](char ch) { return ch == 0; }),
+            "io_uring fallocate lost PUNCH_HOLE");
+
+    operation = {};
+    operation.kind = AsyncIoRequest::FTRUNCATE;
+    operation.fd = int(opened);
+    operation.length = 123;
+    const ssize_t truncated = perform(operation);
+    require(truncated == 0 || truncated == -EINVAL ||
+            truncated == -EOPNOTSUPP,
+            "io_uring ftruncate returned an unexpected result");
+
+    operation = {};
+    operation.kind = AsyncIoRequest::CLOSE;
+    operation.fd = int(opened);
+    cancel_completed_operation = true;
+    require(perform(operation) == 0,
+            "successful io_uring close was reported as cancelled");
+    errno = 0;
+    require(::fcntl(int(opened), F_GETFD) < 0 && errno == EBADF,
+            "successful cancelled close retained descriptor ownership");
+
+    operation = {};
+    operation.kind = AsyncIoRequest::RENAMEAT;
+    operation.fd = directory.get();
+    operation.output_fd = directory.get();
+    operation.path = "file";
+    operation.path2 = "renamed";
+    require(perform(operation) == 0, "io_uring renameat failed");
+
+    void* mapping = ::mmap(nullptr, 4096, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    require(mapping != MAP_FAILED, "create madvise mapping");
+    operation = {};
+    operation.kind = AsyncIoRequest::MADVISE;
+    operation.data = mapping;
+    operation.length = 4096;
+    operation.flags = MADV_DONTNEED;
+    require(perform(operation) == 0, "io_uring madvise failed");
+    ::munmap(mapping, 4096);
+
+    operation = {};
+    operation.kind = AsyncIoRequest::UNLINKAT;
+    operation.fd = directory.get();
+    operation.path = "renamed";
+    require(perform(operation) == 0, "io_uring unlinkat failed");
+    FuseReactor::current_ = nullptr;
     return 0;
   }
 
@@ -1223,13 +1526,17 @@ int main(int argc, char** argv) {
   const bool dispatch = argc == 2 && strcmp(argv[1], "--dispatch") == 0;
   const bool dispatch_freelist =
       argc == 2 && strcmp(argv[1], "--dispatch-freelist") == 0;
-  if (argc > 1 && !sqpoll && !dispatch && !dispatch_freelist) return 1;
+  const bool metadata_io =
+      argc == 2 && strcmp(argv[1], "--metadata-io") == 0;
+  if (argc > 1 && !sqpoll && !dispatch && !dispatch_freelist &&
+      !metadata_io) return 1;
   try {
     if (dispatch) return ReactorIoTest::dispatch_case();
     if (dispatch_freelist) {
       const int result = ReactorIoTest::dispatch_freelist_case();
       return result != 0 ? result : ReactorIoTest::shutdown_msg_ring_case();
     }
+    if (metadata_io) return ReactorIoTest::metadata_io_case();
     ReactorIoTest test;
     if (!test.initialize(sqpoll)) return test.failed ? 1 : 77;
     return test.run();

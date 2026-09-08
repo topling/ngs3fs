@@ -255,10 +255,10 @@ jobs:
       - name: Check out ngs3fs
         uses: actions/checkout@v7
 
-      - name: Check out Dispatch return-pipe baseline
+      - name: Check out pre-owner-complete baseline
         uses: actions/checkout@v7
         with:
-          ref: eba195f1cc74c7dc5cc42a5babf1628501a9ee68
+          ref: 38d78ac41636199d8964cd264acdc07aa5b946bf
           path: build/baseline-src
 
       - name: Check out FlameGraph
@@ -301,10 +301,10 @@ jobs:
           python3 scripts/download_reference_binaries.py \
             build/tools build/tools/reference-binaries.json
 
-      - name: Build Dispatch return-pipe baseline
+      - name: Build pre-owner-complete baseline
         run: |
           test "$(git -C build/baseline-src rev-parse HEAD)" = \
-            eba195f1cc74c7dc5cc42a5babf1628501a9ee68
+            38d78ac41636199d8964cd264acdc07aa5b946bf
           cmake -S build/baseline-src -B build/baseline -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DNGS3FS_BUILD_TESTS=OFF \
@@ -364,11 +364,13 @@ jobs:
             cat "build/benchmarks/github-io-engine-$advice/summary.md" >> "$GITHUB_STEP_SUMMARY"
           done
 
-      - name: A/B test Dispatch recycling
+      - name: A/B test owner-complete worker model
         env:
           BENCHMARK_REPETITIONS: 3
           BENCHMARK_VARIANTS: baseline=${{ github.workspace }}/build/baseline/ngs3fs current=${{ github.workspace }}/build/dev/ngs3fs
-          BENCHMARK_VARIANT_REVISIONS: baseline=eba195f1cc74c7dc5cc42a5babf1628501a9ee68 current=${{ github.sha }}
+          BENCHMARK_VARIANT_REVISIONS: baseline=38d78ac41636199d8964cd264acdc07aa5b946bf current=${{ github.sha }}
+          BENCHMARK_VARIANT_DESCRIPTIONS: baseline=pre-owner-complete current=owner-complete-workers
+          MAX_CONNECTIONS: 8
           NGS3FS_IO_ENGINE: uring
           NGS3FS_REACTORS: 4
           RANDOM_READ_OPERATIONS: 512
@@ -378,6 +380,8 @@ jobs:
               BENCHMARK_REPETITIONS="$BENCHMARK_REPETITIONS" \
               BENCHMARK_VARIANTS="$BENCHMARK_VARIANTS" \
               BENCHMARK_VARIANT_REVISIONS="$BENCHMARK_VARIANT_REVISIONS" \
+              BENCHMARK_VARIANT_DESCRIPTIONS="$BENCHMARK_VARIANT_DESCRIPTIONS" \
+              MAX_CONNECTIONS="$MAX_CONNECTIONS" \
               NGS3FS_IO_ENGINE="$NGS3FS_IO_ENGINE" \
               NGS3FS_REACTORS="$NGS3FS_REACTORS" \
               RANDOM_READ_OPERATIONS="$RANDOM_READ_OPERATIONS" \
@@ -390,6 +394,8 @@ jobs:
               BENCHMARK_REPETITIONS="$BENCHMARK_REPETITIONS" \
               BENCHMARK_VARIANTS="$BENCHMARK_VARIANTS" \
               BENCHMARK_VARIANT_REVISIONS="$BENCHMARK_VARIANT_REVISIONS" \
+              BENCHMARK_VARIANT_DESCRIPTIONS="$BENCHMARK_VARIANT_DESCRIPTIONS" \
+              MAX_CONNECTIONS="$MAX_CONNECTIONS" \
               NGS3FS_IO_ENGINE="$NGS3FS_IO_ENGINE" \
               NGS3FS_REACTORS="$NGS3FS_REACTORS" \
               RANDOM_READ_OPERATIONS="$RANDOM_READ_OPERATIONS" \
@@ -399,7 +405,7 @@ jobs:
               "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-affinity-cache-$mode"
           done
 
-      - name: Profile Dispatch return-pipe baseline
+      - name: Profile pre-owner-complete baseline
         if: always()
         run: |
           sudo env \
@@ -407,6 +413,7 @@ jobs:
             NGS3FS_SOURCE_DIR="$GITHUB_WORKSPACE/build/baseline-src" \
             NGS3FS_IO_ENGINE=uring \
             NGS3FS_REACTORS=4 \
+            MAX_CONNECTIONS=8 \
             WORKLOAD=random-read \
             RANDOM_READ_OPERATIONS=512 \
             RANDOM_READ_ADVICE=normal \
@@ -603,7 +610,7 @@ jobs:
             build/benchmarks/github-mountpoint-random-read-*
           cat build/benchmarks/random-read-report/random-read-cpu-comparison.md \
             >> "$GITHUB_STEP_SUMMARY"
-          cat build/benchmarks/random-read-report/inode-affinity-comparison.md \
+          cat build/benchmarks/random-read-report/owner-complete-comparison.md \
             >> "$GITHUB_STEP_SUMMARY"
           cat build/benchmarks/random-read-report/sqpoll-comparison.md \
             >> "$GITHUB_STEP_SUMMARY"
@@ -630,9 +637,13 @@ jobs:
             build/benchmarks/github-random-read-*/system.txt
             build/benchmarks/github-random-read-*/samples.csv
             build/benchmarks/github-random-read-*/*/client-cpu.csv
+            build/benchmarks/github-random-read-*/*/ngs3fs-threads-after-workload.txt
             build/benchmarks/github-io-engine-*/*/client-cpu.csv
+            build/benchmarks/github-io-engine-*/*/ngs3fs-threads-after-workload.txt
             build/benchmarks/github-mountpoint-random-read-*/*/client-cpu.csv
+            build/benchmarks/github-mountpoint-random-read-*/*/ngs3fs-threads-after-workload.txt
             build/benchmarks/github-socket-buffer/*/client-cpu.csv
+            build/benchmarks/github-socket-buffer/*/ngs3fs-threads-after-workload.txt
             build/benchmarks/github-random-read-*/summary.csv
             build/benchmarks/github-random-read-*/*/random-read-summary.csv
             build/benchmarks/github-random-read-*/*/*-random-read-result.txt
@@ -650,6 +661,7 @@ jobs:
             build/profiles/github-io-engine-*/profile-metadata.txt
             build/profiles/github-io-engine-*/system.txt
             build/profiles/github-io-engine-*/threads-before-perf.txt
+            build/profiles/github-io-engine-*/threads-after-workload.txt
             build/profiles/github-io-engine-*/random-read.txt
             build/profiles/github-io-engine-*/ngs3fs.log
             build/profiles/github-io-engine-*/versity.log

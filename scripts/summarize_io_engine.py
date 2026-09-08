@@ -9,12 +9,15 @@ from pathlib import Path
 from statistics import median
 
 SUITES = ("normal", "random", "cache-cold", "cache-warm", "cache-unlimited")
-DISPATCH_SUITES = ("affinity-normal", "affinity-random",
-                   "affinity-cache-cold", "affinity-cache-warm")
-DISPATCH_BASELINE = ("inode-hash routing with the Dispatch return pipe "
-                     "(eba195f1cc74c7dc5cc42a5babf1628501a9ee68)")
-DISPATCH_CURRENT = ("inode-hash routing with the direct shared lock-free "
-                    "Dispatch allocation/reclamation stack")
+OWNER_COMPLETE_SUITES = ("affinity-normal", "affinity-random",
+                         "affinity-cache-cold", "affinity-cache-warm")
+OWNER_COMPLETE_BASELINE = (
+    "pre-owner-complete execution with inode-hash routing and direct shared "
+    "lock-free Dispatch recycling "
+    "(38d78ac41636199d8964cd264acdc07aa5b946bf)")
+OWNER_COMPLETE_CURRENT = (
+    "owner-complete worker execution; four total reactors are one ingress "
+    "reactor plus three workers")
 NAME = re.compile(r"^(?P<engine>.+)-(?P<reactors>[0-9]+)-r[0-9]+$")
 
 def rows(path: Path):
@@ -81,7 +84,7 @@ def report(data_by_suite, title="I/O-engine CPU comparison", provenance=""):
         baseline = data.get(("baseline", 4))
         current = data.get(("current", 4))
         if baseline and current:
-            out += ["", "Direct-recycling delta (current versus return-pipe baseline):", "",
+            out += ["", "Owner-complete delta (current versus pre-owner-complete baseline):", "",
                     f"- daemon {pct(current[1], baseline[1])}; total {pct(current[2], baseline[2])}"]
         out.append("")
     return "\n".join(out)
@@ -112,7 +115,7 @@ def html(data_by_suite, missing=(), title="I/O-engine CPU comparison",
         baseline = data.get(("baseline", 4))
         current = data.get(("current", 4))
         if baseline and current:
-            out.append("<p>Direct-recycling delta (current versus return-pipe baseline): "
+            out.append("<p>Owner-complete delta (current versus pre-owner-complete baseline): "
                        f"daemon {pct(current[1], baseline[1])}; "
                        f"total {pct(current[2], baseline[2])}</p>")
     if missing:
@@ -145,20 +148,32 @@ def main():
         text += "\nMissing suites: " + ", ".join(missing) + "\n"
     (destination_dir / "sqpoll-comparison.md").write_text(text, encoding="utf-8")
     (destination_dir / "sqpoll-comparison.html").write_text(html(data, missing), encoding="utf-8")
-    dispatch = {suite: data[suite] for suite in DISPATCH_SUITES if suite in data}
-    if dispatch:
-        dispatch_missing = [suite for suite in DISPATCH_SUITES if suite not in dispatch]
-        dispatch_title = "Dispatch recycling CPU comparison"
-        provenance = f"Baseline: {DISPATCH_BASELINE}. Current: {DISPATCH_CURRENT}."
-        dispatch_text = report(dispatch, dispatch_title, provenance)
-        if dispatch_missing:
-            dispatch_text += "\nMissing suites: " + ", ".join(dispatch_missing) + "\n"
-        (destination_dir / "inode-affinity-comparison.md").write_text(
-            dispatch_text, encoding="utf-8")
-        dispatch_html = html(dispatch, dispatch_missing, dispatch_title,
-                             provenance)
-        (destination_dir / "inode-affinity-comparison.html").write_text(
-            dispatch_html, encoding="utf-8")
+    owner_complete = {
+        suite: data[suite] for suite in OWNER_COMPLETE_SUITES if suite in data}
+    if owner_complete:
+        owner_complete_missing = [
+            suite for suite in OWNER_COMPLETE_SUITES
+            if suite not in owner_complete]
+        owner_complete_title = "Owner-complete worker CPU comparison"
+        provenance = (
+            f"Baseline: {OWNER_COMPLETE_BASELINE}. "
+            f"Current: {OWNER_COMPLETE_CURRENT}. "
+            "Both CI variants use four total reactors, a mount-wide limit of "
+            "eight HTTP connections, identical workloads, and alternating "
+            "sample order on the same runner.")
+        owner_complete_text = report(
+            owner_complete, owner_complete_title, provenance)
+        if owner_complete_missing:
+            owner_complete_text += (
+                "\nMissing suites: " + ", ".join(owner_complete_missing) + "\n")
+        owner_complete_html = html(
+            owner_complete, owner_complete_missing, owner_complete_title,
+            provenance)
+        for stem in ("owner-complete-comparison", "inode-affinity-comparison"):
+            (destination_dir / f"{stem}.md").write_text(
+                owner_complete_text, encoding="utf-8")
+            (destination_dir / f"{stem}.html").write_text(
+                owner_complete_html, encoding="utf-8")
 
 if __name__ == "__main__":
     main()

@@ -312,10 +312,15 @@ def write_html(path, comparisons, generated, source_run,
     sqpoll_link = ('<p><a href="sqpoll-comparison.html">SQPOLL vs ordinary uring '
                    'and legacy: daemon and total client CPU</a></p>'
                    if (path.parent / "sqpoll-comparison.html").exists() else "")
-    affinity_link = ('<p><a href="inode-affinity-comparison.html">Dispatch return-pipe '
-                     'baseline vs direct shared lock-free recycling: daemon and total client CPU</a></p>'
-                     if (path.parent / "inode-affinity-comparison.html").exists()
-                     else "")
+    owner_complete = path.parent / "owner-complete-comparison.html"
+    historical_affinity = path.parent / "inode-affinity-comparison.html"
+    comparison_link = (owner_complete.name if owner_complete.exists() else
+                       historical_affinity.name if historical_affinity.exists()
+                       else "")
+    owner_complete_link = (
+        f'<p><a href="{comparison_link}">Pre-owner-complete baseline vs '
+        'owner-complete workers: daemon and total client CPU</a></p>'
+        if comparison_link else "")
     document = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -343,7 +348,7 @@ def write_html(path, comparisons, generated, source_run,
 <body>
   <h1>ngs3fs random-read CPU comparison</h1>
   <p class="subtitle">Generated {html.escape(generated)} from GitHub-hosted runner measurements{workflow}.</p>
-    {affinity_link}
+    {owner_complete_link}
     {sqpoll_link}
   <div class="card">
     <table>

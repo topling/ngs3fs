@@ -62,25 +62,24 @@ class SummarizeIoEngineTest(unittest.TestCase):
     def test_zero_baseline_is_reported_as_not_available(self):
         self.assertEqual(MODULE.pct(10, 0), "n/a (zero baseline)")
 
-    def test_emits_dispatch_recycling_delta(self):
+    def test_emits_owner_complete_delta(self):
         data = {"affinity-normal": {
             ("baseline", 4): (3, 200, 300),
             ("current", 4): (3, 150, 240),
         }}
         text = MODULE.report(data)
-        self.assertIn("Direct-recycling delta", text)
+        self.assertIn("Owner-complete delta", text)
         self.assertIn("daemon -25.00%; total -20.00%", text)
         rendered = MODULE.html(data)
-        self.assertIn("Direct-recycling delta", rendered)
+        self.assertIn("Owner-complete delta", rendered)
         self.assertIn("daemon -25.00%; total -20.00%", rendered)
-        provenance = ("Baseline: inode-hash routing with the Dispatch return "
-                      "pipe. Current: inode-hash routing with direct lock-free "
-                      "Dispatch recycling.")
-        titled = MODULE.html(data, title="Dispatch recycling CPU comparison",
+        provenance = ("Baseline: pre-owner-complete execution. Current: four "
+                      "total reactors are one ingress plus three workers.")
+        titled = MODULE.html(data, title="Owner-complete worker CPU comparison",
                              provenance=provenance)
-        self.assertIn("<h1>Dispatch recycling CPU comparison</h1>", titled)
-        self.assertIn("Baseline: inode-hash routing", titled)
-        self.assertIn("Current: inode-hash routing", titled)
+        self.assertIn("<h1>Owner-complete worker CPU comparison</h1>", titled)
+        self.assertIn("Baseline: pre-owner-complete", titled)
+        self.assertIn("four total reactors are one ingress plus three workers", titled)
 
     def test_even_number_of_samples_uses_median(self):
         with tempfile.TemporaryDirectory() as temporary:

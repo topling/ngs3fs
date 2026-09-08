@@ -6,12 +6,15 @@
 
 #include <atomic>
 #include <array>
+#include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <vector>
 
 class CacheRetirementPending : public std::system_error {
@@ -101,7 +104,49 @@ struct CachePendingDelete {
   bool rollback = false;
 };
 
+class IoExecutor;
 class LocalCache;
+class CacheEntry;
+class CacheAsyncOperation;
+class CacheCapacityOperation;
+class CacheKeyOperation;
+
+struct CacheAsyncResult {
+  std::shared_ptr<CacheEntry> entry;
+  std::exception_ptr error;
+  bool value = false;
+};
+
+// Caller-owned operation storage. The request, callback context, CacheEntry
+// (for entry operations), and LocalCache must outlive completion. Accepted
+// operations complete exactly once and never inline on the submitting stack.
+// The callback may destroy or immediately reuse the request.
+class CacheAsyncRequest {
+ public:
+  using Complete = void (*)(void*, CacheAsyncResult) noexcept;
+
+  CacheAsyncRequest() = default;
+  ~CacheAsyncRequest();
+  CacheAsyncRequest(const CacheAsyncRequest&) = delete;
+  CacheAsyncRequest& operator=(const CacheAsyncRequest&) = delete;
+
+  [[nodiscard]] bool pending() const noexcept {
+    return implementation_ != nullptr;
+  }
+
+  Complete complete = nullptr;
+  void* context      = nullptr;
+
+ private:
+  friend class CacheAsyncOperation;
+  friend class CacheOpenOperation;
+  friend class CacheMarkerOperation;
+  friend class CacheFileOperation;
+  friend class CacheNamespaceOperation;
+  friend class CacheEntry;
+  friend class LocalCache;
+  void* implementation_ = nullptr;
+};
 
 class CacheEntry {
  public:
@@ -132,15 +177,31 @@ class CacheEntry {
   [[nodiscard]] bool range_bad(uint64_t offset, size_t length) const;
   [[nodiscard]] bool fully_clean() const;
   bool prepare_read(uint64_t offset, size_t length);
+  bool prepare_read_async(IoExecutor& executor, CacheAsyncRequest& request,
+                          uint64_t offset, size_t length) noexcept;
   void begin_write();
+  bool begin_write_async(IoExecutor& executor,
+                         CacheAsyncRequest& request) noexcept;
   void prepare_write(uint64_t offset, size_t length);
+  bool prepare_write_async(IoExecutor& executor, CacheAsyncRequest& request,
+                           uint64_t offset, size_t length) noexcept;
   void publish_dirty(uint64_t offset, size_t length, uint64_t written_end);
   void set_upload_id(std::string_view upload_id);
+  bool set_upload_id_async(IoExecutor& executor, CacheAsyncRequest& request,
+                           std::string_view upload_id) noexcept;
   [[nodiscard]] std::string upload_id() const;
   void isolate_write() noexcept;
+  bool mark_commit_pending_async(IoExecutor& executor,
+                                 CacheAsyncRequest& request) noexcept;
   void discard_write() noexcept;
+  bool discard_write_async(IoExecutor& executor,
+                           CacheAsyncRequest& request) noexcept;
   void sync_write();
+  bool sync_write_async(IoExecutor& executor,
+                        CacheAsyncRequest& request) noexcept;
   void commit_write(const CacheIdentity& identity);
+  bool commit_write_async(IoExecutor& executor, CacheAsyncRequest& request,
+                          const CacheIdentity& identity) noexcept;
   [[nodiscard]] bool pin_clean(uint64_t offset, size_t length);
   void pin(uint64_t offset, size_t length);
   void unpin(uint64_t offset, size_t length) noexcept;
@@ -192,11 +253,18 @@ class CacheEntry {
   void abandon_checksum(const CacheChecksumClaim& claim) noexcept;
 
  private:
+  friend class CacheAsyncOperation;
+  friend class CacheCapacityOperation;
+  friend class CacheKeyOperation;
+  friend class CacheOpenOperation;
+  friend class CacheMarkerOperation;
+  friend class CacheFileOperation;
+  friend class CacheNamespaceOperation;
   friend class LocalCache;
 
   CacheEntry(LocalCache& owner, std::string key, int data_fd, int meta_fd,
              int dirty_fd, void* mapping, size_t mapping_size,
-             uint64_t size);
+             uint64_t size, bool punch_missing = true);
 
   [[nodiscard]] CachePageState page_state(size_t page) const noexcept;
   void set_page_state(size_t page, CachePageState state) noexcept;
@@ -263,6 +331,8 @@ class CacheEntry {
   bool unlinked_meta_      = false;
   bool detached_           = false;
   bool stale_              = false;
+  bool async_metadata_inflight_ = false;
+  std::deque<CacheAsyncOperation*> async_metadata_queue_;
 };
 
 class LocalCache {
@@ -278,8 +348,13 @@ class LocalCache {
   std::shared_ptr<CacheEntry> try_open(
       const CacheIdentity& identity) noexcept;
   std::shared_ptr<CacheEntry> open(const CacheIdentity& identity, bool wait = true);
+  bool open_async(IoExecutor& executor, CacheAsyncRequest& request,
+                  const CacheIdentity& identity) noexcept;
   std::shared_ptr<CacheEntry> create_writer(const CacheIdentity& base,
                                             uint64_t maximum_size, bool wait = true);
+  bool create_writer_async(IoExecutor& executor, CacheAsyncRequest& request,
+                           const CacheIdentity& base,
+                           uint64_t maximum_size) noexcept;
   std::shared_ptr<CacheEntry> retiring_entry(
       std::string_view key, const CacheIdentity* reuse = nullptr,
       bool preserve_generation = false);
@@ -289,22 +364,52 @@ class LocalCache {
   void create_pending_delete(
       std::string_view key, std::string_view restore_key = {},
       std::string_view replacement_etag = {});
+  bool create_pending_delete_async(
+      IoExecutor& executor, CacheAsyncRequest& request,
+      std::string_view key, std::string_view restore_key = {},
+      std::string_view replacement_etag = {}) noexcept;
   void commit_pending_delete(std::string_view key);
+  bool commit_pending_delete_async(
+      IoExecutor& executor, CacheAsyncRequest& request,
+      std::string_view key) noexcept;
   void finish_pending_delete(std::string_view key) noexcept;
+  bool finish_pending_delete_async(
+      IoExecutor& executor, CacheAsyncRequest& request,
+      std::string_view key) noexcept;
   bool remove(std::string_view key, bool preserve_generation,
               bool* retry = nullptr, bool wait = true) noexcept;
+  bool remove_async(IoExecutor& executor, CacheAsyncRequest& request,
+                    std::string_view key,
+                    bool preserve_generation) noexcept;
   bool rename(std::string_view old_key, std::string_view new_key,
               bool* retry = nullptr, bool wait = true) noexcept;
+  bool rename_async(IoExecutor& executor, CacheAsyncRequest& request,
+                    std::string_view old_key,
+                    std::string_view new_key) noexcept;
   [[nodiscard]] const CacheConfig& config() const noexcept { return config_; }
 
  private:
+  friend class CacheAsyncOperation;
+  friend class CacheCapacityOperation;
+  friend class CacheKeyOperation;
+  friend class CacheOpenOperation;
+  friend class CacheMarkerOperation;
+  friend class CacheFileOperation;
+  friend class CacheNamespaceOperation;
   friend class CacheEntry;
   friend struct CacheTestAccess;
 
   void probe_filesystem();
   bool prepare_range(CacheEntry& entry, uint64_t offset, size_t length,
                      bool write);
+  bool try_reserve_capacity(uint64_t bytes);
   bool reserve_capacity(uint64_t bytes);
+  bool reclaim_closed_async(
+      IoExecutor& executor, CacheAsyncRequest& request,
+      const std::shared_ptr<CacheEntry>& expected) noexcept;
+  bool open_async_if_idle(
+      IoExecutor& executor, CacheAsyncRequest& request,
+      const CacheIdentity& identity) noexcept;
   void cancel_reservation(uint64_t bytes) noexcept;
   void finish_reservation(uint64_t reserved, uint64_t allocated) noexcept;
   bool evict_one();
@@ -345,12 +450,15 @@ class LocalCache {
   int dirty_root_fd_   = -1;
   int pending_root_fd_ = -1;
   int lock_fd_ = -1;
+  size_t name_max_ = 255;
   void* superblock_mapping_ = nullptr;
   mutable std::mutex mutex_;
   mutable std::mutex capacity_mutex_;
   std::array<std::recursive_mutex, 127> key_mutexes_;
   std::vector<std::weak_ptr<CacheEntry>> entries_;
   std::vector<KeepaliveSlot> keepalive_;
+  std::unordered_set<std::string> async_keys_;
+  std::deque<CacheKeyOperation*> async_key_waiters_;
   size_t keepalive_base_metadata_bytes_ = 0;
   uint64_t pending_reservations_ = 0;
   std::atomic<size_t> clock_entry_{0};

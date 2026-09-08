@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <linux/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -349,9 +350,7 @@ CacheLeaf cache_leaf(int tree_root, std::string_view key, size_t name_max) {
     struct stat status{};
     if (::fstatat(current.get(), encoded.c_str(), &status,
                   AT_SYMLINK_NOFOLLOW) != 0) {
-      if (errno != ENOENT) {
-        cache_throw_errno("fstatat(cache prefix)");
-      }
+      if (errno != ENOENT) cache_throw_errno("fstatat(cache prefix)");
       cache_mkdir_if_missing(current.get(), encoded.c_str());
     } else if (S_ISREG(status.st_mode)) {
       cache_promote_file(current.get(), encoded);
@@ -380,9 +379,7 @@ std::optional<CacheLeaf> cache_find_leaf(
     struct stat status{};
     if (::fstatat(current.get(), encoded.c_str(), &status,
                   AT_SYMLINK_NOFOLLOW) != 0) {
-      if (errno == ENOENT) {
-        return std::nullopt;
-      }
+      if (errno == ENOENT) return std::nullopt;
       cache_throw_errno("fstatat(cache lookup)");
     }
     if (leaf) {
@@ -391,9 +388,7 @@ std::optional<CacheLeaf> cache_find_leaf(
         encoded = kCacheValueName;
         if (::fstatat(current.get(), encoded.c_str(), &status,
                       AT_SYMLINK_NOFOLLOW) != 0) {
-          if (errno == ENOENT) {
-            return std::nullopt;
-          }
+          if (errno == ENOENT) return std::nullopt;
           cache_throw_errno("fstatat(cache value lookup)");
         }
       }
@@ -402,9 +397,7 @@ std::optional<CacheLeaf> cache_find_leaf(
       }
       return CacheLeaf{std::move(current), std::move(encoded)};
     }
-    if (!S_ISDIR(status.st_mode)) {
-      return std::nullopt;
-    }
+    if (!S_ISDIR(status.st_mode)) return std::nullopt;
     current = cache_open_directory(current.get(), encoded.c_str());
     begin = slash + 1;
   }
@@ -717,9 +710,4297 @@ bool cache_visit_clean_directory(
   return found;
 }
 
+class CachePathWalker {
+ public:
+  // On success, an owned parent descriptor is transferred to the callback
+  // whenever parent_owned is true.  Keeping the opened parent (rather than a
+  // reconstructed relative path) preserves O_NOFOLLOW for every component.
+  using Complete = void (*)(void*, bool, int, bool, std::string,
+                            std::exception_ptr) noexcept;
+
+  bool start(IoExecutor& executor, int root, std::string_view key,
+             bool create, Complete complete, void* context,
+             size_t name_max) {
+    if (complete_ != nullptr) throw std::logic_error("cache path walker busy");
+    executor_ = &executor;
+    root_ = root;
+    current_fd_ = root;
+    next_fd_ = -1;
+    create_ = create;
+    complete_ = complete;
+    context_ = context;
+    components_.clear();
+    temporary_.clear();
+    error_ = {};
+    index_ = 0;
+    current_owned_ = false;
+    leaf_directory_ = false;
+    value_after_close_ = false;
+    size_t begin = 0;
+    for (;;) {
+      const size_t slash = key.find('/', begin);
+      const std::string_view component = slash == std::string_view::npos
+          ? key.substr(begin) : key.substr(begin, slash - begin);
+      components_.push_back(cache_encode_component(component, name_max));
+      if (slash == std::string_view::npos) break;
+      begin = slash + 1;
+    }
+    if (components_.empty()) throw std::invalid_argument("empty cache key");
+    phase_ = Phase::STAT_COMPONENT;
+    return submit_stat();
+  }
+
+ private:
+  enum class Phase {
+    STAT_COMPONENT, MKDIR_COMPONENT, OPEN_COMPONENT,
+    PROMOTE_RENAME_OUT, PROMOTE_MKDIR, PROMOTE_OPEN,
+    PROMOTE_RENAME_IN, CLOSE_PARENT, STAT_VALUE,
+    ERROR_CLOSE_NEXT, ERROR_CLOSE_CURRENT,
+  };
+
+  void reset_io(AsyncIoRequest::Kind kind, int fd) noexcept {
+    io_ = AsyncIoRequest{};
+    io_.kind = kind;
+    io_.fd = fd;
+    io_.complete = completed;
+    io_.context = this;
+  }
+
+  bool submit_stat() noexcept {
+    memset(&status_, 0, sizeof(status_));
+    reset_io(AsyncIoRequest::STATX, current_fd_);
+    io_.path = components_[index_].c_str();
+    io_.data = &status_;
+    io_.flags = AT_SYMLINK_NOFOLLOW;
+    io_.mask = STATX_TYPE;
+    return submit();
+  }
+
+  bool submit_mkdir() noexcept {
+    reset_io(AsyncIoRequest::MKDIRAT, current_fd_);
+    io_.path = components_[index_].c_str();
+    io_.mode = 0700;
+    return submit();
+  }
+
+  bool submit_open_component() noexcept {
+    reset_io(AsyncIoRequest::OPENAT, current_fd_);
+    io_.path = components_[index_].c_str();
+    io_.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW;
+    return submit();
+  }
+
+  bool submit_rename(int source, const char* source_name,
+                     int destination, const char* destination_name) noexcept {
+    reset_io(AsyncIoRequest::RENAMEAT, source);
+    io_.output_fd = destination;
+    io_.path = source_name;
+    io_.path2 = destination_name;
+    return submit();
+  }
+
+  bool submit_close(int fd) noexcept {
+    reset_io(AsyncIoRequest::CLOSE, fd);
+    return submit();
+  }
+
+  bool submit() noexcept {
+    if (executor_->submit(io_)) return true;
+    begin_error(make_error(errno == 0 ? EIO : errno,
+                           "submit asynchronous cache path operation"));
+    return false;
+  }
+
+  static std::exception_ptr make_error(int error, const char* what) noexcept {
+    try {
+      return std::make_exception_ptr(std::system_error(
+          error, std::generic_category(), what));
+    } catch (...) {
+      return std::current_exception();
+    }
+  }
+
+  static void completed(void* context, ssize_t result) noexcept {
+    static_cast<CachePathWalker*>(context)->advance(result);
+  }
+
+  void advance(ssize_t result) noexcept {
+    try {
+      const int error = result < 0 ? int(-result) : 0;
+      switch (phase_) {
+        case Phase::STAT_COMPONENT: {
+          const bool leaf = index_ + 1 == components_.size();
+          if (error == ENOENT) {
+            if (leaf) { finish(false, components_[index_]); return; }
+            if (!create_) { finish_missing(); return; }
+            phase_ = Phase::MKDIR_COMPONENT;
+            submit_mkdir();
+            return;
+          }
+          if (error != 0) throw std::system_error(
+              error, std::generic_category(), "statx(cache path component)");
+          const mode_t type = mode_t(status_.stx_mode & S_IFMT);
+          if (leaf) {
+            if (type == S_IFREG) {
+              finish(true, components_[index_]);
+              return;
+            }
+            if (type != S_IFDIR) {
+              throw std::system_error(ELOOP, std::generic_category(),
+                                      "non-regular cache object path");
+            }
+            leaf_directory_ = true;
+            phase_ = Phase::OPEN_COMPONENT;
+            submit_open_component();
+            return;
+          }
+          if (type == S_IFDIR) {
+            phase_ = Phase::OPEN_COMPONENT;
+            submit_open_component();
+            return;
+          }
+          if (type != S_IFREG) {
+            if (create_) {
+              throw std::system_error(ELOOP, std::generic_category(),
+                                      "non-directory inside cache tree");
+            }
+            finish_missing();
+            return;
+          }
+          if (!create_) { finish_missing(); return; }
+          temporary_ = std::string(kCacheEscapePrefix) + "promote-" +
+              std::to_string(::getpid()) + "-" +
+              std::to_string(sequence_.fetch_add(1, std::memory_order_relaxed));
+          phase_ = Phase::PROMOTE_RENAME_OUT;
+          submit_rename(current_fd_, components_[index_].c_str(),
+                        current_fd_, temporary_.c_str());
+          return;
+        }
+
+        case Phase::MKDIR_COMPONENT:
+          if (error == EEXIST) {
+            phase_ = Phase::STAT_COMPONENT;
+            submit_stat();
+            return;
+          }
+          if (error != 0) throw std::system_error(
+              error, std::generic_category(), "mkdirat(cache path component)");
+          phase_ = Phase::OPEN_COMPONENT;
+          submit_open_component();
+          return;
+
+        case Phase::OPEN_COMPONENT:
+          if (error != 0) throw std::system_error(
+              error, std::generic_category(), "openat(cache path component)");
+          next_fd_ = int(result);
+          if (leaf_directory_) {
+            leaf_directory_ = false;
+            if (current_owned_) {
+              phase_ = Phase::CLOSE_PARENT;
+              value_after_close_ = true;
+              submit_close(current_fd_);
+              return;
+            }
+            current_fd_ = next_fd_;
+            next_fd_ = -1;
+            current_owned_ = true;
+            phase_ = Phase::STAT_VALUE;
+            submit_value_stat();
+            return;
+          }
+          transition_to_child();
+          return;
+
+        case Phase::PROMOTE_RENAME_OUT:
+          if (error == ENOENT) {
+            phase_ = Phase::STAT_COMPONENT;
+            submit_stat();
+            return;
+          }
+          if (error != 0) throw std::system_error(
+              error, std::generic_category(), "renameat(cache promotion source)");
+          phase_ = Phase::PROMOTE_MKDIR;
+          submit_mkdir();
+          return;
+
+        case Phase::PROMOTE_MKDIR:
+          if (error != 0) throw std::system_error(
+              error, std::generic_category(), "mkdirat(cache promotion)");
+          phase_ = Phase::PROMOTE_OPEN;
+          submit_open_component();
+          return;
+
+        case Phase::PROMOTE_OPEN:
+          if (error != 0) throw std::system_error(
+              error, std::generic_category(), "openat(cache promotion)");
+          next_fd_ = int(result);
+          phase_ = Phase::PROMOTE_RENAME_IN;
+          submit_rename(current_fd_, temporary_.c_str(),
+                        next_fd_, kCacheValueName);
+          return;
+
+        case Phase::PROMOTE_RENAME_IN:
+          if (error != 0) throw std::system_error(
+              error, std::generic_category(), "renameat(cache promotion value)");
+          transition_to_child();
+          return;
+
+        case Phase::CLOSE_PARENT:
+          if (error != 0) throw std::system_error(
+              error, std::generic_category(), "close(cache path parent)");
+          current_fd_ = next_fd_;
+          next_fd_ = -1;
+          current_owned_ = true;
+          if (value_after_close_) {
+            value_after_close_ = false;
+            phase_ = Phase::STAT_VALUE;
+            submit_value_stat();
+            return;
+          }
+          ++index_;
+          phase_ = Phase::STAT_COMPONENT;
+          submit_stat();
+          return;
+
+        case Phase::STAT_VALUE:
+          if (error == ENOENT) { finish(false, kCacheValueName); return; }
+          if (error != 0) throw std::system_error(
+              error, std::generic_category(), "statx(cache value)");
+          if ((status_.stx_mode & S_IFMT) != S_IFREG) {
+            throw std::system_error(ELOOP, std::generic_category(),
+                                    "non-regular cache value path");
+          }
+          finish(true, kCacheValueName);
+          return;
+
+        case Phase::ERROR_CLOSE_NEXT:
+          if (error != 0 && next_fd_ >= 0) ::close(next_fd_);
+          next_fd_ = -1;
+          close_current_or_finish_error();
+          return;
+
+        case Phase::ERROR_CLOSE_CURRENT:
+          if (error != 0 && current_owned_ && current_fd_ >= 0) {
+            ::close(current_fd_);
+          }
+          current_fd_ = root_;
+          current_owned_ = false;
+          finish_error_now();
+          return;
+      }
+    } catch (...) {
+      begin_error(std::current_exception());
+    }
+  }
+
+  void transition_to_child() {
+    if (current_owned_) {
+      phase_ = Phase::CLOSE_PARENT;
+      submit_close(current_fd_);
+      return;
+    }
+    current_fd_ = next_fd_;
+    next_fd_ = -1;
+    current_owned_ = true;
+    ++index_;
+    phase_ = Phase::STAT_COMPONENT;
+    submit_stat();
+  }
+
+  bool submit_value_stat() noexcept {
+    memset(&status_, 0, sizeof(status_));
+    reset_io(AsyncIoRequest::STATX, current_fd_);
+    io_.path = kCacheValueName;
+    io_.data = &status_;
+    io_.flags = AT_SYMLINK_NOFOLLOW;
+    io_.mask = STATX_TYPE;
+    return submit();
+  }
+
+  void finish(bool exists, std::string leaf) noexcept {
+    Complete complete = complete_;
+    void* context = context_;
+    complete_ = nullptr;
+    const int parent = current_fd_;
+    const bool owned = current_owned_;
+    current_fd_ = root_;
+    current_owned_ = false;
+    complete(context, exists, parent, owned, std::move(leaf), {});
+  }
+
+  void finish_missing() noexcept {
+    error_ = {};
+    begin_cleanup();
+  }
+
+  void begin_error(std::exception_ptr error) noexcept {
+    if (!error_) error_ = std::move(error);
+    begin_cleanup();
+  }
+
+  void begin_cleanup() noexcept {
+    if (next_fd_ >= 0) {
+      const int fd = next_fd_;
+      phase_ = Phase::ERROR_CLOSE_NEXT;
+      reset_io(AsyncIoRequest::CLOSE, fd);
+      if (executor_->submit(io_)) return;
+      ::close(fd);
+      next_fd_ = -1;
+    }
+    close_current_or_finish_error();
+  }
+
+  void close_current_or_finish_error() noexcept {
+    if (current_owned_ && current_fd_ >= 0) {
+      const int fd = current_fd_;
+      phase_ = Phase::ERROR_CLOSE_CURRENT;
+      reset_io(AsyncIoRequest::CLOSE, fd);
+      if (executor_->submit(io_)) return;
+      ::close(fd);
+      current_fd_ = root_;
+      current_owned_ = false;
+    }
+    finish_error_now();
+  }
+
+  void finish_error_now() noexcept {
+    Complete complete = complete_;
+    void* context = context_;
+    std::exception_ptr error = std::move(error_);
+    complete_ = nullptr;
+    complete(context, false, -1, false, {}, std::move(error));
+  }
+
+  inline static std::atomic<uint64_t> sequence_{0};
+  IoExecutor* executor_ = nullptr;
+  AsyncIoRequest io_;
+  struct statx status_{};
+  std::vector<std::string> components_;
+  std::string temporary_;
+  std::exception_ptr error_;
+  Complete complete_ = nullptr;
+  void* context_ = nullptr;
+  int root_ = -1;
+  int current_fd_ = -1;
+  int next_fd_ = -1;
+  size_t index_ = 0;
+  Phase phase_ = Phase::STAT_COMPONENT;
+  bool create_ = false;
+  bool current_owned_ = false;
+  bool leaf_directory_ = false;
+  bool value_after_close_ = false;
+};
+
+class CacheCapacityOperation {
+ public:
+  enum class StartResult { RESERVED, PENDING, FAILED };
+  using Complete = void (*)(void*, std::exception_ptr) noexcept;
+
+  StartResult start(IoExecutor& executor, LocalCache& cache, uint64_t bytes,
+                    Complete complete, void* context) {
+    if (pending_ || complete == nullptr || bytes == 0) {
+      errno = EINVAL;
+      return StartResult::FAILED;
+    }
+    executor_ = &executor;
+    cache_ = &cache;
+    bytes_ = bytes;
+    complete_ = complete;
+    context_ = context;
+    if (cache_->try_reserve_capacity(bytes_)) {
+      reset();
+      return StartResult::RESERVED;
+    }
+    snapshot_live_entries();
+    if (!claim_live_region()) {
+      if (!start_reclaim_or_cold()) {
+        reset();
+        errno = ENOSPC;
+        return StartResult::FAILED;
+      }
+      pending_ = true;
+      return StartResult::PENDING;
+    }
+    phase_ = Phase::STAT_BEFORE;
+    if (!submit_statx()) {
+      restore_claim();
+      reset();
+      return StartResult::FAILED;
+    }
+    pending_ = true;
+    return StartResult::PENDING;
+  }
+
+ private:
+  enum class Phase {
+    STAT_BEFORE, PUNCH, STAT_AFTER,
+    COLD_YIELD, COLD_PATH_STAT, COLD_META_OPEN,
+    COLD_META_STAT, COLD_META_READ,
+  };
+
+  void snapshot_live_entries() {
+    std::lock_guard guard(cache_->mutex_);
+    entries_.reserve(cache_->entries_.size());
+    for (auto i = cache_->entries_.begin(); i != cache_->entries_.end();) {
+      std::shared_ptr<CacheEntry> entry = i->lock();
+      if (!entry) {
+        i = cache_->entries_.erase(i);
+        continue;
+      }
+      entries_.push_back(std::move(entry));
+      ++i;
+    }
+    if (!entries_.empty()) {
+      entry_index_ = cache_->clock_entry_.fetch_add(
+          1, std::memory_order_relaxed) % entries_.size();
+    }
+  }
+
+  bool claim_live_region() {
+    while (entry_attempts_ < entries_.size() * 2) {
+      std::shared_ptr<CacheEntry> entry =
+          entries_[entry_index_++ % entries_.size()];
+      ++entry_attempts_;
+      std::unique_lock guard(entry->mutex_);
+      const auto& header =
+          *static_cast<const CacheMetaHeader*>(entry->mapping_);
+      if (cache_->config_.unlimited || entry->stale_ ||
+          entry->eviction_disabled_ ||
+          (header.flags & (kCacheMetaDirty | kCacheMetaExported)) != 0 ||
+          entry->referenced_.empty()) {
+        continue;
+      }
+      const size_t region_size = entry->block_size_;
+      for (size_t scan = 0; scan < entry->referenced_.size(); ++scan) {
+        const size_t region =
+            entry->clock_hand_++ % entry->referenced_.size();
+        if (entry->referenced_[region] != 0) {
+          entry->referenced_[region] = 0;
+          continue;
+        }
+        const uint64_t offset = uint64_t(region) * region_size;
+        const uint64_t end =
+            std::min<uint64_t>(entry->size_, offset + region_size);
+        const size_t first = size_t(offset / entry->page_size_);
+        const size_t last = size_t((end - 1) / entry->page_size_) + 1;
+        clean_pages_.clear();
+        bool evictable = entry->region_pins_[region] == 0;
+        for (size_t page = first; page < last && evictable; ++page) {
+          const CachePageState state = entry->page_state(page);
+          if (state == CACHE_PAGE_CLEAN) clean_pages_.push_back(page);
+          if (state != CACHE_PAGE_CLEAN && state != CACHE_PAGE_MISSING) {
+            evictable = false;
+          }
+        }
+        if (!evictable || clean_pages_.empty()) continue;
+        for (size_t page : clean_pages_) {
+          // READ_PENDING blocks a new fetch while the hole punch is in flight.
+          entry->set_page_state(page, CACHE_PAGE_READ_PENDING);
+        }
+        victim_ = std::move(entry);
+        offset_ = offset;
+        length_ = region_size;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void finish_claim(bool punched) noexcept {
+    if (!victim_) return;
+    std::lock_guard guard(victim_->mutex_);
+    for (size_t page : clean_pages_) {
+      if (victim_->page_state(page) != CACHE_PAGE_READ_PENDING) abort();
+      victim_->set_page_state(
+          page, punched ? CACHE_PAGE_MISSING : CACHE_PAGE_CLEAN);
+    }
+    victim_->notify_waiters_locked();
+    victim_.reset();
+    clean_pages_.clear();
+  }
+
+  void restore_claim() noexcept { finish_claim(false); }
+
+  void reset_io(AsyncIoRequest::Kind kind, int fd) noexcept {
+    io_ = AsyncIoRequest{};
+    io_.kind = kind;
+    io_.fd = fd;
+    io_.complete = completed;
+    io_.context = this;
+  }
+
+  bool submit_statx() noexcept {
+    status_ = {};
+    reset_io(AsyncIoRequest::STATX, victim_->data_fd_);
+    io_.path = "";
+    io_.data = &status_;
+    io_.flags = AT_EMPTY_PATH;
+    io_.mask = STATX_BLOCKS | STATX_TYPE;
+    return submit();
+  }
+
+  bool submit_punch() noexcept {
+    reset_io(AsyncIoRequest::FALLOCATE, victim_->data_fd_);
+    io_.flags = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+    io_.input_offset = off_t(offset_);
+    io_.length = size_t(length_);
+    return submit();
+  }
+
+  bool start_cold_scan() {
+    if (cold_exhausted_) return false;
+    if (cold_stack_.empty()) {
+      const int duplicate = ::openat(
+          cache_->objects_root_fd_, ".",
+          O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      if (duplicate < 0) return false;
+      DIR* stream = ::fdopendir(duplicate);
+      if (stream == nullptr) {
+        ::close(duplicate);
+        return false;
+      }
+      cold_stack_.push_back(stream);
+    }
+    return scan_cold_batch();
+  }
+
+  bool start_reclaim_or_cold() {
+    while (reclaim_index_ < entries_.size()) {
+      std::shared_ptr<CacheEntry> entry =
+          std::move(entries_[reclaim_index_++]);
+      bool kept = false;
+      {
+        std::lock_guard cache_guard(cache_->mutex_);
+        kept = std::any_of(
+            cache_->keepalive_.begin(), cache_->keepalive_.end(),
+            [&](const auto& slot) { return slot.entry.get() == entry.get(); });
+      }
+      if (entry.use_count() != (kept ? 2 : 1)) continue;
+      {
+        std::lock_guard entry_guard(entry->mutex_);
+        const auto& header =
+            *static_cast<const CacheMetaHeader*>(entry->mapping_);
+        if (entry->stale_ || entry->detached_ ||
+            entry->eviction_disabled_ ||
+            (header.flags & (kCacheMetaDirty | kCacheMetaExported)) != 0 ||
+            !entry->active_claims_.empty() || entry->checksum_ops_ != 0 ||
+            entry->pinned_regions_ != 0) {
+          continue;
+        }
+        bool all_missing = true;
+        for (size_t page = 0; page < entry->page_count_; ++page) {
+          if (entry->page_state(page) != CACHE_PAGE_MISSING) {
+            all_missing = false;
+            break;
+          }
+        }
+        if (!all_missing) continue;
+      }
+      reclaim_entry_ = std::move(entry);
+      reclaim_request_.complete = reclaim_completed;
+      reclaim_request_.context = this;
+      if (cache_->reclaim_closed_async(
+              *executor_, reclaim_request_, reclaim_entry_)) {
+        return true;
+      }
+      reclaim_entry_.reset();
+    }
+    return start_cold_scan();
+  }
+
+  static void reclaim_completed(void* context,
+                                CacheAsyncResult) noexcept {
+    auto* operation = static_cast<CacheCapacityOperation*>(context);
+    operation->reclaim_entry_.reset();
+    try {
+      if (operation->cache_->try_reserve_capacity(operation->bytes_)) {
+        operation->finish({});
+        return;
+      }
+      if (!operation->start_reclaim_or_cold()) {
+        operation->finish(make_error(
+            ENOSPC, "reserve asynchronous cache capacity"));
+      }
+    } catch (...) {
+      operation->finish(std::current_exception());
+    }
+  }
+
+  bool scan_cold_batch() {
+    size_t examined = 0;
+    while (!cold_stack_.empty()) {
+      if (examined >= 32) {
+        phase_ = Phase::COLD_YIELD;
+        return submit_cold_yield();
+      }
+      errno = 0;
+      dirent* item = ::readdir(cold_stack_.back());
+      ++examined;
+      if (item == nullptr) {
+        const int error = errno;
+        ::closedir(cold_stack_.back());
+        cold_stack_.pop_back();
+        if (error != 0) throw std::system_error(
+            error, std::generic_category(), "enumerate cold cache metadata");
+        continue;
+      }
+      if (strcmp(item->d_name, ".") == 0 ||
+          strcmp(item->d_name, "..") == 0) {
+        continue;
+      }
+      cold_name_ = item->d_name;
+      phase_ = Phase::COLD_PATH_STAT;
+      if (!submit_cold_path_stat()) return false;
+      return true;
+    }
+    cold_exhausted_ = true;
+    return false;
+  }
+
+  bool continue_cold_scan() {
+    if (scan_cold_batch()) return true;
+    finish(make_error(ENOSPC, "reserve asynchronous cache capacity"));
+    return false;
+  }
+
+  static void cold_entry_opened(void* context,
+                                CacheAsyncResult result) noexcept {
+    auto* operation = static_cast<CacheCapacityOperation*>(context);
+    operation->cold_meta_fd_.reset();
+    if (!result.error && result.entry) {
+      operation->entries_.clear();
+      operation->entries_.push_back(std::move(result.entry));
+      operation->entry_index_ = 0;
+      operation->entry_attempts_ = 0;
+      operation->reclaim_index_ = 0;
+      if (operation->claim_live_region()) {
+        operation->phase_ = Phase::STAT_BEFORE;
+        operation->submit_statx();
+        return;
+      }
+    }
+    try {
+      if (!operation->start_reclaim_or_cold()) {
+        operation->finish(make_error(
+            ENOSPC, "reserve asynchronous cache capacity"));
+      }
+    } catch (...) {
+      operation->finish(std::current_exception());
+    }
+  }
+
+  bool open_cold_entry() {
+    constexpr std::array<char, 8> magic{
+        'N', 'G', 'S', '3', 'C', 'A', 'C', 'H'};
+    if (cold_header_.magic != magic ||
+        cold_header_.version != kCacheMetaVersion ||
+        cold_header_.header_size != kCacheMetaHeaderSize ||
+        cold_header_.bitmap_unit != kCacheBitmapUnit ||
+        (cold_header_.flags & kCacheMetaDirty) != 0 ||
+        cold_header_.generation_epoch == 0 ||
+        cold_header_.key_length == 0 ||
+        cold_header_.key_length > cold_header_.key.size() ||
+        cold_header_.etag_length > cold_header_.etag.size() ||
+        cold_header_.version_length > cold_header_.version_id.size()) {
+      return continue_cold_scan();
+    }
+    size_t mapping_size;
+    try {
+      mapping_size = cache_mapping_size(
+          cold_header_.object_size, kCacheBitmapUnit);
+    } catch (...) {
+      return continue_cold_scan();
+    }
+    if (uint64_t(cold_status_.stx_size) < mapping_size) {
+      return continue_cold_scan();
+    }
+    cold_key_.assign(cold_header_.key.data(), cold_header_.key_length);
+    cold_etag_.assign(cold_header_.etag.data(), cold_header_.etag_length);
+    cold_version_.assign(
+        cold_header_.version_id.data(), cold_header_.version_length);
+    CacheIdentity identity{
+        .key = cold_key_,
+        .etag = cold_etag_,
+        .version_id = cold_version_,
+        .size = cold_header_.object_size,
+        .mtime = time_t(cold_header_.mtime),
+    };
+    cold_request_.complete = cold_entry_opened;
+    cold_request_.context = this;
+    if (cache_->open_async_if_idle(
+            *executor_, cold_request_, identity)) return true;
+    return continue_cold_scan();
+  }
+
+  bool submit_cold_path_stat() noexcept {
+    cold_status_ = {};
+    reset_io(AsyncIoRequest::STATX, ::dirfd(cold_stack_.back()));
+    io_.path = cold_name_.c_str();
+    io_.data = &cold_status_;
+    io_.flags = AT_SYMLINK_NOFOLLOW;
+    io_.mask = STATX_SIZE | STATX_TYPE;
+    return submit();
+  }
+
+  bool submit_cold_yield() noexcept {
+    cold_status_ = {};
+    reset_io(AsyncIoRequest::STATX, ::dirfd(cold_stack_.back()));
+    io_.path = "";
+    io_.data = &cold_status_;
+    io_.flags = AT_EMPTY_PATH;
+    io_.mask = STATX_TYPE;
+    return submit();
+  }
+
+  bool submit_cold_meta_open() noexcept {
+    reset_io(AsyncIoRequest::OPENAT, ::dirfd(cold_stack_.back()));
+    io_.path = cold_name_.c_str();
+    io_.flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
+    return submit();
+  }
+
+  bool submit_cold_meta_stat() noexcept {
+    cold_status_ = {};
+    reset_io(AsyncIoRequest::STATX, cold_meta_fd_.get());
+    io_.path = "";
+    io_.data = &cold_status_;
+    io_.flags = AT_EMPTY_PATH;
+    io_.mask = STATX_SIZE | STATX_TYPE;
+    return submit();
+  }
+
+  bool submit_cold_meta_read() noexcept {
+    cold_header_ = {};
+    reset_io(AsyncIoRequest::PREAD, cold_meta_fd_.get());
+    io_.data = &cold_header_;
+    io_.length = sizeof(cold_header_);
+    io_.input_offset = 0;
+    io_.exact = true;
+    return submit();
+  }
+
+  bool submit() noexcept {
+    if (executor_->submit(io_)) return true;
+    const int error = errno == 0 ? EIO : errno;
+    if (!pending_) {
+      errno = error;
+      return false;
+    }
+    restore_claim();
+    finish(make_error(error, "submit asynchronous cache eviction"));
+    return true;
+  }
+
+  static std::exception_ptr make_error(int error, const char* what) noexcept {
+    try {
+      return std::make_exception_ptr(std::system_error(
+          error, std::generic_category(), what));
+    } catch (...) {
+      return std::current_exception();
+    }
+  }
+
+  static void completed(void* context, ssize_t result) noexcept {
+    static_cast<CacheCapacityOperation*>(context)->advance(result);
+  }
+
+  void advance(ssize_t result) noexcept {
+    try {
+      if (result < 0) {
+        if (result == -ECANCELED || result == -ENOTCONN) {
+          restore_claim();
+          finish(make_error(
+              int(-result), "cancel asynchronous cache eviction"));
+          return;
+        }
+        if (phase_ >= Phase::COLD_YIELD) {
+          cold_meta_fd_.reset();
+          continue_cold_scan();
+          return;
+        }
+        restore_claim();
+        retry_or_finish();
+        return;
+      }
+      switch (phase_) {
+        case Phase::STAT_BEFORE:
+          before_blocks_ = status_.stx_blocks;
+          phase_ = Phase::PUNCH;
+          submit_punch();
+          return;
+        case Phase::PUNCH:
+          {
+            std::shared_ptr<CacheEntry> punched = victim_;
+            finish_claim(true);
+            victim_ = std::move(punched);
+          }
+          phase_ = Phase::STAT_AFTER;
+          submit_statx();
+          return;
+        case Phase::STAT_AFTER: {
+          const uint64_t after_blocks = status_.stx_blocks;
+          if (before_blocks_ > after_blocks) {
+            cache_->add_allocated(-int64_t(std::min<uint64_t>(
+                (before_blocks_ - after_blocks) * 512, INT64_MAX)));
+          }
+          victim_.reset();
+          retry_or_finish();
+          return;
+        }
+        case Phase::COLD_YIELD:
+          continue_cold_scan();
+          return;
+        case Phase::COLD_PATH_STAT:
+          if ((cold_status_.stx_mode & S_IFMT) == S_IFDIR) {
+            const int child = ::openat(
+                ::dirfd(cold_stack_.back()), cold_name_.c_str(),
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (child >= 0) {
+              DIR* stream = ::fdopendir(child);
+              if (stream != nullptr) cold_stack_.push_back(stream);
+              else ::close(child);
+            }
+            continue_cold_scan();
+            return;
+          }
+          if ((cold_status_.stx_mode & S_IFMT) != S_IFREG ||
+              cold_status_.stx_size < sizeof(CacheMetaHeader)) {
+            continue_cold_scan();
+            return;
+          }
+          phase_ = Phase::COLD_META_OPEN;
+          submit_cold_meta_open();
+          return;
+        case Phase::COLD_META_OPEN:
+          cold_meta_fd_.reset(int(result));
+          phase_ = Phase::COLD_META_STAT;
+          submit_cold_meta_stat();
+          return;
+        case Phase::COLD_META_STAT:
+          if ((cold_status_.stx_mode & S_IFMT) != S_IFREG ||
+              cold_status_.stx_size < sizeof(CacheMetaHeader)) {
+            cold_meta_fd_.reset();
+            continue_cold_scan();
+            return;
+          }
+          phase_ = Phase::COLD_META_READ;
+          submit_cold_meta_read();
+          return;
+        case Phase::COLD_META_READ:
+          if (result != ssize_t(sizeof(CacheMetaHeader))) {
+            cold_meta_fd_.reset();
+            continue_cold_scan();
+            return;
+          }
+          open_cold_entry();
+          return;
+      }
+    } catch (...) {
+      restore_claim();
+      finish(std::current_exception());
+    }
+  }
+
+  void retry_or_finish() {
+    if (cache_->try_reserve_capacity(bytes_)) {
+      finish({});
+      return;
+    }
+    if (!claim_live_region()) {
+      if (start_reclaim_or_cold()) return;
+      finish(make_error(ENOSPC, "reserve asynchronous cache capacity"));
+      return;
+    }
+    phase_ = Phase::STAT_BEFORE;
+    submit_statx();
+  }
+
+  void finish(std::exception_ptr error) noexcept {
+    Complete complete = complete_;
+    void* context = context_;
+    reset();
+    complete(context, std::move(error));
+  }
+
+  void reset() noexcept {
+    for (DIR* stream : cold_stack_) ::closedir(stream);
+    cold_stack_.clear();
+    cold_meta_fd_.reset();
+    reclaim_entry_.reset();
+    cold_name_.clear();
+    cold_key_.clear();
+    cold_etag_.clear();
+    cold_version_.clear();
+    executor_ = nullptr;
+    cache_ = nullptr;
+    entries_.clear();
+    victim_.reset();
+    clean_pages_.clear();
+    complete_ = nullptr;
+    context_ = nullptr;
+    bytes_ = 0;
+    entry_index_ = 0;
+    entry_attempts_ = 0;
+    reclaim_index_ = 0;
+    offset_ = 0;
+    length_ = 0;
+    before_blocks_ = 0;
+    pending_ = false;
+    cold_exhausted_ = false;
+  }
+
+  IoExecutor* executor_ = nullptr;
+  LocalCache* cache_ = nullptr;
+  AsyncIoRequest io_;
+  struct statx status_{};
+  struct statx cold_status_{};
+  CacheMetaHeader cold_header_{};
+  CacheAsyncRequest cold_request_;
+  CacheAsyncRequest reclaim_request_;
+  UniqueFd cold_meta_fd_;
+  std::vector<DIR*> cold_stack_;
+  std::vector<std::shared_ptr<CacheEntry>> entries_;
+  std::shared_ptr<CacheEntry> victim_;
+  std::shared_ptr<CacheEntry> reclaim_entry_;
+  std::vector<size_t> clean_pages_;
+  std::string cold_name_;
+  std::string cold_key_;
+  std::string cold_etag_;
+  std::string cold_version_;
+  Complete complete_ = nullptr;
+  void* context_ = nullptr;
+  uint64_t bytes_ = 0;
+  uint64_t offset_ = 0;
+  uint64_t length_ = 0;
+  uint64_t before_blocks_ = 0;
+  size_t entry_index_ = 0;
+  size_t entry_attempts_ = 0;
+  size_t reclaim_index_ = 0;
+  Phase phase_ = Phase::STAT_BEFORE;
+  bool pending_ = false;
+  bool cold_exhausted_ = false;
+};
+
+class CacheKeyOperation {
+ protected:
+  enum class GateResult { ACTIVE, QUEUED, FAILED };
+
+  CacheKeyOperation(LocalCache& cache, IoExecutor& executor) noexcept
+      : gate_cache_(&cache), gate_executor_(&executor) {}
+
+  GateResult acquire_key_gate(std::string_view first,
+                              std::string_view second = {},
+                              bool wait = true) noexcept {
+    try {
+      gate_keys_[0].assign(first);
+      gate_count_ = 1;
+      if (!second.empty() && second != first) {
+        gate_keys_[1].assign(second);
+        gate_count_ = 2;
+      }
+      std::lock_guard guard(gate_cache_->mutex_);
+      if (gate_available_locked()) {
+        claim_gate_locked();
+        return GateResult::ACTIVE;
+      }
+      if (!wait) {
+        errno = EBUSY;
+        return GateResult::FAILED;
+      }
+      wait_fd_.reset(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+      if (!wait_fd_) return GateResult::FAILED;
+      gate_cache_->async_key_waiters_.push_back(this);
+      gate_waiting_ = true;
+      wait_io_ = AsyncIoRequest{};
+      wait_io_.kind = AsyncIoRequest::READ;
+      wait_io_.fd = wait_fd_.get();
+      wait_io_.data = &wait_value_;
+      wait_io_.length = sizeof(wait_value_);
+      wait_io_.exact = true;
+      wait_io_.complete = queued_completed;
+      wait_io_.context = this;
+      if (!gate_executor_->submit(wait_io_)) {
+        gate_cache_->async_key_waiters_.pop_back();
+        gate_waiting_ = false;
+        wait_fd_.reset();
+        return GateResult::FAILED;
+      }
+      return GateResult::QUEUED;
+    } catch (...) {
+      errno = ENOMEM;
+      return GateResult::FAILED;
+    }
+  }
+
+  void abandon_key_gate() noexcept {
+    {
+      std::lock_guard guard(gate_cache_->mutex_);
+      if (gate_waiting_) {
+        auto& waiters = gate_cache_->async_key_waiters_;
+        const auto found = std::find(waiters.begin(), waiters.end(), this);
+        if (found != waiters.end()) waiters.erase(found);
+        gate_waiting_ = false;
+      }
+      if (gate_held_) {
+        release_gate_locked();
+        wake_ready_locked();
+      }
+    }
+  }
+
+  void release_key_gate() noexcept { abandon_key_gate(); }
+  [[nodiscard]] bool key_gate_held() const noexcept { return gate_held_; }
+
+ private:
+  virtual void activate_key_gate() noexcept = 0;
+  virtual void key_gate_failed(std::exception_ptr) noexcept = 0;
+
+  static void queued_completed(void* context, ssize_t result) noexcept {
+    static_cast<CacheKeyOperation*>(context)->queued_ready(result);
+  }
+
+  void queued_ready(ssize_t result) noexcept {
+    wait_fd_.reset();
+    if (result == ssize_t(sizeof(wait_value_))) {
+      activate_key_gate();
+      return;
+    }
+    {
+      std::lock_guard guard(gate_cache_->mutex_);
+      if (gate_waiting_) {
+        auto& waiters = gate_cache_->async_key_waiters_;
+        const auto found = std::find(waiters.begin(), waiters.end(), this);
+        if (found != waiters.end()) waiters.erase(found);
+        gate_waiting_ = false;
+      }
+      if (gate_held_) release_gate_locked();
+      wake_ready_locked();
+    }
+    key_gate_failed(gate_error(result < 0 ? int(-result) : EIO));
+  }
+
+  static std::exception_ptr gate_error(int error) noexcept {
+    try {
+      return std::make_exception_ptr(std::system_error(
+          error, std::generic_category(), "wait for cache key operation"));
+    } catch (...) {
+      return std::current_exception();
+    }
+  }
+
+  void wake_queued() noexcept {
+    const uint64_t wake = 1;
+    ssize_t result;
+    do {
+      result = ::write(wait_fd_.get(), &wake, sizeof(wake));
+    } while (result < 0 && errno == EINTR);
+    if (result != ssize_t(sizeof(wake))) abort();
+  }
+
+  bool gate_available_locked() const noexcept {
+    for (size_t i = 0; i < gate_count_; ++i) {
+      for (const std::string& active : gate_cache_->async_keys_) {
+        if (keys_conflict(active, gate_keys_[i])) return false;
+      }
+    }
+    return true;
+  }
+
+  static bool keys_conflict(std::string_view left,
+                            std::string_view right) noexcept {
+    if (left == right) return true;
+    if (left.size() < right.size()) {
+      return right.starts_with(left) && right[left.size()] == '/';
+    }
+    return left.starts_with(right) && left[right.size()] == '/';
+  }
+
+  void claim_gate_locked() {
+    for (size_t i = 0; i < gate_count_; ++i) {
+      gate_cache_->async_keys_.insert(gate_keys_[i]);
+    }
+    gate_waiting_ = false;
+    gate_held_ = true;
+  }
+
+  void release_gate_locked() noexcept {
+    for (size_t i = 0; i < gate_count_; ++i) {
+      gate_cache_->async_keys_.erase(gate_keys_[i]);
+    }
+    gate_held_ = false;
+  }
+
+  void wake_ready_locked() {
+    auto& waiters = gate_cache_->async_key_waiters_;
+    for (auto i = waiters.begin(); i != waiters.end();) {
+      CacheKeyOperation* candidate = *i;
+      if (!candidate->gate_available_locked()) {
+        ++i;
+        continue;
+      }
+      i = waiters.erase(i);
+      candidate->claim_gate_locked();
+      candidate->wake_queued();
+    }
+  }
+
+  LocalCache* gate_cache_ = nullptr;
+  IoExecutor* gate_executor_ = nullptr;
+  AsyncIoRequest wait_io_;
+  UniqueFd wait_fd_;
+  uint64_t wait_value_ = 0;
+  std::array<std::string, 2> gate_keys_;
+  size_t gate_count_ = 0;
+  bool gate_waiting_ = false;
+  bool gate_held_ = false;
+};
+
+class CacheAsyncOperation {
+ public:
+  enum class Kind {
+    PREPARE_READ,
+    PREPARE_WRITE,
+    BEGIN_WRITE,
+    SET_UPLOAD_ID,
+    MARK_COMMIT_PENDING,
+    DISCARD_WRITE,
+    SYNC_WRITE,
+    COMMIT_WRITE,
+  };
+
+  CacheAsyncOperation(IoExecutor& executor, CacheAsyncRequest& request,
+                      CacheEntry& entry, Kind kind) noexcept
+      : executor_(&executor), request_(&request), entry_(&entry), kind_(kind) {}
+
+  bool start_prepare_read(uint64_t offset, size_t length) {
+    if (length != 0 && offset > UINT64_MAX - length) {
+      errno = EOVERFLOW;
+      return false;
+    }
+    offset_ = offset;
+    length_ = length;
+    return begin_or_queue();
+  }
+
+  bool activate_prepare_read() {
+    start_ = offset_ / entry_->owner_->config_.block_size *
+        entry_->owner_->config_.block_size;
+    reserve_ = length_ == 0 ? 0 :
+        cache_round_up(length_, entry_->owner_->config_.block_size);
+    phase_ = Phase::RANGE_STAT_BEFORE;
+    return submit_statx(entry_->data_fd_);
+  }
+
+  bool start_prepare_write(uint64_t offset, size_t length) {
+    if (length != 0 && offset > UINT64_MAX - length) {
+      errno = EOVERFLOW;
+      return false;
+    }
+    offset_ = offset;
+    length_ = length;
+    end_ = offset + length;
+    return begin_or_queue();
+  }
+
+  bool activate_prepare_write() {
+    {
+      std::unique_lock guard(entry_->mutex_);
+      const auto& header = *static_cast<const CacheMetaHeader*>(entry_->mapping_);
+      if (entry_->stale_ || (header.flags & kCacheMetaExported) != 0) {
+        return reject_locked(guard, ESTALE);
+      }
+    }
+    if (length_ == 0) return start_dirty_marker();
+    const uint64_t unit = entry_->owner_->config_.upload_part_size;
+    if (unit == 0 || end_ > UINT64_MAX - (unit - 1)) return reject(EOVERFLOW);
+    const uint64_t capacity = (end_ + unit - 1) / unit * unit;
+    wanted_mapping_size_ = cache_mapping_size(capacity, entry_->page_size_);
+    {
+      std::lock_guard guard(entry_->mutex_);
+      old_mapping_size_ = entry_->mapping_size_;
+    }
+    first_part_ = size_t(offset_ / unit);
+    last_part_  = size_t((end_ - 1) / unit);
+    current_part_ = first_part_;
+    if (wanted_mapping_size_ > old_mapping_size_) {
+      phase_ = Phase::META_STAT_BEFORE;
+      return submit_statx(entry_->meta_fd_);
+    }
+    return start_next_write_range();
+  }
+
+  bool start_begin_write() {
+    return begin_or_queue();
+  }
+
+  bool start_set_upload_id(std::string_view upload_id) {
+    if (upload_id.size() > kCacheUploadIdCapacity) {
+      errno = EOVERFLOW;
+      return false;
+    }
+    upload_id_.assign(upload_id);
+    return begin_or_queue();
+  }
+
+  bool activate_set_upload_id() {
+    {
+      std::unique_lock guard(entry_->mutex_);
+      if (entry_->stale_) return reject_locked(guard, ESTALE);
+      auto& header = *static_cast<CacheMetaHeader*>(entry_->mapping_);
+      memset(header.upload_id.data(), 0, header.upload_id.size());
+      memcpy(header.upload_id.data(), upload_id_.data(), upload_id_.size());
+      header.upload_id_length = uint32_t(upload_id_.size());
+      header.upload_part_size = entry_->owner_->config_.upload_part_size;
+      header.write_phase      = upload_id_.empty() ? 1 : 2;
+    }
+    phase_ = Phase::UPDATE_META;
+    return submit_fsync(entry_->meta_fd_, false);
+  }
+
+  bool start_mark_commit_pending() {
+    return begin_or_queue();
+  }
+
+  bool activate_mark_commit_pending() {
+    {
+      std::unique_lock guard(entry_->mutex_);
+      if (entry_->stale_) return reject_locked(guard, ESTALE);
+      auto& header = *static_cast<CacheMetaHeader*>(entry_->mapping_);
+      if ((header.flags & kCacheMetaDirty) == 0) {
+        return reject_locked(guard, EINVAL);
+      }
+      header.write_phase = 3;
+    }
+    phase_ = Phase::UPDATE_META;
+    return submit_fsync(entry_->meta_fd_, false);
+  }
+
+  bool start_discard_write() {
+    return begin_or_queue();
+  }
+
+  bool activate_discard_write() {
+    {
+      std::unique_lock guard(entry_->mutex_);
+      auto& header = *static_cast<CacheMetaHeader*>(entry_->mapping_);
+      header.flags       &= ~kCacheMetaDirty;
+      header.write_phase  = 0;
+      entry_->stale_      = true;
+      entry_->detached_   = true;
+      marker_fd_          = entry_->dirty_fd_;
+      if (marker_fd_ >= 0) entry_->dirty_fd_ = -1;
+    }
+    if (marker_fd_ < 0) {
+      phase_ = Phase::DISCARD_NO_MARKER;
+      return submit_statx(entry_->data_fd_);
+    }
+    marker_path_action_ = MarkerPathAction::REMOVE;
+    return path_.start(*executor_, entry_->owner_->dirty_root_fd_,
+                       entry_->key_, false, marker_path_resolved, this,
+                       entry_->owner_->name_max_);
+  }
+
+  bool start_sync_write() {
+    return begin_or_queue();
+  }
+
+  bool activate_sync_write() {
+    {
+      std::unique_lock guard(entry_->mutex_);
+      if (entry_->stale_) return reject_locked(guard, ESTALE);
+    }
+    phase_ = Phase::SYNC_DATA;
+    return submit_fsync(entry_->data_fd_, true);
+  }
+
+  bool start_commit_write(const CacheIdentity& identity) {
+    if (identity.etag.size() > kCacheEtagCapacity ||
+        identity.version_id.size() > kCacheVersionCapacity) {
+      errno = EOVERFLOW;
+      return false;
+    }
+    identity_key_.assign(identity.key);
+    etag_.assign(identity.etag);
+    version_id_.assign(identity.version_id);
+    identity_size_ = identity.size;
+    identity_mtime_ = identity.mtime;
+    return begin_or_queue();
+  }
+
+  bool activate_commit_write() {
+    {
+      std::unique_lock guard(entry_->mutex_);
+      if (identity_key_ != entry_->key_ || identity_size_ != entry_->size_) {
+        return reject_locked(guard, EINVAL);
+      }
+      auto& header = *static_cast<CacheMetaHeader*>(entry_->mapping_);
+      memset(header.etag.data(), 0, header.etag.size());
+      memset(header.version_id.data(), 0, header.version_id.size());
+      memcpy(header.etag.data(), etag_.data(), etag_.size());
+      memcpy(header.version_id.data(), version_id_.data(), version_id_.size());
+      header.etag_length      = uint32_t(etag_.size());
+      header.version_length   = uint32_t(version_id_.size());
+      header.mtime            = identity_mtime_;
+      header.flags           &= ~kCacheMetaDirty;
+      header.write_phase      = 0;
+      header.upload_id_length = 0;
+      entry_->eviction_disabled_ = false;
+    }
+    phase_ = Phase::COMMIT_META;
+    return submit_fsync(entry_->meta_fd_, false);
+  }
+
+  void abandon_start() noexcept {
+    if (reservation_ != 0) {
+      entry_->owner_->cancel_reservation(reservation_);
+      reservation_ = 0;
+    }
+    if (request_->implementation_ == this) {
+      {
+        std::lock_guard guard(entry_->mutex_);
+        (void)release_entry_operation_locked();
+      }
+      request_->implementation_ = nullptr;
+    }
+  }
+
+ private:
+  enum class Phase {
+    RANGE_STAT_BEFORE, RANGE_FALLOCATE, RANGE_STAT_AFTER,
+    META_STAT_BEFORE, META_FALLOCATE, META_STAT_AFTER,
+    MARKER_ALREADY, MARKER_OPEN, MARKER_FALLOCATE, MARKER_WRITE,
+    MARKER_STAT_AFTER,
+    UPDATE_META, DISCARD_NO_MARKER, SYNC_DATA, SYNC_META, SYNC_MARKER,
+    COMMIT_META, COMMIT_MARKER_STAT, COMMIT_MARKER_CLOSE,
+    COMMIT_MARKER_UNLINK, FINAL_MARKER_CLOSE, FINAL_PARENT_CLOSE,
+  };
+
+  enum class MarkerPathAction { NONE, CREATE, REMOVE };
+  enum class CapacityAction { NONE, RANGE, META, MARKER };
+
+  static void capacity_completed(void* context,
+                                 std::exception_ptr error) noexcept {
+    auto* operation = static_cast<CacheAsyncOperation*>(context);
+    if (error) {
+      if (operation->capacity_action_ == CapacityAction::RANGE &&
+          operation->kind_ == Kind::PREPARE_READ) {
+        operation->finish(false);
+      } else {
+        operation->finish(std::move(error));
+      }
+      return;
+    }
+    operation->reservation_ = operation->capacity_bytes_;
+    try {
+      operation->capacity_ready();
+    } catch (...) {
+      operation->finish(std::current_exception());
+    }
+  }
+
+  bool request_capacity(uint64_t bytes, CapacityAction action) {
+    capacity_bytes_ = bytes;
+    capacity_action_ = action;
+    const CacheCapacityOperation::StartResult result = capacity_.start(
+        *executor_, *entry_->owner_, bytes, capacity_completed, this);
+    if (result == CacheCapacityOperation::StartResult::RESERVED) {
+      reservation_ = bytes;
+      return capacity_ready();
+    }
+    if (result == CacheCapacityOperation::StartResult::PENDING) {
+      accepted_ = true;
+      return true;
+    }
+    const int error = errno == 0 ? ENOSPC : errno;
+    if (action == CapacityAction::RANGE && kind_ == Kind::PREPARE_READ) {
+      finish(false);
+      return false;
+    }
+    throw std::system_error(error, std::generic_category(),
+                            "reserve asynchronous cache capacity");
+  }
+
+  bool capacity_ready() {
+    const CapacityAction action = std::exchange(
+        capacity_action_, CapacityAction::NONE);
+    switch (action) {
+      case CapacityAction::RANGE:
+        phase_ = Phase::RANGE_FALLOCATE;
+        return submit_fallocate(entry_->data_fd_, FALLOC_FL_KEEP_SIZE,
+                                start_, reserve_);
+      case CapacityAction::META:
+        phase_ = Phase::META_FALLOCATE;
+        return submit_fallocate(entry_->meta_fd_, 0, old_mapping_size_,
+                                wanted_mapping_size_ - old_mapping_size_);
+      case CapacityAction::MARKER:
+        marker_path_action_ = MarkerPathAction::CREATE;
+        return path_.start(*executor_, entry_->owner_->dirty_root_fd_,
+                           entry_->key_, true, marker_path_resolved, this,
+                           entry_->owner_->name_max_);
+      case CapacityAction::NONE:
+        abort();
+    }
+    abort();
+  }
+
+  static void marker_path_resolved(void* context, bool exists, int parent_fd,
+                                   bool parent_owned, std::string leaf,
+                                   std::exception_ptr error) noexcept {
+    auto* operation = static_cast<CacheAsyncOperation*>(context);
+    if (error) { operation->finish(std::move(error)); return; }
+    operation->marker_parent_fd_ = parent_fd;
+    operation->marker_parent_owned_ = parent_owned;
+    operation->marker_name_ = std::move(leaf);
+    operation->marker_named_ = exists ||
+        operation->marker_path_action_ == MarkerPathAction::CREATE;
+    if (operation->marker_path_action_ == MarkerPathAction::CREATE) {
+      operation->phase_ = Phase::MARKER_OPEN;
+      operation->submit_open_marker();
+      return;
+    }
+    operation->phase_ = Phase::COMMIT_MARKER_STAT;
+    operation->submit_statx(operation->marker_fd_);
+  }
+
+  enum class BeginResult { REJECTED, ACTIVE, QUEUED };
+
+  BeginResult begin_entry_operation() noexcept {
+    if (request_->complete == nullptr || request_->pending()) {
+      errno = EINVAL;
+      return BeginResult::REJECTED;
+    }
+    std::lock_guard guard(entry_->mutex_);
+    request_->implementation_ = this;
+    if (entry_->async_metadata_inflight_) {
+      wait_fd_.reset(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+      if (!wait_fd_) {
+        request_->implementation_ = nullptr;
+        return BeginResult::REJECTED;
+      }
+      try {
+        entry_->async_metadata_queue_.push_back(this);
+      } catch (...) {
+        request_->implementation_ = nullptr;
+        errno = ENOMEM;
+        return BeginResult::REJECTED;
+      }
+      queued_linked_ = true;
+      wait_io_ = AsyncIoRequest{};
+      wait_io_.kind     = AsyncIoRequest::READ;
+      wait_io_.fd       = wait_fd_.get();
+      wait_io_.data     = &wait_value_;
+      wait_io_.length   = sizeof(wait_value_);
+      wait_io_.exact    = true;
+      wait_io_.complete = queued_completed;
+      wait_io_.context  = this;
+      if (!executor_->submit(wait_io_)) {
+        entry_->async_metadata_queue_.pop_back();
+        queued_linked_ = false;
+        request_->implementation_ = nullptr;
+        wait_fd_.reset();
+        return BeginResult::REJECTED;
+      }
+      accepted_ = true;
+      return BeginResult::QUEUED;
+    }
+    entry_->async_metadata_inflight_ = true;
+    return BeginResult::ACTIVE;
+  }
+
+  bool begin_or_queue() {
+    const BeginResult result = begin_entry_operation();
+    if (result == BeginResult::REJECTED) return false;
+    if (result == BeginResult::QUEUED) return true;
+    return activate();
+  }
+
+  bool activate() {
+    switch (kind_) {
+      case Kind::PREPARE_READ: return activate_prepare_read();
+      case Kind::PREPARE_WRITE: return activate_prepare_write();
+      case Kind::BEGIN_WRITE: return start_dirty_marker();
+      case Kind::SET_UPLOAD_ID: return activate_set_upload_id();
+      case Kind::MARK_COMMIT_PENDING: return activate_mark_commit_pending();
+      case Kind::DISCARD_WRITE: return activate_discard_write();
+      case Kind::SYNC_WRITE: return activate_sync_write();
+      case Kind::COMMIT_WRITE: return activate_commit_write();
+    }
+    abort();
+  }
+
+  static void queued_completed(void* context, ssize_t result) noexcept {
+    static_cast<CacheAsyncOperation*>(context)->queued_ready(result);
+  }
+
+  void queued_ready(ssize_t result) noexcept {
+    if (result == ssize_t(sizeof(wait_value_))) {
+      wait_fd_.reset();
+      try {
+        (void)activate();
+      } catch (...) {
+        finish(std::current_exception());
+      }
+      return;
+    }
+    {
+      std::lock_guard guard(entry_->mutex_);
+      if (queued_linked_) {
+        const auto found = std::find(
+            entry_->async_metadata_queue_.begin(),
+            entry_->async_metadata_queue_.end(), this);
+        if (found == entry_->async_metadata_queue_.end()) abort();
+        entry_->async_metadata_queue_.erase(found);
+        queued_linked_ = false;
+      } else {
+        (void)release_entry_operation_locked();
+      }
+      wait_fd_.reset();
+    }
+    const int error = result < 0 ? int(-result) : EIO;
+    deliver_result(CacheAsyncResult{
+        .entry = {},
+        .error = make_error(error, "wait for cache entry operation"),
+        .value = false});
+  }
+
+  static std::exception_ptr make_error(int error,
+                                       const char* operation) noexcept {
+    try {
+      return std::make_exception_ptr(std::system_error(
+          error, std::generic_category(), operation));
+    } catch (...) {
+      return std::current_exception();
+    }
+  }
+
+  void wake_queued() noexcept {
+    const uint64_t wake = 1;
+    ssize_t result;
+    do {
+      result = ::write(wait_fd_.get(), &wake, sizeof(wake));
+    } while (result < 0 && errno == EINTR);
+    if (result != ssize_t(sizeof(wake))) abort();
+  }
+
+  CacheAsyncOperation* release_entry_operation_locked() noexcept {
+    if (entry_->async_metadata_queue_.empty()) {
+      entry_->async_metadata_inflight_ = false;
+      return nullptr;
+    }
+    CacheAsyncOperation* next = entry_->async_metadata_queue_.front();
+    entry_->async_metadata_queue_.pop_front();
+    if (!next->queued_linked_) abort();
+    next->queued_linked_ = false;
+    next->wake_queued();
+    return next;
+  }
+
+  bool reject(int error) noexcept {
+    if (accepted_) {
+      finish_error(error, "activate queued cache operation");
+      return false;
+    }
+    if (reservation_ != 0) {
+      entry_->owner_->cancel_reservation(reservation_);
+      reservation_ = 0;
+    }
+    {
+      std::unique_lock guard(entry_->mutex_);
+      (void)release_entry_operation_locked();
+    }
+    request_->implementation_ = nullptr;
+    errno = error;
+    return false;
+  }
+
+  template<class Guard>
+  bool reject_locked(Guard& guard, int error) noexcept {
+    if (accepted_) {
+      guard.unlock();
+      finish_error(error, "activate queued cache operation");
+      return false;
+    }
+    (void)release_entry_operation_locked();
+    guard.unlock();
+    request_->implementation_ = nullptr;
+    errno = error;
+    return false;
+  }
+
+  void reset_io(AsyncIoRequest::Kind kind, int fd) noexcept {
+    io_ = AsyncIoRequest{};
+    io_.kind     = kind;
+    io_.fd       = fd;
+    io_.complete = completed;
+    io_.context  = this;
+  }
+
+  bool submit_statx(int fd) noexcept {
+    memset(&status_, 0, sizeof(status_));
+    reset_io(AsyncIoRequest::STATX, fd);
+    io_.path  = "";
+    io_.data  = &status_;
+    io_.flags = AT_EMPTY_PATH;
+    io_.mask  = STATX_BLOCKS | STATX_SIZE | STATX_TYPE;
+    return submit_or_finish();
+  }
+
+  bool submit_fallocate(int fd, int mode, uint64_t offset,
+                        uint64_t length) noexcept {
+    reset_io(AsyncIoRequest::FALLOCATE, fd);
+    io_.flags        = unsigned(mode);
+    io_.input_offset = off_t(offset);
+    io_.length       = size_t(length);
+    return submit_or_finish();
+  }
+
+  bool submit_fsync(int fd, bool data_only) noexcept {
+    reset_io(AsyncIoRequest::FSYNC, fd);
+    io_.flags = data_only ? 1U : 0U;
+    return submit_or_finish();
+  }
+
+  bool submit_open_marker() noexcept {
+    reset_io(AsyncIoRequest::OPENAT, marker_parent_fd_);
+    io_.path  = marker_name_.c_str();
+    io_.flags = O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW;
+    io_.mode  = 0600;
+    return submit_or_finish();
+  }
+
+  bool submit_marker_write() noexcept {
+    reset_io(AsyncIoRequest::PWRITE, marker_fd_);
+    io_.data          = &marker_;
+    io_.length        = sizeof(marker_);
+    io_.output_offset = 0;
+    io_.exact         = true;
+    return submit_or_finish();
+  }
+
+  bool submit_marker_close() noexcept {
+    reset_io(AsyncIoRequest::CLOSE, marker_fd_);
+    return submit_or_finish();
+  }
+
+  bool submit_marker_unlink() noexcept {
+    reset_io(AsyncIoRequest::UNLINKAT, marker_parent_fd_);
+    io_.path = marker_name_.c_str();
+    return submit_or_finish();
+  }
+
+  bool submit_or_finish() noexcept {
+    if (executor_->submit(io_)) {
+      accepted_ = true;
+      return true;
+    }
+    const int error = errno == 0 ? EIO : errno;
+    if (!accepted_) return reject(error);
+    finish_error(error, "submit cache io_uring operation");
+    return false;
+  }
+
+  static void completed(void* context, ssize_t result) noexcept {
+    static_cast<CacheAsyncOperation*>(context)->advance(result);
+  }
+
+  void advance(ssize_t result) noexcept {
+    try {
+      if (phase_ == Phase::FINAL_PARENT_CLOSE) {
+        if (result < 0 && marker_parent_fd_ >= 0) {
+          ::close(marker_parent_fd_);
+        }
+        marker_parent_fd_ = -1;
+        complete_result(std::move(final_result_));
+        return;
+      }
+      if (phase_ == Phase::FINAL_MARKER_CLOSE) {
+        if (result < 0 && marker_fd_ >= 0) ::close(marker_fd_);
+        marker_fd_ = -1;
+        marker_fd_owned_ = false;
+        finish_result(std::move(final_result_));
+        return;
+      }
+      if (result < 0) {
+        const int error = int(-result);
+        if (reservation_ != 0) {
+          entry_->owner_->cancel_reservation(reservation_);
+          reservation_ = 0;
+        }
+        if (kind_ == Kind::PREPARE_READ &&
+            phase_ == Phase::RANGE_FALLOCATE &&
+            (error == ENOSPC || error == EDQUOT)) {
+          finish(false);
+          return;
+        }
+        if (phase_ == Phase::COMMIT_MARKER_UNLINK && error == ENOENT) {
+          finish(true);
+          return;
+        }
+        throw std::system_error(error, std::generic_category(),
+                                "asynchronous cache filesystem operation");
+      }
+      switch (phase_) {
+        case Phase::FINAL_PARENT_CLOSE:
+          return;
+
+        case Phase::FINAL_MARKER_CLOSE:
+          return;
+
+        case Phase::DISCARD_NO_MARKER:
+          finish(true);
+          return;
+
+        case Phase::UPDATE_META:
+          finish(true);
+          return;
+
+        case Phase::MARKER_ALREADY:
+          finish(true);
+          return;
+
+        case Phase::RANGE_STAT_BEFORE:
+          before_blocks_ = status_.stx_blocks;
+          if (reserve_ == 0) { finish(true); return; }
+          request_capacity(reserve_, CapacityAction::RANGE);
+          return;
+
+        case Phase::RANGE_FALLOCATE:
+          phase_ = Phase::RANGE_STAT_AFTER;
+          submit_statx(entry_->data_fd_);
+          return;
+
+        case Phase::RANGE_STAT_AFTER: {
+          const uint64_t after_blocks = status_.stx_blocks;
+          entry_->owner_->finish_reservation(
+              reservation_, after_blocks > before_blocks_
+                  ? (after_blocks - before_blocks_) * 512 : 0);
+          reservation_ = 0;
+          if (kind_ == Kind::PREPARE_READ) { finish(true); return; }
+          {
+            std::lock_guard guard(entry_->mutex_);
+            if (entry_->reserved_units_.size() <= current_part_) {
+              entry_->reserved_units_.resize(current_part_ + 1, 0);
+            }
+            entry_->reserved_units_[current_part_] = 1;
+          }
+          ++current_part_;
+          start_next_write_range();
+          return;
+        }
+
+        case Phase::META_STAT_BEFORE: {
+          before_blocks_ = status_.stx_blocks;
+          const uint64_t bytes = cache_round_up(
+              wanted_mapping_size_ - old_mapping_size_,
+              entry_->owner_->config_.page_size);
+          request_capacity(bytes, CapacityAction::META);
+          return;
+        }
+
+        case Phase::META_FALLOCATE:
+          phase_ = Phase::META_STAT_AFTER;
+          submit_statx(entry_->meta_fd_);
+          return;
+
+        case Phase::META_STAT_AFTER: {
+          const uint64_t after_blocks = status_.stx_blocks;
+          entry_->owner_->finish_reservation(
+              reservation_, after_blocks > before_blocks_
+                  ? (after_blocks - before_blocks_) * 512 : 0);
+          reservation_ = 0;
+          {
+            std::lock_guard guard(entry_->mutex_);
+            if (entry_->mapping_size_ != old_mapping_size_) {
+              throw std::logic_error("cache metadata mapping changed in flight");
+            }
+            void* expanded = ::mremap(entry_->mapping_, old_mapping_size_,
+                                      wanted_mapping_size_, MREMAP_MAYMOVE);
+            if (expanded == MAP_FAILED) cache_throw_errno("mremap(cache metadata)");
+            entry_->mapping_      = expanded;
+            entry_->mapping_size_ = wanted_mapping_size_;
+          }
+          start_next_write_range();
+          return;
+        }
+
+        case Phase::MARKER_OPEN:
+          marker_fd_ = int(result);
+          marker_fd_owned_ = true;
+          phase_ = Phase::MARKER_FALLOCATE;
+          submit_fallocate(marker_fd_, 0, 0, kCacheMetaHeaderSize);
+          return;
+
+        case Phase::MARKER_FALLOCATE:
+          phase_ = Phase::MARKER_WRITE;
+          submit_marker_write();
+          return;
+
+        case Phase::MARKER_WRITE:
+          phase_ = Phase::MARKER_STAT_AFTER;
+          submit_statx(marker_fd_);
+          return;
+
+        case Phase::MARKER_STAT_AFTER: {
+          entry_->owner_->finish_reservation(
+              reservation_, status_.stx_blocks * 512);
+          reservation_ = 0;
+          {
+            std::lock_guard guard(entry_->mutex_);
+            if (entry_->stale_ || entry_->epoch_ != marker_.generation_epoch) {
+              throw std::system_error(ESTALE, std::generic_category(),
+                                      "cache generation changed during write");
+            }
+            entry_->dirty_fd_ = marker_fd_;
+            marker_fd_ = -1;
+            marker_fd_owned_ = false;
+            auto& header = *static_cast<CacheMetaHeader*>(entry_->mapping_);
+            header.flags |= kCacheMetaDirty;
+            header.write_phase = 1;
+          }
+          finish(true);
+          return;
+        }
+
+        case Phase::SYNC_DATA:
+          phase_ = Phase::SYNC_META;
+          submit_fsync(entry_->meta_fd_, false);
+          return;
+
+        case Phase::SYNC_META: {
+          int dirty_fd;
+          {
+            std::lock_guard guard(entry_->mutex_);
+            dirty_fd = entry_->dirty_fd_;
+          }
+          if (dirty_fd < 0) { finish(true); return; }
+          phase_ = Phase::SYNC_MARKER;
+          submit_fsync(dirty_fd, true);
+          return;
+        }
+
+        case Phase::SYNC_MARKER:
+          finish(true);
+          return;
+
+        case Phase::COMMIT_META: {
+          std::unique_lock guard(entry_->mutex_);
+          marker_fd_ = entry_->dirty_fd_;
+          if (marker_fd_ < 0) { finish_locked(guard, true); return; }
+          guard.unlock();
+          marker_path_action_ = MarkerPathAction::REMOVE;
+          path_.start(*executor_, entry_->owner_->dirty_root_fd_,
+                      entry_->key_, false, marker_path_resolved, this,
+                      entry_->owner_->name_max_);
+          return;
+        }
+
+        case Phase::COMMIT_MARKER_STAT:
+          marker_blocks_ = status_.stx_blocks;
+          {
+            std::lock_guard guard(entry_->mutex_);
+            if (entry_->dirty_fd_ == marker_fd_) entry_->dirty_fd_ = -1;
+          }
+          marker_fd_owned_ = true;
+          phase_ = Phase::COMMIT_MARKER_CLOSE;
+          submit_marker_close();
+          return;
+
+        case Phase::COMMIT_MARKER_CLOSE:
+          marker_fd_ = -1;
+          if (!marker_named_) {
+            if (marker_blocks_ != 0) {
+              entry_->owner_->add_allocated(-int64_t(std::min<uint64_t>(
+                  marker_blocks_ * 512, INT64_MAX)));
+            }
+            finish(true);
+            return;
+          }
+          phase_ = Phase::COMMIT_MARKER_UNLINK;
+          submit_marker_unlink();
+          return;
+
+        case Phase::COMMIT_MARKER_UNLINK:
+          if (marker_blocks_ != 0) {
+            entry_->owner_->add_allocated(-int64_t(std::min<uint64_t>(
+                marker_blocks_ * 512, INT64_MAX)));
+          }
+          finish(true);
+          return;
+      }
+    } catch (...) {
+      finish(std::current_exception());
+    }
+  }
+
+  bool start_next_write_range() {
+    const uint64_t unit = entry_->owner_->config_.upload_part_size;
+    while (current_part_ <= last_part_) {
+      bool reserved;
+      {
+        std::lock_guard guard(entry_->mutex_);
+        reserved = current_part_ < entry_->reserved_units_.size() &&
+            entry_->reserved_units_[current_part_] != 0;
+      }
+      if (!reserved) {
+        start_   = uint64_t(current_part_) * unit;
+        reserve_ = unit;
+        phase_   = Phase::RANGE_STAT_BEFORE;
+        return submit_statx(entry_->data_fd_);
+      }
+      ++current_part_;
+    }
+    return start_dirty_marker();
+  }
+
+  bool start_dirty_marker() {
+    uint64_t epoch;
+    {
+      std::unique_lock guard(entry_->mutex_);
+      if (entry_->stale_) return reject_locked(guard, ESTALE);
+      if (entry_->dirty_fd_ >= 0) {
+        const int dirty_fd = entry_->dirty_fd_;
+        guard.unlock();
+        phase_ = Phase::MARKER_ALREADY;
+        return submit_statx(dirty_fd);
+      }
+      epoch = entry_->epoch_;
+    }
+    marker_ = CacheDirtyMarker{};
+    marker_.magic            = {'N', 'G', 'S', '3', 'D', 'I', 'R', 'T'};
+    marker_.version          = kCacheMetaVersion;
+    marker_.header_size      = kCacheMetaHeaderSize;
+    marker_.generation_epoch = epoch;
+    marker_.key_length       = uint32_t(entry_->key_.size());
+    memcpy(marker_.key.data(), entry_->key_.data(), entry_->key_.size());
+    return request_capacity(
+        kCacheMetaHeaderSize, CapacityAction::MARKER);
+  }
+
+  void finish_error(int error, const char* operation) noexcept {
+    try {
+      finish(std::make_exception_ptr(std::system_error(
+          error, std::generic_category(), operation)));
+    } catch (...) {
+      finish(std::current_exception());
+    }
+  }
+
+  void finish(std::exception_ptr error) noexcept {
+    if (reservation_ != 0) {
+      entry_->owner_->cancel_reservation(reservation_);
+      reservation_ = 0;
+    }
+    finish_result(CacheAsyncResult{
+        .entry = {}, .error = std::move(error), .value = false});
+  }
+
+  void finish(bool value) noexcept {
+    finish_result(CacheAsyncResult{.entry = {}, .error = {}, .value = value});
+  }
+
+  template<class Guard>
+  void finish_locked(Guard& guard, bool value) noexcept {
+    guard.unlock();
+    finish_result(CacheAsyncResult{.entry = {}, .error = {}, .value = value});
+  }
+
+  void finish_result(CacheAsyncResult result) noexcept {
+    if (marker_fd_owned_ && marker_fd_ >= 0) {
+      final_result_ = std::move(result);
+      phase_ = Phase::FINAL_MARKER_CLOSE;
+      reset_io(AsyncIoRequest::CLOSE, marker_fd_);
+      if (executor_->submit(io_)) return;
+      ::close(marker_fd_);
+      marker_fd_ = -1;
+      marker_fd_owned_ = false;
+      result = std::move(final_result_);
+    }
+    if (marker_parent_owned_ && marker_parent_fd_ >= 0) {
+      final_result_ = std::move(result);
+      const int fd = marker_parent_fd_;
+      marker_parent_owned_ = false;
+      phase_ = Phase::FINAL_PARENT_CLOSE;
+      reset_io(AsyncIoRequest::CLOSE, fd);
+      if (executor_->submit(io_)) return;
+      ::close(fd);
+      marker_parent_fd_ = -1;
+      complete_result(std::move(final_result_));
+      return;
+    }
+    complete_result(std::move(result));
+  }
+
+  void complete_result(CacheAsyncResult result) noexcept {
+    {
+      std::lock_guard guard(entry_->mutex_);
+      (void)release_entry_operation_locked();
+    }
+    deliver_result(std::move(result));
+  }
+
+  void deliver_result(CacheAsyncResult result) noexcept {
+    CacheAsyncRequest* request = request_;
+    CacheAsyncRequest::Complete callback = request->complete;
+    void* context = request->context;
+    request->implementation_ = nullptr;
+    callback(context, std::move(result));
+    delete this;
+  }
+
+  IoExecutor* executor_ = nullptr;
+  CacheAsyncRequest* request_ = nullptr;
+  CacheEntry* entry_ = nullptr;
+  AsyncIoRequest io_;
+  AsyncIoRequest wait_io_;
+  UniqueFd wait_fd_;
+  CacheCapacityOperation capacity_;
+  CachePathWalker path_;
+  Kind kind_ = Kind::PREPARE_READ;
+  Phase phase_ = Phase::RANGE_STAT_BEFORE;
+  struct statx status_{};
+  CacheDirtyMarker marker_{};
+  std::string etag_;
+  std::string identity_key_;
+  std::string version_id_;
+  std::string upload_id_;
+  std::string marker_name_;
+  uint64_t offset_ = 0;
+  uint64_t identity_size_ = 0;
+  time_t identity_mtime_ = 0;
+  size_t length_ = 0;
+  uint64_t end_ = 0;
+  uint64_t start_ = 0;
+  uint64_t reserve_ = 0;
+  uint64_t reservation_ = 0;
+  uint64_t before_blocks_ = 0;
+  uint64_t marker_blocks_ = 0;
+  uint64_t wait_value_ = 0;
+  uint64_t capacity_bytes_ = 0;
+  size_t wanted_mapping_size_ = 0;
+  size_t old_mapping_size_ = 0;
+  size_t first_part_ = 0;
+  size_t last_part_ = 0;
+  size_t current_part_ = 0;
+  int marker_fd_ = -1;
+  int marker_parent_fd_ = -1;
+  bool accepted_ = false;
+  bool queued_linked_ = false;
+  CapacityAction capacity_action_ = CapacityAction::NONE;
+  bool marker_named_ = false;
+  bool marker_fd_owned_ = false;
+  bool marker_parent_owned_ = false;
+  CacheAsyncResult final_result_;
+  MarkerPathAction marker_path_action_ = MarkerPathAction::NONE;
+};
+
+class CacheOpenOperation {
+ public:
+  CacheOpenOperation(IoExecutor& executor, CacheAsyncRequest& request,
+                     std::shared_ptr<CacheEntry> entry) noexcept
+      : executor_(&executor), request_(&request), entry_(std::move(entry)) {}
+
+  bool start() noexcept {
+    if (request_->complete == nullptr || request_->pending()) {
+      errno = EINVAL;
+      return false;
+    }
+    request_->implementation_ = this;
+    io_.kind     = AsyncIoRequest::STATX;
+    io_.fd       = entry_->data_fd();
+    io_.path     = "";
+    io_.data     = &status_;
+    io_.flags    = AT_EMPTY_PATH;
+    io_.mask     = STATX_TYPE;
+    io_.complete = completed;
+    io_.context  = this;
+    if (executor_->submit(io_)) return true;
+    request_->implementation_ = nullptr;
+    return false;
+  }
+
+ private:
+  static void completed(void* context, ssize_t result) noexcept {
+    auto* operation = static_cast<CacheOpenOperation*>(context);
+    CacheAsyncRequest* request = operation->request_;
+    CacheAsyncRequest::Complete callback = request->complete;
+    void* callback_context = request->context;
+    CacheAsyncResult cache_result;
+    if (result < 0) {
+      try {
+        cache_result.error = std::make_exception_ptr(std::system_error(
+            int(-result), std::generic_category(),
+            "statx(asynchronous cache hit)"));
+      } catch (...) {
+        cache_result.error = std::current_exception();
+      }
+    } else {
+      cache_result.entry = std::move(operation->entry_);
+      cache_result.value = true;
+    }
+    request->implementation_ = nullptr;
+    callback(callback_context, std::move(cache_result));
+    delete operation;
+  }
+
+  IoExecutor* executor_ = nullptr;
+  CacheAsyncRequest* request_ = nullptr;
+  std::shared_ptr<CacheEntry> entry_;
+  AsyncIoRequest io_;
+  struct statx status_{};
+};
+
+class CacheMarkerOperation final : private CacheKeyOperation {
+ public:
+  enum class Kind { CREATE_PENDING, COMMIT_PENDING, FINISH_PENDING };
+
+  CacheMarkerOperation(IoExecutor& executor, CacheAsyncRequest& request,
+                       LocalCache& cache, Kind kind)
+      : CacheKeyOperation(cache, executor), executor_(&executor), request_(&request),
+        cache_(&cache), kind_(kind) {}
+
+  bool start(std::string_view key, std::string_view restore_key,
+             std::string_view replacement_etag) {
+    if (request_->complete == nullptr || request_->pending()) {
+      errno = EINVAL;
+      return false;
+    }
+    if (key.empty() || key.size() > kCacheKeyCapacity ||
+        restore_key.size() > kCacheKeyCapacity ||
+        replacement_etag.size() > kCacheEtagCapacity) {
+      errno = EOVERFLOW;
+      return false;
+    }
+    key_.assign(key);
+    if (kind_ == Kind::CREATE_PENDING) {
+      marker_.magic        = {'N', 'G', 'S', '3', 'P', 'E', 'N', 'D'};
+      marker_.version      = kCacheMetaVersion;
+      marker_.header_size = kCacheMetaHeaderSize;
+      marker_.phase        = restore_key.empty() ? 2U : 1U;
+      marker_.key_length   = uint32_t(key.size());
+      marker_.restore_key_length = uint32_t(restore_key.size());
+      marker_.replacement_etag_length = uint32_t(replacement_etag.size());
+      memcpy(marker_.key.data(), key.data(), key.size());
+      memcpy(marker_.restore_key.data(), restore_key.data(), restore_key.size());
+      memcpy(marker_.replacement_etag.data(), replacement_etag.data(),
+             replacement_etag.size());
+    }
+    request_->implementation_ = this;
+    const GateResult gate = acquire_key_gate(key_);
+    if (gate == GateResult::FAILED) {
+      request_->implementation_ = nullptr;
+      return false;
+    }
+    if (gate == GateResult::QUEUED) {
+      accepted_ = true;
+      return true;
+    }
+    return activate_start();
+  }
+
+  bool activate_start() {
+    if (kind_ == Kind::CREATE_PENDING) {
+      const CacheCapacityOperation::StartResult capacity = capacity_.start(
+          *executor_, *cache_, kCacheMetaHeaderSize,
+          capacity_completed, this);
+      if (capacity == CacheCapacityOperation::StartResult::FAILED) {
+        if (accepted_) {
+          finish(marker_error(errno == 0 ? ENOSPC : errno,
+                              "reserve queued cache marker"));
+          return true;
+        }
+        return reject(errno == 0 ? ENOSPC : errno);
+      }
+      if (capacity == CacheCapacityOperation::StartResult::PENDING) {
+        accepted_ = true;
+        return true;
+      }
+      reservation_ = kCacheMetaHeaderSize;
+      return start_create_path();
+    }
+    if (kind_ == Kind::COMMIT_PENDING) {
+      return path_.start(*executor_, cache_->pending_root_fd_, key_, false,
+                         path_resolved, this, cache_->name_max_);
+    }
+    return path_.start(*executor_, cache_->pending_root_fd_, key_, false,
+                       path_resolved, this, cache_->name_max_);
+  }
+
+  void abandon_start() noexcept {
+    if (reservation_ != 0) {
+      cache_->cancel_reservation(reservation_);
+      reservation_ = 0;
+    }
+    abandon_key_gate();
+    if (request_->implementation_ == this) request_->implementation_ = nullptr;
+  }
+
+ private:
+  void activate_key_gate() noexcept override {
+    try {
+      (void)activate_start();
+    } catch (...) {
+      finish(std::current_exception());
+    }
+  }
+
+  void key_gate_failed(std::exception_ptr error) noexcept override {
+    finish(std::move(error));
+  }
+  enum class Phase {
+    CREATE_OPEN, CREATE_FALLOCATE, CREATE_WRITE, CREATE_STAT, CREATE_FSYNC,
+    CREATE_CLOSE, COMMIT_OPEN, COMMIT_WRITE, COMMIT_FSYNC, COMMIT_CLOSE,
+    FINISH_STAT, FINISH_UNLINK, FAIL_CLOSE, FINAL_PARENT_CLOSE,
+  };
+
+  static void capacity_completed(void* context,
+                                 std::exception_ptr error) noexcept {
+    auto* operation = static_cast<CacheMarkerOperation*>(context);
+    if (error) {
+      operation->finish(std::move(error));
+      return;
+    }
+    operation->reservation_ = kCacheMetaHeaderSize;
+    if (!operation->start_create_path()) {
+      operation->finish(marker_error(
+          errno == 0 ? EIO : errno, "resolve cache marker path"));
+    }
+  }
+
+  bool start_create_path() noexcept {
+    return path_.start(*executor_, cache_->pending_root_fd_, key_, true,
+                       path_resolved, this, cache_->name_max_);
+  }
+
+  static void path_resolved(void* context, bool exists, int parent_fd,
+                            bool parent_owned, std::string leaf,
+                            std::exception_ptr error) noexcept {
+    auto* operation = static_cast<CacheMarkerOperation*>(context);
+    if (error) { operation->finish(std::move(error)); return; }
+    operation->parent_fd_ = parent_fd;
+    operation->parent_owned_ = parent_owned;
+    operation->name_ = std::move(leaf);
+    if (operation->kind_ == Kind::CREATE_PENDING) {
+      operation->phase_ = Phase::CREATE_OPEN;
+      operation->submit_open(
+          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW);
+      return;
+    }
+    if (!exists) {
+      if (operation->kind_ == Kind::FINISH_PENDING) operation->finish(true);
+      else operation->finish(marker_error(
+          ENOENT, "cache pending-delete marker"));
+      return;
+    }
+    if (operation->kind_ == Kind::COMMIT_PENDING) {
+      operation->phase_ = Phase::COMMIT_OPEN;
+      operation->submit_open(O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+      return;
+    }
+    operation->phase_ = Phase::FINISH_STAT;
+    operation->submit_stat_path();
+  }
+
+  static std::exception_ptr marker_error(int error, const char* what) noexcept {
+    try {
+      return std::make_exception_ptr(std::system_error(
+          error, std::generic_category(), what));
+    } catch (...) {
+      return std::current_exception();
+    }
+  }
+
+  void reset_io(AsyncIoRequest::Kind kind, int fd) noexcept {
+    io_ = AsyncIoRequest{};
+    io_.kind = kind;
+    io_.fd = fd;
+    io_.complete = completed;
+    io_.context = this;
+  }
+
+  bool submit_open(unsigned flags) noexcept {
+    reset_io(AsyncIoRequest::OPENAT, parent_fd_);
+    io_.path = name_.c_str();
+    io_.flags = flags;
+    io_.mode = 0600;
+    return submit();
+  }
+
+  bool submit_fallocate() noexcept {
+    reset_io(AsyncIoRequest::FALLOCATE, fd_);
+    io_.input_offset = 0;
+    io_.length = kCacheMetaHeaderSize;
+    return submit();
+  }
+
+  bool submit_write(const void* data, size_t length, off_t offset) noexcept {
+    reset_io(AsyncIoRequest::PWRITE, fd_);
+    io_.data = const_cast<void*>(data);
+    io_.length = length;
+    io_.output_offset = offset;
+    io_.exact = true;
+    return submit();
+  }
+
+  bool submit_stat_fd() noexcept {
+    memset(&status_, 0, sizeof(status_));
+    reset_io(AsyncIoRequest::STATX, fd_);
+    io_.path = "";
+    io_.data = &status_;
+    io_.flags = AT_EMPTY_PATH;
+    io_.mask = STATX_BLOCKS | STATX_TYPE;
+    return submit();
+  }
+
+  bool submit_stat_path() noexcept {
+    memset(&status_, 0, sizeof(status_));
+    reset_io(AsyncIoRequest::STATX, parent_fd_);
+    io_.path = name_.c_str();
+    io_.data = &status_;
+    io_.flags = AT_SYMLINK_NOFOLLOW;
+    io_.mask = STATX_BLOCKS | STATX_TYPE;
+    return submit();
+  }
+
+  bool submit_fsync() noexcept {
+    reset_io(AsyncIoRequest::FSYNC, fd_);
+    return submit();
+  }
+
+  bool submit_close() noexcept {
+    reset_io(AsyncIoRequest::CLOSE, fd_);
+    return submit();
+  }
+
+  bool submit_unlink() noexcept {
+    reset_io(AsyncIoRequest::UNLINKAT, parent_fd_);
+    io_.path = name_.c_str();
+    return submit();
+  }
+
+  bool submit() noexcept {
+    if (executor_->submit(io_)) {
+      accepted_ = true;
+      return true;
+    }
+    const int error = errno == 0 ? EIO : errno;
+    if (!accepted_) return reject(error);
+    fail(error, "submit pending-delete cache operation");
+    return false;
+  }
+
+  bool reject(int error) noexcept {
+    abandon_start();
+    errno = error;
+    return false;
+  }
+
+  static void completed(void* context, ssize_t result) noexcept {
+    static_cast<CacheMarkerOperation*>(context)->advance(result);
+  }
+
+  void advance(ssize_t result) noexcept {
+    try {
+      if (phase_ == Phase::FINAL_PARENT_CLOSE) {
+        if (result < 0 && parent_fd_ >= 0) ::close(parent_fd_);
+        parent_fd_ = -1;
+        complete_now(std::move(final_result_));
+        return;
+      }
+      if (phase_ == Phase::FAIL_CLOSE) {
+        if (result < 0 && fd_ >= 0) ::close(fd_);
+        fd_ = -1;
+        finish(failure_);
+        return;
+      }
+      if (result < 0) {
+        const int error = int(-result);
+        if (phase_ == Phase::FINISH_STAT && error == ENOENT) {
+          finish(true);
+          return;
+        }
+        fail(error, "asynchronous pending-delete cache operation");
+        return;
+      }
+      switch (phase_) {
+        case Phase::FINAL_PARENT_CLOSE:
+          return;
+        case Phase::CREATE_OPEN:
+          fd_ = int(result);
+          phase_ = Phase::CREATE_FALLOCATE;
+          submit_fallocate();
+          return;
+        case Phase::CREATE_FALLOCATE:
+          phase_ = Phase::CREATE_WRITE;
+          submit_write(&marker_, sizeof(marker_), 0);
+          return;
+        case Phase::CREATE_WRITE:
+          phase_ = Phase::CREATE_STAT;
+          submit_stat_fd();
+          return;
+        case Phase::CREATE_STAT:
+          cache_->finish_reservation(
+              reservation_, status_.stx_blocks * 512);
+          reservation_ = 0;
+          phase_ = Phase::CREATE_FSYNC;
+          submit_fsync();
+          return;
+        case Phase::CREATE_FSYNC:
+          phase_ = Phase::CREATE_CLOSE;
+          submit_close();
+          return;
+        case Phase::CREATE_CLOSE:
+          fd_ = -1;
+          finish(true);
+          return;
+        case Phase::COMMIT_OPEN:
+          fd_ = int(result);
+          phase_ = Phase::COMMIT_WRITE;
+          submit_write(&committed_phase_, sizeof(committed_phase_),
+                       off_t(offsetof(CachePendingDeleteMarker, phase)));
+          return;
+        case Phase::COMMIT_WRITE:
+          phase_ = Phase::COMMIT_FSYNC;
+          submit_fsync();
+          return;
+        case Phase::COMMIT_FSYNC:
+          phase_ = Phase::COMMIT_CLOSE;
+          submit_close();
+          return;
+        case Phase::COMMIT_CLOSE:
+          fd_ = -1;
+          finish(true);
+          return;
+        case Phase::FINISH_STAT:
+          blocks_ = status_.stx_blocks;
+          phase_ = Phase::FINISH_UNLINK;
+          submit_unlink();
+          return;
+        case Phase::FINISH_UNLINK:
+          if (blocks_ != 0) {
+            cache_->add_allocated(-int64_t(std::min<uint64_t>(
+                blocks_ * 512, INT64_MAX)));
+          }
+          finish(true);
+          return;
+        case Phase::FAIL_CLOSE:
+          return;
+      }
+    } catch (...) {
+      finish(std::current_exception());
+    }
+  }
+
+  void fail(int error, const char* what) noexcept {
+    try {
+      failure_ = std::make_exception_ptr(std::system_error(
+          error, std::generic_category(), what));
+    } catch (...) {
+      failure_ = std::current_exception();
+    }
+    if (reservation_ != 0) {
+      cache_->cancel_reservation(reservation_);
+      reservation_ = 0;
+    }
+    if (fd_ >= 0 && phase_ != Phase::FAIL_CLOSE) {
+      phase_ = Phase::FAIL_CLOSE;
+      if (executor_->submit((reset_close(), io_))) return;
+      ::close(fd_);
+      fd_ = -1;
+    }
+    finish(failure_);
+  }
+
+  AsyncIoRequest& reset_close() noexcept {
+    reset_io(AsyncIoRequest::CLOSE, fd_);
+    return io_;
+  }
+
+  void finish(bool value) noexcept {
+    finish(CacheAsyncResult{.entry = {}, .error = {}, .value = value});
+  }
+
+  void finish(std::exception_ptr error) noexcept {
+    finish(CacheAsyncResult{
+        .entry = {}, .error = std::move(error), .value = false});
+  }
+
+  void finish(CacheAsyncResult result) noexcept {
+    if (reservation_ != 0) {
+      cache_->cancel_reservation(reservation_);
+      reservation_ = 0;
+    }
+    if (parent_owned_ && parent_fd_ >= 0) {
+      final_result_ = std::move(result);
+      const int fd = parent_fd_;
+      parent_owned_ = false;
+      phase_ = Phase::FINAL_PARENT_CLOSE;
+      reset_io(AsyncIoRequest::CLOSE, fd);
+      if (executor_->submit(io_)) return;
+      ::close(fd);
+      parent_fd_ = -1;
+      complete_now(std::move(final_result_));
+      return;
+    }
+    complete_now(std::move(result));
+  }
+
+  void complete_now(CacheAsyncResult result) noexcept {
+    release_key_gate();
+    CacheAsyncRequest* request = request_;
+    CacheAsyncRequest::Complete callback = request->complete;
+    void* context = request->context;
+    request->implementation_ = nullptr;
+    callback(context, std::move(result));
+    delete this;
+  }
+
+  IoExecutor* executor_ = nullptr;
+  CacheAsyncRequest* request_ = nullptr;
+  LocalCache* cache_ = nullptr;
+  Kind kind_ = Kind::CREATE_PENDING;
+  Phase phase_ = Phase::CREATE_OPEN;
+  AsyncIoRequest io_;
+  CacheCapacityOperation capacity_;
+  CachePathWalker path_;
+  CachePendingDeleteMarker marker_{};
+  struct statx status_{};
+  std::exception_ptr failure_;
+  std::string key_;
+  std::string name_;
+  uint64_t reservation_ = 0;
+  uint64_t blocks_ = 0;
+  int fd_ = -1;
+  int parent_fd_ = -1;
+  uint32_t committed_phase_ = 2;
+  bool accepted_ = false;
+  bool parent_owned_ = false;
+  CacheAsyncResult final_result_;
+};
+
+class CacheFileOperation final : private CacheKeyOperation {
+ public:
+  enum class Kind { OPEN, CREATE_WRITER };
+
+  CacheFileOperation(IoExecutor& executor, CacheAsyncRequest& request,
+                     LocalCache& cache, Kind kind)
+      : CacheKeyOperation(cache, executor), executor_(&executor), request_(&request),
+        cache_(&cache), kind_(kind) {}
+
+  bool start(const CacheIdentity& identity, uint64_t maximum_size,
+             bool wait_for_key = true, bool require_absent = false) {
+    if (request_->complete == nullptr || request_->pending()) {
+      errno = EINVAL;
+      return false;
+    }
+    if (identity.key.size() > kCacheKeyCapacity ||
+        identity.etag.size() > kCacheEtagCapacity ||
+        identity.version_id.size() > kCacheVersionCapacity ||
+        (kind_ == Kind::CREATE_WRITER && maximum_size == 0)) {
+      errno = EOVERFLOW;
+      return false;
+    }
+    key_.assign(identity.key);
+    etag_.assign(identity.etag);
+    version_id_.assign(identity.version_id);
+    object_size_ = kind_ == Kind::CREATE_WRITER ? 0 : identity.size;
+    mtime_ = kind_ == Kind::CREATE_WRITER ? 0 : identity.mtime;
+    maximum_size_ = maximum_size;
+    mapping_size_ = kind_ == Kind::CREATE_WRITER
+        ? kCacheMetaHeaderSize
+        : cache_mapping_size(object_size_, kCacheBitmapUnit);
+    request_->implementation_ = this;
+    const GateResult gate = acquire_key_gate(key_, {}, wait_for_key);
+    if (gate == GateResult::FAILED) {
+      request_->implementation_ = nullptr;
+      return false;
+    }
+    if (gate == GateResult::QUEUED) {
+      accepted_ = true;
+      return true;
+    }
+    if (require_absent) {
+      bool present = false;
+      {
+        std::lock_guard guard(cache_->mutex_);
+        for (const auto& weak : cache_->entries_) {
+          std::shared_ptr<CacheEntry> entry = weak.lock();
+          if (entry && entry->key_ == key_) {
+            present = true;
+            break;
+          }
+        }
+      }
+      if (present) {
+        abandon_key_gate();
+        request_->implementation_ = nullptr;
+        errno = EBUSY;
+        return false;
+      }
+    }
+    return inspect_registry();
+  }
+
+  void abandon_start() noexcept {
+    if (reservation_ != 0) {
+      cache_->cancel_reservation(reservation_);
+      reservation_ = 0;
+    }
+    abandon_key_gate();
+    if (request_->implementation_ == this) request_->implementation_ = nullptr;
+  }
+
+ private:
+  void activate_key_gate() noexcept override {
+    try {
+      (void)inspect_registry();
+    } catch (...) {
+      fail(std::current_exception());
+    }
+  }
+
+
+  void key_gate_failed(std::exception_ptr error) noexcept override {
+    fail(std::move(error));
+  }
+  enum class Phase {
+    HIT_STAT, RETIRE_WAIT,
+    OPEN_DATA, OPEN_META, META_STAT, EXISTING_HEADER_READ,
+    EXISTING_POPULATE, DATA_STAT, RECOVERY_STAT_BEFORE,
+    RECOVERY_PUNCH, RECOVERY_STAT_AFTER,
+    RECREATE_DATA_UNLINK, RECREATE_DATA_CLOSE, RECREATE_DATA_OPEN,
+    TRUNCATE_DATA, TRUNCATE_META, TRUNCATED_META_STAT,
+    TRUNCATED_DATA_STAT, ALLOCATE_META, ALLOCATED_META_STAT,
+    ALLOCATED_DATA_STAT, NEW_POPULATE,
+    FAIL_CLOSE_META, FAIL_CLOSE_DATA, FAIL_CLOSE_META_PARENT,
+    FAIL_CLOSE_DATA_PARENT, FINAL_CLOSE_META_PARENT,
+    FINAL_CLOSE_DATA_PARENT,
+  };
+
+  CacheIdentity identity() const noexcept {
+    return CacheIdentity{
+        .key = key_, .etag = etag_, .version_id = version_id_,
+        .size = object_size_, .mtime = mtime_};
+  }
+
+  static void capacity_completed(void* context,
+                                 std::exception_ptr error) noexcept {
+    auto* operation = static_cast<CacheFileOperation*>(context);
+    if (error) {
+      operation->finish(std::move(error));
+      return;
+    }
+    operation->reservation_ = operation->capacity_bytes_;
+    operation->start_metadata_allocation();
+  }
+
+  void start_metadata_allocation() noexcept {
+    phase_ = Phase::ALLOCATE_META;
+    submit_fallocate(meta_fd_, mapping_size_);
+  }
+
+  bool inspect_registry() {
+    std::shared_ptr<CacheEntry> pending;
+    std::vector<std::shared_ptr<CacheEntry>> released;
+    {
+      std::unique_lock guard(cache_->mutex_);
+      for (auto i = cache_->entries_.begin(); i != cache_->entries_.end();) {
+        std::shared_ptr<CacheEntry> entry = i->lock();
+        if (!entry) {
+          i = cache_->entries_.erase(i);
+          continue;
+        }
+        if (entry->key_ != key_) {
+          ++i;
+          continue;
+        }
+        bool matches = false;
+        bool busy = false;
+        {
+          std::lock_guard entry_guard(entry->mutex_);
+          const auto& header =
+              *static_cast<const CacheMetaHeader*>(entry->mapping_);
+          matches = kind_ == Kind::OPEN && !entry->detached_ &&
+              !entry->stale_ &&
+              cache_identity_matches(header, identity(), kCacheBitmapUnit);
+          if (matches) {
+            cache_->retain_entry_locked(entry, released);
+          } else {
+            cache_->release_keepalive_locked(entry.get(), released);
+            entry->stale_ = true;
+            entry->notify_waiters_locked();
+            busy = !entry->active_claims_.empty() ||
+                entry->checksum_ops_ != 0 || entry->pinned_regions_ != 0 ||
+                entry->async_metadata_inflight_;
+          }
+        }
+        if (matches) {
+          hit_ = std::move(entry);
+          guard.unlock();
+          phase_ = Phase::HIT_STAT;
+          return submit_statx_fd(hit_->data_fd());
+        }
+        if (busy) {
+          pending = std::move(entry);
+          break;
+        }
+        i = cache_->entries_.erase(i);
+      }
+    }
+    if (pending) {
+      retiring_ = std::move(pending);
+      const int fd = retiring_->begin_retire_wait();
+      if (fd >= 0) {
+        phase_ = Phase::RETIRE_WAIT;
+        notification_ = 0;
+        reset_io(AsyncIoRequest::READ, fd);
+        io_.data = &notification_;
+        io_.length = sizeof(notification_);
+        return submit();
+      }
+      retiring_.reset();
+      return inspect_registry();
+    }
+    resolving_data_ = true;
+    return path_.start(*executor_, cache_->data_root_fd_, key_, true,
+                       path_resolved, this, cache_->name_max_);
+  }
+
+  static void path_resolved(void* context, bool, int parent_fd,
+                            bool parent_owned, std::string leaf,
+                            std::exception_ptr error) noexcept {
+    auto* operation = static_cast<CacheFileOperation*>(context);
+    if (error) { operation->fail(std::move(error)); return; }
+    if (operation->resolving_data_) {
+      operation->resolving_data_ = false;
+      operation->data_parent_fd_ = parent_fd;
+      operation->data_parent_owned_ = parent_owned;
+      operation->data_name_ = std::move(leaf);
+      operation->phase_ = Phase::OPEN_DATA;
+      operation->submit_open(operation->data_parent_fd_,
+                             operation->data_name_,
+                             O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW);
+      return;
+    }
+    operation->meta_parent_fd_ = parent_fd;
+    operation->meta_parent_owned_ = parent_owned;
+    operation->meta_name_ = std::move(leaf);
+    operation->phase_ = Phase::OPEN_META;
+    operation->submit_open(operation->meta_parent_fd_,
+                           operation->meta_name_,
+                           O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW);
+  }
+
+  void reset_io(AsyncIoRequest::Kind kind, int fd) noexcept {
+    io_ = AsyncIoRequest{};
+    io_.kind = kind;
+    io_.fd = fd;
+    io_.complete = completed;
+    io_.context = this;
+  }
+
+  bool submit_open(int parent, const std::string& name,
+                   unsigned flags) noexcept {
+    reset_io(AsyncIoRequest::OPENAT, parent);
+    io_.path = name.c_str();
+    io_.flags = flags;
+    io_.mode = 0600;
+    return submit();
+  }
+
+  bool submit_statx_fd(int fd) noexcept {
+    memset(&status_, 0, sizeof(status_));
+    reset_io(AsyncIoRequest::STATX, fd);
+    io_.path = "";
+    io_.data = &status_;
+    io_.flags = AT_EMPTY_PATH;
+    io_.mask = STATX_BLOCKS | STATX_SIZE | STATX_TYPE;
+    return submit();
+  }
+
+  bool submit_existing_header() noexcept {
+    memset(&existing_header_, 0, sizeof(existing_header_));
+    reset_io(AsyncIoRequest::PREAD, meta_fd_);
+    io_.data = &existing_header_;
+    io_.length = sizeof(existing_header_);
+    io_.input_offset = 0;
+    io_.exact = true;
+    return submit();
+  }
+
+  bool submit_truncate(int fd, uint64_t length) noexcept {
+    reset_io(AsyncIoRequest::FTRUNCATE, fd);
+    io_.length = size_t(length);
+    return submit();
+  }
+
+  bool submit_fallocate(int fd, uint64_t length) noexcept {
+    reset_io(AsyncIoRequest::FALLOCATE, fd);
+    io_.input_offset = 0;
+    io_.length = size_t(length);
+    return submit();
+  }
+
+  bool submit_recovery_punch() noexcept {
+    reset_io(AsyncIoRequest::FALLOCATE, data_fd_);
+    io_.flags = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+    io_.input_offset = off_t(recovery_offsets_[recovery_index_]);
+    io_.length = cache_->config_.block_size;
+    return submit();
+  }
+
+  bool submit_madvise(int advice) noexcept {
+    reset_io(AsyncIoRequest::MADVISE, -1);
+    io_.data = mapping_;
+    io_.length = mapping_size_;
+    io_.flags = unsigned(advice);
+    return submit();
+  }
+
+  bool submit_close(int fd) noexcept {
+    reset_io(AsyncIoRequest::CLOSE, fd);
+    return submit();
+  }
+
+  bool submit_unlink_data() noexcept {
+    reset_io(AsyncIoRequest::UNLINKAT, data_parent_fd_);
+    io_.path = data_name_.c_str();
+    return submit();
+  }
+
+  bool submit() noexcept {
+    if (executor_->submit(io_)) {
+      accepted_ = true;
+      return true;
+    }
+    const int error = errno == 0 ? EIO : errno;
+    if (!accepted_) return reject(error);
+    fail(std::make_exception_ptr(std::system_error(
+        error, std::generic_category(), "submit asynchronous cache file operation")));
+    return false;
+  }
+
+  bool reject(int error) noexcept {
+    abandon_start();
+    errno = error;
+    return false;
+  }
+
+  static void completed(void* context, ssize_t result) noexcept {
+    static_cast<CacheFileOperation*>(context)->advance(result);
+  }
+
+  void advance(ssize_t result) noexcept {
+    try {
+      if (result < 0 && is_cleanup_phase()) {
+        cleanup_failed_close();
+        return;
+      }
+      if (result < 0 && recovery_phase()) {
+        if (result == -ECANCELED) {
+          throw std::system_error(ECANCELED, std::generic_category(),
+                                  "cancel cache recovery punch");
+        }
+        ++recovery_index_;
+        start_next_recovery_punch();
+        return;
+      }
+      if (result < 0) {
+        throw std::system_error(int(-result), std::generic_category(),
+                                "asynchronous cache file operation");
+      }
+      switch (phase_) {
+        case Phase::HIT_STAT:
+          finish(CacheAsyncResult{
+              .entry = std::move(hit_), .error = {}, .value = true});
+          return;
+
+        case Phase::RETIRE_WAIT:
+          retiring_->end_async_wait();
+          retiring_.reset();
+          inspect_registry();
+          return;
+
+        case Phase::OPEN_DATA:
+          data_fd_ = int(result);
+          path_ = CachePathWalker{};
+          path_.start(*executor_, cache_->objects_root_fd_, key_, true,
+                      path_resolved, this, cache_->name_max_);
+          return;
+
+        case Phase::OPEN_META:
+          meta_fd_ = int(result);
+          if (::flock(meta_fd_, LOCK_EX | LOCK_NB) != 0) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+              fail(std::make_exception_ptr(CacheRetirementPending{}));
+              return;
+            }
+            cache_throw_errno("flock(asynchronous cache metadata)");
+          }
+          metadata_locked_ = true;
+          phase_ = Phase::META_STAT;
+          submit_statx_fd(meta_fd_);
+          return;
+
+        case Phase::META_STAT:
+          old_meta_blocks_ = status_.stx_blocks;
+          existing_mapping_size_ = size_t(status_.stx_size);
+          if (existing_mapping_size_ >= mapping_size_) {
+            mapping_size_ = existing_mapping_size_;
+            mapping_ = ::mmap(nullptr, mapping_size_, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, meta_fd_, 0);
+            if (mapping_ == MAP_FAILED) {
+              mapping_ = nullptr;
+              cache_throw_errno("mmap(asynchronous cache metadata)");
+            }
+            phase_ = Phase::EXISTING_POPULATE;
+            submit_madvise(MADV_POPULATE_READ);
+            return;
+          }
+          reset_ = true;
+          if (existing_mapping_size_ >= sizeof(CacheMetaHeader)) {
+            phase_ = Phase::EXISTING_HEADER_READ;
+            submit_existing_header();
+            return;
+          }
+          phase_ = Phase::DATA_STAT;
+          submit_statx_fd(data_fd_);
+          return;
+
+        case Phase::EXISTING_HEADER_READ: {
+          constexpr std::array<char, 8> magic{
+              'N', 'G', 'S', '3', 'C', 'A', 'C', 'H'};
+          existing_exported_ = result == ssize_t(sizeof(existing_header_)) &&
+              existing_header_.magic == magic &&
+              existing_header_.version == kCacheMetaVersion &&
+              (existing_header_.flags & kCacheMetaExported) != 0;
+          phase_ = Phase::DATA_STAT;
+          submit_statx_fd(data_fd_);
+          return;
+        }
+
+        case Phase::EXISTING_POPULATE: {
+          auto& header = *static_cast<CacheMetaHeader*>(mapping_);
+          existing_exported_ = (header.flags & kCacheMetaExported) != 0;
+          reset_ = kind_ == Kind::CREATE_WRITER ||
+              !cache_identity_matches(header, identity(), kCacheBitmapUnit);
+          phase_ = Phase::DATA_STAT;
+          submit_statx_fd(data_fd_);
+          return;
+        }
+
+        case Phase::DATA_STAT:
+          old_data_blocks_ = status_.stx_blocks;
+          if (kind_ == Kind::OPEN && status_.stx_size != object_size_) reset_ = true;
+          if (!reset_) {
+            begin_recovery_punches();
+            return;
+          }
+          if (mapping_ != nullptr) {
+            ::munmap(mapping_, mapping_size_);
+            mapping_ = nullptr;
+          }
+          mapping_size_ = kind_ == Kind::CREATE_WRITER
+              ? kCacheMetaHeaderSize
+              : cache_mapping_size(object_size_, kCacheBitmapUnit);
+          allocation_tracking_ = true;
+          if (existing_exported_) {
+            phase_ = Phase::RECREATE_DATA_UNLINK;
+            submit_unlink_data();
+            return;
+          }
+          phase_ = Phase::TRUNCATE_DATA;
+          submit_truncate(data_fd_, object_size_);
+          return;
+
+        case Phase::RECREATE_DATA_UNLINK:
+          cache_->add_allocated(-int64_t(std::min<uint64_t>(
+              old_data_blocks_ * 512, INT64_MAX)));
+          old_data_blocks_ = 0;
+          ignore_data_fd_allocation_ = true;
+          phase_ = Phase::RECREATE_DATA_CLOSE;
+          submit_close(data_fd_);
+          return;
+
+        case Phase::RECREATE_DATA_CLOSE:
+          data_fd_ = -1;
+          phase_ = Phase::RECREATE_DATA_OPEN;
+          submit_open(data_parent_fd_, data_name_,
+                      O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW);
+          return;
+
+        case Phase::RECREATE_DATA_OPEN:
+          data_fd_ = int(result);
+          ignore_data_fd_allocation_ = false;
+          phase_ = Phase::TRUNCATE_DATA;
+          submit_truncate(data_fd_, object_size_);
+          return;
+
+        case Phase::TRUNCATE_DATA:
+          phase_ = Phase::TRUNCATE_META;
+          submit_truncate(meta_fd_, mapping_size_);
+          return;
+
+        case Phase::TRUNCATE_META:
+          phase_ = Phase::TRUNCATED_META_STAT;
+          submit_statx_fd(meta_fd_);
+          return;
+
+        case Phase::TRUNCATED_META_STAT:
+          new_meta_blocks_ = status_.stx_blocks;
+          phase_ = Phase::TRUNCATED_DATA_STAT;
+          submit_statx_fd(data_fd_);
+          return;
+
+        case Phase::TRUNCATED_DATA_STAT: {
+          reconcile_truncated_allocation(
+              new_meta_blocks_, status_.stx_blocks);
+          const uint64_t reserve =
+              cache_round_up(mapping_size_, cache_->config_.page_size);
+          capacity_bytes_ = reserve;
+          const CacheCapacityOperation::StartResult capacity = capacity_.start(
+              *executor_, *cache_, reserve, capacity_completed, this);
+          if (capacity == CacheCapacityOperation::StartResult::FAILED) {
+            throw std::system_error(
+                errno == 0 ? ENOSPC : errno, std::generic_category(),
+                "reserve asynchronous cache metadata");
+          }
+          if (capacity == CacheCapacityOperation::StartResult::RESERVED) {
+            reservation_ = reserve;
+            start_metadata_allocation();
+          }
+          return;
+        }
+
+        case Phase::ALLOCATE_META:
+          phase_ = Phase::ALLOCATED_META_STAT;
+          submit_statx_fd(meta_fd_);
+          return;
+
+        case Phase::ALLOCATED_META_STAT:
+          new_meta_blocks_ = status_.stx_blocks;
+          phase_ = Phase::ALLOCATED_DATA_STAT;
+          submit_statx_fd(data_fd_);
+          return;
+
+        case Phase::ALLOCATED_DATA_STAT: {
+          const uint64_t new_data_blocks = status_.stx_blocks;
+          reconcile_allocation(new_meta_blocks_, new_data_blocks);
+          mapping_ = ::mmap(nullptr, mapping_size_, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, meta_fd_, 0);
+          if (mapping_ == MAP_FAILED) {
+            mapping_ = nullptr;
+            cache_throw_errno("mmap(new asynchronous cache metadata)");
+          }
+          phase_ = Phase::NEW_POPULATE;
+          submit_madvise(MADV_POPULATE_WRITE);
+          return;
+        }
+
+        case Phase::NEW_POPULATE: {
+          memset(mapping_, 0, mapping_size_);
+          CacheRootHeader& superblock =
+              *static_cast<CacheRootHeader*>(cache_->superblock_mapping_);
+          std::atomic_ref<uint64_t> next_epoch(superblock.next_epoch);
+          const uint64_t epoch =
+              next_epoch.fetch_add(1, std::memory_order_relaxed);
+          cache_initialize_header(
+              *static_cast<CacheMetaHeader*>(mapping_), identity(),
+              kCacheBitmapUnit, epoch);
+          if (kind_ == Kind::CREATE_WRITER) {
+            auto& header = *static_cast<CacheMetaHeader*>(mapping_);
+            cache_initialize_write_id(header);
+            header.upload_part_size   = cache_->config_.upload_part_size;
+            header.checksum_algorithm = cache_->config_.checksum_algorithm;
+          }
+          publish_entry();
+          return;
+        }
+
+        case Phase::RECOVERY_STAT_BEFORE:
+          recovery_before_blocks_ = status_.stx_blocks;
+          phase_ = Phase::RECOVERY_PUNCH;
+          submit_recovery_punch();
+          return;
+
+        case Phase::RECOVERY_PUNCH:
+          phase_ = Phase::RECOVERY_STAT_AFTER;
+          submit_statx_fd(data_fd_);
+          return;
+
+        case Phase::RECOVERY_STAT_AFTER:
+          if (recovery_before_blocks_ > status_.stx_blocks) {
+            cache_->add_allocated(-int64_t(std::min<uint64_t>(
+                (recovery_before_blocks_ - status_.stx_blocks) * 512,
+                INT64_MAX)));
+          }
+          ++recovery_index_;
+          start_next_recovery_punch();
+          return;
+
+        case Phase::FAIL_CLOSE_META:
+          meta_fd_ = -1;
+          continue_failure_cleanup();
+          return;
+
+        case Phase::FAIL_CLOSE_DATA:
+          data_fd_ = -1;
+          continue_failure_cleanup();
+          return;
+
+        case Phase::FAIL_CLOSE_META_PARENT:
+          meta_parent_fd_ = -1;
+          continue_failure_cleanup();
+          return;
+
+        case Phase::FAIL_CLOSE_DATA_PARENT:
+          data_parent_fd_ = -1;
+          complete_now(CacheAsyncResult{
+              .entry = {}, .error = failure_, .value = false});
+          return;
+
+        case Phase::FINAL_CLOSE_META_PARENT:
+          meta_parent_fd_ = -1;
+          continue_final_cleanup();
+          return;
+
+        case Phase::FINAL_CLOSE_DATA_PARENT:
+          data_parent_fd_ = -1;
+          complete_now(std::move(final_result_));
+          return;
+      }
+    } catch (...) {
+      fail(std::current_exception());
+    }
+  }
+
+  void publish_entry() {
+    auto entry = std::shared_ptr<CacheEntry>(new CacheEntry(
+        *cache_, key_, data_fd_, meta_fd_, -1, mapping_, mapping_size_,
+        object_size_, false));
+    if (kind_ == Kind::CREATE_WRITER) entry->disable_eviction();
+    data_fd_ = -1;
+    meta_fd_ = -1;
+    mapping_ = nullptr;
+    if (metadata_locked_) {
+      ::flock(entry->meta_fd_, LOCK_UN);
+      metadata_locked_ = false;
+    }
+    std::vector<std::shared_ptr<CacheEntry>> released;
+    {
+      std::lock_guard guard(cache_->mutex_);
+      cache_->entries_.push_back(entry);
+      if (kind_ == Kind::OPEN) {
+        std::lock_guard entry_guard(entry->mutex_);
+        cache_->retain_entry_locked(entry, released);
+      }
+    }
+    finish(CacheAsyncResult{
+        .entry = std::move(entry), .error = {}, .value = true});
+  }
+
+  bool recovery_phase() const noexcept {
+    return phase_ == Phase::RECOVERY_STAT_BEFORE ||
+        phase_ == Phase::RECOVERY_PUNCH ||
+        phase_ == Phase::RECOVERY_STAT_AFTER;
+  }
+
+  void begin_recovery_punches() {
+    const auto& header = *static_cast<const CacheMetaHeader*>(mapping_);
+    if ((header.flags & kCacheMetaExported) == 0 && object_size_ != 0) {
+      const auto* words = reinterpret_cast<const uint64_t*>(
+          static_cast<const char*>(mapping_) + kCacheMetaHeaderSize);
+      const size_t pages = size_t((object_size_ - 1) / kCacheBitmapUnit + 1);
+      const size_t blocks = size_t(
+          (object_size_ - 1) / cache_->config_.block_size + 1);
+      for (size_t block = 0; block < blocks; ++block) {
+        const uint64_t offset = uint64_t(block) * cache_->config_.block_size;
+        const size_t first = size_t(offset / kCacheBitmapUnit);
+        const size_t last = std::min(
+            pages, first + cache_->config_.block_size / kCacheBitmapUnit);
+        bool had_pending = false;
+        bool all_missing = true;
+        for (size_t page = first; page < last; ++page) {
+          const unsigned shift = unsigned(page % 32) * 2;
+          const CachePageState state = CachePageState(
+              (words[page / 32] >> shift) & 3);
+          had_pending |= state == CACHE_PAGE_READ_PENDING;
+          all_missing &= state == CACHE_PAGE_MISSING ||
+              state == CACHE_PAGE_READ_PENDING;
+        }
+        if (had_pending && all_missing) recovery_offsets_.push_back(offset);
+      }
+    }
+    start_next_recovery_punch();
+  }
+
+  void start_next_recovery_punch() {
+    if (recovery_index_ == recovery_offsets_.size()) {
+      publish_entry();
+      return;
+    }
+    phase_ = Phase::RECOVERY_STAT_BEFORE;
+    submit_statx_fd(data_fd_);
+  }
+
+  static uint64_t allocation_bytes(uint64_t meta_blocks,
+                                   uint64_t data_blocks) noexcept {
+    if (meta_blocks > UINT64_MAX - data_blocks) return UINT64_MAX;
+    const uint64_t blocks = meta_blocks + data_blocks;
+    return blocks > UINT64_MAX / 512 ? UINT64_MAX : blocks * 512;
+  }
+
+  void reconcile_truncated_allocation(uint64_t meta_blocks,
+                                      uint64_t data_blocks) noexcept {
+    const uint64_t old_bytes = allocation_bytes(
+        old_meta_blocks_, old_data_blocks_);
+    const uint64_t truncated_bytes = allocation_bytes(
+        meta_blocks, data_blocks);
+    if (old_bytes > truncated_bytes) {
+      cache_->add_allocated(-int64_t(std::min<uint64_t>(
+          old_bytes - truncated_bytes, INT64_MAX)));
+    } else if (truncated_bytes > old_bytes) {
+      cache_->add_allocated(int64_t(std::min<uint64_t>(
+          truncated_bytes - old_bytes, INT64_MAX)));
+    }
+    // Subsequent allocation reconciliation starts from the blocks that
+    // remain after truncate, so the same release is not counted twice.
+    old_meta_blocks_ = meta_blocks;
+    old_data_blocks_ = data_blocks;
+  }
+
+  void reconcile_allocation(uint64_t meta_blocks,
+                            uint64_t data_blocks) noexcept {
+    const uint64_t old_bytes = allocation_bytes(
+        old_meta_blocks_, old_data_blocks_);
+    const uint64_t actual_bytes = allocation_bytes(meta_blocks, data_blocks);
+    const uint64_t growth = actual_bytes > old_bytes
+        ? actual_bytes - old_bytes : 0;
+    if (reservation_ != 0) {
+      cache_->finish_reservation(reservation_, growth);
+      reservation_ = 0;
+    } else if (growth != 0) {
+      cache_->add_allocated(int64_t(std::min<uint64_t>(growth, INT64_MAX)));
+    }
+    if (old_bytes > actual_bytes) {
+      cache_->add_allocated(-int64_t(std::min<uint64_t>(
+          old_bytes - actual_bytes, INT64_MAX)));
+    }
+    allocation_tracking_ = false;
+  }
+
+  void reconcile_failed_allocation() noexcept {
+    if (!allocation_tracking_) {
+      if (reservation_ != 0) {
+        cache_->cancel_reservation(reservation_);
+        reservation_ = 0;
+      }
+      return;
+    }
+    uint64_t meta_blocks = old_meta_blocks_;
+    uint64_t data_blocks = old_data_blocks_;
+    struct stat status{};
+    if (meta_fd_ >= 0 && ::fstat(meta_fd_, &status) == 0) {
+      meta_blocks = uint64_t(status.st_blocks);
+    }
+    if (ignore_data_fd_allocation_) {
+      data_blocks = 0;
+    } else if (data_fd_ >= 0 && ::fstat(data_fd_, &status) == 0) {
+      data_blocks = uint64_t(status.st_blocks);
+    }
+    reconcile_allocation(meta_blocks, data_blocks);
+  }
+
+  void fail(std::exception_ptr error) noexcept {
+    if (!failure_) failure_ = std::move(error);
+    if (retiring_) {
+      retiring_->end_async_wait();
+      retiring_.reset();
+    }
+    if (mapping_ != nullptr) {
+      ::munmap(mapping_, mapping_size_);
+      mapping_ = nullptr;
+    }
+    if (metadata_locked_ && meta_fd_ >= 0) {
+      ::flock(meta_fd_, LOCK_UN);
+      metadata_locked_ = false;
+    }
+    reconcile_failed_allocation();
+    continue_failure_cleanup();
+  }
+
+  bool submit_cleanup_close(int fd, Phase phase) noexcept {
+    phase_ = phase;
+    reset_io(AsyncIoRequest::CLOSE, fd);
+    if (executor_->submit(io_)) return true;
+    ::close(fd);
+    return false;
+  }
+
+  void continue_failure_cleanup() noexcept {
+    if (meta_fd_ >= 0) {
+      if (submit_cleanup_close(meta_fd_, Phase::FAIL_CLOSE_META)) return;
+      meta_fd_ = -1;
+    }
+    if (data_fd_ >= 0) {
+      if (submit_cleanup_close(data_fd_, Phase::FAIL_CLOSE_DATA)) return;
+      data_fd_ = -1;
+    }
+    if (meta_parent_owned_ && meta_parent_fd_ >= 0) {
+      meta_parent_owned_ = false;
+      if (submit_cleanup_close(meta_parent_fd_,
+                               Phase::FAIL_CLOSE_META_PARENT)) return;
+      meta_parent_fd_ = -1;
+    }
+    if (data_parent_owned_ && data_parent_fd_ >= 0) {
+      data_parent_owned_ = false;
+      if (submit_cleanup_close(data_parent_fd_,
+                               Phase::FAIL_CLOSE_DATA_PARENT)) return;
+      data_parent_fd_ = -1;
+    }
+    complete_now(CacheAsyncResult{
+        .entry = {}, .error = failure_, .value = false});
+  }
+
+  void continue_final_cleanup() noexcept {
+    if (meta_parent_owned_ && meta_parent_fd_ >= 0) {
+      meta_parent_owned_ = false;
+      if (submit_cleanup_close(meta_parent_fd_,
+                               Phase::FINAL_CLOSE_META_PARENT)) return;
+      meta_parent_fd_ = -1;
+    }
+    if (data_parent_owned_ && data_parent_fd_ >= 0) {
+      data_parent_owned_ = false;
+      if (submit_cleanup_close(data_parent_fd_,
+                               Phase::FINAL_CLOSE_DATA_PARENT)) return;
+      data_parent_fd_ = -1;
+    }
+    complete_now(std::move(final_result_));
+  }
+
+  bool is_cleanup_phase() const noexcept {
+    return phase_ == Phase::FAIL_CLOSE_META ||
+        phase_ == Phase::FAIL_CLOSE_DATA ||
+        phase_ == Phase::FAIL_CLOSE_META_PARENT ||
+        phase_ == Phase::FAIL_CLOSE_DATA_PARENT ||
+        phase_ == Phase::FINAL_CLOSE_META_PARENT ||
+        phase_ == Phase::FINAL_CLOSE_DATA_PARENT;
+  }
+
+  void cleanup_failed_close() noexcept {
+    switch (phase_) {
+      case Phase::FAIL_CLOSE_META:
+        ::close(meta_fd_); meta_fd_ = -1; continue_failure_cleanup(); return;
+      case Phase::FAIL_CLOSE_DATA:
+        ::close(data_fd_); data_fd_ = -1; continue_failure_cleanup(); return;
+      case Phase::FAIL_CLOSE_META_PARENT:
+        ::close(meta_parent_fd_); meta_parent_fd_ = -1;
+        continue_failure_cleanup(); return;
+      case Phase::FAIL_CLOSE_DATA_PARENT:
+        ::close(data_parent_fd_); data_parent_fd_ = -1;
+        complete_now(CacheAsyncResult{
+            .entry = {}, .error = failure_, .value = false}); return;
+      case Phase::FINAL_CLOSE_META_PARENT:
+        ::close(meta_parent_fd_); meta_parent_fd_ = -1;
+        continue_final_cleanup(); return;
+      case Phase::FINAL_CLOSE_DATA_PARENT:
+        ::close(data_parent_fd_); data_parent_fd_ = -1;
+        complete_now(std::move(final_result_)); return;
+      default: return;
+    }
+  }
+
+  void finish(std::exception_ptr error) noexcept {
+    finish(CacheAsyncResult{
+        .entry = {}, .error = std::move(error), .value = false});
+  }
+
+  void finish(CacheAsyncResult result) noexcept {
+    final_result_ = std::move(result);
+    continue_final_cleanup();
+  }
+
+  void complete_now(CacheAsyncResult result) noexcept {
+    release_key_gate();
+    CacheAsyncRequest* request = request_;
+    CacheAsyncRequest::Complete callback = request->complete;
+    void* context = request->context;
+    request->implementation_ = nullptr;
+    callback(context, std::move(result));
+    delete this;
+  }
+
+  IoExecutor* executor_ = nullptr;
+  CacheAsyncRequest* request_ = nullptr;
+  LocalCache* cache_ = nullptr;
+  Kind kind_ = Kind::OPEN;
+  Phase phase_ = Phase::OPEN_DATA;
+  AsyncIoRequest io_;
+  CacheCapacityOperation capacity_;
+  CachePathWalker path_;
+  struct statx status_{};
+  CacheMetaHeader existing_header_{};
+  std::shared_ptr<CacheEntry> hit_;
+  std::shared_ptr<CacheEntry> retiring_;
+  std::exception_ptr failure_;
+  std::string key_;
+  std::string etag_;
+  std::string version_id_;
+  std::string data_name_;
+  std::string meta_name_;
+  std::vector<uint64_t> recovery_offsets_;
+  int data_fd_ = -1;
+  int meta_fd_ = -1;
+  int data_parent_fd_ = -1;
+  int meta_parent_fd_ = -1;
+  void* mapping_ = nullptr;
+  size_t mapping_size_ = 0;
+  size_t existing_mapping_size_ = 0;
+  uint64_t object_size_ = 0;
+  uint64_t maximum_size_ = 0;
+  time_t mtime_ = 0;
+  uint64_t old_data_blocks_ = 0;
+  uint64_t old_meta_blocks_ = 0;
+  uint64_t new_meta_blocks_ = 0;
+  uint64_t recovery_before_blocks_ = 0;
+  size_t recovery_index_ = 0;
+  uint64_t reservation_ = 0;
+  uint64_t capacity_bytes_ = 0;
+  uint64_t notification_ = 0;
+  bool reset_ = false;
+  bool existing_exported_ = false;
+  bool allocation_tracking_ = false;
+  bool ignore_data_fd_allocation_ = false;
+  bool metadata_locked_ = false;
+  bool accepted_ = false;
+  bool resolving_data_ = false;
+  bool data_parent_owned_ = false;
+  bool meta_parent_owned_ = false;
+  CacheAsyncResult final_result_;
+};
+
+class CacheNamespaceOperation final : private CacheKeyOperation {
+ public:
+  enum class Kind { REMOVE, RENAME };
+
+  CacheNamespaceOperation(IoExecutor& executor, CacheAsyncRequest& request,
+                          LocalCache& cache, Kind kind)
+      : CacheKeyOperation(cache, executor), executor_(&executor), request_(&request),
+        cache_(&cache), kind_(kind) {}
+
+  bool start(std::string_view key, bool preserve_generation,
+             std::string_view new_key = {}, bool wait_for_key = true,
+             const std::shared_ptr<CacheEntry>& expected_reclaim = {}) {
+    if (request_->complete == nullptr || request_->pending()) {
+      errno = EINVAL;
+      return false;
+    }
+    if (key.size() > kCacheKeyCapacity ||
+        new_key.size() > kCacheKeyCapacity ||
+        (kind_ == Kind::RENAME && new_key.empty())) {
+      errno = EOVERFLOW;
+      return false;
+    }
+    old_key_.assign(key);
+    new_key_.assign(new_key);
+    preserve_generation_ = preserve_generation;
+    expected_reclaim_ = expected_reclaim;
+    request_->implementation_ = this;
+    const GateResult gate = acquire_key_gate(
+        old_key_, kind_ == Kind::RENAME ? std::string_view(new_key_)
+                                        : std::string_view{},
+        wait_for_key);
+    if (gate == GateResult::FAILED) {
+      request_->implementation_ = nullptr;
+      return false;
+    }
+    if (gate == GateResult::QUEUED) {
+      accepted_ = true;
+      return true;
+    }
+    return activate_start();
+  }
+
+  bool activate_start() {
+    if (expected_reclaim_ && !validate_reclaim_candidate()) {
+      phase_ = Phase::DEFER_RESULT;
+      result_value_ = false;
+      return submit_root_stat();
+    }
+    if (kind_ == Kind::RENAME && old_key_ == new_key_) {
+      phase_ = Phase::DEFER_RESULT;
+      result_value_ = true;
+      return submit_root_stat();
+    }
+    inspect_registry();
+    if (failure_) {
+      phase_ = Phase::DEFER_RESULT;
+      return submit_root_stat();
+    }
+    return start_destination_data_path();
+  }
+
+  void abandon_start() noexcept {
+    abandon_key_gate();
+    if (request_->implementation_ == this) request_->implementation_ = nullptr;
+  }
+
+ private:
+  bool validate_reclaim_candidate() {
+    bool kept = false;
+    bool current = false;
+    {
+      std::lock_guard guard(cache_->mutex_);
+      kept = std::any_of(
+          cache_->keepalive_.begin(), cache_->keepalive_.end(),
+          [&](const auto& slot) {
+            return slot.entry.get() == expected_reclaim_.get();
+          });
+      for (const auto& weak : cache_->entries_) {
+        std::shared_ptr<CacheEntry> entry = weak.lock();
+        if (entry && entry.get() == expected_reclaim_.get() &&
+            entry->key_ == old_key_) {
+          current = true;
+          break;
+        }
+      }
+    }
+    // capacity.reclaim_entry_ and expected_reclaim_ are the only strong
+    // references here, plus the optional keepalive.
+    if (!current || expected_reclaim_.use_count() != (kept ? 3 : 2)) {
+      return false;
+    }
+    std::lock_guard guard(expected_reclaim_->mutex_);
+    const auto& header = *static_cast<const CacheMetaHeader*>(
+        expected_reclaim_->mapping_);
+    if (expected_reclaim_->stale_ || expected_reclaim_->detached_ ||
+        expected_reclaim_->eviction_disabled_ ||
+        (header.flags & (kCacheMetaDirty | kCacheMetaExported)) != 0 ||
+        !expected_reclaim_->active_claims_.empty() ||
+        expected_reclaim_->checksum_ops_ != 0 ||
+        expected_reclaim_->pinned_regions_ != 0) {
+      return false;
+    }
+    for (size_t page = 0; page < expected_reclaim_->page_count_; ++page) {
+      if (expected_reclaim_->page_state(page) != CACHE_PAGE_MISSING) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void activate_key_gate() noexcept override {
+    try {
+      (void)activate_start();
+    } catch (...) {
+      finish(std::current_exception());
+    }
+  }
+
+
+  void key_gate_failed(std::exception_ptr error) noexcept override {
+    finish(std::move(error));
+  }
+  enum class Phase {
+    DEFER_RESULT,
+    DEST_DATA_STAT, DEST_DATA_UNLINK, DEST_META_STAT, DEST_META_UNLINK,
+    RENAME_DATA, RENAME_META, RENAME_TARGET_FSYNC,
+    RENAME_META_OPEN, RENAME_META_READ, RENAME_META_WRITE,
+    RENAME_META_FSYNC, RENAME_META_CLOSE,
+    ROLLBACK_OLD_DATA_STAT, ROLLBACK_OLD_DATA_UNLINK,
+    ROLLBACK_OLD_META_STAT, ROLLBACK_OLD_META_UNLINK,
+    ROLLBACK_NEW_DATA_STAT, ROLLBACK_NEW_DATA_UNLINK,
+    ROLLBACK_NEW_META_STAT, ROLLBACK_NEW_META_UNLINK,
+    FINAL_CLOSE,
+  };
+  enum class PathPurpose { DEST_DATA, DEST_META, SOURCE_DATA, SOURCE_META };
+
+  bool start_destination_data_path() {
+    path_purpose_ = PathPurpose::DEST_DATA;
+    const std::string_view key =
+        kind_ == Kind::REMOVE ? std::string_view(old_key_)
+                              : std::string_view(new_key_);
+    return path_.start(*executor_, cache_->data_root_fd_, key,
+                       kind_ == Kind::RENAME, path_resolved, this,
+                       cache_->name_max_);
+  }
+
+  void start_destination_meta_path() {
+    path_ = CachePathWalker{};
+    path_purpose_ = PathPurpose::DEST_META;
+    const std::string_view key =
+        kind_ == Kind::REMOVE ? std::string_view(old_key_)
+                              : std::string_view(new_key_);
+    path_.start(*executor_, cache_->objects_root_fd_, key,
+                kind_ == Kind::RENAME, path_resolved, this,
+                cache_->name_max_);
+  }
+
+  void start_source_data_path() {
+    path_ = CachePathWalker{};
+    path_purpose_ = PathPurpose::SOURCE_DATA;
+    path_.start(*executor_, cache_->data_root_fd_, old_key_, false,
+                path_resolved, this, cache_->name_max_);
+  }
+
+  void start_source_meta_path() {
+    path_ = CachePathWalker{};
+    path_purpose_ = PathPurpose::SOURCE_META;
+    path_.start(*executor_, cache_->objects_root_fd_, old_key_, false,
+                path_resolved, this, cache_->name_max_);
+  }
+
+  static void path_resolved(void* context, bool exists, int parent_fd,
+                            bool parent_owned, std::string leaf,
+                            std::exception_ptr error) noexcept {
+    auto* operation = static_cast<CacheNamespaceOperation*>(context);
+    if (error) { operation->finish(std::move(error)); return; }
+    switch (operation->path_purpose_) {
+      case PathPurpose::DEST_DATA:
+        operation->destination_data_parent_fd_ = parent_fd;
+        operation->destination_data_parent_owned_ = parent_owned;
+        operation->destination_data_name_ = std::move(leaf);
+        if (!exists) { operation->start_destination_meta_path(); return; }
+        operation->phase_ = Phase::DEST_DATA_STAT;
+        operation->submit_path_stat(operation->destination_data_parent_fd_,
+                                    operation->destination_data_name_);
+        return;
+      case PathPurpose::DEST_META:
+        operation->destination_meta_parent_fd_ = parent_fd;
+        operation->destination_meta_parent_owned_ = parent_owned;
+        operation->destination_meta_name_ = std::move(leaf);
+        if (!exists) { operation->after_destination_removed(); return; }
+        operation->phase_ = Phase::DEST_META_STAT;
+        operation->submit_path_stat(operation->destination_meta_parent_fd_,
+                                    operation->destination_meta_name_);
+        return;
+      case PathPurpose::SOURCE_DATA:
+        operation->source_data_parent_fd_ = parent_fd;
+        operation->source_data_parent_owned_ = parent_owned;
+        operation->source_data_name_ = std::move(leaf);
+        operation->source_data_exists_ = exists;
+        operation->start_source_meta_path();
+        return;
+      case PathPurpose::SOURCE_META:
+        operation->source_meta_parent_fd_ = parent_fd;
+        operation->source_meta_parent_owned_ = parent_owned;
+        operation->source_meta_name_ = std::move(leaf);
+        operation->source_meta_exists_ = exists;
+        if (!operation->source_data_exists_ && !exists) {
+          operation->finish(true);
+          return;
+        }
+        if (operation->source_data_exists_) {
+          operation->phase_ = Phase::RENAME_DATA;
+          operation->submit_rename(
+              operation->source_data_parent_fd_, operation->source_data_name_,
+              operation->destination_data_parent_fd_,
+              operation->destination_data_name_);
+          return;
+        }
+        operation->phase_ = Phase::RENAME_META;
+        operation->submit_rename(
+            operation->source_meta_parent_fd_, operation->source_meta_name_,
+            operation->destination_meta_parent_fd_,
+            operation->destination_meta_name_);
+        return;
+    }
+  }
+
+  void inspect_registry() {
+    const std::string_view destination =
+        kind_ == Kind::REMOVE ? std::string_view(old_key_)
+                              : std::string_view(new_key_);
+    std::vector<std::shared_ptr<CacheEntry>> released;
+    std::lock_guard guard(cache_->mutex_);
+    for (auto i = cache_->entries_.begin(); i != cache_->entries_.end();) {
+      std::shared_ptr<CacheEntry> entry = i->lock();
+      if (!entry) {
+        i = cache_->entries_.erase(i);
+        continue;
+      }
+      if (entry->key_ == destination) {
+        bool busy;
+        bool preserved = false;
+        {
+          std::lock_guard entry_guard(entry->mutex_);
+          const auto& header =
+              *static_cast<const CacheMetaHeader*>(entry->mapping_);
+          preserved = kind_ == Kind::REMOVE && preserve_generation_ &&
+              !entry->stale_ && (header.flags & kCacheMetaDirty) == 0;
+          entry->detached_ = true;
+          if (preserved) {
+            entry->eviction_disabled_ = true;
+          } else {
+            entry->stale_ = true;
+            entry->notify_waiters_locked();
+          }
+          busy = !preserved && (!entry->active_claims_.empty() ||
+              entry->checksum_ops_ != 0 || entry->pinned_regions_ != 0 ||
+              entry->async_metadata_inflight_);
+        }
+        cache_->release_keepalive_locked(entry.get(), released);
+        if (busy) {
+          failure_ = std::make_exception_ptr(CacheRetirementPending{});
+          return;
+        }
+        destination_entry_ = entry;
+        result_value_ = preserved;
+        i = cache_->entries_.erase(i);
+        continue;
+      }
+      if (kind_ == Kind::RENAME && entry->key_ == old_key_) {
+        source_entry_ = entry;
+      }
+      ++i;
+    }
+  }
+
+  void reset_io(AsyncIoRequest::Kind kind, int fd) noexcept {
+    io_ = AsyncIoRequest{};
+    io_.kind = kind;
+    io_.fd = fd;
+    io_.complete = completed;
+    io_.context = this;
+  }
+
+  bool submit_root_stat() noexcept {
+    memset(&status_, 0, sizeof(status_));
+    reset_io(AsyncIoRequest::STATX, cache_->root_fd_);
+    io_.path = "";
+    io_.data = &status_;
+    io_.flags = AT_EMPTY_PATH;
+    io_.mask = STATX_TYPE;
+    return submit();
+  }
+
+  bool submit_path_stat(int root, const std::string& name) noexcept {
+    memset(&status_, 0, sizeof(status_));
+    reset_io(AsyncIoRequest::STATX, root);
+    io_.path = name.c_str();
+    io_.data = &status_;
+    io_.flags = AT_SYMLINK_NOFOLLOW;
+    io_.mask = STATX_BLOCKS | STATX_TYPE;
+    return submit();
+  }
+
+  bool submit_unlink(int root, const std::string& name) noexcept {
+    reset_io(AsyncIoRequest::UNLINKAT, root);
+    io_.path = name.c_str();
+    return submit();
+  }
+
+  bool submit_rename(int source_parent, const std::string& old_name,
+                     int destination_parent,
+                     const std::string& new_name) noexcept {
+    reset_io(AsyncIoRequest::RENAMEAT, source_parent);
+    io_.output_fd = destination_parent;
+    io_.path = old_name.c_str();
+    io_.path2 = new_name.c_str();
+    return submit();
+  }
+
+  bool submit_open_meta() noexcept {
+    reset_io(AsyncIoRequest::OPENAT, destination_meta_parent_fd_);
+    io_.path = destination_meta_name_.c_str();
+    io_.flags = O_RDWR | O_CLOEXEC | O_NOFOLLOW;
+    return submit();
+  }
+
+  bool submit_read_header() noexcept {
+    reset_io(AsyncIoRequest::PREAD, metadata_fd_);
+    io_.data = &header_;
+    io_.length = sizeof(header_);
+    io_.input_offset = 0;
+    io_.exact = true;
+    return submit();
+  }
+
+  bool submit_write_header() noexcept {
+    reset_io(AsyncIoRequest::PWRITE, metadata_fd_);
+    io_.data = &header_;
+    io_.length = sizeof(header_);
+    io_.output_offset = 0;
+    io_.exact = true;
+    return submit();
+  }
+
+  bool submit_fsync(int fd) noexcept {
+    reset_io(AsyncIoRequest::FSYNC, fd);
+    return submit();
+  }
+
+  bool submit_close(int fd) noexcept {
+    reset_io(AsyncIoRequest::CLOSE, fd);
+    return submit();
+  }
+
+  bool submit() noexcept {
+    if (executor_->submit(io_)) {
+      accepted_ = true;
+      return true;
+    }
+    const int error = errno == 0 ? EIO : errno;
+    if (!accepted_) {
+      abandon_start();
+      errno = error;
+      return false;
+    }
+    finish(make_error(error, "submit asynchronous cache namespace operation"));
+    return false;
+  }
+
+  static std::exception_ptr make_error(int error, const char* what) noexcept {
+    try {
+      return std::make_exception_ptr(std::system_error(
+          error, std::generic_category(), what));
+    } catch (...) {
+      return std::current_exception();
+    }
+  }
+
+  static void completed(void* context, ssize_t result) noexcept {
+    static_cast<CacheNamespaceOperation*>(context)->advance(result);
+  }
+
+  bool missing_is_ok(ssize_t result) const noexcept {
+    return result == -ENOENT &&
+        (phase_ == Phase::DEST_DATA_STAT ||
+         phase_ == Phase::DEST_DATA_UNLINK ||
+         phase_ == Phase::DEST_META_STAT ||
+         phase_ == Phase::DEST_META_UNLINK ||
+         phase_ == Phase::RENAME_DATA ||
+         phase_ == Phase::RENAME_META || rollback_phase());
+  }
+
+  bool rollback_phase() const noexcept {
+    return phase_ >= Phase::ROLLBACK_OLD_DATA_STAT &&
+        phase_ <= Phase::ROLLBACK_NEW_META_UNLINK;
+  }
+
+  void advance(ssize_t result) noexcept {
+    try {
+      if (phase_ == Phase::FINAL_CLOSE) {
+        if (result < 0 && closing_fd_ >= 0) ::close(closing_fd_);
+        clear_closed_target();
+        continue_final_close();
+        return;
+      }
+      if (result < 0 && !missing_is_ok(result)) {
+        throw std::system_error(int(-result), std::generic_category(),
+                                "asynchronous cache namespace operation");
+      }
+      switch (phase_) {
+        case Phase::DEFER_RESULT:
+          if (failure_) finish(failure_);
+          else finish(result_value_);
+          return;
+
+        case Phase::DEST_DATA_STAT:
+          if (result == -ENOENT) {
+            start_destination_meta_path();
+            return;
+          }
+          blocks_ = status_.stx_blocks;
+          phase_ = Phase::DEST_DATA_UNLINK;
+          submit_unlink(destination_data_parent_fd_,
+                        destination_data_name_);
+          return;
+
+        case Phase::DEST_DATA_UNLINK:
+          account_unlink(true);
+          start_destination_meta_path();
+          return;
+
+        case Phase::DEST_META_STAT:
+          if (result == -ENOENT) {
+            after_destination_removed();
+            return;
+          }
+          blocks_ = status_.stx_blocks;
+          phase_ = Phase::DEST_META_UNLINK;
+          submit_unlink(destination_meta_parent_fd_,
+                        destination_meta_name_);
+          return;
+
+        case Phase::DEST_META_UNLINK:
+          account_unlink(false);
+          after_destination_removed();
+          return;
+
+        case Phase::RENAME_DATA:
+          data_moved_ = result >= 0;
+          if (!source_meta_exists_) {
+            if (!data_moved_) { finish(true); return; }
+            throw std::runtime_error("cache rename metadata is missing");
+          }
+          phase_ = Phase::RENAME_META;
+          submit_rename(source_meta_parent_fd_, source_meta_name_,
+                        destination_meta_parent_fd_, destination_meta_name_);
+          return;
+
+        case Phase::RENAME_META:
+          meta_moved_ = result >= 0;
+          if (!data_moved_ && !meta_moved_) { finish(true); return; }
+          if (!meta_moved_) {
+            throw std::runtime_error("cache rename metadata is missing");
+          }
+          rewrite_renamed_metadata();
+          return;
+
+        case Phase::RENAME_TARGET_FSYNC:
+          finish(true);
+          return;
+
+        case Phase::RENAME_META_OPEN:
+          metadata_fd_ = int(result);
+          phase_ = Phase::RENAME_META_READ;
+          submit_read_header();
+          return;
+
+        case Phase::RENAME_META_READ:
+          validate_and_rewrite_header(header_);
+          phase_ = Phase::RENAME_META_WRITE;
+          submit_write_header();
+          return;
+
+        case Phase::RENAME_META_WRITE:
+          phase_ = Phase::RENAME_META_FSYNC;
+          submit_fsync(metadata_fd_);
+          return;
+
+        case Phase::RENAME_META_FSYNC:
+          phase_ = Phase::RENAME_META_CLOSE;
+          submit_close(metadata_fd_);
+          return;
+
+        case Phase::RENAME_META_CLOSE:
+          metadata_fd_ = -1;
+          finish(true);
+          return;
+
+        case Phase::ROLLBACK_OLD_DATA_STAT:
+          if (result == -ENOENT) { start_rollback_old_meta(); return; }
+          blocks_ = status_.stx_blocks;
+          phase_ = Phase::ROLLBACK_OLD_DATA_UNLINK;
+          submit_unlink(source_data_parent_fd_, source_data_name_);
+          return;
+
+        case Phase::ROLLBACK_OLD_DATA_UNLINK:
+          if (result >= 0) account_rollback_unlink(true);
+          start_rollback_old_meta();
+          return;
+
+        case Phase::ROLLBACK_OLD_META_STAT:
+          if (result == -ENOENT) { start_rollback_new_data(); return; }
+          blocks_ = status_.stx_blocks;
+          phase_ = Phase::ROLLBACK_OLD_META_UNLINK;
+          submit_unlink(source_meta_parent_fd_, source_meta_name_);
+          return;
+
+        case Phase::ROLLBACK_OLD_META_UNLINK:
+          if (result >= 0) account_rollback_unlink(false);
+          start_rollback_new_data();
+          return;
+
+        case Phase::ROLLBACK_NEW_DATA_STAT:
+          if (result == -ENOENT) { start_rollback_new_meta(); return; }
+          blocks_ = status_.stx_blocks;
+          phase_ = Phase::ROLLBACK_NEW_DATA_UNLINK;
+          submit_unlink(destination_data_parent_fd_, destination_data_name_);
+          return;
+
+        case Phase::ROLLBACK_NEW_DATA_UNLINK:
+          if (result >= 0) account_rollback_unlink(true);
+          start_rollback_new_meta();
+          return;
+
+        case Phase::ROLLBACK_NEW_META_STAT:
+          if (result == -ENOENT) { finish(rollback_error_); return; }
+          blocks_ = status_.stx_blocks;
+          phase_ = Phase::ROLLBACK_NEW_META_UNLINK;
+          submit_unlink(destination_meta_parent_fd_, destination_meta_name_);
+          return;
+
+        case Phase::ROLLBACK_NEW_META_UNLINK:
+          if (result >= 0) account_rollback_unlink(false);
+          finish(rollback_error_);
+          return;
+
+        case Phase::FINAL_CLOSE:
+          return;
+      }
+    } catch (...) {
+      if (rollback_phase()) {
+        advance_rollback_after_error();
+      } else if (kind_ == Kind::RENAME && (data_moved_ || meta_moved_)) {
+        begin_rollback(std::current_exception());
+      } else {
+        finish(std::current_exception());
+      }
+    }
+  }
+
+  void account_unlink(bool data) noexcept {
+    if (destination_entry_) {
+      std::lock_guard guard(destination_entry_->mutex_);
+      if (data) destination_entry_->unlinked_data_ = true;
+      else destination_entry_->unlinked_meta_ = true;
+    } else if (blocks_ != 0) {
+      cache_->add_allocated(-int64_t(std::min<uint64_t>(
+          blocks_ * 512, INT64_MAX)));
+    }
+    blocks_ = 0;
+  }
+
+  void begin_rollback(std::exception_ptr error) noexcept {
+    rollback_error_ = std::move(error);
+    if (source_entry_) {
+      std::lock_guard guard(source_entry_->mutex_);
+      source_entry_->stale_ = true;
+      source_entry_->detached_ = true;
+      source_entry_->notify_waiters_locked();
+    }
+    start_rollback_old_data();
+  }
+
+  void start_rollback_old_data() noexcept {
+    if (source_data_parent_fd_ < 0 || source_data_name_.empty()) {
+      start_rollback_old_meta();
+      return;
+    }
+    phase_ = Phase::ROLLBACK_OLD_DATA_STAT;
+    submit_path_stat(source_data_parent_fd_, source_data_name_);
+  }
+
+  void start_rollback_old_meta() noexcept {
+    if (source_meta_parent_fd_ < 0 || source_meta_name_.empty()) {
+      start_rollback_new_data();
+      return;
+    }
+    phase_ = Phase::ROLLBACK_OLD_META_STAT;
+    submit_path_stat(source_meta_parent_fd_, source_meta_name_);
+  }
+
+  void start_rollback_new_data() noexcept {
+    if (destination_data_parent_fd_ < 0 || destination_data_name_.empty()) {
+      start_rollback_new_meta();
+      return;
+    }
+    phase_ = Phase::ROLLBACK_NEW_DATA_STAT;
+    submit_path_stat(destination_data_parent_fd_, destination_data_name_);
+  }
+
+  void start_rollback_new_meta() noexcept {
+    if (destination_meta_parent_fd_ < 0 || destination_meta_name_.empty()) {
+      finish(rollback_error_);
+      return;
+    }
+    phase_ = Phase::ROLLBACK_NEW_META_STAT;
+    submit_path_stat(destination_meta_parent_fd_, destination_meta_name_);
+  }
+
+  void advance_rollback_after_error() noexcept {
+    switch (phase_) {
+      case Phase::ROLLBACK_OLD_DATA_STAT:
+      case Phase::ROLLBACK_OLD_DATA_UNLINK:
+        start_rollback_old_meta(); return;
+      case Phase::ROLLBACK_OLD_META_STAT:
+      case Phase::ROLLBACK_OLD_META_UNLINK:
+        start_rollback_new_data(); return;
+      case Phase::ROLLBACK_NEW_DATA_STAT:
+      case Phase::ROLLBACK_NEW_DATA_UNLINK:
+        start_rollback_new_meta(); return;
+      case Phase::ROLLBACK_NEW_META_STAT:
+      case Phase::ROLLBACK_NEW_META_UNLINK:
+        finish(rollback_error_); return;
+      default:
+        finish(rollback_error_); return;
+    }
+  }
+
+  void account_rollback_unlink(bool data) noexcept {
+    if (source_entry_) {
+      std::lock_guard guard(source_entry_->mutex_);
+      if (data) source_entry_->unlinked_data_ = true;
+      else source_entry_->unlinked_meta_ = true;
+    } else if (blocks_ != 0) {
+      cache_->add_allocated(-int64_t(std::min<uint64_t>(
+          blocks_ * 512, INT64_MAX)));
+    }
+    blocks_ = 0;
+  }
+
+  void after_destination_removed() {
+    destination_entry_.reset();
+    expected_reclaim_.reset();
+    if (kind_ == Kind::REMOVE) { finish(result_value_); return; }
+    start_source_data_path();
+  }
+
+  void validate_and_rewrite_header(CacheMetaHeader& header) {
+    constexpr std::array<char, 8> magic{
+        'N', 'G', 'S', '3', 'C', 'A', 'C', 'H'};
+    if (header.magic != magic || header.version != kCacheMetaVersion ||
+        header.key_length != old_key_.size() ||
+        memcmp(header.key.data(), old_key_.data(), old_key_.size()) != 0) {
+      throw std::runtime_error("cache rename metadata key mismatch");
+    }
+    memset(header.key.data(), 0, header.key.size());
+    memcpy(header.key.data(), new_key_.data(), new_key_.size());
+    header.key_length = uint32_t(new_key_.size());
+  }
+
+  void rewrite_renamed_metadata() {
+    if (source_entry_) {
+      {
+        std::lock_guard cache_guard(cache_->mutex_);
+        std::lock_guard entry_guard(source_entry_->mutex_);
+        auto& header = *static_cast<CacheMetaHeader*>(source_entry_->mapping_);
+        validate_and_rewrite_header(header);
+        source_entry_->key_ = new_key_;
+      }
+      phase_ = Phase::RENAME_TARGET_FSYNC;
+      submit_fsync(source_entry_->meta_fd_);
+      return;
+    }
+    phase_ = Phase::RENAME_META_OPEN;
+    submit_open_meta();
+  }
+
+  void release_gates() noexcept {
+    release_key_gate();
+  }
+
+  void finish(bool value) noexcept {
+    finish(CacheAsyncResult{.entry = {}, .error = {}, .value = value});
+  }
+
+  void finish(std::exception_ptr error) noexcept {
+    finish(CacheAsyncResult{
+        .entry = {}, .error = std::move(error), .value = false});
+  }
+
+  void finish(CacheAsyncResult result) noexcept {
+    final_result_ = std::move(result);
+    continue_final_close();
+  }
+
+  void continue_final_close() noexcept {
+    for (;;) {
+      int fd = -1;
+      if (metadata_fd_ >= 0) {
+        close_target_ = CloseTarget::METADATA;
+        fd = metadata_fd_;
+      } else if (source_meta_parent_owned_ && source_meta_parent_fd_ >= 0) {
+        source_meta_parent_owned_ = false;
+        close_target_ = CloseTarget::SOURCE_META_PARENT;
+        fd = source_meta_parent_fd_;
+      } else if (source_data_parent_owned_ && source_data_parent_fd_ >= 0) {
+        source_data_parent_owned_ = false;
+        close_target_ = CloseTarget::SOURCE_DATA_PARENT;
+        fd = source_data_parent_fd_;
+      } else if (destination_meta_parent_owned_ &&
+                 destination_meta_parent_fd_ >= 0) {
+        destination_meta_parent_owned_ = false;
+        close_target_ = CloseTarget::DEST_META_PARENT;
+        fd = destination_meta_parent_fd_;
+      } else if (destination_data_parent_owned_ &&
+                 destination_data_parent_fd_ >= 0) {
+        destination_data_parent_owned_ = false;
+        close_target_ = CloseTarget::DEST_DATA_PARENT;
+        fd = destination_data_parent_fd_;
+      } else {
+        complete_now(std::move(final_result_));
+        return;
+      }
+      closing_fd_ = fd;
+      phase_ = Phase::FINAL_CLOSE;
+      reset_io(AsyncIoRequest::CLOSE, fd);
+      if (executor_->submit(io_)) return;
+      ::close(fd);
+      clear_closed_target();
+    }
+  }
+
+  void clear_closed_target() noexcept {
+    switch (close_target_) {
+      case CloseTarget::METADATA: metadata_fd_ = -1; break;
+      case CloseTarget::SOURCE_META_PARENT: source_meta_parent_fd_ = -1; break;
+      case CloseTarget::SOURCE_DATA_PARENT: source_data_parent_fd_ = -1; break;
+      case CloseTarget::DEST_META_PARENT: destination_meta_parent_fd_ = -1; break;
+      case CloseTarget::DEST_DATA_PARENT: destination_data_parent_fd_ = -1; break;
+      case CloseTarget::NONE: break;
+    }
+    close_target_ = CloseTarget::NONE;
+    closing_fd_ = -1;
+  }
+
+  void complete_now(CacheAsyncResult result) noexcept {
+    expected_reclaim_.reset();
+    release_gates();
+    CacheAsyncRequest* request = request_;
+    CacheAsyncRequest::Complete callback = request->complete;
+    void* context = request->context;
+    request->implementation_ = nullptr;
+    callback(context, std::move(result));
+    delete this;
+  }
+
+  IoExecutor* executor_ = nullptr;
+  CacheAsyncRequest* request_ = nullptr;
+  LocalCache* cache_ = nullptr;
+  Kind kind_ = Kind::REMOVE;
+  Phase phase_ = Phase::DEST_DATA_STAT;
+  AsyncIoRequest io_;
+  CachePathWalker path_;
+  struct statx status_{};
+  CacheMetaHeader header_{};
+  std::shared_ptr<CacheEntry> destination_entry_;
+  std::shared_ptr<CacheEntry> expected_reclaim_;
+  std::shared_ptr<CacheEntry> source_entry_;
+  std::exception_ptr failure_;
+  std::exception_ptr rollback_error_;
+  std::string old_key_;
+  std::string new_key_;
+  enum class CloseTarget {
+    NONE, METADATA, SOURCE_META_PARENT, SOURCE_DATA_PARENT,
+    DEST_META_PARENT, DEST_DATA_PARENT,
+  };
+  std::string destination_data_name_;
+  std::string destination_meta_name_;
+  std::string source_data_name_;
+  std::string source_meta_name_;
+  int metadata_fd_ = -1;
+  int destination_data_parent_fd_ = -1;
+  int destination_meta_parent_fd_ = -1;
+  int source_data_parent_fd_ = -1;
+  int source_meta_parent_fd_ = -1;
+  int closing_fd_ = -1;
+  uint64_t blocks_ = 0;
+  bool preserve_generation_ = false;
+  bool result_value_ = false;
+  bool data_moved_ = false;
+  bool meta_moved_ = false;
+  bool accepted_ = false;
+  bool source_data_exists_ = false;
+  bool source_meta_exists_ = false;
+  bool destination_data_parent_owned_ = false;
+  bool destination_meta_parent_owned_ = false;
+  bool source_data_parent_owned_ = false;
+  bool source_meta_parent_owned_ = false;
+  PathPurpose path_purpose_ = PathPurpose::DEST_DATA;
+  CloseTarget close_target_ = CloseTarget::NONE;
+  CacheAsyncResult final_result_;
+};
+
+CacheAsyncRequest::~CacheAsyncRequest() {
+  if (pending()) abort();
+}
+
 CacheEntry::CacheEntry(LocalCache& owner, std::string key, int data_fd,
                        int meta_fd, int dirty_fd, void* mapping,
-                       size_t mapping_size, uint64_t size)
+                       size_t mapping_size, uint64_t size,
+                       bool punch_missing)
     : owner_(&owner),
       key_(std::move(key)),
       data_fd_(data_fd),
@@ -753,13 +5034,15 @@ CacheEntry::CacheEntry(LocalCache& owner, std::string key, int data_fd,
     for (size_t page = first; page < last && all_missing; ++page) {
       all_missing = page_state(page) == CACHE_PAGE_MISSING;
     }
-    if (all_missing && (header.flags & kCacheMetaExported) == 0) {
+    if (punch_missing && all_missing &&
+        (header.flags & kCacheMetaExported) == 0) {
       owner_->punch_range(data_fd_, offset, block_size_);
     }
   }
 }
 
 CacheEntry::~CacheEntry() {
+  if (async_metadata_inflight_ || !async_metadata_queue_.empty()) abort();
   if (wait_fd_ >= 0) {
     ::close(wait_fd_);
   }
@@ -1023,6 +5306,55 @@ bool CacheEntry::prepare_read(uint64_t offset, size_t length) {
   return owner_->prepare_range(*this, offset, length, false);
 }
 
+int cache_async_start_errno(std::exception_ptr error) noexcept {
+  try {
+    if (error) std::rethrow_exception(error);
+  } catch (const std::system_error& system_error) {
+    return system_error.code().value();
+  } catch (const std::overflow_error&) {
+    return EOVERFLOW;
+  } catch (const std::bad_alloc&) {
+    return ENOMEM;
+  } catch (...) {
+    return EIO;
+  }
+  return EIO;
+}
+
+template<class Start>
+bool cache_start_entry_operation(IoExecutor& executor,
+                                 CacheAsyncRequest& request,
+                                 CacheEntry& entry,
+                                 CacheAsyncOperation::Kind kind,
+                                 Start&& start) noexcept {
+  CacheAsyncOperation* operation = nullptr;
+  try {
+    operation = new CacheAsyncOperation(executor, request, entry, kind);
+    if (start(*operation)) return true;
+    delete operation;
+    return false;
+  } catch (...) {
+    const std::exception_ptr error = std::current_exception();
+    if (operation != nullptr) {
+      operation->abandon_start();
+      delete operation;
+    }
+    errno = cache_async_start_errno(error);
+    return false;
+  }
+}
+
+bool CacheEntry::prepare_read_async(IoExecutor& executor,
+                                    CacheAsyncRequest& request,
+                                    uint64_t offset,
+                                    size_t length) noexcept {
+  return cache_start_entry_operation(
+      executor, request, *this, CacheAsyncOperation::Kind::PREPARE_READ,
+      [&](CacheAsyncOperation& operation) {
+        return operation.start_prepare_read(offset, length);
+      });
+}
+
 void CacheEntry::begin_write() {
   uint64_t epoch;
   {
@@ -1052,6 +5384,15 @@ void CacheEntry::begin_write() {
   auto& header = *static_cast<CacheMetaHeader*>(mapping_);
   header.flags |= kCacheMetaDirty;
   header.write_phase = 1;
+}
+
+bool CacheEntry::begin_write_async(IoExecutor& executor,
+                                   CacheAsyncRequest& request) noexcept {
+  return cache_start_entry_operation(
+      executor, request, *this, CacheAsyncOperation::Kind::BEGIN_WRITE,
+      [](CacheAsyncOperation& operation) {
+        return operation.start_begin_write();
+      });
 }
 
 void CacheEntry::ensure_write_capacity(uint64_t end) {
@@ -1155,6 +5496,17 @@ void CacheEntry::prepare_write(uint64_t offset, size_t length) {
   begin_write();
 }
 
+bool CacheEntry::prepare_write_async(IoExecutor& executor,
+                                     CacheAsyncRequest& request,
+                                     uint64_t offset,
+                                     size_t length) noexcept {
+  return cache_start_entry_operation(
+      executor, request, *this, CacheAsyncOperation::Kind::PREPARE_WRITE,
+      [&](CacheAsyncOperation& operation) {
+        return operation.start_prepare_write(offset, length);
+      });
+}
+
 void CacheEntry::publish_dirty(uint64_t offset, size_t length,
                                uint64_t written_end) {
   std::lock_guard guard(mutex_);
@@ -1199,6 +5551,16 @@ void CacheEntry::set_upload_id(std::string_view upload_id) {
   header.write_phase      = upload_id.empty() ? 1 : 2;
 }
 
+bool CacheEntry::set_upload_id_async(IoExecutor& executor,
+                                     CacheAsyncRequest& request,
+                                     std::string_view upload_id) noexcept {
+  return cache_start_entry_operation(
+      executor, request, *this, CacheAsyncOperation::Kind::SET_UPLOAD_ID,
+      [&](CacheAsyncOperation& operation) {
+        return operation.start_set_upload_id(upload_id);
+      });
+}
+
 std::string CacheEntry::upload_id() const {
   std::lock_guard guard(mutex_);
   const auto& header = *static_cast<const CacheMetaHeader*>(mapping_);
@@ -1217,6 +5579,16 @@ void CacheEntry::isolate_write() noexcept {
   header.write_phase = 3;
 }
 
+bool CacheEntry::mark_commit_pending_async(
+    IoExecutor& executor, CacheAsyncRequest& request) noexcept {
+  return cache_start_entry_operation(
+      executor, request, *this,
+      CacheAsyncOperation::Kind::MARK_COMMIT_PENDING,
+      [](CacheAsyncOperation& operation) {
+        return operation.start_mark_commit_pending();
+      });
+}
+
 void CacheEntry::discard_write() noexcept {
   int marker_fd = -1;
   {
@@ -1231,6 +5603,15 @@ void CacheEntry::discard_write() noexcept {
   }
   cache_close_fd(marker_fd);
   owner_->remove_dirty_marker(key_);
+}
+
+bool CacheEntry::discard_write_async(IoExecutor& executor,
+                                     CacheAsyncRequest& request) noexcept {
+  return cache_start_entry_operation(
+      executor, request, *this, CacheAsyncOperation::Kind::DISCARD_WRITE,
+      [](CacheAsyncOperation& operation) {
+        return operation.start_discard_write();
+      });
 }
 
 void CacheEntry::sync_write() {
@@ -1248,6 +5629,15 @@ void CacheEntry::sync_write() {
   if (dirty_fd_ >= 0 && ::fdatasync(dirty_fd_) != 0) {
     cache_throw_errno("fdatasync(cache dirty marker)");
   }
+}
+
+bool CacheEntry::sync_write_async(IoExecutor& executor,
+                                  CacheAsyncRequest& request) noexcept {
+  return cache_start_entry_operation(
+      executor, request, *this, CacheAsyncOperation::Kind::SYNC_WRITE,
+      [](CacheAsyncOperation& operation) {
+        return operation.start_sync_write();
+      });
 }
 
 void CacheEntry::commit_write(const CacheIdentity& identity) {
@@ -1284,6 +5674,16 @@ void CacheEntry::commit_write(const CacheIdentity& identity) {
     cache_close_fd(dirty_fd_);
   }
   owner_->remove_dirty_marker(key_);
+}
+
+bool CacheEntry::commit_write_async(IoExecutor& executor,
+                                    CacheAsyncRequest& request,
+                                    const CacheIdentity& identity) noexcept {
+  return cache_start_entry_operation(
+      executor, request, *this, CacheAsyncOperation::Kind::COMMIT_WRITE,
+      [&](CacheAsyncOperation& operation) {
+        return operation.start_commit_write(identity);
+      });
 }
 
 bool CacheEntry::pin_clean(uint64_t offset, size_t length) {
@@ -2299,41 +6699,45 @@ uint64_t LocalCache::reserve_floor_bytes() const {
   return uint64_t(total * config_.reserve_percent / 100);
 }
 
-bool LocalCache::reserve_capacity(uint64_t bytes) {
+bool LocalCache::try_reserve_capacity(uint64_t bytes) {
   if (config_.unlimited) {
     std::lock_guard guard(capacity_mutex_);
     pending_reservations_ = pending_reservations_ > UINT64_MAX - bytes
         ? UINT64_MAX : pending_reservations_ + bytes;
     return true;
   }
+  std::lock_guard guard(capacity_mutex_);
+  struct statvfs fs{};
+  if (::fstatvfs(root_fd_, &fs) != 0) {
+    cache_throw_errno("fstatvfs(cache capacity)");
+  }
+  const uint64_t unit = fs.f_frsize == 0 ? fs.f_bsize : fs.f_frsize;
+  const __uint128_t available_wide = __uint128_t(fs.f_bavail) * unit;
+  const uint64_t available = available_wide > UINT64_MAX
+      ? UINT64_MAX : uint64_t(available_wide);
+  const uint64_t floor = config_.reserve_is_percent
+      ? uint64_t(__uint128_t(fs.f_blocks) * unit *
+                 config_.reserve_percent / 100)
+      : config_.reserve_bytes;
+  const uint64_t allocated = allocated_bytes();
+  const bool maximum_ok = config_.maximum_bytes == 0 ||
+      (allocated <= config_.maximum_bytes &&
+       pending_reservations_ <= config_.maximum_bytes - allocated &&
+       bytes <= config_.maximum_bytes - allocated - pending_reservations_);
+  const bool free_ok = available >= floor &&
+      pending_reservations_ <= available - floor &&
+      bytes <= available - floor - pending_reservations_;
+  if (!maximum_ok || !free_ok) {
+    return false;
+  }
+  pending_reservations_ += bytes;
+  return true;
+}
+
+bool LocalCache::reserve_capacity(uint64_t bytes) {
   for (;;) {
-    {
-      std::lock_guard guard(capacity_mutex_);
-      struct statvfs fs{};
-      if (::fstatvfs(root_fd_, &fs) != 0) {
-        cache_throw_errno("fstatvfs(cache capacity)");
-      }
-      const uint64_t unit = fs.f_frsize == 0 ? fs.f_bsize : fs.f_frsize;
-      const __uint128_t available_wide = __uint128_t(fs.f_bavail) * unit;
-      const uint64_t available = available_wide > UINT64_MAX
-          ? UINT64_MAX : uint64_t(available_wide);
-      const uint64_t floor = config_.reserve_is_percent
-          ? uint64_t(__uint128_t(fs.f_blocks) * unit *
-                     config_.reserve_percent / 100)
-          : config_.reserve_bytes;
-      const uint64_t allocated = allocated_bytes();
-      const bool maximum_ok = config_.maximum_bytes == 0 ||
-          (allocated <= config_.maximum_bytes &&
-           pending_reservations_ <= config_.maximum_bytes - allocated &&
-           bytes <= config_.maximum_bytes - allocated -
-               pending_reservations_);
-      const bool free_ok = available >= floor &&
-          pending_reservations_ <= available - floor &&
-          bytes <= available - floor - pending_reservations_;
-      if (maximum_ok && free_ok) {
-        pending_reservations_ += bytes;
-        return true;
-      }
+    if (try_reserve_capacity(bytes)) {
+      return true;
     }
     if (!evict_one()) {
       return false;
@@ -2828,6 +7232,12 @@ LocalCache::~LocalCache() {
 }
 
 void LocalCache::probe_filesystem() {
+  struct statvfs filesystem{};
+  if (::fstatvfs(root_fd_, &filesystem) != 0) {
+    cache_throw_errno("fstatvfs(cache filesystem probe)");
+  }
+  name_max_ = filesystem.f_namemax == 0 ? NAME_MAX : filesystem.f_namemax;
+
   constexpr char upper[] = ".ngs3fs-case-A";
   constexpr char lower[] = ".ngs3fs-case-a";
   const int upper_fd = ::openat(root_fd_, upper,
@@ -3235,6 +7645,38 @@ void LocalCache::create_pending_delete(
   }
 }
 
+bool cache_start_marker_operation(
+    IoExecutor& executor, CacheAsyncRequest& request, LocalCache& cache,
+    CacheMarkerOperation::Kind kind, std::string_view key,
+    std::string_view restore_key = {},
+    std::string_view replacement_etag = {}) noexcept {
+  CacheMarkerOperation* operation = nullptr;
+  try {
+    operation = new CacheMarkerOperation(executor, request, cache, kind);
+    if (operation->start(key, restore_key, replacement_etag)) return true;
+    delete operation;
+    return false;
+  } catch (...) {
+    const std::exception_ptr error = std::current_exception();
+    if (operation != nullptr) {
+      operation->abandon_start();
+      delete operation;
+    }
+    errno = cache_async_start_errno(error);
+    return false;
+  }
+}
+
+bool LocalCache::create_pending_delete_async(
+    IoExecutor& executor, CacheAsyncRequest& request,
+    std::string_view key, std::string_view restore_key,
+    std::string_view replacement_etag) noexcept {
+  return cache_start_marker_operation(
+      executor, request, *this,
+      CacheMarkerOperation::Kind::CREATE_PENDING,
+      key, restore_key, replacement_etag);
+}
+
 void cache_scan_pending_directory(int directory,
                                   std::vector<CachePendingDelete>& records) {
   const int duplicate = ::openat(
@@ -3364,6 +7806,14 @@ void LocalCache::commit_pending_delete(std::string_view key) {
   }
 }
 
+bool LocalCache::commit_pending_delete_async(
+    IoExecutor& executor, CacheAsyncRequest& request,
+    std::string_view key) noexcept {
+  return cache_start_marker_operation(
+      executor, request, *this,
+      CacheMarkerOperation::Kind::COMMIT_PENDING, key);
+}
+
 void LocalCache::finish_pending_delete(std::string_view key) noexcept {
   try {
     struct statvfs fs{};
@@ -3373,9 +7823,7 @@ void LocalCache::finish_pending_delete(std::string_view key) noexcept {
     const size_t name_max = fs.f_namemax == 0 ? NAME_MAX : fs.f_namemax;
     std::optional<CacheLeaf> leaf = cache_find_leaf(
         pending_root_fd_, key, name_max);
-    if (!leaf) {
-      return;
-    }
+    if (!leaf) return;
     struct stat status{};
     const bool measured = ::fstatat(
         leaf->parent.get(), leaf->name.c_str(), &status,
@@ -3396,6 +7844,14 @@ void LocalCache::finish_pending_delete(std::string_view key) noexcept {
     fprintf(stderr,
             "warning: cannot remove cache pending-delete marker\n");
   }
+}
+
+bool LocalCache::finish_pending_delete_async(
+    IoExecutor& executor, CacheAsyncRequest& request,
+    std::string_view key) noexcept {
+  return cache_start_marker_operation(
+      executor, request, *this,
+      CacheMarkerOperation::Kind::FINISH_PENDING, key);
 }
 
 std::shared_ptr<CacheEntry> LocalCache::retiring_entry(
@@ -4106,5 +8562,137 @@ std::shared_ptr<CacheEntry> LocalCache::open(
     cache_close_fd(meta_fd);
     cache_close_fd(data_fd);
     throw;
+  }
+}
+
+bool LocalCache::open_async(IoExecutor& executor, CacheAsyncRequest& request,
+                            const CacheIdentity& identity) noexcept {
+  if (std::shared_ptr<CacheEntry> hit = try_open(identity)) {
+    CacheOpenOperation* operation = nullptr;
+    try {
+      operation = new CacheOpenOperation(executor, request, std::move(hit));
+      if (operation->start()) return true;
+      delete operation;
+      return false;
+    } catch (...) {
+      delete operation;
+      errno = cache_async_start_errno(std::current_exception());
+      return false;
+    }
+  }
+  CacheFileOperation* operation = nullptr;
+  try {
+    operation = new CacheFileOperation(
+        executor, request, *this, CacheFileOperation::Kind::OPEN);
+    if (operation->start(identity, 0)) return true;
+    delete operation;
+    return false;
+  } catch (...) {
+    const std::exception_ptr error = std::current_exception();
+    if (operation != nullptr) operation->abandon_start();
+    delete operation;
+    errno = cache_async_start_errno(error);
+    return false;
+  }
+}
+
+bool LocalCache::open_async_if_idle(
+    IoExecutor& executor, CacheAsyncRequest& request,
+    const CacheIdentity& identity) noexcept {
+  CacheFileOperation* operation = nullptr;
+  try {
+    operation = new CacheFileOperation(
+        executor, request, *this, CacheFileOperation::Kind::OPEN);
+    if (operation->start(identity, 0, false, true)) return true;
+    delete operation;
+    return false;
+  } catch (...) {
+    const std::exception_ptr error = std::current_exception();
+    if (operation != nullptr) operation->abandon_start();
+    delete operation;
+    errno = cache_async_start_errno(error);
+    return false;
+  }
+}
+
+bool LocalCache::create_writer_async(IoExecutor& executor,
+                                     CacheAsyncRequest& request,
+                                     const CacheIdentity& identity,
+                                     uint64_t maximum_size) noexcept {
+  CacheFileOperation* operation = nullptr;
+  try {
+    operation = new CacheFileOperation(
+        executor, request, *this, CacheFileOperation::Kind::CREATE_WRITER);
+    if (operation->start(identity, maximum_size)) return true;
+    delete operation;
+    return false;
+  } catch (...) {
+    const std::exception_ptr error = std::current_exception();
+    if (operation != nullptr) operation->abandon_start();
+    delete operation;
+    errno = cache_async_start_errno(error);
+    return false;
+  }
+}
+
+bool LocalCache::remove_async(IoExecutor& executor,
+                              CacheAsyncRequest& request,
+                              std::string_view key,
+                              bool preserve_generation) noexcept {
+  CacheNamespaceOperation* operation = nullptr;
+  try {
+    operation = new CacheNamespaceOperation(
+        executor, request, *this, CacheNamespaceOperation::Kind::REMOVE);
+    if (operation->start(key, preserve_generation)) return true;
+    delete operation;
+    return false;
+  } catch (...) {
+    const std::exception_ptr error = std::current_exception();
+    if (operation != nullptr) operation->abandon_start();
+    delete operation;
+    errno = cache_async_start_errno(error);
+    return false;
+  }
+}
+
+bool LocalCache::reclaim_closed_async(
+    IoExecutor& executor, CacheAsyncRequest& request,
+    const std::shared_ptr<CacheEntry>& expected) noexcept {
+  CacheNamespaceOperation* operation = nullptr;
+  try {
+    operation = new CacheNamespaceOperation(
+        executor, request, *this, CacheNamespaceOperation::Kind::REMOVE);
+    if (operation->start(
+            expected->key_, false, {}, false, expected)) {
+      return true;
+    }
+    delete operation;
+    return false;
+  } catch (...) {
+    const std::exception_ptr error = std::current_exception();
+    if (operation != nullptr) operation->abandon_start();
+    delete operation;
+    errno = cache_async_start_errno(error);
+    return false;
+  }
+}
+
+bool LocalCache::rename_async(IoExecutor& executor,
+                              CacheAsyncRequest& request,
+                              std::string_view old_key,
+                              std::string_view new_key) noexcept {
+  CacheNamespaceOperation* operation = nullptr;
+  try {
+    operation = new CacheNamespaceOperation(
+        executor, request, *this, CacheNamespaceOperation::Kind::RENAME);
+    if (operation->start(old_key, false, new_key)) return true;
+    delete operation;
+    return false;
+  } catch (...) {
+    const std::exception_ptr error = std::current_exception();
+    if (operation != nullptr) operation->abandon_start();
+    delete operation;
+    errno = cache_async_start_errno(error);
+    return false;
   }
 }

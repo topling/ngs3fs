@@ -13,6 +13,7 @@ cache_drop_status=not-attempted
 cache_mode=${CACHE_MODE:-none}
 variants=${BENCHMARK_VARIANTS:-}
 variant_revisions=${BENCHMARK_VARIANT_REVISIONS:-}
+variant_descriptions=${BENCHMARK_VARIANT_DESCRIPTIONS:-}
 
 if [[ -e "$output_dir" ]]; then
   echo "benchmark output directory already exists: $output_dir" >&2
@@ -40,6 +41,7 @@ mkdir -p "$output_dir"
   printf 'cache_mode=%s\n' "$cache_mode"
   printf 'cache_block_size=%s\n' "${NGS3FS_CACHE_BLOCK_SIZE:-2MiB}"
   printf 'cache_unlimited=%s\n' "${NGS3FS_CACHE_UNLIMITED:-0}"
+  printf 'max_connections=%s\n' "${MAX_CONNECTIONS:-8}"
   printf 'git_dirty=%s\n' "$(git -c safe.directory="$project_dir" -C "$project_dir" status --porcelain | tr '\n' ' ')"
   if [[ -z "$variants" ]]; then
     printf 'ngs3fs_path=%s\n' "$(realpath "${NGS3FS_BIN:-$project_dir/build/dev/ngs3fs}")"
@@ -91,6 +93,10 @@ printf 'benchmark_variants=%s\n' "${variants:-default-io-engines}" \
   >>"$output_dir/system.txt"
 if [[ -n "$variant_revisions" ]]; then
   printf 'benchmark_variant_revisions=%s\n' "$variant_revisions" \
+    >>"$output_dir/system.txt"
+fi
+if [[ -n "$variant_descriptions" ]]; then
+  printf 'benchmark_variant_descriptions=%s\n' "$variant_descriptions" \
     >>"$output_dir/system.txt"
 fi
 for configuration in "${configurations[@]}"; do

@@ -1,6 +1,10 @@
 #include "cache.hpp"
+#include "io.hpp"
 
 #include <fcntl.h>
+#include <linux/stat.h>
+#include <sys/mman.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -8,6 +12,7 @@
 #include <algorithm>
 #include <assert.h>
 #include <chrono>
+#include <deque>
 #include <filesystem>
 #include <future>
 #include <string.h>
@@ -21,6 +26,7 @@ struct CacheTestAccess {
   static uint64_t allocated_bytes(LocalCache& cache) {
     return cache.allocated_bytes();
   }
+  static int data_root_fd(LocalCache& cache) { return cache.data_root_fd_; }
   static size_t keepalive_entries(LocalCache& cache) {
     std::lock_guard guard(cache.mutex_);
     return cache.keepalive_.size();
@@ -47,6 +53,15 @@ struct CacheTestAccess {
     cache.config_.maximum_bytes = maximum_bytes;
     cache.config_.unlimited = false;
   }
+  static uint64_t pending_reservations(LocalCache& cache) {
+    std::lock_guard guard(cache.capacity_mutex_);
+    return cache.pending_reservations_;
+  }
+  static bool reclaim_closed_async(
+      LocalCache& cache, IoExecutor& executor, CacheAsyncRequest& request,
+      const std::shared_ptr<CacheEntry>& expected) {
+    return cache.reclaim_closed_async(executor, request, expected);
+  }
 };
 
 struct TemporaryDirectory {
@@ -62,6 +77,133 @@ struct TemporaryDirectory {
   ~TemporaryDirectory() { std::filesystem::remove_all(path); }
 
   std::string path;
+};
+
+class DeferredIoExecutor : public IoExecutor {
+ public:
+  bool submit(AsyncIoRequest& request) noexcept override {
+    try {
+      pending_.push_back(&request);
+    } catch (...) {
+      errno = ENOMEM;
+      return false;
+    }
+    return true;
+  }
+
+  bool cancel(AsyncIoRequest&) noexcept override { return false; }
+
+  void fail_next(AsyncIoRequest::Kind kind, int error) noexcept {
+    fail_kind_ = kind;
+    fail_error_ = error;
+  }
+
+  bool pump_one() {
+    auto selected = pending_.begin();
+    while (selected != pending_.end() &&
+           (*selected)->kind == AsyncIoRequest::READ) {
+      pollfd descriptor{.fd = (*selected)->fd, .events = POLLIN};
+      if (::poll(&descriptor, 1, 0) > 0) break;
+      ++selected;
+    }
+    if (selected == pending_.end()) return false;
+    AsyncIoRequest* request = *selected;
+    pending_.erase(selected);
+    ssize_t result;
+    if (fail_error_ != 0 && request->kind == fail_kind_) {
+      result = -fail_error_;
+      fail_error_ = 0;
+    } else {
+      result = perform(*request);
+    }
+    request->complete(request->context, result);
+    return true;
+  }
+
+  void drain() {
+    size_t operations = 0;
+    while (pump_one()) {
+      assert(++operations < 256);
+    }
+  }
+
+ private:
+  static ssize_t perform(AsyncIoRequest& request) noexcept {
+    int result;
+    switch (request.kind) {
+      case AsyncIoRequest::READ: {
+        const ssize_t bytes = ::read(
+            request.fd, request.data, request.length);
+        return bytes < 0 ? -errno : bytes;
+      }
+      case AsyncIoRequest::OPENAT:
+        result = ::openat(request.fd, request.path, int(request.flags),
+                          mode_t(request.mode));
+        return result < 0 ? -errno : result;
+      case AsyncIoRequest::CLOSE:
+        result = ::close(request.fd);
+        return result < 0 ? -errno : result;
+      case AsyncIoRequest::STATX:
+        result = ::statx(request.fd, request.path, int(request.flags),
+                         request.mask,
+                         static_cast<struct statx*>(request.data));
+        return result < 0 ? -errno : result;
+      case AsyncIoRequest::FALLOCATE:
+        result = ::fallocate(request.fd, int(request.flags),
+                             request.input_offset, off_t(request.length));
+        return result < 0 ? -errno : result;
+      case AsyncIoRequest::FSYNC:
+        result = request.flags != 0
+            ? ::fdatasync(request.fd) : ::fsync(request.fd);
+        return result < 0 ? -errno : result;
+      case AsyncIoRequest::FTRUNCATE:
+        result = ::ftruncate(request.fd, off_t(request.length));
+        return result < 0 ? -errno : result;
+      case AsyncIoRequest::MKDIRAT:
+        result = ::mkdirat(request.fd, request.path, mode_t(request.mode));
+        return result < 0 ? -errno : result;
+      case AsyncIoRequest::MADVISE:
+        result = ::madvise(request.data, request.length, int(request.flags));
+        return result < 0 ? -errno : result;
+      case AsyncIoRequest::PREAD: {
+        const ssize_t bytes = ::pread(
+            request.fd, request.data, request.length, request.input_offset);
+        return bytes < 0 ? -errno : bytes;
+      }
+      case AsyncIoRequest::PWRITE: {
+        const ssize_t bytes = ::pwrite(
+            request.fd, request.data, request.length, request.output_offset);
+        return bytes < 0 ? -errno : bytes;
+      }
+      case AsyncIoRequest::UNLINKAT:
+        result = ::unlinkat(request.fd, request.path, int(request.flags));
+        return result < 0 ? -errno : result;
+      case AsyncIoRequest::RENAMEAT:
+        result = ::renameat(request.fd, request.path,
+                            request.output_fd, request.path2);
+        return result < 0 ? -errno : result;
+      default:
+        return -EOPNOTSUPP;
+    }
+  }
+
+  std::deque<AsyncIoRequest*> pending_;
+  AsyncIoRequest::Kind fail_kind_ = AsyncIoRequest::RECEIVE;
+  int fail_error_ = 0;
+};
+
+struct AsyncCacheCapture {
+  bool done = false;
+  CacheAsyncResult result;
+  std::vector<unsigned>* order = nullptr;
+  unsigned sequence = 0;
+
+  static void completed(void* context, CacheAsyncResult result) noexcept {
+    auto& capture = *static_cast<AsyncCacheCapture*>(context);
+    capture.done = true;
+    capture.result = std::move(result);
+    if (capture.order != nullptr) capture.order->push_back(capture.sequence);
+  }
 };
 
 void write_test_bytes(int fd, uint64_t offset, size_t length) {
@@ -115,6 +257,395 @@ int main() {
   std::string recovery_write_id;
 
   {
+    TemporaryDirectory async_directory;
+    CacheConfig async_config = config;
+    async_config.root = async_directory.path;
+    LocalCache cache(async_config);
+    DeferredIoExecutor executor;
+
+    const CacheIdentity reader_identity = test_identity(
+        "async/cache-read", "etag", 2 * kCacheBitmapUnit);
+    CacheAsyncRequest open_request;
+    AsyncCacheCapture open_capture;
+    open_request.complete = AsyncCacheCapture::completed;
+    open_request.context = &open_capture;
+    assert(cache.open_async(executor, open_request, reader_identity));
+    assert(!open_capture.done);
+    executor.drain();
+    if (open_capture.result.error) {
+      try {
+        std::rethrow_exception(open_capture.result.error);
+      } catch (const std::exception& error) {
+        fprintf(stderr, "async cold open failed: %s\n", error.what());
+      }
+    }
+    assert(open_capture.done && !open_capture.result.error);
+    std::shared_ptr<CacheEntry> reader = std::move(open_capture.result.entry);
+    assert(reader && reader->key() == reader_identity.key);
+
+    CacheAsyncRequest reopen_request;
+    AsyncCacheCapture reopen_capture;
+    reopen_request.complete = AsyncCacheCapture::completed;
+    reopen_request.context = &reopen_capture;
+    assert(cache.open_async(executor, reopen_request, reader_identity));
+    assert(!reopen_capture.done);
+    executor.drain();
+    assert(reopen_capture.done && !reopen_capture.result.error);
+    assert(reopen_capture.result.entry.get() == reader.get());
+    CacheAsyncRequest read_request;
+    AsyncCacheCapture read_capture;
+    std::vector<unsigned> read_order;
+    read_capture.order = &read_order;
+    read_capture.sequence = 1;
+    read_request.complete = AsyncCacheCapture::completed;
+    read_request.context = &read_capture;
+    assert(reader->prepare_read_async(
+        executor, read_request, 0, kCacheBitmapUnit));
+    assert(read_request.pending());
+    assert(!read_capture.done);
+
+    CacheAsyncRequest contended_request;
+    AsyncCacheCapture contended_capture;
+    contended_capture.order = &read_order;
+    contended_capture.sequence = 2;
+    contended_request.complete = AsyncCacheCapture::completed;
+    contended_request.context = &contended_capture;
+    assert(reader->prepare_read_async(
+        executor, contended_request, kCacheBitmapUnit, kCacheBitmapUnit));
+    assert(contended_request.pending());
+    assert(!contended_capture.done);
+
+    CacheAsyncRequest rejected_request;
+    AsyncCacheCapture rejected_capture;
+    rejected_capture.order = &read_order;
+    rejected_capture.sequence = 3;
+    rejected_request.complete = AsyncCacheCapture::completed;
+    rejected_request.context = &rejected_capture;
+    assert(reader->mark_commit_pending_async(executor, rejected_request));
+    assert(rejected_request.pending());
+    assert(!rejected_capture.done);
+
+    executor.drain();
+    assert(read_capture.done && !read_capture.result.error);
+    assert(read_capture.result.value);
+    assert(!read_request.pending());
+    assert(contended_capture.done && !contended_capture.result.error);
+    assert(contended_capture.result.value);
+    assert(!contended_request.pending());
+    assert(rejected_capture.done && rejected_capture.result.error);
+    assert(!rejected_request.pending());
+    assert((read_order == std::vector<unsigned>{1, 2, 3}));
+
+    DeferredIoExecutor other_executor;
+    CacheAsyncRequest owner_request;
+    AsyncCacheCapture owner_capture;
+    owner_request.complete = AsyncCacheCapture::completed;
+    owner_request.context = &owner_capture;
+    assert(reader->prepare_read_async(
+        executor, owner_request, 0, kCacheBitmapUnit));
+    CacheAsyncRequest other_owner_request;
+    AsyncCacheCapture other_owner_capture;
+    other_owner_request.complete = AsyncCacheCapture::completed;
+    other_owner_request.context = &other_owner_capture;
+    assert(reader->prepare_read_async(
+        other_executor, other_owner_request,
+        kCacheBitmapUnit, kCacheBitmapUnit));
+    other_executor.drain();
+    assert(!other_owner_capture.done);
+    executor.drain();
+    assert(owner_capture.done && !owner_capture.result.error);
+    other_executor.drain();
+    assert(other_owner_capture.done && !other_owner_capture.result.error);
+
+    const CacheIdentity writer_identity =
+        test_identity("async/cache-write", "old", 0);
+    CacheAsyncRequest writer_request;
+    AsyncCacheCapture writer_capture;
+    writer_request.complete = AsyncCacheCapture::completed;
+    writer_request.context = &writer_capture;
+    assert(cache.create_writer_async(
+        executor, writer_request, writer_identity, 8U * 1024U * 1024U));
+    assert(!writer_capture.done);
+    executor.drain();
+    assert(writer_capture.done && !writer_capture.result.error);
+    std::shared_ptr<CacheEntry> writer = std::move(writer_capture.result.entry);
+    assert(writer && writer->key() == writer_identity.key);
+    CacheAsyncRequest prepare_request;
+    AsyncCacheCapture prepare_capture;
+    std::vector<unsigned> writer_order;
+    prepare_capture.order = &writer_order;
+    prepare_capture.sequence = 1;
+    prepare_request.complete = AsyncCacheCapture::completed;
+    prepare_request.context = &prepare_capture;
+    assert(writer->prepare_write_async(executor, prepare_request, 0, 4096));
+    assert(!prepare_capture.done);
+
+    CacheAsyncRequest upload_request;
+    AsyncCacheCapture upload_capture;
+    upload_capture.order = &writer_order;
+    upload_capture.sequence = 2;
+    upload_request.complete = AsyncCacheCapture::completed;
+    upload_request.context = &upload_capture;
+    std::string queued_upload_id = "async-upload";
+    assert(writer->set_upload_id_async(
+        executor, upload_request, queued_upload_id));
+    assert(!upload_capture.done);
+    queued_upload_id = "mutated-after-queue";
+    executor.drain();
+    assert(prepare_capture.done && !prepare_capture.result.error);
+    assert(prepare_capture.result.value && writer->dirty());
+    assert(upload_capture.done && !upload_capture.result.error);
+    assert(writer->upload_id() == "async-upload");
+    assert((writer_order == std::vector<unsigned>{1, 2}));
+
+    write_test_bytes(writer->data_fd(), 0, 4096);
+    writer->publish_dirty(0, 4096, 4096);
+
+    CacheAsyncRequest sync_request;
+    AsyncCacheCapture sync_capture;
+    sync_request.complete = AsyncCacheCapture::completed;
+    sync_request.context = &sync_capture;
+    assert(writer->sync_write_async(executor, sync_request));
+    assert(!sync_capture.done);
+    executor.drain();
+    assert(sync_capture.done && !sync_capture.result.error);
+    assert(sync_capture.result.value);
+
+    CacheAsyncRequest pending_request;
+    AsyncCacheCapture pending_capture;
+    pending_request.complete = AsyncCacheCapture::completed;
+    pending_request.context = &pending_capture;
+    assert(writer->mark_commit_pending_async(executor, pending_request));
+    assert(!pending_capture.done);
+    executor.drain();
+    assert(pending_capture.done && !pending_capture.result.error);
+
+    CacheAsyncRequest commit_request;
+    AsyncCacheCapture commit_capture;
+    commit_request.complete = AsyncCacheCapture::completed;
+    commit_request.context = &commit_capture;
+    const CacheIdentity committed =
+        test_identity("async/cache-write", "new", 4096);
+    assert(writer->commit_write_async(executor, commit_request, committed));
+    assert(!commit_capture.done);
+    executor.drain();
+    assert(commit_capture.done && !commit_capture.result.error);
+    assert(commit_capture.result.value);
+    assert(!writer->dirty());
+    assert(writer->etag() == "new");
+
+    CacheAsyncRequest rename_request;
+    AsyncCacheCapture rename_capture;
+    rename_request.complete = AsyncCacheCapture::completed;
+    rename_request.context = &rename_capture;
+    assert(cache.rename_async(executor, rename_request,
+                              "async/cache-write", "async/cache-renamed"));
+    executor.drain();
+    assert(rename_capture.done && !rename_capture.result.error);
+    assert(rename_capture.result.value);
+    assert(writer->key() == "async/cache-renamed");
+
+    CacheAsyncRequest remove_request;
+    AsyncCacheCapture remove_capture;
+    remove_request.complete = AsyncCacheCapture::completed;
+    remove_request.context = &remove_capture;
+    assert(cache.remove_async(
+        executor, remove_request, "async/cache-renamed", true));
+    executor.drain();
+    assert(remove_capture.done && !remove_capture.result.error);
+    assert(remove_capture.result.value);
+    assert(writer->range_clean(0, 4096));
+
+    const CacheIdentity empty_identity =
+        test_identity("async/empty-writer", "old", 0);
+    CacheAsyncRequest empty_create_request;
+    AsyncCacheCapture empty_create_capture;
+    empty_create_request.complete = AsyncCacheCapture::completed;
+    empty_create_request.context = &empty_create_capture;
+    assert(cache.create_writer_async(executor, empty_create_request,
+                                     empty_identity, 8U * 1024U * 1024U));
+    executor.drain();
+    assert(empty_create_capture.done && !empty_create_capture.result.error);
+    std::shared_ptr<CacheEntry> empty_writer =
+        std::move(empty_create_capture.result.entry);
+    CacheAsyncRequest begin_request;
+    AsyncCacheCapture begin_capture;
+    begin_request.complete = AsyncCacheCapture::completed;
+    begin_request.context = &begin_capture;
+    assert(empty_writer->begin_write_async(executor, begin_request));
+    assert(!begin_capture.done);
+    executor.drain();
+    assert(begin_capture.done && !begin_capture.result.error);
+    assert(empty_writer->dirty());
+
+    CacheAsyncRequest discard_request;
+    AsyncCacheCapture discard_capture;
+    discard_request.complete = AsyncCacheCapture::completed;
+    discard_request.context = &discard_capture;
+    assert(empty_writer->discard_write_async(executor, discard_request));
+    executor.drain();
+    assert(discard_capture.done && !discard_capture.result.error);
+    assert(empty_writer->stale());
+
+    CacheAsyncRequest pending_create_request;
+    AsyncCacheCapture pending_create_capture;
+    pending_create_request.complete = AsyncCacheCapture::completed;
+    pending_create_request.context = &pending_create_capture;
+    assert(cache.create_pending_delete_async(
+        executor, pending_create_request, "async/pending",
+        "async/restore", "replacement"));
+    executor.drain();
+    assert(pending_create_capture.done && !pending_create_capture.result.error);
+    std::vector<CachePendingDelete> pending = cache.recover_pending_deletes();
+    assert(pending.size() == 1 && pending.front().rollback);
+
+    CacheAsyncRequest pending_commit_request;
+    AsyncCacheCapture pending_commit_capture;
+    pending_commit_request.complete = AsyncCacheCapture::completed;
+    pending_commit_request.context = &pending_commit_capture;
+    assert(cache.commit_pending_delete_async(
+        executor, pending_commit_request, "async/pending"));
+    executor.drain();
+    assert(pending_commit_capture.done && !pending_commit_capture.result.error);
+    pending = cache.recover_pending_deletes();
+    assert(pending.size() == 1 && !pending.front().rollback);
+
+    CacheAsyncRequest pending_finish_request;
+    AsyncCacheCapture pending_finish_capture;
+    pending_finish_request.complete = AsyncCacheCapture::completed;
+    pending_finish_request.context = &pending_finish_capture;
+    assert(cache.finish_pending_delete_async(
+        executor, pending_finish_request, "async/pending"));
+    executor.drain();
+    assert(pending_finish_capture.done && !pending_finish_capture.result.error);
+    assert(cache.recover_pending_deletes().empty());
+
+    CacheAsyncRequest prefix_request;
+    AsyncCacheCapture prefix_capture;
+    prefix_request.complete = AsyncCacheCapture::completed;
+    prefix_request.context = &prefix_capture;
+    CacheAsyncRequest child_request;
+    AsyncCacheCapture child_capture;
+    child_request.complete = AsyncCacheCapture::completed;
+    child_request.context = &child_capture;
+    assert(cache.open_async(
+        executor, prefix_request, test_identity("promote", "p", 0)));
+    assert(cache.open_async(
+        executor, child_request,
+        test_identity("promote/child", "c", 0)));
+    assert(prefix_request.pending() && child_request.pending());
+    executor.drain();
+    assert(prefix_capture.done && !prefix_capture.result.error);
+    assert(child_capture.done && !child_capture.result.error);
+    assert(prefix_capture.result.entry->key() == "promote");
+    assert(child_capture.result.entry->key() == "promote/child");
+
+    assert(::symlinkat("/tmp", CacheTestAccess::data_root_fd(cache),
+                       "unsafe") == 0);
+    CacheAsyncRequest unsafe_request;
+    AsyncCacheCapture unsafe_capture;
+    unsafe_request.complete = AsyncCacheCapture::completed;
+    unsafe_request.context = &unsafe_capture;
+    assert(cache.open_async(
+        executor, unsafe_request,
+        test_identity("unsafe/child", "unsafe", 0)));
+    executor.drain();
+    assert(unsafe_capture.done && unsafe_capture.result.error);
+    assert(::unlinkat(CacheTestAccess::data_root_fd(cache), "unsafe", 0) == 0);
+  }
+
+  {
+    TemporaryDirectory exported_directory;
+    CacheConfig exported_config = config;
+    exported_config.root = exported_directory.path;
+    exported_config.unlimited = true;
+    LocalCache cache(exported_config);
+    DeferredIoExecutor executor;
+    auto old = cache.open(test_identity("async/exported", "old", 4096));
+    CacheFetchClaim claim = old->claim_fetch(0, 4096, 4096);
+    assert(old->prepare_read(claim.offset, claim.length));
+    write_test_bytes(old->data_fd(), 0, claim.length);
+    old->publish_clean(claim, 0, claim.length, true);
+    old->finish_fetch(claim);
+    assert(old->try_export(false));
+    struct stat old_status{};
+    assert(::fstat(old->data_fd(), &old_status) == 0);
+
+    CacheAsyncRequest replacement_request;
+    AsyncCacheCapture replacement_capture;
+    replacement_request.complete = AsyncCacheCapture::completed;
+    replacement_request.context = &replacement_capture;
+    assert(cache.open_async(
+        executor, replacement_request,
+        test_identity("async/exported", "new", 64 * kCacheBitmapUnit)));
+    executor.drain();
+    assert(replacement_capture.done && !replacement_capture.result.error);
+    auto replacement = std::move(replacement_capture.result.entry);
+    struct stat replacement_status{};
+    assert(replacement &&
+           ::fstat(replacement->data_fd(), &replacement_status) == 0);
+    assert(old_status.st_dev != replacement_status.st_dev ||
+           old_status.st_ino != replacement_status.st_ino);
+    struct stat retained_status{};
+    assert(::fstat(old->data_fd(), &retained_status) == 0 &&
+           retained_status.st_size == old_status.st_size);
+    std::array<std::byte, 16> bytes{};
+    assert(::pread(old->data_fd(), bytes.data(), bytes.size(), 0) ==
+           ssize_t(bytes.size()));
+    for (size_t i = 0; i < bytes.size(); ++i) {
+      assert(bytes[i] == std::byte(i));
+    }
+  }
+
+  {
+    TemporaryDirectory budget_directory;
+    CacheConfig budget_config = config;
+    budget_config.root = budget_directory.path;
+    budget_config.unlimited = true;
+    LocalCache cache(budget_config);
+    DeferredIoExecutor executor;
+    constexpr uint64_t old_size = 1024 * 1024;
+    auto old = cache.open(test_identity("async/budget", "old", old_size));
+    CacheFetchClaim claim = old->claim_fetch(0, old_size, old_size);
+    assert(old->prepare_read(claim.offset, claim.length));
+    write_test_bytes(old->data_fd(), 0, claim.length);
+    old->publish_clean(claim, 0, claim.length, true);
+    old->finish_fetch(claim);
+    struct stat before_status{};
+    assert(::fstat(old->data_fd(), &before_status) == 0);
+    const uint64_t before = CacheTestAccess::allocated_bytes(cache);
+    CacheTestAccess::set_maximum_bytes(cache, before);
+
+    CacheAsyncRequest reset_request;
+    AsyncCacheCapture reset_capture;
+    reset_request.complete = AsyncCacheCapture::completed;
+    reset_request.context = &reset_capture;
+    assert(cache.open_async(
+        executor, reset_request,
+        test_identity("async/budget", "new", 0)));
+    executor.drain();
+    if (reset_capture.result.error) {
+      try {
+        std::rethrow_exception(reset_capture.result.error);
+      } catch (const std::exception& error) {
+        fprintf(stderr, "same-key asynchronous cache reset failed: %s\n",
+                error.what());
+      }
+    }
+    assert(reset_capture.done && !reset_capture.result.error);
+    assert(reset_capture.result.entry);
+    struct stat after_status{};
+    assert(::fstat(old->data_fd(), &after_status) == 0 &&
+           after_status.st_size == 0);
+    const uint64_t after = CacheTestAccess::allocated_bytes(cache);
+    assert(before_status.st_blocks >= after_status.st_blocks);
+    const uint64_t freed_data =
+        uint64_t(before_status.st_blocks - after_status.st_blocks) * 512;
+    assert(after <= before && before - after >= freed_data);
+    assert(CacheTestAccess::pending_reservations(cache) == 0);
+  }
+
+  {
     TemporaryDirectory cold_directory;
     CacheConfig cold = config;
     cold.root = cold_directory.path;
@@ -145,6 +676,110 @@ int main() {
     assert(ready && !evicted);
     CacheTestAccess::clear_keepalive(cache);
     assert(CacheTestAccess::evict_cold(cache));
+  }
+
+  {
+    TemporaryDirectory async_cold_directory;
+    CacheConfig cold = config;
+    cold.root = async_cold_directory.path;
+    cold.unlimited = true;
+    constexpr uint64_t old_size = 1024 * 1024;
+    {
+      LocalCache cache(cold);
+      auto old = cache.open(test_identity(
+          "async/cold-old", "old", old_size));
+      const CacheFetchClaim claim = old->claim_fetch(0, old_size, old_size);
+      assert(old->prepare_read(claim.offset, claim.length));
+      write_test_bytes(old->data_fd(), 0, claim.length);
+      old->publish_clean(claim, 0, claim.length, true);
+      old->finish_fetch(claim);
+    }
+    {
+      LocalCache cache(cold);
+      CacheTestAccess::set_maximum_bytes(
+          cache, CacheTestAccess::allocated_bytes(cache));
+      DeferredIoExecutor executor;
+      CacheAsyncRequest request;
+      AsyncCacheCapture capture;
+      request.complete = AsyncCacheCapture::completed;
+      request.context = &capture;
+      assert(cache.open_async(
+          executor, request,
+          test_identity("async/cold-new", "new", 0)));
+      executor.drain();
+      assert(capture.done && !capture.result.error && capture.result.entry);
+      assert(CacheTestAccess::pending_reservations(cache) == 0);
+    }
+  }
+
+  {
+    TemporaryDirectory metadata_directory;
+    CacheConfig bounded = config;
+    bounded.root = metadata_directory.path;
+    bounded.unlimited = true;
+    LocalCache cache(bounded);
+    for (unsigned i = 0; i < 8; ++i) {
+      auto entry = cache.open(test_identity(
+          "async/metadata-" + std::to_string(i), "old", 0));
+      assert(entry);
+    }
+    CacheTestAccess::set_maximum_bytes(
+        cache, CacheTestAccess::allocated_bytes(cache));
+    DeferredIoExecutor executor;
+    CacheAsyncRequest request;
+    AsyncCacheCapture capture;
+    request.complete = AsyncCacheCapture::completed;
+    request.context = &capture;
+    assert(cache.open_async(
+        executor, request,
+        test_identity("async/metadata-new", "new", 0)));
+    executor.drain();
+    assert(capture.done && !capture.result.error && capture.result.entry);
+    assert(CacheTestAccess::pending_reservations(cache) == 0);
+  }
+
+  {
+    TemporaryDirectory cancellation_directory;
+    CacheConfig cancellation = config;
+    cancellation.root = cancellation_directory.path;
+    cancellation.unlimited = true;
+    LocalCache cache(cancellation);
+    DeferredIoExecutor executor;
+    executor.fail_next(AsyncIoRequest::FALLOCATE, ECANCELED);
+    CacheAsyncRequest request;
+    AsyncCacheCapture capture;
+    request.complete = AsyncCacheCapture::completed;
+    request.context = &capture;
+    assert(cache.create_writer_async(
+        executor, request,
+        test_identity("async/cancel-reservation", "", 0),
+        8U * 1024U * 1024U));
+    executor.drain();
+    assert(capture.done && capture.result.error);
+    assert(CacheTestAccess::pending_reservations(cache) == 0);
+  }
+
+  {
+    TemporaryDirectory reclaim_identity_directory;
+    CacheConfig reclaim = config;
+    reclaim.root = reclaim_identity_directory.path;
+    LocalCache cache(reclaim);
+    auto old = cache.open(test_identity("async/reclaim-race", "old", 0));
+    auto replacement = cache.open(
+        test_identity("async/reclaim-race", "replacement", 0));
+    assert(old && replacement && old.get() != replacement.get());
+    DeferredIoExecutor executor;
+    CacheAsyncRequest request;
+    AsyncCacheCapture capture;
+    request.complete = AsyncCacheCapture::completed;
+    request.context = &capture;
+    assert(CacheTestAccess::reclaim_closed_async(
+        cache, executor, request, old));
+    executor.drain();
+    assert(capture.done && !capture.result.error && !capture.result.value);
+    assert(cache.open(test_identity(
+               "async/reclaim-race", "replacement", 0)).get() ==
+           replacement.get());
   }
 
   {

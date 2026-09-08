@@ -235,8 +235,15 @@ std::unique_ptr<FileWriter> make_file_writer(State& state,
 class HttpPool {
  private:
   struct Slot {
+    explicit Slot(unsigned owner) noexcept : owner(owner) {}
+
     std::unique_ptr<HttpClient> client;
     std::atomic<bool> busy{false};
+    const unsigned owner;
+  };
+
+  struct alignas(64) WorkerCursor {
+    size_t next = 0;
   };
 
  public:
@@ -276,10 +283,17 @@ class HttpPool {
 
     HttpPool* owner_ = nullptr;
     size_t slot_ = 0;
+
+#ifdef NGS3FS_FUSE_OWNER_TEST
+   public:
+    size_t test_slot() const noexcept { return slot_; }
+#endif
   };
 
   explicit HttpPool(const MountConfig& config)
-      : release_pipe_(Pipe::create(4096)) {
+      : worker_count_(config.reactor_count > 1 ? config.reactor_count - 1 : 0),
+        worker_next_(worker_count_),
+        release_pipe_(Pipe::create(4096)) {
     const int release_flags = ::fcntl(
         release_pipe_.write_fd(), F_GETFL, 0);
     if (release_flags < 0 ||
@@ -293,7 +307,8 @@ class HttpPool {
     std::vector<std::thread> threads;
     threads.reserve(config.max_connections);
     for (size_t i = 0; i < slots_.size(); ++i) {
-      slots_[i] = std::make_unique<Slot>();
+      slots_[i] = std::make_unique<Slot>(
+          worker_count_ == 0 ? 0 : unsigned(i % worker_count_));
       threads.emplace_back([&, i] {
         try {
           slots_[i]->client = HttpClient::connect(
@@ -316,6 +331,19 @@ class HttpPool {
       }
     }
   }
+
+#ifdef NGS3FS_FUSE_OWNER_TEST
+  HttpPool(size_t slot_count, unsigned worker_count)
+      : worker_count_(worker_count),
+        worker_next_(worker_count_),
+        release_pipe_(Pipe::create(4096)) {
+    slots_.reserve(slot_count);
+    for (size_t i = 0; i < slot_count; ++i) {
+      slots_.push_back(std::make_unique<Slot>(
+          worker_count_ == 0 ? 0 : unsigned(i % worker_count_)));
+    }
+  }
+#endif
 
   Lease acquire() {
     return acquire_slots(slots_.size());
@@ -353,10 +381,46 @@ class HttpPool {
 
  private:
   Lease try_acquire_slots(size_t usable) noexcept {
+    if (FuseReactor* reactor = current_fuse_reactor();
+        reactor != nullptr && reactor->is_multi_worker() &&
+        reactor->worker_count() == worker_count_) {
+      return try_acquire_affine(usable, reactor->worker_index());
+    }
     const size_t begin = next_.fetch_add(1, std::memory_order_relaxed) %
         usable;
     for (size_t n = 0; n < usable; ++n) {
       const size_t i = (begin + n) % usable;
+      bool available = false;
+      if (slots_[i]->busy.compare_exchange_strong(
+              available, true, std::memory_order_acquire,
+              std::memory_order_relaxed)) {
+        return Lease(this, i);
+      }
+    }
+    return {};
+  }
+
+  Lease try_acquire_affine(size_t usable, unsigned worker) noexcept {
+    // A worker is the sole writer of its cursor. Slot ownership is immutable;
+    // borrowing changes only busy, so returning a lease restores the owner's
+    // local preference without migrating an in-flight connection.
+    size_t& cursor = worker_next_[worker].next;
+    const size_t begin = cursor++ % usable;
+    for (size_t n = 0; n < usable; ++n) {
+      const size_t i = (begin + n) % usable;
+      if (slots_[i]->owner != worker) continue;
+      bool available = false;
+      if (slots_[i]->busy.compare_exchange_strong(
+              available, true, std::memory_order_acquire,
+              std::memory_order_relaxed)) {
+        return Lease(this, i);
+      }
+    }
+    // Local capacity is busy. Borrow any completely idle slot rather than
+    // enforcing a hard quota that could strand mount-wide capacity.
+    for (size_t n = 0; n < usable; ++n) {
+      const size_t i = (begin + n) % usable;
+      if (slots_[i]->owner == worker) continue;
       bool available = false;
       if (slots_[i]->busy.compare_exchange_strong(
               available, true, std::memory_order_acquire,
@@ -406,6 +470,8 @@ class HttpPool {
   }
 
   std::vector<std::unique_ptr<Slot>> slots_;
+  const unsigned worker_count_;
+  std::vector<WorkerCursor> worker_next_;
   std::atomic<size_t> next_{0};
   std::atomic<uint64_t> released_{0};
   Pipe release_pipe_;
@@ -422,13 +488,17 @@ class UploadScheduler {
     bool asynchronous = false;
   };
 
+  struct OwnerJob {
+    FuseReactor* reactor;
+    FuseReactor::ReactorTask* continuation;
+    void (*activate)(void*) noexcept;
+    void* context;
+  };
+
  public:
   UploadScheduler(unsigned concurrency, int io_timeout_ms)
       : io_timeout_ms_(io_timeout_ms), max_uploads_(concurrency) {
     threads_.reserve(concurrency);
-    for (unsigned i = 0; i < concurrency; ++i) {
-      threads_.emplace_back([this] { worker(); });
-    }
   }
 
   UploadScheduler(const UploadScheduler&) = delete;
@@ -437,15 +507,21 @@ class UploadScheduler {
   ~UploadScheduler() { shutdown(); }
 
   void shutdown() noexcept {
+    std::deque<OwnerJob> cancelled;
     {
       std::lock_guard guard(mutex_);
+      if (stopping_) return;
       stopping_ = true;
+      cancelled.swap(owner_jobs_);
     }
     condition_.notify_all();
     for (std::thread& thread : threads_) {
       if (thread.joinable()) {
         thread.join();
       }
+    }
+    for (const OwnerJob& job : cancelled) {
+      job.reactor->complete(job.continuation);
     }
   }
 
@@ -456,6 +532,7 @@ class UploadScheduler {
         throw std::system_error(ECANCELED, std::generic_category(),
                                 "upload scheduler stopped");
       }
+      start_workers_locked();
       jobs_.push_back(Job{owner, current_fuse_reactor(), std::move(run)});
     }
     condition_.notify_one();
@@ -469,24 +546,70 @@ class UploadScheduler {
         throw std::system_error(ECANCELED, std::generic_category(),
                                 "upload scheduler stopped");
       }
+      start_workers_locked();
       jobs_.push_back(Job{owner, current_fuse_reactor(), std::move(run),
                           true, asynchronous});
     }
     condition_.notify_one();
   }
 
+  void submit_owner_upload(FuseReactor& reactor,
+                           FuseReactor::ReactorTask& continuation,
+                           void (*activate)(void*) noexcept,
+                           void* context) {
+    bool ready = false;
+    {
+      std::lock_guard guard(mutex_);
+      if (stopping_) {
+        throw std::system_error(ECANCELED, std::generic_category(),
+                                "upload scheduler stopped");
+      }
+      if (active_uploads_ < max_uploads_) {
+        ++active_uploads_;
+        ready = true;
+      } else {
+        owner_jobs_.push_back(
+            OwnerJob{&reactor, &continuation, activate, context});
+      }
+    }
+    if (ready) {
+      activate(context);
+      reactor.complete(&continuation);
+    }
+  }
+
   // Asynchronous upload admission lasts through its final network/local
   // completion, not merely until the CPU preparation worker returns.
   void finish_upload() noexcept {
+    OwnerJob ready{};
     {
       std::lock_guard guard(mutex_);
       if (active_uploads_ == 0) abort();
       --active_uploads_;
+      if (!stopping_ && !owner_jobs_.empty()) {
+        ready = owner_jobs_.front();
+        owner_jobs_.pop_front();
+        ++active_uploads_;
+      }
     }
     condition_.notify_all();
+    if (ready.reactor != nullptr) {
+      ready.activate(ready.context);
+      ready.reactor->complete(ready.continuation);
+    }
   }
 
+#ifdef NGS3FS_FUSE_OWNER_TEST
+  size_t test_thread_count() const noexcept { return threads_.size(); }
+#endif
+
  private:
+  void start_workers_locked() {
+    for (size_t i = threads_.size(); i < max_uploads_; ++i) {
+      threads_.emplace_back([this] { worker(); });
+    }
+  }
+
   void worker() noexcept {
     for (;;) {
       Job job;
@@ -535,6 +658,7 @@ class UploadScheduler {
 
   std::vector<std::thread> threads_;
   std::deque<Job> jobs_;
+  std::deque<OwnerJob> owner_jobs_;
   std::mutex mutex_;
   std::condition_variable condition_;
   int io_timeout_ms_ = kRequestIoTimeoutMs;
@@ -851,10 +975,17 @@ time_t wall_time_seconds() {
   return now.tv_sec;
 }
 
+struct State;
+
 class AmzDateTimeCache {
  public:
   AmzDateTimeCache() {
     publish(amz_datetime_now());
+  }
+
+  void start_thread() {
+    if (thread_.joinable()) return;
+    stopping_.store(false, std::memory_order_release);
     thread_ = std::thread([this] {
       while (!stopping_.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -868,12 +999,16 @@ class AmzDateTimeCache {
   AmzDateTimeCache(const AmzDateTimeCache&) = delete;
   AmzDateTimeCache& operator=(const AmzDateTimeCache&) = delete;
 
-  ~AmzDateTimeCache() {
+  ~AmzDateTimeCache() { stop(); }
+
+  void stop() noexcept {
     stopping_.store(true, std::memory_order_release);
     if (thread_.joinable()) {
       thread_.join();
     }
   }
+
+  void tick() noexcept { update(); }
 
   std::array<uint64_t, 2> now() const noexcept {
     for (;;) {
@@ -917,11 +1052,38 @@ class AmzDateTimeCache {
   std::thread thread_;
 };
 
-struct State;
 struct UncachedPrefetch;
 void cache_reclaim_loop(std::stop_token stop, State* state) noexcept;
 void cache_recovery_loop(std::stop_token stop, State* state) noexcept;
 void stats_report_loop(std::stop_token stop, State* state) noexcept;
+void cache_reclaim_tick(State& state, size_t invalidation_limit,
+                        size_t scan_limit) noexcept;
+void emit_runtime_stats(State& state, const char* event) noexcept;
+void start_owner_cache_recovery(State& state,
+                                FuseReactor& reactor) noexcept;
+
+struct ReactorMaintenance {
+  explicit ReactorMaintenance(State* value) noexcept : state(value) {
+    start_task = {start, cancel, this};
+  }
+
+  State* state;
+  FuseReactor* reactor = nullptr;
+  FuseReactor::ReactorTask start_task;
+  AsyncIoRequest timer;
+  UniqueFd timer_fd;
+  uint64_t expirations = 0;
+  uint64_t next_reclaim_ns = 0;
+  uint64_t next_stats_ns = 0;
+  bool shutdown_stats_emitted = false;
+
+  static void start(void* context) noexcept;
+  static void cancel(void* context) noexcept;
+  static void retry(void* context) noexcept;
+  static void tick(void* context, ssize_t result) noexcept;
+  void submit_wait() noexcept;
+  void finish() noexcept;
+};
 
 size_t receive_demand_capacity(size_t maximum_read) {
   // Worst object offset within a block: one READ can need both edge blocks.
@@ -963,20 +1125,39 @@ struct State {
             16, std::max(kReceiveBlockSize, prefetch_capacity(config, page_size)))),
         http(std::make_unique<HttpPool>(config)),
         uploads(std::make_unique<UploadScheduler>(
-            config.max_uploads, config.request_timeout_ms)),
-        cache_reclaimer([this](std::stop_token stop) {
-          cache_reclaim_loop(stop, this);
-        }) {
+            config.max_uploads, config.request_timeout_ms)) {
     config.max_prefetch_memory = prefetch_capacity(config, page_size);
     if (config.cache_dir.empty() && !config.tls && config.io_engine != IO_ENGINE_LEGACY) {
       read_ahead_pool->preallocate_receive_blocks(config.max_connections);
     }
     root_item->set_parent(root_item.get());
-    if (config.stats_interval_seconds != 0) {
+  }
+
+  void start_thread_maintenance() {
+    date_time.start_thread();
+    if (cache_recovery_pending && !cache_recovery.joinable()) {
+      cache_recovery_pending = false;
+      cache_recovery = std::jthread([this](std::stop_token stop) {
+        cache_recovery_loop(stop, this);
+      });
+    }
+    if (!cache_reclaimer.joinable()) {
+      cache_reclaimer = std::jthread([this](std::stop_token stop) {
+        cache_reclaim_loop(stop, this);
+      });
+    }
+    if (config.stats_interval_seconds != 0 && !stats_reporter.joinable()) {
       stats_reporter = std::jthread([this](std::stop_token stop) {
         stats_report_loop(stop, this);
       });
     }
+  }
+
+  bool start_reactor_maintenance(FuseReactorGroup& group) {
+    reactor_maintenance = std::make_unique<ReactorMaintenance>(this);
+    if (group.post_to_worker(&reactor_maintenance->start_task)) return true;
+    reactor_maintenance.reset();
+    return false;
   }
 
   void stop_background_tasks() noexcept {
@@ -1001,6 +1182,7 @@ struct State {
     if (cache_reclaimer.joinable()) {
       cache_reclaimer.join();
     }
+    date_time.stop();
     uploads.reset();
   }
 
@@ -1096,6 +1278,7 @@ struct State {
   std::set<std::string, std::less<>> recovery_paths;
   std::vector<BlockedPath> blocked_paths;
   std::vector<std::shared_ptr<CacheEntry>> recovery_entries;
+  bool cache_recovery_pending = false;
   std::unique_ptr<HttpPool> http;
   std::unique_ptr<UploadScheduler> uploads;
   fuse_session* session = nullptr;
@@ -1134,6 +1317,7 @@ struct State {
   std::jthread cache_reclaimer;
   std::jthread cache_recovery;
   std::jthread stats_reporter;
+  std::unique_ptr<ReactorMaintenance> reactor_maintenance;
 };
 
 void emit_runtime_stats(State& state, const char* event) noexcept {
@@ -3111,9 +3295,7 @@ void initialize_local_cache(State& state) {
             isolated_keys.size(), isolated_keys.size() == 1 ? "" : "s");
   }
   if (!state.recovery_entries.empty() || !state.pending_deletes.empty()) {
-    state.cache_recovery = std::jthread([&state](std::stop_token stop) {
-      cache_recovery_loop(stop, &state);
-    });
+    state.cache_recovery_pending = true;
   }
 }
 
@@ -6043,57 +6225,51 @@ void warn_inode_cache_budget(State& state) noexcept {
           state.config.max_cached_inodes);
 }
 
-void cache_reclaim_loop(std::stop_token stop, State* state) noexcept {
-  while (!stop.stop_requested()) {
-    size_t scan_limit = 0;
-    std::deque<State::PendingInvalidation> invalidations;
-    {
-      std::unique_lock guard(state->cache_mutex);
-      state->cache_condition.wait_for(
-          guard, std::chrono::milliseconds(250), [&] {
-            return stop.stop_requested() ||
-                !state->pending_invalidations.empty() ||
-                state->cached_inodes.load(std::memory_order_acquire) >
-                    state->config.max_cached_inodes;
-          });
-      if (stop.stop_requested()) {
-        return;
-      }
-      invalidations.swap(state->pending_invalidations);
-      if (state->cached_inodes.load(std::memory_order_acquire) <=
-          state->config.max_cached_inodes) {
-        state->cache_budget_warned = false;
-      } else {
-        scan_limit = state->cache_clock_size * 2 + 1;
-      }
+void cache_reclaim_tick(State& state, size_t invalidation_limit,
+                        size_t maximum_scan) noexcept {
+  size_t scan_limit = 0;
+  std::deque<State::PendingInvalidation> invalidations;
+  {
+    std::lock_guard guard(state.cache_mutex);
+    while (!state.pending_invalidations.empty() &&
+           invalidations.size() < invalidation_limit) {
+      invalidations.push_back(std::move(state.pending_invalidations.front()));
+      state.pending_invalidations.pop_front();
     }
-    for (const State::PendingInvalidation& pending : invalidations) {
+    if (state.cached_inodes.load(std::memory_order_acquire) <=
+        state.config.max_cached_inodes) {
+      state.cache_budget_warned = false;
+    } else {
+      const size_t available = state.cache_clock_size > (SIZE_MAX - 1) / 2
+          ? SIZE_MAX : state.cache_clock_size * 2 + 1;
+      scan_limit = std::min(maximum_scan, available);
+    }
+  }
+  for (const State::PendingInvalidation& pending : invalidations) {
       if (pending.generation_epoch != 0 &&
           (pending.item->generation_epoch.load(std::memory_order_acquire) &
            ((1ULL << 63) - 1)) != pending.generation_epoch) {
         continue;
       }
-      invalidate_page_cache(*state, pending.inode,
+      invalidate_page_cache(state, pending.inode,
                             pending.offset, pending.length);
-    }
-    if (!invalidations.empty()) {
-      invalidations.clear();
-      sweep_retired_items(*state);
-    }
-    if (scan_limit == 0) {
-      continue;
-    }
+  }
+  if (!invalidations.empty()) {
+    invalidations.clear();
+    sweep_retired_items(state);
+  }
+  if (scan_limit == 0) return;
 
-    size_t reclaimed = 0;
-    for (size_t scan = 0; scan < scan_limit; ++scan) {
+  size_t reclaimed = 0;
+  for (size_t scan = 0; scan < scan_limit; ++scan) {
       InodeDir* item = nullptr;
       {
-        std::lock_guard guard(state->cache_mutex);
-        item = state->cache_clock_hand;
+        std::lock_guard guard(state.cache_mutex);
+        item = state.cache_clock_hand;
         if (item == nullptr) {
           break;
         }
-        state->cache_clock_hand = item->children.clock_next;
+        state.cache_clock_hand = item->children.clock_next;
         if (item->children.clock_referenced.exchange(
                 false, std::memory_order_relaxed)) {
           continue;
@@ -6112,27 +6288,128 @@ void cache_reclaim_loop(std::stop_token stop, State* state) noexcept {
         continue;
       }
       try {
-        reclaimed += reclaim_cached_children(*state, *item);
+        reclaimed += reclaim_cached_children(state, *item);
       } catch (const std::exception& error) {
         fprintf(stderr, "warning: inode cache reclamation failed: %s\n",
                 error.what());
       } catch (...) {
       }
       if (release_inode_count(item->open_count)) {
-        sweep_retired_items(*state);
+        sweep_retired_items(state);
       }
-      if (state->cached_inodes.load(std::memory_order_acquire) <=
-          state->config.max_cached_inodes) {
-        state->cache_budget_warned = false;
+      if (state.cached_inodes.load(std::memory_order_acquire) <=
+          state.config.max_cached_inodes) {
+        state.cache_budget_warned = false;
         break;
       }
+  }
+  if (reclaimed == 0 &&
+      state.cached_inodes.load(std::memory_order_acquire) >
+          state.config.max_cached_inodes) {
+    warn_inode_cache_budget(state);
+  }
+}
+
+void cache_reclaim_loop(std::stop_token stop, State* state) noexcept {
+  while (!stop.stop_requested()) {
+    {
+      std::unique_lock guard(state->cache_mutex);
+      state->cache_condition.wait_for(
+          guard, std::chrono::milliseconds(250), [&] {
+            return stop.stop_requested() ||
+                !state->pending_invalidations.empty() ||
+                state->cached_inodes.load(std::memory_order_acquire) >
+                    state->config.max_cached_inodes;
+          });
     }
-    if (reclaimed == 0 &&
-        state->cached_inodes.load(std::memory_order_acquire) >
-            state->config.max_cached_inodes) {
-      warn_inode_cache_budget(*state);
+    if (stop.stop_requested()) return;
+    cache_reclaim_tick(*state, SIZE_MAX, SIZE_MAX);
+  }
+}
+
+void ReactorMaintenance::finish() noexcept {
+  timer_fd.reset();
+  if (!shutdown_stats_emitted && state->config.stats_interval_seconds != 0) {
+    shutdown_stats_emitted = true;
+    emit_runtime_stats(*state, "shutdown_stats");
+  }
+}
+
+void ReactorMaintenance::submit_wait() noexcept {
+  timer = {};
+  timer.kind = AsyncIoRequest::READ;
+  timer.fd = timer_fd.get();
+  timer.data = &expirations;
+  timer.length = sizeof(expirations);
+  timer.complete = tick;
+  timer.context = this;
+  if (reactor->submit(timer)) return;
+  if (errno == EAGAIN) {
+    start_task = {retry, cancel, this};
+    if (reactor->reserve_completion(&start_task)) {
+      reactor->complete(&start_task);
+      return;
     }
   }
+  finish();
+}
+
+void ReactorMaintenance::start(void* context) noexcept {
+  auto* self = static_cast<ReactorMaintenance*>(context);
+  self->reactor = current_fuse_reactor();
+  if (self->reactor == nullptr) {
+    self->finish();
+    return;
+  }
+  start_owner_cache_recovery(*self->state, *self->reactor);
+  self->timer_fd.reset(::timerfd_create(
+      CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
+  if (!self->timer_fd) {
+    self->finish();
+    return;
+  }
+  itimerspec interval{};
+  interval.it_value.tv_nsec = 100'000'000;
+  interval.it_interval = interval.it_value;
+  if (::timerfd_settime(self->timer_fd.get(), 0, &interval, nullptr) != 0) {
+    self->finish();
+    return;
+  }
+  const uint64_t now = fuse_monotonic_ns_noexcept();
+  self->next_reclaim_ns = now + 250'000'000;
+  if (self->state->config.stats_interval_seconds != 0) {
+    self->next_stats_ns = now +
+        uint64_t(self->state->config.stats_interval_seconds) * 1'000'000'000;
+  }
+  self->submit_wait();
+}
+
+void ReactorMaintenance::cancel(void* context) noexcept {
+  static_cast<ReactorMaintenance*>(context)->finish();
+}
+
+void ReactorMaintenance::retry(void* context) noexcept {
+  static_cast<ReactorMaintenance*>(context)->submit_wait();
+}
+
+void ReactorMaintenance::tick(void* context, ssize_t result) noexcept {
+  auto* self = static_cast<ReactorMaintenance*>(context);
+  if (result != ssize_t(sizeof(self->expirations))) {
+    self->finish();
+    return;
+  }
+  self->state->date_time.tick();
+  const uint64_t now = fuse_monotonic_ns_noexcept();
+  if (now >= self->next_reclaim_ns) {
+    cache_reclaim_tick(*self->state, 32, 32);
+    self->next_reclaim_ns = now + 250'000'000;
+  }
+  if (self->next_stats_ns != 0 && now >= self->next_stats_ns) {
+    emit_runtime_stats(*self->state, "stats");
+    self->next_stats_ns = now +
+        uint64_t(self->state->config.stats_interval_seconds) * 1'000'000'000;
+  }
+  self->submit_wait();
 }
 
 void append_authorization(std::vector<Header>& headers, State& state,
@@ -6183,6 +6460,149 @@ ChecksumValue retained_checksum(ChecksumAlgorithm algorithm,
   }
   return checksum.finish();
 }
+
+// Stackless owner-local checksum progression. Each callback hashes at most one
+// receive-sized chunk; file/pipe reads return through the owner's CQ. The
+// caller keeps the source and this operation alive until completion.
+class ReactorChecksum {
+ public:
+  using Complete = void (*)(void*, ChecksumValue, std::exception_ptr) noexcept;
+
+  ReactorChecksum(FuseReactor& reactor, ChecksumAlgorithm algorithm,
+                  Complete complete, void* context)
+      : reactor_(reactor), checksum_(algorithm), complete_(complete), context_(context) {}
+
+  bool memory(const void* data, size_t length) noexcept {
+    memory_ = static_cast<const std::byte*>(data);
+    length_ = length;
+    return schedule();
+  }
+
+  bool file(int fd, uint64_t offset, size_t length) noexcept {
+    fd_ = fd;
+    offset_ = offset;
+    length_ = length;
+    return schedule();
+  }
+
+  bool retained(const RetainedPart* part) noexcept {
+    part_ = part;
+    length_ = part ? size_t(part->bytes) : 0;
+    return schedule();
+  }
+
+ private:
+  bool schedule() noexcept {
+    task_ = {step, cancelled, this};
+    if (!reactor_.reserve_completion(&task_)) return false;
+    reactor_.complete(&task_);
+    return true;
+  }
+
+  void finish(std::exception_ptr error = {}) noexcept {
+    ChecksumValue value;
+    if (!error) {
+      try { value = checksum_.finish(); }
+      catch (...) { error = std::current_exception(); }
+    }
+    complete_(context_, std::move(value), std::move(error));
+  }
+
+  void fail(int error) noexcept {
+    try { throw std::system_error(error, std::generic_category(), "owner checksum"); }
+    catch (...) { finish(std::current_exception()); }
+  }
+
+  static void cancelled(void* context) noexcept {
+    static_cast<ReactorChecksum*>(context)->fail(ECANCELED);
+  }
+
+  static void received(void* context, ssize_t result) noexcept {
+    auto* self = static_cast<ReactorChecksum*>(context);
+    if (result < 0) { self->fail(-int(result)); return; }
+    if (result == 0 || size_t(result) > self->io_.length) {
+      self->fail(EIO);
+      return;
+    }
+    try {
+      self->checksum_.update(std::span(self->buffer_).first(size_t(result)));
+      self->done_ += size_t(result);
+      if (self->part_) self->segment_remaining_ -= size_t(result);
+      if (!self->schedule()) self->fail(errno);
+    } catch (...) { self->finish(std::current_exception()); }
+  }
+
+  static void step(void* context) noexcept {
+    auto* self = static_cast<ReactorChecksum*>(context);
+    if (self->done_ == self->length_) { self->finish(); return; }
+    try {
+      const size_t size = std::min(kPreferredIoSize, self->length_ - self->done_);
+      if (self->memory_) {
+        self->checksum_.update(std::span(self->memory_ + self->done_, size));
+        self->done_ += size;
+        if (!self->schedule()) self->fail(errno);
+        return;
+      }
+      self->buffer_.resize(size);
+      self->io_ = {};
+      self->io_.kind     = AsyncIoRequest::PREAD;
+      self->io_.fd       = self->fd_;
+      self->io_.data     = self->buffer_.data();
+      self->io_.length   = size;
+      self->io_.input_offset = off_t(self->offset_ + self->done_);
+      // Try pagecache hits without an io-wq handoff. io_uring offloads a
+      // blocking miss itself; IOSQE_ASYNC would force a handoff on every read.
+      if (self->part_) {
+        if (self->segment_remaining_ == 0) {
+          while (self->segment_ < self->part_->segments.size() &&
+                 self->part_->segments[self->segment_].bytes == 0) ++self->segment_;
+          if (self->segment_ == self->part_->segments.size()) {
+            self->fail(EIO);
+            return;
+          }
+          const auto& segment = self->part_->segments[self->segment_++];
+          self->copy_ = Pipe::create(segment.pipe.capacity());
+          if (self->copy_.capacity() < segment.bytes) { self->fail(ENOBUFS); return; }
+          ssize_t copied;
+          do {
+            copied = ::tee(segment.pipe.read_fd(), self->copy_.write_fd(),
+                           segment.bytes, SPLICE_F_NONBLOCK);
+          } while (copied < 0 && errno == EINTR);
+          // tee does not advance its input. A short clone must never be
+          // retried from the unchanged prefix and silently duplicate bytes.
+          if (copied != ssize_t(segment.bytes)) {
+            self->fail(copied < 0 ? errno : EIO);
+            return;
+          }
+          self->segment_remaining_ = segment.bytes;
+        }
+        self->io_.kind   = AsyncIoRequest::READ;
+        self->io_.fd     = self->copy_.read_fd();
+        self->io_.length = std::min(size, self->segment_remaining_);
+      }
+      self->io_.complete = received;
+      self->io_.context  = self;
+      if (!self->reactor_.submit(self->io_)) self->fail(errno);
+    } catch (...) { self->finish(std::current_exception()); }
+  }
+
+  FuseReactor& reactor_;
+  DataChecksum checksum_;
+  Complete complete_;
+  void* context_;
+  FuseReactor::ReactorTask task_;
+  AsyncIoRequest io_;
+  std::vector<std::byte> buffer_;
+  const std::byte* memory_ = nullptr;
+  const RetainedPart* part_ = nullptr;
+  Pipe copy_;
+  int fd_ = -1;
+  uint64_t offset_ = 0;
+  size_t length_ = 0;
+  size_t done_ = 0;
+  size_t segment_ = 0;
+  size_t segment_remaining_ = 0;
+};
 
 void append_upload_checksum(std::vector<Header>& headers,
                             ChecksumAlgorithm algorithm,
@@ -6803,7 +7223,10 @@ struct AsyncPartUpload {
   ssostr<248> created_id;
   std::vector<Pipe> replay;
   std::unique_ptr<AsyncSignedS3Request> http;
+  std::unique_ptr<ReactorChecksum> checksum_operation;
+  CacheAsyncRequest cache_request;
   FuseReactor::ReactorTask continuation;
+  FuseReactor::ReactorTask preparation;
   AsyncIoRequest wait;
   UniqueFd timer;
   uint64_t notification = 0;
@@ -6857,27 +7280,12 @@ struct AsyncPartUpload {
     if (admitted) state.uploads->finish_upload();
   }
 
-  void reserve_completion(void (*run)(void*) noexcept) {
-    continuation = {run, run, this};
-    if (!reactor.reserve_completion(&continuation)) {
+  void reserve_completion(FuseReactor::ReactorTask& task,
+                          void (*run)(void*) noexcept,
+                          void (*cancel)(void*) noexcept) {
+    task = {run, cancel, this};
+    if (!reactor.reserve_completion(&task)) {
       throw std::system_error(errno, std::generic_category(), "reserve multipart completion");
-    }
-  }
-
-  template<class Work>
-  void local(void (*run)(void*) noexcept, Work work) {
-    reserve_completion(run);
-    try {
-      state.uploads->submit(&handle, [this, work = std::move(work)]() mutable {
-        try {
-          IoExecutorScope local_only(nullptr, 0);
-          work();
-        } catch (...) { worker_error = std::current_exception(); }
-        reactor.complete(&continuation);
-      });
-    } catch (...) {
-      worker_error = std::current_exception();
-      reactor.complete(&continuation);
     }
   }
 
@@ -6892,33 +7300,90 @@ struct AsyncPartUpload {
         throw std::system_error(ENOBUFS, std::generic_category(),
                                 "multipart replay pipe is too small");
       }
-      tee_exact(segment.pipe.read_fd(), copy.write_fd(), segment.bytes, 0);
+      ssize_t copied;
+      do {
+        copied = ::tee(segment.pipe.read_fd(), copy.write_fd(), segment.bytes,
+                       SPLICE_F_NONBLOCK);
+      } while (copied < 0 && errno == EINTR);
+      if (copied != ssize_t(segment.bytes)) {
+        throw std::system_error(copied < 0 ? errno : EIO,
+                                std::generic_category(),
+                                "clone multipart replay pipe");
+      }
       copy.close_write_end();
       replay.push_back(std::move(copy));
     }
   }
 
-  void prepare() noexcept {
-    admitted = true;
+  static void activate_admission(void* context) noexcept {
+    static_cast<AsyncPartUpload*>(context)->admitted = true;
+  }
+
+  static void admission_cancelled(void* context) noexcept {
+    static_cast<AsyncPartUpload*>(context)->finish(ECANCELED);
+  }
+
+  static void checksum_complete(void* context, ChecksumValue value,
+                                std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncPartUpload*>(context);
+    self->checksum = std::move(value);
+    self->worker_error = std::move(error);
+    self->reactor.complete(&self->preparation);
+  }
+
+  static void preparation_cancelled(void* context) noexcept {
+    static_cast<AsyncPartUpload*>(context)->finish(ECANCELED);
+  }
+
+  static void admitted_ready(void* context) noexcept {
+    auto* self = static_cast<AsyncPartUpload*>(context);
+    if (!self->admitted) {
+      self->finish(ECANCELED);
+      return;
+    }
     try {
-      IoExecutorScope local_only(nullptr, 0);
-      if (checksum_has_digest(state.config.checksum)) {
-        checksum = part ? retained_checksum(state.config.checksum, part.get())
-            : checksum_file_range(state.config.checksum,
-                handle.cache_entry->data_fd(), offset, length);
+      self->reserve_completion(self->preparation, prepared,
+                               preparation_cancelled);
+    } catch (...) {
+      self->finish(error_code(std::current_exception()));
+      return;
+    }
+    try {
+      if (checksum_has_digest(self->state.config.checksum)) {
+        self->checksum_operation = std::make_unique<ReactorChecksum>(
+            self->reactor, self->state.config.checksum, checksum_complete,
+            self);
+        const bool scheduled = self->part
+            ? self->checksum_operation->retained(self->part.get())
+            : self->checksum_operation->file(
+                self->handle.cache_entry->data_fd(), self->offset,
+                self->length);
+        if (!scheduled) {
+          throw std::system_error(errno, std::generic_category(),
+                                  "schedule multipart checksum");
+        }
+      } else {
+        self->reactor.complete(&self->preparation);
       }
-      prepare_replay();
-    } catch (...) { worker_error = std::current_exception(); }
-    reactor.complete(&continuation);
+    } catch (...) {
+      self->worker_error = std::current_exception();
+      self->reactor.complete(&self->preparation);
+    }
   }
 
   static void prepared(void* context) noexcept {
     auto* self = static_cast<AsyncPartUpload*>(context);
+    self->checksum_operation.reset();
     if (self->worker_error) {
       self->finish(error_code(self->worker_error));
       return;
     }
-    self->begin();
+    try {
+      self->prepare_replay();
+      self->begin();
+    } catch (...) {
+      self->finish(error_code(std::current_exception()));
+    }
   }
 
   static void awakened(void* context, ssize_t result) noexcept {
@@ -7011,7 +7476,8 @@ struct AsyncPartUpload {
     auto* self = static_cast<AsyncPartUpload*>(context);
     if (result < 0) { self->finish(-int(result)); return; }
     try {
-      self->local(prepared, [self] { self->prepare_replay(); });
+      self->prepare_replay();
+      self->begin();
     } catch (...) { self->finish(error_code(std::current_exception())); }
   }
 
@@ -7056,6 +7522,16 @@ struct AsyncPartUpload {
     self->begin();
   }
 
+  static void upload_id_persisted(void* context,
+                                  CacheAsyncResult result) noexcept {
+    auto* self = static_cast<AsyncPartUpload*>(context);
+    if (result.error) {
+      self->finish(error_code(std::move(result.error)));
+      return;
+    }
+    created(self);
+  }
+
   static void received(void* context, Response&& response,
                        std::exception_ptr error) noexcept {
     auto* self = static_cast<AsyncPartUpload*>(context);
@@ -7091,9 +7567,14 @@ struct AsyncPartUpload {
             xml.result_root("InitiateMultipartUploadResult"), "UploadId");
         if (self->created_id.empty()) throw std::runtime_error("missing UploadId");
         if (self->handle.cache_entry) {
-          self->local(created, [self] {
-            self->handle.cache_entry->set_upload_id(sso_view(self->created_id));
-          });
+          self->cache_request.complete = upload_id_persisted;
+          self->cache_request.context  = self;
+          if (!self->handle.cache_entry->set_upload_id_async(
+                  self->reactor, self->cache_request,
+                  sso_view(self->created_id))) {
+            throw std::system_error(errno, std::generic_category(),
+                                    "persist multipart upload ID");
+          }
         } else {
           created(self);
         }
@@ -7125,16 +7606,19 @@ void submit_async_part(State& state, OpenHandle& handle, FuseReactor& reactor,
   auto* task = new AsyncPartUpload(
       state, handle, reactor, std::move(part), number, offset, length, parent);
   try {
-    task->reserve_completion(AsyncPartUpload::prepared);
+    task->reserve_completion(task->continuation,
+                             AsyncPartUpload::admitted_ready,
+                             AsyncPartUpload::admission_cancelled);
   } catch (...) {
     delete task;
     throw;
   }
   try {
-    state.uploads->submit_upload(&handle, [task] { task->prepare(); }, true);
+    state.uploads->submit_owner_upload(
+        reactor, task->continuation, AsyncPartUpload::activate_admission, task);
   } catch (...) {
-    // Admission already pins the reactor and this handle. Complete on its
-    // owner even when the CPU queue rejects the preparation job.
+    // The reserved continuation pins the reactor and this handle. Complete on
+    // its owner even when admission rejects the upload.
     task->worker_error = std::current_exception();
     reactor.complete(&task->continuation);
   }
@@ -9282,6 +9766,7 @@ void ngs3fs_getattr(fuse_req_t request, fuse_ino_t inode,
 
 struct AsyncLocalCacheWork {
   using Work = void (*)(void*);
+  using AsyncWork = bool (*)(void*, CacheAsyncRequest&);
   using Complete = void (*)(void*, std::exception_ptr) noexcept;
   FuseReactor::ReactorTask ticket;
   FuseReactor* reactor = nullptr;
@@ -9289,19 +9774,37 @@ struct AsyncLocalCacheWork {
   Complete complete = nullptr;
   void* context = nullptr;
   std::exception_ptr failure;
+  CacheAsyncRequest operation;
 
   void start(State& state, FuseReactor& owner, Work run,
-               Complete done, void* value) {
+               Complete done, void* value, AsyncWork async_run = nullptr) {
     reactor = &owner;
     work = run;
     complete = done;
     context = value;
     failure = {};
+    result = false;
     ticket = {completed, completed, this};
     if (!owner.reserve_completion(&ticket)) {
       throw std::system_error(errno, std::generic_category(), "reserve local cache work");
     }
     try {
+      if (owner.is_multi_worker()) {
+        if (async_run == nullptr) {
+          throw std::logic_error("cache operation lacks owner asynchronous implementation");
+        }
+        operation.complete = [](void* value, CacheAsyncResult result) noexcept {
+          auto* task = static_cast<AsyncLocalCacheWork*>(value);
+          task->failure = std::move(result.error);
+          task->result = result.value;
+          task->reactor->complete(&task->ticket);
+        };
+        operation.context = this;
+        if (!async_run(context, operation)) {
+          throw std::system_error(errno, std::generic_category(), "submit local cache operation");
+        }
+        return;
+      }
       state.uploads->submit(value, [this] {
         try {
           IoExecutorScope local_only(nullptr, 0);
@@ -9313,6 +9816,15 @@ struct AsyncLocalCacheWork {
       failure = std::current_exception();
       owner.complete(&ticket);
     }
+  }
+
+  bool result = false;
+
+  bool retirement_pending(std::exception_ptr& error) noexcept {
+    if (!error) return false;
+    try { std::rethrow_exception(error); }
+    catch (const CacheRetirementPending&) { error = {}; return true; }
+    catch (...) { return false; }
   }
 
   static void completed(void* value) noexcept {
@@ -9374,6 +9886,13 @@ struct AsyncCacheRetirement {
       throw std::system_error(errno, std::generic_category(), "reserve cache retirement");
     }
     try {
+      if (reactor->is_multi_worker()) {
+        // This only marks in-memory generations and registers a wait. File
+        // retirement itself is performed by the subsequent asynchronous op.
+        work();
+        reactor->complete(&ticket);
+        return;
+      }
       state->uploads->submit(this, [this] {
         {
           IoExecutorScope local_only(nullptr, 0);
@@ -9680,6 +10199,7 @@ struct AsyncOpen {
   std::unique_ptr<AsyncSignedS3Request> head;
   AsyncCacheRetirement retirement;
   FuseReactor::ReactorTask cache_ticket;
+  CacheAsyncRequest cache_operation;
   std::shared_ptr<CacheEntry> cache_result;
   std::exception_ptr cache_failure;
   AsyncIoRequest wait;
@@ -9906,6 +10426,31 @@ struct AsyncOpen {
     cache_retry = false;
     cache_failure = {};
     try {
+      if (reactor.is_multi_worker()) {
+        cache_operation.context = this;
+        cache_operation.complete = [](void* context, CacheAsyncResult result) noexcept {
+          auto* self = static_cast<AsyncOpen*>(context);
+          self->cache_result = std::move(result.entry);
+          self->cache_failure = std::move(result.error);
+          if (self->cache_failure) {
+            try { std::rethrow_exception(self->cache_failure); }
+            catch (const CacheRetirementPending&) {
+              self->cache_retry = true;
+              self->cache_failure = {};
+            } catch (...) {}
+          }
+          self->reactor.complete(&self->cache_ticket);
+        };
+        const bool accepted = handle->writable
+            ? state.local_cache->create_writer_async(reactor, cache_operation,
+                  cache_identity, std::min(state.config.part_size * kMaximumMultipartParts,
+                                           kMaximumObjectSize))
+            : state.local_cache->open_async(reactor, cache_operation, cache_identity);
+        if (!accepted) {
+          throw std::system_error(errno, std::generic_category(), "submit cache open");
+        }
+        return;
+      }
       // identity remains locked and the registered handle owns these identity
       // strings until the terminal owner callback; only the result is shared.
       state.uploads->submit(handle.get(), [this, cache_identity] {
@@ -11494,6 +12039,9 @@ struct AsyncCacheChecksum {
   Response response;
   std::unique_ptr<CacheRetrySink> sink;
   std::unique_ptr<AsyncSignedS3Request> http;
+  std::unique_ptr<ReactorChecksum> owner_checksum;
+  ssostr<128> expected_checksum;
+  ChecksumAlgorithm checksum_algorithm = CHECKSUM_NONE;
   FuseReactor::ReactorTask completion;
   AsyncIoRequest wait;
   uint64_t notification = 0;
@@ -11641,6 +12189,20 @@ struct AsyncCacheChecksum {
     self->verify();
   }
 
+  static void checksum_ready(void* context, ChecksumValue actual,
+                              std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncCacheChecksum*>(context);
+    self->owner_checksum.reset();
+    self->error = std::move(error);
+    if (!self->error) {
+      uint64_t value = 0;
+      self->valid = self->whole && self->checksum_algorithm == CHECKSUM_CRC64XZ
+          ? parse_unsigned(sso_view(self->expected_checksum), value) && value == actual.integer
+          : sso_view(self->expected_checksum) == sso_view(actual.base64);
+    }
+    self->context.reactor.complete(&self->completion);
+  }
+
   void verify() noexcept {
     completion = {verified, nullptr, this};
     if (!context.reactor.reserve_completion(&completion)) {
@@ -11648,6 +12210,27 @@ struct AsyncCacheChecksum {
       return;
     }
     try {
+      if (context.reactor.is_multi_worker()) {
+        std::string_view expected;
+        if (whole) {
+          if (!read_checksum_from_response(response, context.state.config.checksum,
+                                           checksum_algorithm, expected)) {
+            valid = !retrying;
+            context.reactor.complete(&completion);
+            return;
+          }
+        } else {
+          checksum_algorithm = ChecksumAlgorithm(part.algorithm);
+          expected = part.value;
+        }
+        expected_checksum.assign(expected.data(), expected.size());
+        owner_checksum = std::make_unique<ReactorChecksum>(
+            context.reactor, checksum_algorithm, checksum_ready, this);
+        if (!owner_checksum->file(context.entry->data_fd(), offset(), length())) {
+          throw std::system_error(errno, std::generic_category(), "schedule cache checksum");
+        }
+        return;
+      }
       context.state.uploads->submit(&context.handle, [this] {
         try {
           IoExecutorScope local_only(nullptr, 0);
@@ -12747,6 +13330,9 @@ struct AsyncRangeTransfer {
   std::unique_ptr<RangeFileSink> retry_sink;
   Response checksum_response;
   FuseReactor::ReactorTask checksum_completion;
+  std::unique_ptr<ReactorChecksum> owner_checksum;
+  ssostr<128> expected_checksum;
+  ChecksumAlgorithm checksum_algorithm = CHECKSUM_NONE;
   PrefetchContinuation retry_continuation;
   std::exception_ptr checksum_error;
   bool retried = false;
@@ -12995,6 +13581,20 @@ struct AsyncRangeTransfer {
     verified(task);
   }
 
+  static void checksum_ready(void* context, ChecksumValue actual,
+                              std::exception_ptr error) noexcept {
+    auto* self = static_cast<AsyncRangeTransfer*>(context);
+    self->owner_checksum.reset();
+    self->checksum_error = std::move(error);
+    if (!self->checksum_error) {
+      uint64_t value = 0;
+      self->checksum_valid = self->checksum_algorithm == CHECKSUM_CRC64XZ
+          ? parse_unsigned(sso_view(self->expected_checksum), value) && value == actual.integer
+          : sso_view(self->expected_checksum) == sso_view(actual.base64);
+    }
+    self->reactor.complete(&self->checksum_completion);
+  }
+
   void verify() noexcept {
     checksum_completion = {verified, nullptr, this};
     if (!reactor.reserve_completion(&checksum_completion)) {
@@ -13003,6 +13603,27 @@ struct AsyncRangeTransfer {
       return;
     }
     try {
+      if (reactor.is_multi_worker()) {
+        std::string_view expected;
+        if (!read_checksum_from_response(checksum_response, state.config.checksum,
+                                         checksum_algorithm, expected)) {
+          checksum_valid = !retried;
+          reactor.complete(&checksum_completion);
+          return;
+        }
+        expected_checksum.assign(expected.data(), expected.size());
+        checksum_available = true;
+        const auto& storage = retried ? retry_storage : prefetch->storage;
+        owner_checksum = std::make_unique<ReactorChecksum>(
+            reactor, checksum_algorithm, checksum_ready, this);
+        const bool accepted = storage->mapping
+            ? owner_checksum->memory(storage->mapping, prefetch->length)
+            : owner_checksum->file(storage->fd.get(), 0, prefetch->length);
+        if (!accepted) {
+          throw std::system_error(errno, std::generic_category(), "schedule owner checksum");
+        }
+        return;
+      }
       state.uploads->submit(&checksums->handle, [this] {
         try {
           IoExecutorScope local_only(nullptr, 0);
@@ -13549,6 +14170,7 @@ struct AsyncCachedReadTask final : AsyncReadTask {
   std::exception_ptr prepare_error;
   bool cache_prepared = false;
   FuseReactor::ReactorTask prepare_task;
+  CacheAsyncRequest prepare_operation;
   std::unique_ptr<ReadChecksumContext> checksums;
   AsyncCredentialWait credential_wait;
 
@@ -13793,6 +14415,20 @@ struct AsyncCachedReadTask final : AsyncReadTask {
         throw std::system_error(errno, std::generic_category(), "reserve cache completion");
       }
       try {
+        if (reactor->is_multi_worker()) {
+          prepare_operation.context = this;
+          prepare_operation.complete = [](void* context, CacheAsyncResult result) noexcept {
+            auto* self = static_cast<AsyncCachedReadTask*>(context);
+            self->cache_prepared = result.value;
+            self->prepare_error = std::move(result.error);
+            self->reactor->complete(&self->prepare_task);
+          };
+          if (!handle->cache_entry->prepare_read_async(*reactor, prepare_operation,
+                                                       cache_claim.offset, cache_claim.length)) {
+            throw std::system_error(errno, std::generic_category(), "submit cache preparation");
+          }
+          return;
+        }
         state->uploads->submit(handle, [this] {
           try {
             IoExecutorScope local_only(nullptr, 0);
@@ -14859,6 +15495,7 @@ class AsyncPendingDelete {
   AsyncIoRequest wait_;
   uint64_t notification_ = 0;
   std::exception_ptr local_error_;
+  CacheAsyncRequest cache_operation_;
   bool owned_ = false;
   bool cancelled_ = false;
 
@@ -15097,6 +15734,19 @@ class AsyncPendingDelete {
       return;
     }
     try {
+      if (reactor_.is_multi_worker()) {
+        cache_operation_.complete = [](void* value, CacheAsyncResult result) noexcept {
+          auto* self = static_cast<AsyncPendingDelete*>(value);
+          self->local_error_ = std::move(result.error);
+          self->reactor_.complete(&self->completion_);
+        };
+        cache_operation_.context = this;
+        if (!state_.local_cache->finish_pending_delete_async(
+                reactor_, cache_operation_, operation_.key)) {
+          throw std::system_error(errno, std::generic_category(), "remove pending delete marker");
+        }
+        return;
+      }
       state_.uploads->submit(this, [this] {
         try {
           IoExecutorScope local_only(nullptr, 0);
@@ -15630,6 +16280,134 @@ struct AsyncCachedWrite final : AsyncWriteRequest {
   using AsyncWriteRequest::AsyncWriteRequest;
   FuseReactor::ReactorTask completion;
   std::exception_ptr worker_error;
+  CacheAsyncRequest prepare_operation;
+  enum Stage { SPLICE, MEMORY_WRITE, COPY_READ, COPY_WRITE } stage = SPLICE;
+  std::vector<std::byte> copy;
+  size_t written = 0;
+  size_t copy_length = 0;
+  size_t copy_done = 0;
+  size_t copied_bytes = 0;
+  bool copying_fd = false;
+
+  void failed(std::exception_ptr error) noexcept {
+    worker_error = std::move(error);
+    reactor.complete(&completion);
+  }
+
+  void submit_io() {
+    io.timeout_ms = 0;
+    io.force_async = stage != COPY_READ;
+    io.complete = received;
+    io.context = this;
+    if (!reactor.submit(io)) {
+      throw std::system_error(errno, std::generic_category(), "submit cached write");
+    }
+  }
+
+  void copy_write() {
+    stage = COPY_WRITE;
+    io = {};
+    io.kind = AsyncIoRequest::PWRITE;
+    io.fd = handle.cache_entry->data_fd();
+    io.data = copy.data() + copy_done;
+    io.length = copy_length - copy_done;
+    io.output_offset = offset + off_t(written);
+    submit_io();
+  }
+
+  void transfer() noexcept {
+    try {
+      if (written == length) {
+        if (copied_bytes != 0) record_memory_fallback(state, copied_bytes);
+        handle.cache_entry->publish_dirty(uint64_t(offset), length, end);
+        reactor.complete(&completion);
+        return;
+      }
+      fuse_bufvec& input = buffers();
+      while (input.idx < input.count && input.off == input.buf[input.idx].size) {
+        ++input.idx;
+        input.off = 0;
+      }
+      if (input.idx == input.count || input.off > input.buf[input.idx].size) {
+        throw std::runtime_error("short asynchronous cached write buffer");
+      }
+      fuse_buf& buf = input.buf[input.idx];
+      const size_t count = std::min({remaining, buf.size - input.off,
+                                    size_t(kPreferredIoSize)});
+      io = {};
+      io.length = count;
+      if ((buf.flags & FUSE_BUF_IS_FD) == 0) {
+        if (buf.mem == nullptr) {
+          throw std::system_error(EFAULT, std::generic_category(), "null FUSE write memory");
+        }
+        stage = MEMORY_WRITE;
+        io.kind = AsyncIoRequest::PWRITE;
+        io.fd = handle.cache_entry->data_fd();
+        io.output_offset = offset + off_t(written);
+        io.data = static_cast<std::byte*>(buf.mem) + input.off;
+      } else {
+        const bool seek = (buf.flags & FUSE_BUF_FD_SEEK) != 0;
+        if (seek && (buf.pos < 0 || uint64_t(buf.pos) > uint64_t(INT64_MAX) - input.off)) {
+          throw std::system_error(EOVERFLOW, std::generic_category(), "FUSE buffer offset");
+        }
+        io.fd = buf.fd;
+        io.input_offset = seek ? buf.pos + off_t(input.off) : -1;
+        if (copying_fd) {
+          stage = COPY_READ;
+          copy.resize(count);
+          io.kind = seek ? AsyncIoRequest::PREAD : AsyncIoRequest::READ;
+          io.data = copy.data();
+        } else {
+          stage = SPLICE;
+          io.kind = AsyncIoRequest::SPLICE;
+          io.output_fd = handle.cache_entry->data_fd();
+          io.output_offset = offset + off_t(written);
+          io.flags = SPLICE_F_MOVE;
+        }
+      }
+      submit_io();
+    } catch (...) { failed(std::current_exception()); }
+  }
+
+  static void received(void* context, ssize_t result) noexcept {
+    auto* self = static_cast<AsyncCachedWrite*>(context);
+    try {
+      if (self->stage == SPLICE &&
+          (result == -EINVAL || result == -EPERM || result == -ENOSYS ||
+           result == -EOPNOTSUPP || result == -EXDEV)) {
+        self->copying_fd = true;
+        self->transfer();
+        return;
+      }
+      if (result <= 0 || size_t(result) > self->io.length) {
+        throw std::system_error(result < 0 ? -int(result) : EIO,
+                                std::generic_category(), "cached FUSE write");
+      }
+      const size_t count = size_t(result);
+      if (self->stage == COPY_READ) {
+        // A non-seekable input has already been consumed, even if the later
+        // cache write fails. Keep its retirement accounting independent.
+        self->consume(count);
+        self->copy_length = count;
+        self->copy_done = 0;
+        self->copy_write();
+        return;
+      }
+      self->written += count;
+      if (self->stage == COPY_WRITE) {
+        self->copied_bytes += count;
+        self->copy_done += count;
+        if (self->copy_done != self->copy_length) {
+          self->copy_write();
+          return;
+        }
+      } else {
+        self->consume(count);
+        if (self->stage == MEMORY_WRITE) self->copied_bytes += count;
+      }
+      self->transfer();
+    } catch (...) { self->failed(std::current_exception()); }
+  }
 
   static void ready(void* context) noexcept {
     auto* self = static_cast<AsyncCachedWrite*>(context);
@@ -15657,6 +16435,19 @@ struct AsyncCachedWrite final : AsyncWriteRequest {
       return;
     }
     try {
+      if (reactor.is_multi_worker()) {
+        prepare_operation.complete = [](void* context, CacheAsyncResult result) noexcept {
+          auto* self = static_cast<AsyncCachedWrite*>(context);
+          if (result.error) self->failed(std::move(result.error));
+          else self->transfer();
+        };
+        prepare_operation.context = this;
+        if (!handle.cache_entry->prepare_write_async(
+                reactor, prepare_operation, uint64_t(offset), length)) {
+          throw std::system_error(errno, std::generic_category(), "prepare cached write");
+        }
+        return;
+      }
       state.uploads->submit(&handle, [this] {
         try {
           IoExecutorScope local_only(nullptr, 0);
@@ -15730,6 +16521,7 @@ void ngs3fs_write_buf(fuse_req_t request, fuse_ino_t inode,
 }
 
 struct AsyncFlushRequest {
+  using Complete = void (*)(void*, int) noexcept;
   AsyncFlushRequest(State& s, OpenHandle& h, FuseReactor& r, fuse_req_t req)
       : state(s), handle(h), reactor(r), request(req), active(h) {}
 
@@ -15746,6 +16538,8 @@ struct AsyncFlushRequest {
   Response committed;
   std::optional<ObjectMetadata> metadata;
   std::unique_ptr<AsyncSignedS3Request> http;
+  std::unique_ptr<ReactorChecksum> owner_checksum;
+  CacheAsyncRequest cache_operation;
   FuseReactor::ReactorTask completion;
   AsyncIoRequest wait;
   UniqueFd timer;
@@ -15760,6 +16554,8 @@ struct AsyncFlushRequest {
   bool ambiguous = false;
   bool recovering = false;
   unsigned attempt = 0;
+  Complete recovery_complete = nullptr;
+  void* recovery_context = nullptr;
 
   void finish(int error) noexcept {
     std::unique_ptr<AsyncFlushRequest> self(this);
@@ -15785,7 +16581,14 @@ struct AsyncFlushRequest {
       }
     }
     if (unregister) unregister_open_handle(state, handle.object_path, handle, false);
-    fuse_reply_err(request, error);
+    if (request != nullptr) {
+      fuse_reply_err(request, error);
+    } else {
+      const auto callback = recovery_complete;
+      void* context = recovery_context;
+      self.reset(); // Drop the admitted handle reference before its owner exits.
+      callback(context, error);
+    }
   }
 
   static void awakened(void* context, ssize_t result) noexcept {
@@ -15861,17 +16664,26 @@ struct AsyncFlushRequest {
         throw std::system_error(errno, std::generic_category(), "wait for write seal");
       }
       // Admission covers the final PUT/Complete until local publication finishes.
-      completion = {prepared_ready, prepared_ready, this};
+      completion = reactor.is_multi_worker()
+          ? FuseReactor::ReactorTask{admitted_ready, admitted_ready, this}
+          : FuseReactor::ReactorTask{prepared_ready, prepared_ready, this};
       if (!reactor.reserve_completion(&completion)) {
         finish(ECANCELED);
         return;
       }
       try {
+        if (reactor.is_multi_worker()) {
+          state.uploads->submit_owner_upload(reactor, completion,
+              [](void* context) noexcept {
+                static_cast<AsyncFlushRequest*>(context)->admitted = true;
+              }, this);
+          return;
+        }
         state.uploads->submit_upload(&handle, [this] {
           admitted = true;
           prepare();
           reactor.complete(&completion);
-        }, true);
+          }, true);
       } catch (...) {
         worker_error = std::current_exception();
         reactor.complete(&completion);
@@ -15881,12 +16693,86 @@ struct AsyncFlushRequest {
 
   bool finish_after_unlock = false;
 
+  static void admitted_ready(void* context) noexcept {
+    auto* self = static_cast<AsyncFlushRequest*>(context);
+    if (self->worker_error || !self->admitted) {
+      self->finish(self->worker_error ? AsyncPartUpload::error_code(self->worker_error) : ECANCELED);
+      return;
+    }
+    self->completion = {prepared_ready, prepared_ready, self};
+    if (!self->reactor.reserve_completion(&self->completion)) {
+      self->finish(ECANCELED);
+      return;
+    }
+    self->prepare_owner();
+  }
+
+  void prepare_owner() noexcept {
+    try {
+      if (!prepared && handle.cache_entry) {
+        cache_operation.complete = [](void* context, CacheAsyncResult result) noexcept {
+          auto* self = static_cast<AsyncFlushRequest*>(context);
+          if (result.error) {
+            self->worker_error = std::move(result.error);
+            self->reactor.complete(&self->completion);
+          } else self->prepare_owner_contents();
+        };
+        cache_operation.context = this;
+        if (!handle.cache_entry->begin_write_async(reactor, cache_operation)) {
+          throw std::system_error(errno, std::generic_category(), "begin cached commit");
+        }
+        return;
+      }
+      prepare_owner_contents();
+    } catch (...) {
+      worker_error = std::current_exception();
+      reactor.complete(&completion);
+    }
+  }
+
+  void prepare_owner_contents() noexcept {
+    try {
+      if (!prepared && !handle.multipart_required && checksum_has_digest(state.config.checksum)) {
+        owner_checksum = std::make_unique<ReactorChecksum>(
+            reactor, state.config.checksum,
+            [](void* context, ChecksumValue value, std::exception_ptr error) noexcept {
+              auto* self = static_cast<AsyncFlushRequest*>(context);
+              self->owner_checksum.reset();
+              if (error) {
+                self->worker_error = std::move(error);
+                self->reactor.complete(&self->completion);
+                return;
+              }
+              self->checksum = std::move(value);
+              self->prepared = true;
+              self->prepare_owner_contents();
+            }, this);
+        const bool accepted = handle.cache_entry
+            ? owner_checksum->file(handle.cache_entry->data_fd(), 0, size_t(handle.stream_offset))
+            : owner_checksum->retained(part.get());
+        if (!accepted) {
+          throw std::system_error(errno, std::generic_category(), "prepare write checksum");
+        }
+        return;
+      }
+      // Multipart validation and replay do not read a cache file. The retained
+      // pipe clone must never wait: the complete source is already retained.
+      prepare_contents(true);
+    } catch (...) { worker_error = std::current_exception(); }
+    reactor.complete(&completion);
+  }
+
   void prepare() noexcept {
     try {
       IoExecutorScope local_only(nullptr, 0);
-      if (!prepared) {
-        if (handle.cache_entry) handle.cache_entry->begin_write();
-        if (handle.multipart_required) {
+      if (!prepared && handle.cache_entry) handle.cache_entry->begin_write();
+      prepare_contents(false);
+    } catch (...) { worker_error = std::current_exception(); }
+  }
+
+  void prepare_contents(bool owner) {
+        if (!prepared) {
+          if (handle.multipart_required) {
           for (const auto& etag : handle.part_etags) {
             if (etag.empty()) throw std::runtime_error("multipart commit has a missing ETag");
           }
@@ -15920,12 +16806,20 @@ struct AsyncFlushRequest {
           if (clone.capacity() < segment.bytes) {
             throw std::system_error(ENOBUFS, std::generic_category(), "write replay capacity");
           }
-          tee_exact(segment.pipe.read_fd(), clone.write_fd(), segment.bytes, 0);
+            if (owner) {
+              const ssize_t count = ::tee(segment.pipe.read_fd(), clone.write_fd(),
+                                          segment.bytes, SPLICE_F_NONBLOCK);
+              if (count < 0 || size_t(count) != segment.bytes) {
+                throw std::system_error(count < 0 ? errno : EIO,
+                                        std::generic_category(), "clone write replay");
+              }
+            } else {
+              tee_exact(segment.pipe.read_fd(), clone.write_fd(), segment.bytes, 0);
+            }
           clone.close_write_end();
           replay.push_back(std::move(clone));
         }
       }
-    } catch (...) { worker_error = std::current_exception(); }
   }
 
   static void prepared_ready(void* context) noexcept {
@@ -15991,6 +16885,10 @@ struct AsyncFlushRequest {
       return;
     }
     try {
+      if (self->reactor.is_multi_worker()) {
+        self->prepare_owner();
+        return;
+      }
       self->state.uploads->submit(&self->handle, [self] {
         self->prepare();
         self->reactor.complete(&self->completion);
@@ -16140,6 +17038,30 @@ struct AsyncFlushRequest {
     completion = {committed_local, committed_local, this};
     if (!reactor.reserve_completion(&completion)) { finish(ECANCELED); return; }
     try {
+      if (reactor.is_multi_worker()) {
+        publish_written_metadata(handle, committed, metadata ? &*metadata : nullptr,
+                                  sso_view(body_etag));
+        if (!handle.cache_entry) {
+          reactor.complete(&completion);
+          return;
+        }
+        cache_operation.complete = [](void* context, CacheAsyncResult result) noexcept {
+          auto* self = static_cast<AsyncFlushRequest*>(context);
+          self->worker_error = std::move(result.error);
+          self->reactor.complete(&self->completion);
+        };
+        cache_operation.context = this;
+        if (!handle.cache_entry->commit_write_async(reactor, cache_operation, CacheIdentity{
+            .key = handle.key,
+            .etag = handle.etag,
+            .version_id = handle.version_id,
+            .size = handle.stream_offset,
+            .mtime = handle.item->mtime.load(std::memory_order_relaxed),
+        })) {
+          throw std::system_error(errno, std::generic_category(), "publish cached commit");
+        }
+        return;
+      }
       state.uploads->submit(&handle, [this] {
         try {
           IoExecutorScope local_only(nullptr, 0);
@@ -16156,6 +17078,261 @@ struct AsyncFlushRequest {
   }
 };
 
+class OwnerCacheRecovery {
+ public:
+  OwnerCacheRecovery(State& state, FuseReactor& reactor)
+      : state_(state), reactor_(reactor) {
+    std::lock_guard guard(state_.open_files_mutex);
+    for (const auto& [path, operation] : state_.pending_deletes) {
+      (void)operation;
+      deletes_.push_back(path);
+    }
+    entries_ = state_.recovery_entries;
+  }
+
+  bool start() noexcept {
+    task_ = {advance, cancelled, this};
+    if (!reactor_.reserve_completion(&task_)) return false;
+    reactor_.complete(&task_);
+    return true;
+  }
+
+ private:
+  State& state_;
+  FuseReactor& reactor_;
+  FuseReactor::ReactorTask task_;
+  std::vector<std::string> deletes_;
+  std::vector<std::shared_ptr<CacheEntry>> entries_;
+  size_t delete_index_ = 0;
+  size_t entry_index_ = 0;
+  std::unique_ptr<AsyncPendingDelete> deletion_;
+  std::unique_ptr<AsyncSignedS3Request> http_;
+  std::unique_ptr<ReactorChecksum> checksum_;
+  std::unique_ptr<InodeFile> item_;
+  std::unique_ptr<OpenHandle> handle_;
+  size_t part_index_ = 0;
+  unsigned marker_ = 0;
+  int result_ = 0;
+
+  static void cancelled(void* context) noexcept {
+    delete static_cast<OwnerCacheRecovery*>(context);
+  }
+
+  static void deleted(void* context, std::exception_ptr error) noexcept {
+    auto* self = static_cast<OwnerCacheRecovery*>(context);
+    self->deletion_.reset();
+    if (AsyncPartUpload::error_code(error) == ECANCELED) { delete self; return; }
+    ++self->delete_index_;
+    if (!self->start()) delete self;
+  }
+
+  static void advance(void* context) noexcept {
+    auto* self = static_cast<OwnerCacheRecovery*>(context);
+    try {
+      if (self->delete_index_ != self->deletes_.size()) {
+        self->deletion_ = std::make_unique<AsyncPendingDelete>(
+            self->state_, self->reactor_, self->deletes_[self->delete_index_], deleted, self);
+        if (!self->deletion_->start()) {
+          throw std::system_error(errno, std::generic_category(), "start cached delete recovery");
+        }
+        return;
+      }
+      if (self->entry_index_ == self->entries_.size()) { delete self; return; }
+      const auto& entry = self->entries_[self->entry_index_];
+      self->item_ = std::make_unique<InodeFile>();
+      self->handle_ = std::make_unique<OpenHandle>();
+      OpenHandle& handle = *self->handle_;
+      handle.writable = true;
+      handle.item = self->item_.get();
+      handle.key = entry->key();
+      handle.object_path = object_request_path(self->state_, handle.key);
+      handle.etag = entry->etag();
+      handle.version_id = entry->version_id();
+      handle.upload_id = entry->upload_id();
+      handle.write_id = entry->write_id();
+      handle.cache_entry = entry;
+      handle.stream_offset = entry->written_end();
+      handle.size = handle.stream_offset;
+      handle.item->set_fsize(handle.size);
+      self->part_index_ = 0;
+      self->marker_ = 0;
+      fprintf(stderr, "warning: recovering cached write on owner reactor: path=%s bytes=%" PRIu64 "\n",
+              handle.object_path.c_str(), handle.size);
+      if (handle.size <= self->state_.config.part_size && handle.upload_id.empty()) {
+        self->flush();
+        return;
+      }
+      if (handle.size == 0) throw std::runtime_error("empty multipart cache recovery");
+      const size_t count = size_t((handle.size - 1) / self->state_.config.part_size + 1);
+      if (count > kMaximumMultipartParts) throw std::runtime_error("excess cached recovery parts");
+      handle.multipart_required = true;
+      handle.next_part_number = unsigned(count + 1);
+      handle.part_etags.resize(count);
+      if (checksum_multipart_type(self->state_.config.checksum) == "COMPOSITE") {
+        handle.part_checksums.resize(count);
+      }
+      if (self->state_.config.checksum == CHECKSUM_CRC64NVME ||
+          self->state_.config.checksum == CHECKSUM_CRC64XZ) {
+        handle.part_checksum_values.resize(count);
+        handle.part_sizes.resize(count);
+      }
+      if (handle.upload_id.empty()) self->parts();
+      else self->list();
+    } catch (...) { self->fail(AsyncPartUpload::error_code(std::current_exception())); }
+  }
+
+  void list() {
+    AsyncHttpRequest args;
+    args.method = "GET";
+    std::string query = "uploadId=" + uri_encode(handle_->upload_id, false) + "&max-parts=1000";
+    if (marker_ != 0) query += "&part-number-marker=" + std::to_string(marker_);
+    args.path = query_path(handle_->object_path, query);
+    http_ = std::make_unique<AsyncSignedS3Request>(state_, reactor_, std::move(args), listed, this);
+    if (!http_->start()) throw std::system_error(errno, std::generic_category(), "ListParts(cache recovery)");
+  }
+
+  static void listed(void* context, Response&& response, std::exception_ptr error) noexcept {
+    auto* self = static_cast<OwnerCacheRecovery*>(context);
+    self->http_.reset();
+    try {
+      if (error) std::rethrow_exception(error);
+      require_s3_success(response, "ListParts(cache recovery)");
+      S3Xml xml(response_xml(response), "ListParts(cache recovery)");
+      const auto& root = xml.result_root("ListPartsResult");
+      uint64_t last = self->marker_;
+      for (const auto* child = root.FirstChildElement(); child; child = child->NextSiblingElement()) {
+        if (!S3Xml::named(*child, "Part")) continue;
+        uint64_t number = 0, length = 0;
+        if (!parse_unsigned(trim_xml_space(xml.required_text(*child, "PartNumber")), number) ||
+            !parse_unsigned(trim_xml_space(xml.required_text(*child, "Size")), length) ||
+            number <= last || number > self->handle_->part_etags.size()) {
+          throw std::runtime_error("ListParts(cache recovery) returned invalid or unordered parts");
+        }
+        const uint64_t offset = (number - 1) * self->state_.config.part_size;
+        const uint64_t expected = std::min(self->state_.config.part_size, self->handle_->size - offset);
+        std::string etag = xml.required_text(*child, "ETag");
+        if (length != expected || etag.empty()) {
+          throw std::runtime_error("ListParts(cache recovery) disagrees with local data");
+        }
+        self->handle_->part_etags[number - 1] = std::move(etag);
+        last = number;
+      }
+      if (xml.required_bool(root, "IsTruncated")) {
+        uint64_t next = 0;
+        if (!parse_unsigned(trim_xml_space(xml.required_text(root, "NextPartNumberMarker")), next) ||
+            next <= self->marker_ || next > kMaximumMultipartParts || next < last) {
+          throw std::runtime_error("ListParts(cache recovery) returned an invalid marker");
+        }
+        self->marker_ = unsigned(next);
+        self->list();
+      } else self->parts();
+    } catch (...) { self->fail(AsyncPartUpload::error_code(std::current_exception())); }
+  }
+
+  static void checksummed(void* context, ChecksumValue value, std::exception_ptr error) noexcept {
+    auto* self = static_cast<OwnerCacheRecovery*>(context);
+    self->checksum_.reset();
+    if (error) { self->fail(AsyncPartUpload::error_code(error)); return; }
+    OpenHandle& handle = *self->handle_;
+    const size_t i = self->part_index_++;
+    if (!handle.part_checksums.empty()) handle.part_checksums[i] = std::move(value.base64);
+    if (!handle.part_checksum_values.empty()) {
+      handle.part_checksum_values[i] = value.integer;
+      handle.part_sizes[i] = std::min(self->state_.config.part_size,
+          handle.size - i * self->state_.config.part_size);
+    }
+    self->parts();
+  }
+
+  void parts() noexcept {
+    try {
+      OpenHandle& handle = *handle_;
+      for (; part_index_ != handle.part_etags.size(); ++part_index_) {
+        const uint64_t offset = part_index_ * state_.config.part_size;
+        const size_t length = size_t(std::min(state_.config.part_size, handle.size - offset));
+        if (!handle.part_etags[part_index_].empty()) {
+          if (checksum_has_digest(state_.config.checksum)) {
+            checksum_ = std::make_unique<ReactorChecksum>(reactor_, state_.config.checksum, checksummed, this);
+            if (!checksum_->file(handle.cache_entry->data_fd(), offset, length)) {
+              throw std::system_error(errno, std::generic_category(), "checksum recovered part");
+            }
+            return;
+          }
+          continue;
+        }
+        ++handle.pending_parts;
+        try {
+          submit_async_part(state_, handle, reactor_, {}, unsigned(part_index_ + 1), offset, length, nullptr);
+        } catch (...) { --handle.pending_parts; throw; }
+      }
+      flush();
+    } catch (...) { fail(AsyncPartUpload::error_code(std::current_exception())); }
+  }
+
+  void flush() {
+    auto task = std::make_unique<AsyncFlushRequest>(state_, *handle_, reactor_, nullptr);
+    task->parts_prepared = true;
+    task->recovery_complete = [](void* context, int error) noexcept {
+      static_cast<OwnerCacheRecovery*>(context)->fail(error);
+    };
+    task->recovery_context = this;
+    task.release()->start();
+  }
+
+  void fail(int error) noexcept {
+    result_ = error;
+    if (!handle_) { delete this; return; }
+    if (error != 0) {
+      std::lock_guard guard(handle_->mutex);
+      fail_write(*handle_, error);
+    }
+    // A failed commit may still have cancelled/in-flight parts. Reuse handle
+    // retirement so the private recovery inode outlives all admitted uploads.
+    handle_->release_ready = retired;
+    handle_->release_context = this;
+    handle_->request_state.fetch_or(1ULL << 63, std::memory_order_release);
+    drop_open_request(*handle_);
+  }
+
+  static void retired(void* context) noexcept {
+    auto* self = static_cast<OwnerCacheRecovery*>(context);
+    self->task_ = {finished, cancelled, self};
+    if (!self->reactor_.reserve_completion(&self->task_)) { delete self; return; }
+    self->reactor_.complete(&self->task_);
+  }
+
+  static void finished(void* context) noexcept {
+    auto* self = static_cast<OwnerCacheRecovery*>(context);
+    if (self->result_ == 0) {
+      std::lock_guard guard(self->state_.open_files_mutex);
+      self->state_.recovery_paths.erase(self->handle_->object_path);
+      std::erase(self->state_.recovery_entries, self->entries_[self->entry_index_]);
+      self->state_.open_files_condition.notify_all();
+    }
+    fprintf(stderr, "%s: cached write recovery %s: path=%s\n",
+            self->result_ == 0 ? "warning" : "error",
+            self->result_ == 0 ? "completed" : "isolated",
+            self->handle_->object_path.c_str());
+    self->handle_.reset();
+    self->item_.reset();
+    if (self->result_ == ECANCELED) { delete self; return; }
+    ++self->entry_index_;
+    if (!self->start()) delete self;
+  }
+};
+
+void start_owner_cache_recovery(State& state, FuseReactor& reactor) noexcept {
+  if (!state.cache_recovery_pending) return;
+  state.cache_recovery_pending = false;
+  try {
+    auto task = std::make_unique<OwnerCacheRecovery>(state, reactor);
+    if (!task->start()) throw std::system_error(errno, std::generic_category(), "start cache recovery");
+    task.release();
+  } catch (const std::exception& error) {
+    fprintf(stderr, "error: cached recovery retained for next mount: %s\n", error.what());
+  }
+}
+
 struct AsyncFsyncRequest {
   AsyncFsyncRequest(State& s, OpenHandle& h, FuseReactor& r, fuse_req_t req)
       : state(s), handle(h), reactor(r), request(req), active(h) {}
@@ -16168,6 +17345,7 @@ struct AsyncFsyncRequest {
   FuseReactor::ReactorTask completion;
   uint64_t notification = 0;
   std::exception_ptr error;
+  CacheAsyncRequest cache_operation;
 
   void finish(int value) noexcept {
     std::unique_ptr<AsyncFsyncRequest> self(this);
@@ -16225,6 +17403,18 @@ struct AsyncFsyncRequest {
       completion = {ready, ready, this};
       if (!reactor.reserve_completion(&completion)) { finish(ECANCELED); return; }
       try {
+        if (reactor.is_multi_worker()) {
+          cache_operation.complete = [](void* context, CacheAsyncResult result) noexcept {
+            auto* self = static_cast<AsyncFsyncRequest*>(context);
+            self->error = std::move(result.error);
+            self->reactor.complete(&self->completion);
+          };
+          cache_operation.context = this;
+          if (!handle.cache_entry->sync_write_async(reactor, cache_operation)) {
+            throw std::system_error(errno, std::generic_category(), "sync cached write");
+          }
+          return;
+        }
         state.uploads->submit(&handle, [this] {
           try {
             IoExecutorScope local_only(nullptr, 0);
@@ -16298,7 +17488,8 @@ void discard_pending_inode(State& state, OpenHandle& handle) noexcept {
   }
 }
 
-void release_write_local_no_network(State& state, OpenHandle& handle) noexcept;
+void release_write_local_no_network(State& state, OpenHandle& handle,
+                                     bool discard_cache = true) noexcept;
 
 void UncachedFileWriter::release(State& state,
                                  OpenHandle& handle) noexcept {
@@ -16338,7 +17529,8 @@ void CachedFileWriter::release(State& state,
 
 // Last-reference retirement only. Never waits for an admitted write and never
 // performs S3 I/O, including the allocation/shutdown fallback of async release.
-void release_write_local_no_network(State& state, OpenHandle& handle) noexcept {
+void release_write_local_no_network(State& state, OpenHandle& handle,
+                                     bool discard_cache) noexcept {
   bool registered = false;
   bool release_budget = false;
   bool preserve = false;
@@ -16377,7 +17569,7 @@ void release_write_local_no_network(State& state, OpenHandle& handle) noexcept {
                       "write remains on disk: path=%s\n",
               handle.object_path.c_str());
     }
-  } else if (unlinked && handle.cache_entry) {
+  } else if (unlinked && handle.cache_entry && discard_cache) {
     try { handle.cache_entry->discard_write(); }
     catch (...) {
       fprintf(stderr, "warning: local cache cleanup failed for unlinked "
@@ -16399,6 +17591,8 @@ void release_write_local_no_network(State& state, OpenHandle& handle) noexcept {
 
 struct AsyncWriteRelease {
   using Complete = void (*)(void*, int) noexcept;
+  AsyncWriteRelease(State& s, OpenHandle& h, FuseReactor& r, Complete done, void* value)
+      : state(s), handle(h), reactor(r), complete(done), context(value) {}
   State& state;
   OpenHandle& handle;
   FuseReactor& reactor;
@@ -16407,6 +17601,12 @@ struct AsyncWriteRelease {
   FuseReactor::ReactorTask ticket;
   std::unique_ptr<AsyncSignedS3Request> http;
   int error = 0;
+  CacheAsyncRequest cache_operation;
+
+  void finish_local() noexcept {
+    release_write_local_no_network(state, handle, false);
+    reactor.complete(&ticket);
+  }
 
   static void done(void* context) noexcept {
     auto* self = static_cast<AsyncWriteRelease*>(context);
@@ -16419,6 +17619,20 @@ struct AsyncWriteRelease {
 
   void cleanup() noexcept {
     try {
+      if (reactor.is_multi_worker()) {
+        if (handle.unlinked.load() && handle.cache_entry) {
+          cache_operation.complete = [](void* context, CacheAsyncResult result) noexcept {
+            auto* self = static_cast<AsyncWriteRelease*>(context);
+            if (result.error) self->error = AsyncPartUpload::error_code(result.error);
+            self->finish_local();
+          };
+          cache_operation.context = this;
+          if (!handle.cache_entry->discard_write_async(reactor, cache_operation)) {
+            throw std::system_error(errno, std::generic_category(), "discard unlinked cache write");
+          }
+        } else finish_local();
+        return;
+      }
       state.uploads->submit(&handle, [this] {
         {
           IoExecutorScope local_only(nullptr, 0);
@@ -16427,6 +17641,13 @@ struct AsyncWriteRelease {
         reactor.complete(&ticket);
       });
     } catch (...) {
+      if (reactor.is_multi_worker()) {
+        error = AsyncPartUpload::error_code(std::current_exception());
+        fprintf(stderr, "warning: asynchronous cache cleanup failed; retaining marker: path=%s\n",
+                handle.object_path.c_str());
+        finish_local();
+        return;
+      }
       fprintf(stderr, "warning: local release worker unavailable; completing "
                       "local-only handle cleanup inline: path=%s\n",
               handle.object_path.c_str());
@@ -16493,8 +17714,7 @@ bool start_async_write_release(State& state, OpenHandle& handle,
     }
   }
   try {
-    auto task = std::make_unique<AsyncWriteRelease>(
-        AsyncWriteRelease{state, handle, reactor, complete, context, {}, {}});
+    auto task = std::make_unique<AsyncWriteRelease>(state, handle, reactor, complete, context);
     task->ticket = {AsyncWriteRelease::done, AsyncWriteRelease::done, task.get()};
     if (!reactor.reserve_completion(&task->ticket)) return false;
     task.release()->start();
@@ -17188,7 +18408,12 @@ class AsyncHideReaders {
     failure_ = std::move(error);
     if (!marker_) { finish_discard_marker(); return; }
     try {
-      local_.start(state_, reactor_, remove_marker, marker_removed, this);
+      local_.start(state_, reactor_, remove_marker, marker_removed, this,
+          [](void* value, CacheAsyncRequest& request) {
+            auto* self = static_cast<AsyncHideReaders*>(value);
+            return self->state_.local_cache->finish_pending_delete_async(
+                self->reactor_, request, self->hidden_key_);
+          });
     } catch (...) {
       // Keep the marker for mount-time recovery if local cleanup cannot be
       // admitted; no filesystem operation is allowed in this owner fallback.
@@ -17264,7 +18489,12 @@ class AsyncHideReaders {
       handle->object_path.reserve(hidden_path_.size());
       handle->key.reserve(hidden_key_.size());
     }
-    local_.start(state_, reactor_, create_marker, marker_created, this);
+    local_.start(state_, reactor_, create_marker, marker_created, this,
+        [](void* value, CacheAsyncRequest& request) {
+          auto* self = static_cast<AsyncHideReaders*>(value);
+          return self->state_.local_cache->create_pending_delete_async(
+              self->reactor_, request, self->hidden_key_, self->restore_, self->replacement_);
+        });
   }
 
   static void create_marker(void* value) {
@@ -17355,7 +18585,11 @@ class AsyncHideReaders {
     retirement_.context = this;
     if (cache_retry_ && !retirement_.ready(state_, reactor_, key_, nullptr, true)) return;
     cache_retry_ = false;
-    local_.start(state_, reactor_, remove_cache, cache_removed, this);
+    local_.start(state_, reactor_, remove_cache, cache_removed, this,
+        [](void* value, CacheAsyncRequest& request) {
+          auto* self = static_cast<AsyncHideReaders*>(value);
+          return self->state_.local_cache->remove_async(self->reactor_, request, self->key_, true);
+        });
   }
 
   static void remove_cache(void* value) {
@@ -17367,6 +18601,10 @@ class AsyncHideReaders {
   static void cache_removed(void* value, std::exception_ptr error) noexcept {
     auto* task = static_cast<AsyncHideReaders*>(value);
     try {
+      if (task->reactor_.is_multi_worker()) {
+        task->cache_retry_ = task->local_.retirement_pending(error);
+        task->cache_removed_ = task->local_.result;
+      }
       if (error) std::rethrow_exception(error);
       if (task->cache_retry_) { task->finish_cache(); return; }
       if (!task->cache_removed_) {
@@ -17506,9 +18744,15 @@ struct AsyncUnlink {
 
   void fail(std::exception_ptr error) noexcept {
     failure = std::move(error);
+    if (reactor.is_multi_worker()) reader_entries.clear();
     if ((marker_created && !delete_committed) || !reader_entries.empty()) {
       try {
-        local.start(state, reactor, remove_marker, failed_marker_removed, this);
+        local.start(state, reactor, remove_marker, failed_marker_removed, this,
+            [](void* value, CacheAsyncRequest& request) {
+              auto* self = static_cast<AsyncUnlink*>(value);
+              return self->state.local_cache->finish_pending_delete_async(
+                  self->reactor, request, self->key);
+            });
       } catch (...) { failed_marker_removed(this, std::current_exception()); }
       return;
     }
@@ -17540,6 +18784,13 @@ struct AsyncUnlink {
 
   static void resumed(void* context, std::exception_ptr error) noexcept {
     auto* task = static_cast<AsyncUnlink*>(context);
+    if (task->reactor.is_multi_worker()) {
+      if (task->phase == 30 && !error) task->marker_created = true;
+      if (task->phase == 50) {
+        task->cache_retry = task->local.retirement_pending(error);
+        task->cache_preserved = task->local.result;
+      }
+    }
     if (error) task->fail(std::move(error));
     else task->advance();
   }
@@ -17661,9 +18912,15 @@ struct AsyncUnlink {
             writer->write_in_progress = true;
             writer_reserved = true;
             guard.unlock();
-            if (state.local_cache && writer->cache_entry) {
+            if (state.local_cache && writer->cache_entry &&
+                (!reactor.is_multi_worker() || writer->cache_entry->dirty())) {
               phase = 30;
-              local.start(state, reactor, create_marker, resumed, this);
+              local.start(state, reactor, create_marker, resumed, this,
+                  [](void* value, CacheAsyncRequest& request) {
+                    auto* self = static_cast<AsyncUnlink*>(value);
+                    return self->state.local_cache->create_pending_delete_async(
+                        self->reactor, request, self->key);
+                  });
               owner.release(); return;
             }
           }
@@ -17699,7 +18956,11 @@ struct AsyncUnlink {
             }
             if (writer->cache_entry) {
               phase = 40;
-              local.start(state, reactor, discard_write, resumed, this);
+              local.start(state, reactor, discard_write, resumed, this,
+                  [](void* value, CacheAsyncRequest& request) {
+                    auto* self = static_cast<AsyncUnlink*>(value);
+                    return self->writer->cache_entry->discard_write_async(self->reactor, request);
+                  });
               owner.release(); return;
             }
           }
@@ -17722,7 +18983,16 @@ struct AsyncUnlink {
             }
             cache_retry = false;
             phase = 50;
-            local.start(state, reactor, remove_cache, resumed, this);
+            local.start(state, reactor, remove_cache, resumed, this,
+                [](void* value, CacheAsyncRequest& request) {
+                  auto* self = static_cast<AsyncUnlink*>(value);
+                  if (!self->cache_qualified) {
+                    self->preserve_readers = cached_readers_fully_clean(std::move(self->reader_entries));
+                    self->cache_qualified = true;
+                  }
+                  return self->state.local_cache->remove_async(
+                      self->reactor, request, self->key, self->preserve_readers);
+                });
             owner.release(); return;
           }
           phase = 50;
@@ -18484,6 +19754,10 @@ struct AsyncRename {
 
   static void destination_removed(void* value, std::exception_ptr error) noexcept {
     auto* task = static_cast<AsyncRename*>(value);
+    if (task->reactor.is_multi_worker()) {
+      task->cache_retry = task->local.retirement_pending(error);
+      task->destination_preserved = task->local.result;
+    }
     if (error) { task->fail(std::move(error)); return; }
     task->cache_destination_processed = !task->cache_retry;
     task->advance();
@@ -18497,6 +19771,7 @@ struct AsyncRename {
 
   static void cache_rename_done(void* value, std::exception_ptr error) noexcept {
     auto* task = static_cast<AsyncRename*>(value);
+    if (task->reactor.is_multi_worker()) task->cache_retry = task->local.retirement_pending(error);
     if (error) { task->fail(std::move(error)); return; }
     task->cache_renamed = !task->cache_retry;
     task->advance();
@@ -18538,7 +19813,16 @@ struct AsyncRename {
           if (cache_retry && !retirement.ready(state, reactor, destination_key,
                                                  nullptr, preserve_destination)) return false;
           cache_retry = false;
-          local.start(state, reactor, remove_destination, destination_removed, this);
+          local.start(state, reactor, remove_destination, destination_removed, this,
+              [](void* value, CacheAsyncRequest& request) {
+                auto* self = static_cast<AsyncRename*>(value);
+                if (!self->destination_qualified) {
+                  self->preserve_destination = cached_readers_fully_clean(std::move(self->destination_entries));
+                  self->destination_qualified = true;
+                }
+                return self->state.local_cache->remove_async(
+                    self->reactor, request, self->destination_key, self->preserve_destination);
+              });
           return false;
         }
         cache_destination_processed = true;
@@ -18546,7 +19830,12 @@ struct AsyncRename {
       if (!cache_renamed && state.local_cache) {
         if (cache_retry && !retirement.ready(state, reactor, destination_key)) return false;
         cache_retry = false;
-        local.start(state, reactor, rename_cache, cache_rename_done, this);
+        local.start(state, reactor, rename_cache, cache_rename_done, this,
+            [](void* value, CacheAsyncRequest& request) {
+              auto* self = static_cast<AsyncRename*>(value);
+              return self->state.local_cache->rename_async(
+                  self->reactor, request, self->source_key, self->destination_key);
+            });
         return false;
       }
       finish_open_file_rename(state, source_path, destination_path, destination_key,
@@ -18658,7 +19947,12 @@ struct AsyncRename {
         case 11:
           if (destination_hidden) {
             phase = 111;
-            local.start(state, reactor, commit_marker, marker_committed, this);
+            local.start(state, reactor, commit_marker, marker_committed, this,
+                [](void* value, CacheAsyncRequest& request) {
+                  auto* self = static_cast<AsyncRename*>(value);
+                  return self->state.local_cache->commit_pending_delete_async(
+                      self->reactor, request, self->hidden_key);
+                });
             owner.release(); return;
           }
           phase = 12;
@@ -19552,7 +20846,18 @@ int run(int argc, char** argv) {
                             "for uncached io_uring reads yet; use local cache or "
                             "--io-engine legacy for read checksum verification\n");
           }
-          result = reactors->run();
+          if (state.config.reactor_count > 1) {
+            if (!state.start_reactor_maintenance(*reactors)) {
+              fprintf(stderr, "unable to start reactor maintenance: %s\n",
+                      strerror(errno));
+              result = -EIO;
+            } else {
+              result = reactors->run();
+            }
+          } else {
+            state.start_thread_maintenance();
+            result = reactors->run();
+          }
           reactors->report_stats();
           if (result != 0) {
             fprintf(stderr, "io_uring engine failed: %s\n",
@@ -19571,6 +20876,7 @@ int run(int argc, char** argv) {
         }
       }
       if (run_legacy) {
+        state.start_thread_maintenance();
         if (loop_config == nullptr) {
           fprintf(stderr, "unable to allocate legacy FUSE loop config\n");
           result = -ENOMEM;

@@ -121,14 +121,23 @@ class RandomReadReportTest(unittest.TestCase):
                 self.assertEqual(float(row["reference_cpu_over_ngs3fs"]), 2.0)
                 self.assertEqual(float(row["ngs3fs_cpu_saving_percent"]), 50.0)
 
-    def test_pages_links_dispatch_recycling_report_when_present(self):
+    def test_pages_links_owner_complete_report_when_present(self):
+        page = self.root / "index.html"
+        (self.root / "owner-complete-comparison.html").write_text(
+            "test", encoding="utf-8")
+        summary.write_html(page, self.rows, "test", "")
+        rendered = page.read_text(encoding="utf-8")
+        self.assertIn('href="owner-complete-comparison.html"', rendered)
+        self.assertIn("Pre-owner-complete baseline vs owner-complete workers", rendered)
+
+    def test_pages_keeps_historical_affinity_report_link_compatible(self):
         page = self.root / "index.html"
         (self.root / "inode-affinity-comparison.html").write_text(
             "test", encoding="utf-8")
         summary.write_html(page, self.rows, "test", "")
         rendered = page.read_text(encoding="utf-8")
         self.assertIn('href="inode-affinity-comparison.html"', rendered)
-        self.assertIn("Dispatch return-pipe baseline vs direct shared lock-free recycling", rendered)
+        self.assertIn("Pre-owner-complete baseline vs owner-complete workers", rendered)
 
     def test_total_client_cpu_uses_daemon_plus_workload_and_links_samples(self):
         samples = [

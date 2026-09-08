@@ -163,6 +163,42 @@ wait_for_mount() {
   return 1
 }
 
+capture_thread_census() {
+  local pid=$1
+  local output=$2
+  local task
+  local tid
+  local comm
+  local kind
+  local count=0
+  local sqpoll_count=0
+
+  if ! {
+    printf 'process_pid=%s\n' "$pid"
+    printf 'source=/proc/%s/task\n' "$pid"
+    printf 'tid\tkind\tcomm\n'
+    for task in /proc/"$pid"/task/[0-9]*; do
+      [[ -r "$task/comm" ]] || continue
+      if ! IFS= read -r comm <"$task/comm"; then
+        continue
+      fi
+      tid=${task##*/}
+      kind=application
+      if [[ "$comm" = iou-sqp-* ]]; then
+        kind=kernel-sqpoll
+        ((++sqpoll_count))
+      fi
+      printf '%s\t%s\t%s\n' "$tid" "$kind" "$comm"
+      ((++count))
+    done
+    printf 'task_count=%s\n' "$count"
+    printf 'sqpoll_task_count=%s\n' "$sqpoll_count"
+  } >"$output" 2>/dev/null; then
+    printf 'process_pid=%s\nthread_census=unavailable\n' "$pid" \
+      >"$output" 2>/dev/null || true
+  fi
+}
+
 run_random_read() {
   local operations=$1
   local output=$2
@@ -450,6 +486,8 @@ if [[ ! -s "$run_dir/perf.folded" ]]; then
   echo "perf captured no stack samples after retry" >&2
   exit 2
 fi
+capture_thread_census "$ngs3fs_pid" \
+  "$run_dir/threads-after-workload.txt"
 if [[ "$io_engine" = uring-sqpoll ]]; then
   if awk '/^iou-sqp-/ { found = 1 } END { exit !found }' \
       "$run_dir/perf.folded"; then

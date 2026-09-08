@@ -164,6 +164,42 @@ process_cpu_ns() {
       (fields[11] + fields[12]) * 1000000000 / ticks))"
 }
 
+capture_thread_census() {
+  local pid=$1
+  local output=$2
+  local task
+  local tid
+  local comm
+  local kind
+  local count=0
+  local sqpoll_count=0
+
+  if ! {
+    printf 'process_pid=%s\n' "$pid"
+    printf 'source=/proc/%s/task\n' "$pid"
+    printf 'tid\tkind\tcomm\n'
+    for task in /proc/"$pid"/task/[0-9]*; do
+      [[ -r "$task/comm" ]] || continue
+      if ! IFS= read -r comm <"$task/comm"; then
+        continue
+      fi
+      tid=${task##*/}
+      kind=application
+      if [[ "$comm" = iou-sqp-* ]]; then
+        kind=kernel-sqpoll
+        ((++sqpoll_count))
+      fi
+      printf '%s\t%s\t%s\n' "$tid" "$kind" "$comm"
+      ((++count))
+    done
+    printf 'task_count=%s\n' "$count"
+    printf 'sqpoll_task_count=%s\n' "$sqpoll_count"
+  } >"$output" 2>/dev/null; then
+    printf 'process_pid=%s\nthread_census=unavailable\n' "$pid" \
+      >"$output" 2>/dev/null || true
+  fi
+}
+
 start_ngs3fs() {
   if [[ "$cache_mode" != none ]]; then
     mkdir -p "$cache_dir"
@@ -303,6 +339,10 @@ run_case() {
     kill -INT "$perf_pid" 2>/dev/null || true
     wait "$perf_pid" 2>/dev/null || true
   fi
+  if [[ "$client" = ngs3fs ]]; then
+    capture_thread_census "$daemon_pid" \
+      "$stem-threads-after-workload.txt"
+  fi
 
   last_line=$(wc -l <"$daemon_log")
   if ((last_line > first_line)); then
@@ -358,6 +398,10 @@ run_random_read_case() {
   printf '%s\n' "$result" >"$run_dir/$client-random-read-result.txt"
   end_ns=$(process_cpu_ns "$daemon_pid")
   used_ns=$((end_ns - start_ns))
+  if [[ "$client" = ngs3fs ]]; then
+    capture_thread_census "$daemon_pid" \
+      "$run_dir/ngs3fs-threads-after-workload.txt"
+  fi
   last_line=$(wc -l <"$run_dir/versity-access.log")
   if ((last_line > first_line)); then
     sed -n "$((first_line + 1)),${last_line}p" \

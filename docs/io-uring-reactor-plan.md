@@ -1,5 +1,79 @@
 # io_uring reactor execution contract
 
+## Current implementation target: ingress and owner-complete workers (2026-09-08)
+
+This section supersedes the earlier multi-reactor execution and notification
+rules below. The implementation passes compilation and all 98 non-mounted
+unit checks locally (2026-09-09). Fresh runner integration, stress and matched
+performance validation remain required; this is not a measured CPU-win claim.
+
+- `--reactors N` remains the total number of application reactors. For N > 1,
+  reactor 0 only receives FUSE messages, dispatches them and owns the recycled
+  Dispatch containers. Stable mixed-inode routing selects workers 1 through
+  N-1. INIT and session-control transport remain ingress responsibilities.
+  For N == 1, ingress and execution remain combined.
+- A worker owns the request state machine through completion: HTTP connection
+  use, network and local-cache I/O, parsing, checksum work and local state
+  publication. Replies go directly to FUSE from that worker. Do not bounce
+  replies through ingress or offload work to a second application thread pool.
+- Multi-reactor request work must not call UploadScheduler to run a blocking
+  function on another thread. Convert file operations and composite metadata
+  transactions into resumable asynchronous steps on the owner's io_uring.
+  Do not merely execute existing blocking cache functions inside a callback.
+  Preserve filesystem/cache ordering, error propagation, quotas and shutdown
+  ownership. Avoid holding a blocking mutex across asynchronous suspension.
+- Preserve both live-entry and cold on-disk CLOCK eviction when capacity is
+  exhausted. Do not replace eviction with ENOSPC or change the S3-key directory
+  layout to make the asynchronous implementation easier. Directory enumeration
+  has no io_uring getdents opcode in the current upstream UAPI: allow bounded
+  owner-local enumeration batches, yielding between batches, while candidate
+  open/stat/read/punch operations use the owner's ring. This is an explicit
+  metadata-primitive exception, not a claim that cold scans are wholly
+  nonblocking. Existing mmap bookkeeping and rare failure-cleanup syscalls
+  also remain local; never hide an entire blocking cache transaction in a CQE.
+- Checksum and other CPU work run on the owner. Large work is advanced in
+  bounded chunks interleaved with ready CQEs; no fibers or hidden worker pool.
+  Owner-local continuations need neither a cross-thread completion mutex nor
+  eventfd self-notification. Kernel io_uring implementation workers are not an
+  application task pool and must not be confused with one in reporting.
+  Keep one incremental checksum object per operation. Each step consumes at
+  most 256 KiB, saves progress and queues the next owner-local continuation;
+  the callback runner executes a snapshot, not an unbounded self-requeue loop.
+  Cache-file reads are owner-ring PREAD operations; checksum updates are CPU
+  callbacks, not fabricated SQEs/CQEs. The current validation pass remains a
+  post-download scan, not a claim of checksum-at-receive fusion.
+  Do not force every checksum PREAD through io-wq: leave the ordinary
+  nonblocking-first submission policy in place, so a pagecache hit need not
+  incur a helper-thread handoff. A miss may still use kernel io-wq normally.
+- Connection affinity follows execution ownership. Normal reuse should remain
+  local; preserve the mount-wide connection cap and metadata/demand progress.
+  Do not move active sockets between rings or forward each request to another
+  worker just to borrow its connection. Contended shared metadata/budgets still
+  require explicit coordination; inode routing does not remove their races.
+- Periodic maintenance belongs to bounded worker-reactor tasks. Keep legacy
+  and explicitly supported TLS fallback separate; do not silently fall back
+  the new multi-reactor plaintext path to the old worker pool.
+  Existing dynamic credential-provider refresh is a separate compatibility
+  boundary, not an object-I/O offload path. It may still use its existing
+  refresh thread for credential_process, file reload, metadata services or
+  HTTPS STS. Do not stop credential refresh or run these blocking providers
+  on a reactor merely to claim a smaller thread count. Static environment
+  credentials and anonymous access do not require a refresh thread.
+- Ordinary remote Dispatch returns still push the existing lock-free stack.
+  Only a return that needs to wake ingress may carry its valid Dispatch pointer
+  through a dedicated return pipe instead, without shared-freelist push/pop.
+  Never put nullptr/control records in this pipe. Other lifecycle/control
+  notifications remain separate. A pointer record transfers ownership and may
+  not be dropped; queued returns count as outstanding until acquired by ingress.
+  If capacity/race/error handling requires ordinary publication, preserve a
+  separate control wake rather than inventing an invalid pointer message.
+
+Validation: non-mounted compile/unit checks locally; mounted correctness,
+concurrency/stress, sanitizers and matched CPU/latency/flamegraph comparisons
+only on GitHub runners. Compare equal total reactor and connection counts;
+retain readable evidence, not perf.data. Audit source and runtime evidence for
+remaining offload paths before claiming the no-extra-worker target complete.
+
 ## Direct Dispatch freelist (2026-09-08)
 
 `Dispatch` allocation and reclamation use one intrusive lock-free LIFO stack.

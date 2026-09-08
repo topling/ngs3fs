@@ -8,6 +8,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <linux/fuse.h>
+#include <linux/stat.h>
 #include <new>
 #include <poll.h>
 #include <stdio.h>
@@ -185,6 +186,14 @@ void FuseReactor::release_input_dispatch(
 }
 
 bool FuseReactor::run_ready_callbacks() noexcept {
+  while (local_completion_head_ != nullptr &&
+         callback_count_ < ready_callbacks_.size()) {
+    ReactorTask* task = local_completion_head_;
+    local_completion_head_ = task->completion_next;
+    if (!start_task(task)) abort();
+    task->completion_next = nullptr;
+  }
+  if (local_completion_head_ == nullptr) local_completion_tail_ = nullptr;
   if (completion_pending_.load(std::memory_order_acquire)) {
     std::lock_guard guard(completion_mutex_);
     while (completion_head_ != nullptr && callback_count_ < ready_callbacks_.size()) {
@@ -271,6 +280,15 @@ FuseReactor::~FuseReactor() {
     }
     ::close(task_pipe_[0]);
   }
+  if (return_pipe_[1] >= 0) {
+    ::close(return_pipe_[1]);
+    return_pipe_[1] = -1;
+  }
+  if (return_pipe_[0] >= 0) {
+    (void)drain_return_pipe();
+    ::close(return_pipe_[0]);
+    return_pipe_[0] = -1;
+  }
   while (callback_count_ != 0) {
     ReactorTask* task = ready_callbacks_[callback_head_];
     callback_head_ = (callback_head_ + 1) % ready_callbacks_.size();
@@ -293,6 +311,15 @@ FuseReactor::~FuseReactor() {
     if (dispatch->pipe[1] >= 0) {
       ::close(dispatch->pipe[1]);
     }
+    delete dispatch;
+  }
+  while (Dispatch* dispatch = pop_returned_dispatch()) {
+    if (dispatch->reply != nullptr &&
+        !dispatch->reply_submitted.load(std::memory_order_relaxed)) {
+      release_reply(dispatch->reply);
+    }
+    if (dispatch->pipe[0] >= 0) ::close(dispatch->pipe[0]);
+    if (dispatch->pipe[1] >= 0) ::close(dispatch->pipe[1]);
     delete dispatch;
   }
   if (wake_fd_ >= 0) {
@@ -343,6 +370,12 @@ bool FuseReactor::initialize(FuseReactorGroup* group,
   }
   if (::pipe2(task_pipe_, O_CLOEXEC | O_NONBLOCK) != 0) {
     error = "pipe2(reactor tasks): " + std::string(strerror(errno));
+    return false;
+  }
+  if (initialization_owner_ &&
+      ::pipe2(return_pipe_, O_CLOEXEC | O_NONBLOCK) != 0) {
+    error = "pipe2(FUSE dispatch returns): " +
+        std::string(strerror(errno));
     return false;
   }
   wake_fd_ = eventfd(0, EFD_CLOEXEC);
@@ -453,16 +486,55 @@ bool FuseReactor::submit(AsyncIoRequest& operation) noexcept {
     errno = ENOTCONN;
     return false;
   }
-  if (operation.complete == nullptr || operation.fd < 0 ||
-      operation.length > INT_MAX || operation.timeout_ms < 0 ||
+  const bool directory_fd = operation.fd >= 0 || operation.fd == AT_FDCWD;
+  const bool output_directory_fd =
+      operation.output_fd >= 0 || operation.output_fd == AT_FDCWD;
+  const bool ordinary_fd = operation.fd >= 0;
+  const bool sized_io = operation.kind >= AsyncIoRequest::RECEIVE &&
+      operation.kind <= AsyncIoRequest::SPLICE;
+  const bool valid_target = operation.kind == AsyncIoRequest::MADVISE ||
+      ((operation.kind == AsyncIoRequest::OPENAT ||
+        operation.kind == AsyncIoRequest::STATX ||
+        operation.kind == AsyncIoRequest::RENAMEAT ||
+        operation.kind == AsyncIoRequest::UNLINKAT ||
+        operation.kind == AsyncIoRequest::MKDIRAT) ? directory_fd : ordinary_fd);
+  if (operation.complete == nullptr || !valid_target ||
+      (sized_io && operation.length > INT_MAX) ||
+      operation.timeout_ms < 0 ||
       (operation.kind != AsyncIoRequest::CONNECT &&
        operation.kind != AsyncIoRequest::SPLICE &&
+       operation.kind != AsyncIoRequest::OPENAT &&
+       operation.kind != AsyncIoRequest::CLOSE &&
+       operation.kind != AsyncIoRequest::STATX &&
+       operation.kind != AsyncIoRequest::FALLOCATE &&
+       operation.kind != AsyncIoRequest::FSYNC &&
+       operation.kind != AsyncIoRequest::FTRUNCATE &&
+       operation.kind != AsyncIoRequest::RENAMEAT &&
+       operation.kind != AsyncIoRequest::UNLINKAT &&
+       operation.kind != AsyncIoRequest::MKDIRAT &&
+       operation.kind != AsyncIoRequest::MADVISE &&
        operation.length != 0 && operation.data == nullptr) ||
       (operation.kind == AsyncIoRequest::CONNECT &&
        (operation.address == nullptr || operation.address_length == 0)) ||
       (operation.kind == AsyncIoRequest::SPLICE && operation.output_fd < 0) ||
       (operation.kind == AsyncIoRequest::PREAD && operation.input_offset < 0) ||
       (operation.kind == AsyncIoRequest::PWRITE && operation.output_offset < 0) ||
+      ((operation.kind == AsyncIoRequest::OPENAT ||
+        operation.kind == AsyncIoRequest::STATX ||
+        operation.kind == AsyncIoRequest::UNLINKAT ||
+        operation.kind == AsyncIoRequest::MKDIRAT) && operation.path == nullptr) ||
+      (operation.kind == AsyncIoRequest::RENAMEAT &&
+       (!output_directory_fd || operation.path == nullptr ||
+        operation.path2 == nullptr)) ||
+      (operation.kind == AsyncIoRequest::STATX && operation.data == nullptr) ||
+      (operation.kind == AsyncIoRequest::FALLOCATE &&
+       (operation.input_offset < 0 ||
+        operation.length > size_t(std::numeric_limits<off_t>::max()) -
+            size_t(operation.input_offset))) ||
+      (operation.kind == AsyncIoRequest::FTRUNCATE &&
+       operation.length > size_t(std::numeric_limits<off_t>::max())) ||
+      (operation.kind == AsyncIoRequest::MADVISE &&
+       operation.data == nullptr) ||
       (operation.processor != nullptr &&
        (operation.kind != AsyncIoRequest::RECEIVE || operation.length == 0))) {
     errno = EINVAL;
@@ -491,6 +563,16 @@ bool FuseReactor::submit(AsyncIoRequest& operation) noexcept {
     case AsyncIoRequest::PWRITE:  request->kind = IO_PWRITE;  break;
     case AsyncIoRequest::SPLICE:  request->kind = IO_SPLICE;  break;
     case AsyncIoRequest::CONNECT: request->kind = IO_CONNECT; break;
+    case AsyncIoRequest::OPENAT: request->kind = IO_OPENAT; break;
+    case AsyncIoRequest::CLOSE: request->kind = IO_CLOSE; break;
+    case AsyncIoRequest::STATX: request->kind = IO_STATX; break;
+    case AsyncIoRequest::FALLOCATE: request->kind = IO_FALLOCATE; break;
+    case AsyncIoRequest::FSYNC: request->kind = IO_FSYNC; break;
+    case AsyncIoRequest::FTRUNCATE: request->kind = IO_FTRUNCATE; break;
+    case AsyncIoRequest::RENAMEAT: request->kind = IO_RENAMEAT; break;
+    case AsyncIoRequest::UNLINKAT: request->kind = IO_UNLINKAT; break;
+    case AsyncIoRequest::MKDIRAT: request->kind = IO_MKDIRAT; break;
+    case AsyncIoRequest::MADVISE: request->kind = IO_MADVISE; break;
     default:
       request->next_free = async_free_;
       async_free_ = request;
@@ -502,10 +584,14 @@ bool FuseReactor::submit(AsyncIoRequest& operation) noexcept {
   request->data               = operation.data;
   request->address            = operation.address;
   request->address_length     = operation.address_length;
+  request->path               = operation.path;
+  request->path2              = operation.path2;
   request->length             = operation.length;
   request->transferred        = 0;
   request->operations         = 0;
   request->flags              = int(operation.flags);
+  request->mode               = operation.mode;
+  request->mask               = operation.mask;
   request->timeout_ms         = operation.timeout_ms;
   request->input_offset       = operation.input_offset;
   request->output_offset      = operation.output_offset;
@@ -630,7 +716,6 @@ bool FuseReactor::reserve_completion(ReactorTask* task) noexcept {
     errno = EINVAL;
     return false;
   }
-  std::shared_lock guard(group_->external_mutex_);
   if (!ring_ready_ ||
       ((group_->shutting_down_.load(std::memory_order_acquire) || error_ != 0) &&
        continuation_depth_ == 0)) {
@@ -651,6 +736,18 @@ bool FuseReactor::reserve_completion(ReactorTask* task) noexcept {
 
 void FuseReactor::complete(ReactorTask* task) noexcept {
   if (task == nullptr || task->completion_owner != this) abort();
+  if (current_ == this) {
+    if (task->completion_queued) abort();
+    task->completion_queued = true;
+    task->completion_next = nullptr;
+    if (local_completion_tail_ != nullptr) {
+      local_completion_tail_->completion_next = task;
+    } else {
+      local_completion_head_ = task;
+    }
+    local_completion_tail_ = task;
+    return;
+  }
   {
     std::lock_guard guard(completion_mutex_);
     if (task->completion_queued) abort();
@@ -669,6 +766,20 @@ void FuseReactor::complete(ReactorTask* task) noexcept {
     result = ::write(wake_fd_, &wake, sizeof(wake));
   } while (result < 0 && errno == EINTR);
   errno = saved_errno;
+}
+
+bool FuseReactor::is_multi_worker() const noexcept {
+  return group_ != nullptr && group_->reactors_.size() > 1 &&
+      reactor_index_ != 0;
+}
+
+unsigned FuseReactor::worker_index() const noexcept {
+  return is_multi_worker() ? unsigned(reactor_index_ - 1) : 0;
+}
+
+unsigned FuseReactor::worker_count() const noexcept {
+  if (group_ == nullptr || group_->reactors_.size() <= 1) return 1;
+  return unsigned(group_->reactors_.size() - 1);
 }
 
 ssize_t FuseReactor::sync_writev(int fd, iovec* iov, int count,
@@ -1182,6 +1293,22 @@ bool FuseReactor::submit_task_receive() noexcept {
   return true;
 }
 
+bool FuseReactor::submit_return_receive() noexcept {
+  if (return_pipe_[0] < 0 || return_pending_) {
+    return true;
+  }
+  // This poll is the sole notification for pointer returns. Unlike a
+  // coalesced control wake, it must not be silently omitted when the SQ fills.
+  io_uring_sqe* sqe = acquire_sqe();
+  if (sqe == nullptr) {
+    return false;
+  }
+  io_uring_prep_poll_add(sqe, return_pipe_[0], POLLIN);
+  io_uring_sqe_set_data(sqe, &return_token_);
+  return_pending_ = true;
+  return true;
+}
+
 bool FuseReactor::submit_wakeup() noexcept {
   if (wake_pending_) {
     return true;
@@ -1301,6 +1428,50 @@ bool FuseReactor::submit_io_request(IoRequest* request) noexcept {
       io_uring_prep_connect(operation, request->fd, request->address,
                             request->address_length);
       break;
+    case IO_OPENAT:
+      io_uring_prep_openat(operation, request->fd, request->path,
+                           request->flags, request->mode);
+      break;
+    case IO_CLOSE:
+      io_uring_prep_close(operation, request->fd);
+      break;
+    case IO_STATX:
+      io_uring_prep_statx(operation, request->fd, request->path,
+                          request->flags, request->mask,
+                          static_cast<struct statx*>(request->data));
+      break;
+    case IO_FALLOCATE:
+      io_uring_prep_fallocate(operation, request->fd, request->flags,
+                              request->input_offset, request->length);
+      break;
+    case IO_FSYNC:
+      io_uring_prep_fsync(operation, request->fd, request->flags);
+      break;
+    case IO_FTRUNCATE: {
+      // IORING_OP_FTRUNCATE was added after the bundled liburing headers.
+      // Keep the opcode local until that dependency exposes its helper.
+      constexpr int kIoUringOpFtruncate = 55;
+      io_uring_prep_rw(kIoUringOpFtruncate, operation, request->fd,
+                       nullptr, 0, request->length);
+      break;
+    }
+    case IO_RENAMEAT:
+      io_uring_prep_renameat(operation, request->fd, request->path,
+                             request->output_fd, request->path2,
+                             request->flags);
+      break;
+    case IO_UNLINKAT:
+      io_uring_prep_unlinkat(operation, request->fd, request->path,
+                             request->flags);
+      break;
+    case IO_MKDIRAT:
+      io_uring_prep_mkdirat(operation, request->fd, request->path,
+                            request->mode);
+      break;
+    case IO_MADVISE:
+      io_uring_prep_madvise(operation, request->data, request->length,
+                            request->flags);
+      break;
   }
   constexpr uintptr_t kOperationTag = 1;
   io_uring_sqe_set_data64(
@@ -1411,6 +1582,15 @@ FuseReactor::Dispatch* FuseReactor::pop_dispatch() noexcept {
   return nullptr;
 }
 
+FuseReactor::Dispatch* FuseReactor::pop_returned_dispatch() noexcept {
+  Dispatch* dispatch = returned_dispatches_;
+  if (dispatch != nullptr) {
+    returned_dispatches_ = dispatch->next_free;
+    dispatch->next_free = nullptr;
+  }
+  return dispatch;
+}
+
 FuseReactor::Dispatch* FuseReactor::acquire_dispatch() noexcept {
   size_t size = fuse_session_bufsize(session_);
   if (size == 0 || size > INT_MAX) {
@@ -1420,7 +1600,8 @@ FuseReactor::Dispatch* FuseReactor::acquire_dispatch() noexcept {
   if (first_receive_) {
     size = std::min(size, size_t(64U * 1024U));
   }
-  Dispatch* dispatch = pop_dispatch();
+  Dispatch* dispatch = pop_returned_dispatch();
+  if (dispatch == nullptr) dispatch = pop_dispatch();
   if (dispatch == nullptr) {
     dispatch = new (std::nothrow) Dispatch;
     if (dispatch == nullptr) {
@@ -1519,13 +1700,33 @@ bool FuseReactor::drain_receive_pipe(int fd) noexcept {
 }
 
 void FuseReactor::dispatch_complete(Dispatch* dispatch) noexcept {
+  const bool remote = current_ != this;
+  const size_t observed = dispatch_count_.load(std::memory_order_acquire);
+  const bool shutdown_last = observed == 1 &&
+      group_->shutting_down_.load(std::memory_order_acquire);
+  if (remote && return_pipe_[1] >= 0 &&
+      (observed == max_dispatch_count_ || shutdown_last)) {
+    Dispatch* value = dispatch;
+    ssize_t result;
+    do {
+      result = ::write(return_pipe_[1], &value, sizeof(value));
+    } while (result < 0 && errno == EINTR);
+    if (result == ssize_t(sizeof(value))) {
+      // The unread pointer retains the dispatch_count_ ownership. The producer
+      // transferred the node through the pipe and must not touch it again.
+      return;
+    }
+    if (result >= 0) abort();
+    // A failed transfer never changes ownership. Publish normally, then use
+    // the independent control wake so capacity cannot be stranded.
+  }
   recycle_dispatch(dispatch);
   const size_t previous = dispatch_count_.fetch_sub(1, std::memory_order_acq_rel);
   if (previous == 0) abort();
   // An ordinary return only pushes the stack. Full admission leaves ingress
   // without a pending FUSE receive; wake once on the full->available edge.
   // eventfd retains the wake even if ingress has not entered its wait yet.
-  if (current_ != this &&
+  if (remote &&
       (previous == max_dispatch_count_ ||
        (previous == 1 && group_->shutting_down_.load(std::memory_order_acquire)))) {
     const int saved_errno = errno;
@@ -1535,6 +1736,40 @@ void FuseReactor::dispatch_complete(Dispatch* dispatch) noexcept {
       result = ::write(wake_fd_, &wake, sizeof(wake));
     } while (result < 0 && errno == EINTR);
     errno = saved_errno;
+  }
+}
+
+bool FuseReactor::drain_return_pipe() noexcept {
+  std::array<Dispatch*, 32> returned{};
+  for (;;) {
+    ssize_t result;
+    do {
+      result = ::read(return_pipe_[0], returned.data(), sizeof(returned));
+    } while (result < 0 && errno == EINTR);
+    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return true;
+    }
+    if (result == 0 &&
+        group_->shutting_down_.load(std::memory_order_acquire)) {
+      return true;
+    }
+    if (result <= 0 || size_t(result) % sizeof(Dispatch*) != 0) {
+      error_ = result < 0 ? -errno : -EIO;
+      return false;
+    }
+    const size_t count = size_t(result) / sizeof(Dispatch*);
+    for (size_t i = 0; i < count; ++i) {
+      Dispatch* dispatch = returned[i];
+      if (dispatch == nullptr) {
+        error_ = -EIO;
+        return false;
+      }
+      dispatch->next_free = returned_dispatches_;
+      returned_dispatches_ = dispatch;
+      const size_t previous = dispatch_count_.fetch_sub(
+          1, std::memory_order_acq_rel);
+      if (previous == 0) abort();
+    }
   }
 }
 
@@ -1615,23 +1850,52 @@ void FuseReactor::complete_io(IoRequest* request, int result) noexcept {
 }
 
 void FuseReactor::complete_async_io(IoRequest* request, int result) noexcept {
-  if (result > 0) {
+  const bool byte_result = request->kind == IO_RECEIVE ||
+      request->kind == IO_READ || request->kind == IO_PREAD ||
+      request->kind == IO_SEND || request->kind == IO_WRITE ||
+      request->kind == IO_PWRITE || request->kind == IO_SPLICE;
+  if (result > 0 && byte_result) {
     if (size_t(result) > size_t(SSIZE_MAX) - request->transferred) {
       finish_async_io(request, -EOVERFLOW);
       return;
     }
     request->transferred += size_t(result);
   }
+  const auto discard_open_result = [&] {
+    if (request->kind == IO_OPENAT && result >= 0) {
+      (void)::close(result);
+    }
+  };
+  // A successful CLOSE has already transferred descriptor ownership to the
+  // kernel. Never turn that completion into cancellation: a caller retry
+  // could close an unrelated descriptor that reused the same number.
+  if (request->kind == IO_CLOSE && result == 0) {
+    finish_async_io(request, 0);
+    return;
+  }
   if (request->timed_out) {
+    discard_open_result();
     finish_async_io(request, -ETIMEDOUT);
     return;
   }
   if (request->cancelled) {
+    discard_open_result();
     finish_async_io(request, -ECANCELED);
     return;
   }
   if (group_->shutting_down_.load(std::memory_order_acquire)) {
+    discard_open_result();
     finish_async_io(request, error_ != 0 ? error_ : -ENOTCONN);
+    return;
+  }
+  if (!byte_result) {
+    if (result == -EINTR) {
+      if (submit_io_request(request)) return;
+      finish_async_io(request, -EAGAIN);
+      return;
+    }
+    if (result > 0 && request->kind != IO_OPENAT) result = -EIO;
+    finish_async_io(request, result);
     return;
   }
   if (result == -EINTR ||
@@ -1783,6 +2047,7 @@ void FuseReactor::drain_shutdown() noexcept {
 
   for (;;) {
     drain_task_pipe();
+    if (return_pipe_[0] >= 0) drain_return_pipe();
     run_ready_callbacks();
 
     io_uring_cqe* cqe = nullptr;
@@ -1829,6 +2094,9 @@ void FuseReactor::drain_shutdown() noexcept {
         external_pending_ = false;
       } else if (data == &task_token_) {
         task_pending_ = false;
+      } else if (data == &return_token_) {
+        return_pending_ = false;
+        if (return_pipe_[0] >= 0) drain_return_pipe();
       } else if (data != &cancel_token_) {
         complete_reply(static_cast<Reply*>(data), result);
       }
@@ -1858,9 +2126,14 @@ void FuseReactor::drain_shutdown() noexcept {
     }
     // Remote continuations can still finish after the initial cancellation.
     submit_task_receive();
+    if (return_pipe_[0] >= 0 &&
+        dispatch_count_.load(std::memory_order_acquire) != 0) {
+      submit_return_receive();
+    }
     if (task_count_.load(std::memory_order_acquire) != 0 ||
         dispatch_count_.load(std::memory_order_acquire) != 0) submit_wakeup();
-    if (callback_count_ != 0 || completion_pending_.load(std::memory_order_acquire)) {
+    if (callback_count_ != 0 || local_completion_head_ != nullptr ||
+        completion_pending_.load(std::memory_order_acquire)) {
       io_uring_submit_and_get_events(&ring_);
       continue;
     }
@@ -1882,7 +2155,8 @@ bool FuseReactor::resume_receive() noexcept {
   // for a locked folio whose request has not yet been read from /dev/fuse.
   const bool receive_ready = reply_queues_[0].count >= max_reply_count_ ||
       submit_receive();
-  if (receive_ready && submit_external_receive() && submit_task_receive()) {
+  if (receive_ready && submit_external_receive() && submit_task_receive() &&
+      submit_return_receive()) {
     return true;
   }
   if (error_ == 0) {
@@ -2005,7 +2279,8 @@ int FuseReactor::run() noexcept {
   }
   ring_enabled_ = true;
   if (!submit_receive() || !submit_wakeup() ||
-      !submit_external_receive() || !submit_task_receive()) {
+      !submit_external_receive() || !submit_task_receive() ||
+      !submit_return_receive()) {
     return error_ != 0 ? error_ : -EINVAL;
   }
   current_ = this;
@@ -2022,7 +2297,8 @@ int FuseReactor::run() noexcept {
     const uint64_t deadline = next_io_deadline_;
     ++wait_calls_;
     int result;
-    if (callback_count_ != 0 || completion_pending_.load(std::memory_order_acquire)) {
+    if (callback_count_ != 0 || local_completion_head_ != nullptr ||
+        completion_pending_.load(std::memory_order_acquire)) {
       // GETEVENTS with no minimum flushes deferred task work without sleeping.
       // A continuously replenished callback queue must not starve I/O CQEs.
       result = io_uring_submit_and_get_events(&ring_);
@@ -2117,6 +2393,15 @@ int FuseReactor::run() noexcept {
             error_ = -EAGAIN;
           }
         }
+      } else if (data == &return_token_) {
+        return_pending_ = false;
+        if (completion < 0 && completion != -ECANCELED) {
+          error_ = completion;
+        } else if (!fuse_session_exited(session_) &&
+                   (!drain_return_pipe() ||
+                    !submit_return_receive() || !submit_receive())) {
+          if (error_ == 0) error_ = -EAGAIN;
+        }
       } else if (data == &cancel_token_) {
         // The original operation CQE owns request completion.  Cancellation
         // CQEs carry no request pointer so they cannot outlive stack-backed
@@ -2139,7 +2424,7 @@ int FuseReactor::run() noexcept {
       }
       // A receive may make waiting FUSE reads ready. Reply before consuming
       // the next network CQE; each callback pass has a bounded snapshot.
-      if ((callback_count_ != 0 ||
+      if ((callback_count_ != 0 || local_completion_head_ != nullptr ||
            completion_pending_.load(std::memory_order_acquire)) &&
           !run_ready_callbacks()) {
         break;
@@ -2240,6 +2525,15 @@ bool FuseReactorGroup::initialize(fuse_session* session, unsigned count,
 FuseReactorGroup::~FuseReactorGroup() {
 }
 
+bool FuseReactorGroup::post_to_worker(
+    FuseReactor::ReactorTask* task) noexcept {
+  if (reactors_.size() <= 1) {
+    errno = EINVAL;
+    return false;
+  }
+  return reactors_[1]->post(task);
+}
+
 FuseReactor* FuseReactorGroup::callback_reactor() noexcept {
   if (shutting_down_.load(std::memory_order_acquire)) {
     return nullptr;
@@ -2274,7 +2568,8 @@ FuseReactor* FuseReactorGroup::dispatch_reactor(uint64_t inode) noexcept {
   inode = (inode ^ (inode >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
   inode = (inode ^ (inode >> 27)) * UINT64_C(0x94d049bb133111eb);
   inode ^= inode >> 31;
-  return reactors_[inode % reactors_.size()].get();
+  const size_t worker_count = reactors_.size() - 1;
+  return reactors_[1 + inode % worker_count].get();
 }
 
 void FuseReactorGroup::begin_shutdown() noexcept {

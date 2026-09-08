@@ -235,10 +235,15 @@ class IoExecutor;
 class FuseReactor;
 
 // The caller owns this request, its descriptors, buffers, and callback context
-// until complete(context, result). A result is bytes transferred or -errno.
+// until complete(context, result). A result is bytes transferred, the opened
+// descriptor, zero for a completed metadata operation, or -errno.
 // Submit/cancel and completion all run on the executor's owner reactor.
 struct AsyncIoRequest {
-  enum Kind { RECEIVE, READ, PREAD, SEND, WRITE, PWRITE, SPLICE, CONNECT };
+  enum Kind {
+    RECEIVE, READ, PREAD, SEND, WRITE, PWRITE, SPLICE, CONNECT,
+    OPENAT, CLOSE, STATX, FALLOCATE, FSYNC, FTRUNCATE,
+    RENAMEAT, UNLINKAT, MKDIRAT, MADVISE,
+  };
   using Complete = void (*)(void*, ssize_t) noexcept;
   using Processor = int (*)(void*, size_t) noexcept;
 
@@ -247,11 +252,17 @@ struct AsyncIoRequest {
   int output_fd                = -1;
   void* data                   = nullptr;
   size_t length                = 0;
-  off_t input_offset           = -1;
-  off_t output_offset          = -1;
+  off_t input_offset           = -1; // PREAD; SPLICE input; FALLOCATE start.
+  off_t output_offset          = -1; // PWRITE; SPLICE output.
   const sockaddr* address      = nullptr;
   socklen_t address_length     = 0;
-  unsigned flags               = 0;
+  // Path buffers remain owned by the caller through completion. For path
+  // operations fd/output_fd are the source/destination directory descriptors.
+  const char* path             = nullptr;
+  const char* path2             = nullptr;
+  unsigned flags               = 0; // Operation flags, including FALLOC_FL_*.
+  unsigned mode                = 0; // Permissions for OPENAT/MKDIRAT.
+  unsigned mask                = 0;
   int timeout_ms               = 0;
   bool exact                   = false;
   bool force_async             = false;
