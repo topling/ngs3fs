@@ -72,6 +72,7 @@ enum IoEngine {
   IO_ENGINE_AUTO,
   IO_ENGINE_LEGACY,
   IO_ENGINE_URING,
+  IO_ENGINE_URING_SQPOLL,
 };
 
 struct MountConfig {
@@ -2184,9 +2185,11 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
           config.io_engine = IO_ENGINE_LEGACY;
         } else if (value == "uring") {
           config.io_engine = IO_ENGINE_URING;
+        } else if (value == "uring-sqpoll") {
+          config.io_engine = IO_ENGINE_URING_SQPOLL;
         } else {
           throw std::invalid_argument(
-              "invalid --io-engine; expected auto, legacy, or uring");
+              "invalid --io-engine; expected auto, legacy, uring, or uring-sqpoll");
         }
         break;
       }
@@ -2328,6 +2331,9 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   }
   if (config.endpoint_port == 443) {
     config.tls = true;
+  }
+  if (config.tls && config.io_engine == IO_ENGINE_URING_SQPOLL) {
+    throw std::invalid_argument("--io-engine uring-sqpoll requires plaintext; TLS uses legacy");
   }
   while (!config.prefix.empty() && config.prefix.front() == '/') {
     config.prefix.erase(config.prefix.begin());
@@ -19284,8 +19290,9 @@ void print_help() {
       "                             reject requests to a bucket owned by a "
       "different account\n"
       "      --requester-pays       acknowledge requester-pays billing\n"
-      "      --io-engine MODE       FUSE loop: auto, legacy, or uring "
+      "      --io-engine MODE       FUSE loop: auto, legacy, uring, or uring-sqpoll "
       "(default legacy)\n"
+      "                             uring-sqpoll: kernel SQ polling, idle 1 ms, plaintext only\n"
       "      --reactors N           io_uring reactor count (default 1)\n"
       "  -K, --checksum ALGORITHM  upload checksum: auto, default, none, "
       "crc32, crc32c, crc64nvme, sha1, sha256, md5, xxhash64, "
@@ -19538,6 +19545,7 @@ int run(int argc, char** argv) {
         if (reactors->initialize(session, state.config.reactor_count,
                                  kFuseReactorQueueDepth,
                                  state.config.request_timeout_ms,
+                                 state.config.io_engine == IO_ENGINE_URING_SQPOLL,
                                  reactor_error)) {
           if (!state.local_cache && state.config.verify_read_checksum) {
             fprintf(stderr, "warning: --verify-read-checksum is not implemented "
@@ -19550,7 +19558,7 @@ int run(int argc, char** argv) {
             fprintf(stderr, "io_uring engine failed: %s\n",
                     strerror(-result));
           }
-        } else if (state.config.io_engine == IO_ENGINE_URING) {
+        } else if (state.config.io_engine != IO_ENGINE_AUTO) {
           fprintf(stderr, "unable to start io_uring engine: %s\n",
                   reactor_error.c_str());
           result = -EIO;

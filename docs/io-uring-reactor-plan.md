@@ -1163,6 +1163,43 @@ After a mount has started, a fatal ring or transport failure fails the mount. It
 
 `ReactorGroup(1)` and `ReactorGroup(N)` share all code. Auto reactor count uses effective CPU availability from affinity and cgroup quota rather than `hardware_concurrency()` alone. SQPOLL is not enabled by default, especially on one- and two-vCPU instances.
 
+### Optional SQPOLL with minimum idle polling
+
+`--io-engine uring-sqpoll` explicitly selects the existing reactor with kernel
+submission polling. The default engine and ordinary `uring` mode are unchanged;
+`--reactors 1` remains the default reactor count. Each selected reactor owns its
+own SQPOLL ring and kernel submission thread.
+
+- Fix `sq_thread_idle` at **1 millisecond**, the smallest positive API value.
+  Zero means the kernel default (about one second), not immediate sleep. The
+  kernel rounds and checks this timeout using jiffies; do not describe it as an
+  exact one-millisecond or microsecond sleep deadline.
+- Use `R_DISABLED | SINGLE_ISSUER | SQPOLL`, without `COOP_TASKRUN`,
+  `TASKRUN_FLAG`, or `DEFER_TASKRUN`. The latter task-work modes conflict with
+  SQPOLL. Continue enabling each ring in its reactor's startup path.
+- An explicit SQPOLL request must fail if ring setup is unavailable; never retry
+  it with zero setup flags or silently run a different engine. Reject TLS for
+  this explicit mode because the existing TLS path uses the legacy engine.
+- Log the actual setup flags and requested idle timeout. Do not enable device
+  `IOPOLL` or NAPI busy polling as a side effect.
+- The SQPOLL loop submits SQEs and executes kernel io_uring task work; user-space
+  HTTP parsing, CQ harvesting, and FUSE callbacks remain on the reactor. Kernel
+  submission polling does not imply user-space CQ polling or eliminate syscalls
+  needed to wait for completions or wake a sleeping SQPOLL thread.
+- Keep the normal liburing submit/wait helpers, which handle the SQPOLL wakeup
+  protocol. Test startup on a different thread, asynchronous I/O, FUSE replies,
+  cancellation, and shutdown in both ring modes using the non-mounted reactor
+  unit test. Mounted, stress, CPU comparisons, and profiles run only on CI
+  runners; include SQPOLL thread CPU when comparing engines.
+- Runner coverage includes single-reactor uncached/cached mounted I/O,
+  receive-pool reads, multi-reactor prefetch budget/shutdown, and libfuse
+  functional/stress cases. Rotating unsampled A/B runs compare legacy,
+  ordinary uring (one/four reactors), and SQPOLL (one reactor) across both
+  advice modes and cached cold/warm/unlimited cases. Separate 4000 Hz profiles
+  retain thread lists, readable stacks, and interactive flamegraphs, never
+  raw `perf.data`. The artifact/Pages report records daemon and total client
+  CPU medians, including the SQPOLL kernel threads.
+
 ## TLS boundary
 
 TLS connections may continue to use the existing `TlsTunnel` thread. Such mounts are described and measured as an io_uring data plane with threaded TLS, not as a fully single-threaded daemon. TLS reactor integration and kTLS are future work.

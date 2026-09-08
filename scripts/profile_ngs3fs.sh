@@ -326,6 +326,16 @@ else
   flame_svg="$run_dir/ngs3fs-write.svg"
   flame_html="$run_dir/ngs3fs-write-interactive.html"
 fi
+ps -T -p "$ngs3fs_pid" -o pid,tid,comm,cls,ni,psr,stat \
+  >"$run_dir/threads-before-perf.txt"
+if [[ "$io_engine" = uring-sqpoll ]]; then
+  if ! awk '$3 ~ /^iou-sqp-/ { found = 1 } END { exit !found }' \
+      "$run_dir/threads-before-perf.txt"; then
+    echo "SQPOLL selected but no kernel submission thread exists before perf attach" >&2
+    exit 2
+  fi
+fi
+
 run_profile_measurement() {
   local attempt=$1
   local multiplier=$2
@@ -438,6 +448,15 @@ fi
 if [[ ! -s "$run_dir/perf.folded" ]]; then
   echo "perf captured no stack samples after retry" >&2
   exit 2
+fi
+if [[ "$io_engine" = uring-sqpoll ]]; then
+  if awk '/^iou-sqp-/ { found = 1 } END { exit !found }' \
+      "$run_dir/perf.folded"; then
+    printf 'sqpoll_stacks_sampled=yes\n' >>"$run_dir/system.txt"
+  else
+    printf 'sqpoll_stacks_sampled=no\n' >>"$run_dir/system.txt"
+    echo "warning: SQPOLL thread existed at perf attach but has no named stacks in this profile" >&2
+  fi
 fi
 {
   printf 'profile_attempt=%s\n' "$profile_attempt"

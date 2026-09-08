@@ -50,7 +50,7 @@ printf '%s\n' \
   'engine,reactors,repetition,client,advice,max_connections,files,threads,operations,pread_operations,mmap_operations,bytes,wall_ns,daemon_cpu_ns,daemon_cpu_ns_per_operation,s3_get_requests' \
   >"$output_dir/samples.csv"
 
-engines=("legacy:1" "uring:1" "uring:4")
+engines=("legacy:1" "uring:1" "uring:4" "uring-sqpoll:1")
 sample=0
 for ((repetition = 1; repetition <= repetitions; ++repetition)); do
   # Rotate the first configuration so machine warm-up and temporal drift are
@@ -143,6 +143,8 @@ awk -F, '
 printf '\nCache mode: %s; cache block: %s; unlimited: %s. CPU in the table is daemon CPU only. Each sample also contains client-cpu.csv with workload CPU and the daemon + workload total; use that total when assessing passthrough. It excludes the separate S3 server and unattributed global kernel work.\n' \
   "$cache_mode" "${NGS3FS_CACHE_BLOCK_SIZE:-2MiB}" \
   "${NGS3FS_CACHE_UNLIMITED:-0}" >>"$output_dir/summary.md"
+printf '\nSQPOLL uses the minimum configured idle timeout of 1 ms (kernel tick granularity). Daemon process CPU includes its kernel SQPOLL threads; polling CPU is not excluded from the comparison.\n' \
+  >>"$output_dir/summary.md"
 
 cat "$output_dir/summary.md"
 printf '%s\n' "$output_dir"

@@ -1800,6 +1800,10 @@ std::string make_mountpoint() {
   return path.data();
 }
 
+bool uses_receive_pool(std::string_view engine) {
+  return engine == "uring" || engine == "uring-sqpoll";
+}
+
 pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
                    uint16_t port, std::string_view checksum,
                    std::string_view cache_dir,
@@ -1812,8 +1816,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
                    bool hardlink_as_copy = false) {
   // The receive-pool implementation deliberately omits uncached checksum
   // verification. Cached and legacy tests still request it explicitly.
-  if (engine == "uring" && cache_dir.empty()) verify_reads = false;
-  const char* low_limit = engine == "uring" ? "4MiB" : "2MiB";
+  if (uses_receive_pool(engine) && cache_dir.empty()) verify_reads = false;
+  const char* low_limit = uses_receive_pool(engine) ? "4MiB" : "2MiB";
   const char* mount_limit = memory_budget ? memory_budget : (low_budget ? low_limit : "0");
   const std::string port_text = std::to_string(port);
   const std::string uid_text  = std::to_string(::getuid());
@@ -2043,7 +2047,7 @@ int main(int argc, char** argv) {
                  "[CHECKSUM [plain|cache|prefetch|prefetch-verified "
                  "|passthrough|passthrough-budget|hardlink-copy"
                  "|hardlink-copy-cache "
-                 "[auto|legacy|uring [REACTORS [STRACE]]]]]\n";
+                 "[auto|legacy|uring|uring-sqpoll [REACTORS [STRACE]]]]]\n";
     return 2;
   }
   if (::access("/dev/fuse", R_OK | W_OK) != 0) {
@@ -2065,7 +2069,8 @@ int main(int argc, char** argv) {
           "integration checksum must be xxhash128, crc64nvme, or crc64xz");
     }
     const std::string_view engine = argc >= 5 ? argv[4] : "auto";
-    if (engine != "auto" && engine != "legacy" && engine != "uring") {
+    if (engine != "auto" && engine != "legacy" && engine != "uring" &&
+        engine != "uring-sqpoll") {
       throw std::invalid_argument("unknown integration-test io engine");
     }
     const std::string_view reactors = argc >= 6 ? argv[5] : "1";
@@ -2093,7 +2098,8 @@ int main(int argc, char** argv) {
     const bool pool_pressure = argc >= 4 && std::string_view(argv[3]) == "prefetch-pool-pressure";
     const bool legacy_window_test = engine == "legacy" && argc >= 4 &&
         std::string_view(argv[3]) == "prefetch";
-    const bool pool_prefetch = engine == "uring" && argc >= 4 &&
+    const bool receive_pool_engine = uses_receive_pool(engine);
+    const bool pool_prefetch = receive_pool_engine && argc >= 4 &&
         (pool_limited || std::string_view(argv[3]) == "prefetch-pool" ||
          std::string_view(argv[3]) == "prefetch" || shutdown_prefetch);
     const bool verified_prefetch = verified_clean || (argc >= 4 &&
@@ -2101,8 +2107,9 @@ int main(int argc, char** argv) {
     const bool budget_prefetch = argc >= 4 && std::string_view(argv[3]) == "prefetch-budget";
     const bool prefetch_mode = verified_prefetch || budget_prefetch || shutdown_prefetch || partial_prefetch || pressure_prefetch || pool_prefetch || pool_pressure || (argc >= 4 &&
         std::string_view(argv[3]) == "prefetch");
-    require(!pool_pressure || engine == "uring", "pool pressure requires io_uring");
-    require(engine != "uring" || !(verified_prefetch || partial_prefetch || pressure_prefetch),
+    require(!pool_pressure || receive_pool_engine, "pool pressure requires io_uring");
+    require(!receive_pool_engine ||
+                !(verified_prefetch || partial_prefetch || pressure_prefetch),
             "uring checksum/STORE/connection-pressure experiments were replaced by prefetch-pool and prefetch-budget");
     std::vector<std::byte> expected(512U * 1024U + 37U);
     for (size_t i = 0; i < expected.size(); ++i) {
@@ -3135,7 +3142,7 @@ int main(int argc, char** argv) {
       start.store(true, std::memory_order_release);
       for (auto& reader : readers) reader.join();
       for (const auto& error : errors) if (error) std::rethrow_exception(error);
-      if (engine == "uring") {
+      if (receive_pool_engine) {
         constexpr size_t block = 2U * 1024U * 1024U;
         const auto wait = [](auto&& ready, const char* message) {
           for (unsigned n = 0; n != 3000; ++n) {
@@ -3208,7 +3215,7 @@ int main(int argc, char** argv) {
         for (auto& reader : readers) reader.join();
         for (const auto& error : errors) if (error) std::rethrow_exception(error);
       }
-      if (engine != "uring") {
+      if (!receive_pool_engine) {
         UniqueFd retry(::open((mountpoint + "/budget-retry.bin").c_str(), O_RDONLY | O_CLOEXEC));
         if (!retry) fail_errno("open demand-only checksum retry");
         std::vector<std::byte> bytes(32U * 1024U + 37U);
@@ -3232,9 +3239,9 @@ int main(int argc, char** argv) {
       server.join();
       if (::rmdir(mountpoint.c_str()) != 0) fail_errno("rmdir budget mountpoint");
       fprintf(stderr, "%s mount/file limits: 8 readers, 3 files, 512 random reads%s passed\n",
-              engine == "uring" ? "4 MiB" : "2 MiB",
-              engine == "uring" ? " and 96 cross-block reads" :
-                                  " and demand-only checksum retry");
+              receive_pool_engine ? "4 MiB" : "2 MiB",
+              receive_pool_engine ? " and 96 cross-block reads" :
+                                    " and demand-only checksum retry");
       return 0;
     }
 

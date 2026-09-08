@@ -140,9 +140,9 @@ define the new uncached implementation.
   `--cache-unlimited` mode, a read-only open of a complete clean cache entry
   may instead use native Linux FUSE passthrough. Missing kernel capability or
   backing-registration permission falls back to ordinary cached I/O.
-- The FUSE transport can be selected with `--io-engine auto|legacy|uring`.
-  `legacy` remains the default while the uring engine is experimental and its
-  CPU cost remains higher on the local random-read benchmark.
+- The FUSE transport can be selected with `--io-engine auto|legacy|uring|uring-sqpoll`.
+  `legacy` remains the default while the uring engine is experimental;
+  runner A/B tests compare its CPU cost with ordinary uring and SQPOLL.
   `legacy` uses the existing libfuse threaded loop; `uring` uses the
   caller-owned io_uring reactor for the classic `/dev/fuse` transport while
   libfuse continues to own request decoding, dispatch and reply semantics.
@@ -157,6 +157,13 @@ define the new uncached implementation.
   cloned FUSE device fd; the one-reactor case uses the same group code without
   a shared hot-path lock. A fallback is possible only during startup; a
   running mount never changes engines.
+  `uring-sqpoll` explicitly enables kernel submission polling with
+  `sq_thread_idle=1` ms (the smallest positive value, subject to kernel jiffies
+  granularity). It uses the same reactor implementation and defaults to one
+  reactor, with one kernel SQPOLL thread per ring. It does not enable device
+  IOPOLL or network busy polling. Startup logs the setup flags and idle timeout;
+  unavailable SQPOLL or TLS is an error, not a silent engine fallback. The
+  existing default engine and ordinary `uring` mode are unchanged.
 - TLS remains at the existing threaded `TlsTunnel` boundary. Thus an uring
   mount uses a threaded remote TLS socket. On a cleartext cache miss, pipe to
   cache-file splice and cache-file `pwrite` use `IOSQE_ASYNC`, keeping buffered

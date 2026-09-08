@@ -309,6 +309,9 @@ def write_html(path, comparisons, generated, source_run,
     if source_run:
         safe_run = html.escape(source_run)
         workflow = f' · <a href="{safe_run}">source workflow</a>'
+    sqpoll_link = ('<p><a href="sqpoll-comparison.html">SQPOLL vs ordinary uring '
+                   'and legacy: daemon and total client CPU</a></p>'
+                   if (path.parent / "sqpoll-comparison.html").exists() else "")
     document = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -336,6 +339,7 @@ def write_html(path, comparisons, generated, source_run,
 <body>
   <h1>ngs3fs random-read CPU comparison</h1>
   <p class="subtitle">Generated {html.escape(generated)} from GitHub-hosted runner measurements{workflow}.</p>
+  {sqpoll_link}
   <div class="card">
     <table>
       <thead><tr>

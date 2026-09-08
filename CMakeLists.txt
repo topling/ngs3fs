@@ -190,13 +190,18 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME summarize_random_read_test
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/summarize_random_read_test.py)
+  add_test(NAME summarize_io_engine_test
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/summarize_io_engine_test.py)
 
   add_executable(reactor_io_test tests/reactor_io_test.cpp src/fuse_reactor.cpp)
   target_link_libraries(reactor_io_test PRIVATE ngs3fs_core FUSE3::fuse3 LIBURING::uring)
   target_compile_definitions(reactor_io_test PRIVATE FUSE_USE_VERSION=318)
   target_compile_options(reactor_io_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
   add_test(NAME reactor_io_test COMMAND reactor_io_test)
-  set_tests_properties(reactor_io_test PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+  add_test(NAME reactor_sqpoll_io_test COMMAND reactor_io_test --sqpoll)
+  set_tests_properties(reactor_io_test reactor_sqpoll_io_test
+    PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
 
   add_executable(mounted_e2e_client tests/mounted_e2e_client.cpp)
   target_compile_options(mounted_e2e_client PRIVATE
@@ -334,6 +339,16 @@ if(NGS3FS_BUILD_TESTS)
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
             xxhash128 plain legacy)
   set_tests_properties(fuse_legacy_integration_test PROPERTIES TIMEOUT 60)
+  add_test(NAME fuse_sqpoll_plain_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 plain uring-sqpoll)
+  add_test(NAME fuse_sqpoll_cached_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 cache uring-sqpoll)
+  set_tests_properties(
+    fuse_sqpoll_plain_test
+    fuse_sqpoll_cached_test
+    PROPERTIES TIMEOUT 90 RESOURCE_LOCK fuse_mounts)
   add_test(NAME fuse_multi_reactor_integration_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
             xxhash128 plain uring 2)
@@ -364,6 +379,15 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME fuse_multi_reactor_prefetch_pool_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
             xxhash128 prefetch-pool uring 2)
+  add_test(NAME fuse_sqpoll_prefetch_pool_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 prefetch-pool uring-sqpoll)
+  add_test(NAME fuse_sqpoll_prefetch_shutdown_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 prefetch-shutdown uring-sqpoll 2)
+  add_test(NAME fuse_sqpoll_prefetch_budget_test
+    COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+            xxhash128 prefetch-budget uring-sqpoll 2)
   add_test(NAME fuse_uring_prefetch_pool_limited_test
     COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
             xxhash128 prefetch-pool-limited uring)
@@ -386,6 +410,9 @@ if(NGS3FS_BUILD_TESTS)
             xxhash128 prefetch-verified legacy)
   set_tests_properties(fuse_uring_prefetch_pool_test
     fuse_multi_reactor_prefetch_pool_test
+    fuse_sqpoll_prefetch_pool_test
+    fuse_sqpoll_prefetch_shutdown_test
+    fuse_sqpoll_prefetch_budget_test
     fuse_uring_prefetch_pool_limited_test
     fuse_legacy_prefetch_verified_clean_test
     fuse_legacy_prefetch_retry_test PROPERTIES TIMEOUT 60)
@@ -396,6 +423,8 @@ if(NGS3FS_BUILD_TESTS)
     fuse_mmap_integration_test
     fuse_uring_integration_test
     fuse_legacy_integration_test
+    fuse_sqpoll_plain_test
+    fuse_sqpoll_cached_test
     fuse_multi_reactor_integration_test
     fuse_multi_reactor_cached_integration_test
     fuse_crc64nvme_integration_test
@@ -404,6 +433,9 @@ if(NGS3FS_BUILD_TESTS)
     fuse_uncached_read_ahead_integration_test
     fuse_uring_prefetch_pool_test
     fuse_multi_reactor_prefetch_pool_test
+    fuse_sqpoll_prefetch_pool_test
+    fuse_sqpoll_prefetch_shutdown_test
+    fuse_sqpoll_prefetch_budget_test
     fuse_uring_prefetch_pool_limited_test
     fuse_legacy_prefetch_verified_clean_test
     fuse_legacy_prefetch_retry_test
@@ -507,6 +539,11 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME io_engine_options_test COMMAND ngs3fs --io-engine auto --reactors 1 --help)
   add_test(NAME io_engine_legacy_option_test COMMAND ngs3fs --io-engine legacy --help)
   add_test(NAME io_engine_uring_option_test COMMAND ngs3fs --io-engine uring --help)
+  add_test(NAME io_engine_sqpoll_option_test COMMAND ngs3fs --io-engine uring-sqpoll --help)
+  add_test(NAME io_engine_sqpoll_tls_test COMMAND ngs3fs --io-engine uring-sqpoll --tls --help)
+  add_test(NAME io_engine_sqpoll_https_test COMMAND ngs3fs --io-engine uring-sqpoll -p 443 --help)
+  set_tests_properties(io_engine_sqpoll_tls_test io_engine_sqpoll_https_test
+    PROPERTIES WILL_FAIL TRUE)
   add_test(NAME io_engine_invalid_test COMMAND ngs3fs --io-engine nope --help)
   set_tests_properties(io_engine_invalid_test PROPERTIES WILL_FAIL TRUE)
   add_test(NAME reactors_invalid_test COMMAND ngs3fs --reactors nope --help)

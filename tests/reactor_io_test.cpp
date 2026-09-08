@@ -68,6 +68,7 @@ struct ReactorIoTest {
   bool shutdown_completed = false;
   bool stopped_called = false;
   bool failed = false;
+  bool sqpoll = false;
 
   ~ReactorIoTest() {
     notification_can_drain.store(true, std::memory_order_release);
@@ -89,7 +90,8 @@ struct ReactorIoTest {
     return condition;
   }
 
-  bool initialize() {
+  bool initialize(bool use_sqpoll = false) {
+    sqpoll = use_sqpoll;
     char name[] = "reactor_io_test";
     char* argv[]{name};
     fuse_args args = FUSE_ARGS_INIT(1, argv);
@@ -121,16 +123,24 @@ struct ReactorIoTest {
     auto value = std::make_unique<FuseReactor>();
     std::string error;
     if (!value->initialize(&group, session, fake_fuse.get(), false,
-                           false, 32, 0, error)) {
+                           false, 32, 0, sqpoll, error)) {
       fprintf(stderr, "reactor_io_test: %s\n", error.c_str());
       return false;
     }
     group.reactors_.push_back(std::move(value));
     if (!check((reactor().setup_flags_ & IORING_SETUP_R_DISABLED) != 0,
                "reactor ring was not created disabled")) return false;
+    if (!check(bool(reactor().setup_flags_ & IORING_SETUP_SQPOLL) == sqpoll,
+               "SQPOLL mode silently changed")) return false;
+    if (sqpoll &&
+        !check((reactor().setup_flags_ & (IORING_SETUP_COOP_TASKRUN |
+                                        IORING_SETUP_DEFER_TASKRUN |
+                                        IORING_SETUP_TASKRUN_FLAG |
+                                        IORING_SETUP_IOPOLL)) == 0,
+               "SQPOLL ring has conflicting task-work or device polling flags")) return false;
     auto disabled_target = std::make_unique<FuseReactor>();
     if (!disabled_target->initialize(&group, session, fake_fuse.get(), false,
-                                     false, 32, 0, error)) {
+                                     false, 32, 0, sqpoll, error)) {
       fprintf(stderr, "reactor_io_test: disabled target: %s\n", error.c_str());
       return false;
     }
@@ -578,9 +588,11 @@ struct ReactorIoTest {
                       "notification serialized an unrelated read")) return;
       // Both ordinary replies must complete while INVAL remains blocked.
       // Draining INVAL earlier would hide a shared-FIFO dependency cycle.
-      const unsigned pending = io_uring_sq_ready(&test.reactor().ring_);
+      // SQPOLL can advance the shared head concurrently; inspect the
+      // owner-local preparation tail to count this newly queued reply.
+      const unsigned tail = test.reactor().ring_.sq.sqe_tail;
       if (test.queue_plain_reply('a', queued_reply_done)) {
-        if (!test.check(io_uring_sq_ready(&test.reactor().ring_) == pending + 1,
+        if (!test.check(test.reactor().ring_.sq.sqe_tail == tail + 1,
                         "ordinary reply was queued behind INVAL")) return;
         test.queue_plain_reply('b', queued_reply_done);
       }
@@ -640,12 +652,13 @@ struct ReactorIoTest {
 
   bool reply_shutdown_case() {
     ReactorIoTest test;
-    if (!check(test.initialize(), "initialize reply shutdown case")) return false;
+    if (!check(test.initialize(sqpoll), "initialize reply shutdown case")) return false;
     FuseReactor& owner = test.reactor();
     if (!check(io_uring_enable_rings(&owner.ring_) == 0,
                "enable reply shutdown ring") ||
         !test.fill_socket(test.fake_fuse.get()) ||
         !test.fill_socket(test.fairness_socket.get())) return false;
+    owner.ring_enabled_ = true;
     struct Completion {
       unsigned count = 0;
       int result = 0;
@@ -729,7 +742,7 @@ struct ReactorIoTest {
     for (unsigned index = 0; index < 2; ++index) {
       auto value = std::make_unique<FuseReactor>();
       if (!value->initialize(&closed_group, session, fake_fuse.get(), false,
-                             false, 8, 0, error)) {
+                             false, 8, 0, sqpoll, error)) {
         fprintf(stderr, "reactor_io_test: shutdown gate reactor: %s\n",
                 error.c_str());
         return false;
@@ -780,7 +793,47 @@ struct ReactorIoTest {
                  "closed remote dispatch changed target admission or SQEs");
   }
 
+  bool full_sq_case() {
+    ReactorIoTest test;
+    if (!check(test.initialize(sqpoll), "initialize full SQ case")) return false;
+    FuseReactor& owner = test.reactor();
+    if (!check(io_uring_enable_rings(&owner.ring_) == 0,
+               "enable full SQ ring")) return false;
+    owner.ring_enabled_ = true;
+    const unsigned count = io_uring_sq_space_left(&owner.ring_);
+    // Only prepare SQEs: the shared tail is not published, so even SQPOLL
+    // cannot consume anything before acquire_sqe() takes its full-SQ path.
+    for (unsigned i = 0; i < count; ++i) {
+      io_uring_sqe* sqe = io_uring_get_sqe(&owner.ring_);
+      if (!check(sqe != nullptr, "prepare full SQ")) return false;
+      io_uring_prep_nop(sqe);
+      io_uring_sqe_set_data64(sqe, i);
+    }
+    if (!check(io_uring_sq_space_left(&owner.ring_) == 0,
+               "SQ was not full before retry")) return false;
+    io_uring_sqe* sqe = owner.acquire_sqe();
+    if (!check(sqe != nullptr, "full SQ retry failed to obtain a slot")) return false;
+    io_uring_prep_nop(sqe);
+    io_uring_sqe_set_data64(sqe, count);
+    std::vector<bool> seen(count + 1, false);
+    for (unsigned done = 0; done <= count;) {
+      if (!check(io_uring_submit_and_wait(&owner.ring_, 1) >= 0,
+                 "submit/wait full SQ operations")) return false;
+      io_uring_cqe* cqe = nullptr;
+      while (io_uring_peek_cqe(&owner.ring_, &cqe) == 0) {
+        const uint64_t id = cqe->user_data;
+        if (!check(cqe->res == 0 && id <= count && !seen[size_t(id)],
+                   "full SQ returned an erroneous or duplicate completion")) return false;
+        seen[size_t(id)] = true;
+        ++done;
+        io_uring_cqe_seen(&owner.ring_, cqe);
+      }
+    }
+    return true;
+  }
+
   int run() {
+    if (!full_sq_case()) return 1;
     errno = 0;
     check(!reactor().notify_inval_inode(
                FUSE_ROOT_ID, 0, 4096, notification_done, this) &&
@@ -830,10 +883,12 @@ struct ReactorIoTest {
   }
 };
 
-int main() {
+int main(int argc, char** argv) {
+  const bool sqpoll = argc == 2 && strcmp(argv[1], "--sqpoll") == 0;
+  if (argc > 1 && !sqpoll) return 1;
   try {
     ReactorIoTest test;
-    if (!test.initialize()) return 77;
+    if (!test.initialize(sqpoll)) return test.failed ? 1 : 77;
     return test.run();
   } catch (const std::exception& error) {
     fprintf(stderr, "reactor_io_test: %s\n", error.what());

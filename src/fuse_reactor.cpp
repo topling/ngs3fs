@@ -111,7 +111,7 @@ bool FuseReactor::start_remote_dispatch(
   target->task_count_.fetch_add(1, std::memory_order_acquire);
   dispatch->task = {dispatch_entry, nullptr, dispatch, dispatch};
   dispatch->target = target;
-  io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+  io_uring_sqe* sqe = acquire_sqe();
   if (sqe == nullptr) {
     target->task_count_.fetch_sub(1, std::memory_order_release);
     return false;
@@ -300,6 +300,7 @@ bool FuseReactor::initialize(FuseReactorGroup* group,
                              bool initialization_owner,
                              unsigned depth,
                              unsigned receive_concurrency,
+                             bool sqpoll,
                              std::string& error) {
   if (session == nullptr || fuse_fd < 0 || depth < 8) {
     error = "invalid FUSE reactor configuration";
@@ -343,22 +344,39 @@ bool FuseReactor::initialize(FuseReactorGroup* group,
     return false;
   }
   io_uring_params params{};
-  // initialize() can run on a different thread from run(). Enabling a disabled
-  // ring on its owner binds SINGLE_ISSUER to that thread, also for multi-ring
-  // mounts; only that owner submits SQEs or advances its completion queue.
-  params.flags = IORING_SETUP_R_DISABLED | IORING_SETUP_COOP_TASKRUN |
-                 IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+  // initialize() can run on a different thread from run(). Enable on the
+  // reactor owner; with SQPOLL the kernel thread is the issuer instead.
+  params.flags = IORING_SETUP_R_DISABLED | IORING_SETUP_SINGLE_ISSUER;
+  if (sqpoll) {
+    params.flags |= IORING_SETUP_SQPOLL;
+    // Smallest positive millisecond value: zero means the ~1 second default.
+    params.sq_thread_idle = 1;
+  } else {
+    params.flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN;
+  }
   int result = io_uring_queue_init_params(depth, &ring_, &params);
-  if (result == -EINVAL) {
+  if (result == -EINVAL && !sqpoll) {
     params = {};
     result = io_uring_queue_init_params(depth, &ring_, &params);
   }
   if (result != 0) {
-    error = "io_uring_queue_init: " + std::string(strerror(-result));
+    error = std::string(sqpoll ? "io_uring_queue_init(SQPOLL, idle=1ms): "
+                              : "io_uring_queue_init: ") + strerror(-result);
     return false;
   }
   ring_ready_ = true;
   setup_flags_ = params.flags;
+  if (sqpoll &&
+      (params.features & IORING_FEAT_SQPOLL_NONFIXED) == 0) {
+    error = "io_uring SQPOLL lacks IORING_FEAT_SQPOLL_NONFIXED; "
+            "fixed-file-only kernels are unsupported";
+    return false;
+  }
+  if (sqpoll) {
+    fprintf(stderr, "io_uring: SQPOLL ring created, setup_flags=0x%x, "
+                    "configured sq_thread_idle=%u ms (kernel jiffies granularity)\n",
+            setup_flags_, params.sq_thread_idle);
+  }
   io_uring_probe* probe = io_uring_get_probe_ring(&ring_);
   if (probe == nullptr) {
     error = "io_uring_get_probe_ring: " + std::string(strerror(errno));
@@ -504,7 +522,6 @@ bool FuseReactor::submit(AsyncIoRequest& operation) noexcept {
     request->async = nullptr;
     request->next_free = async_free_;
     async_free_ = request;
-    errno = EAGAIN;
     return false;
   }
   operation.transferred = 0;
@@ -532,17 +549,8 @@ bool FuseReactor::cancel(AsyncIoRequest& operation) noexcept {
     errno = EALREADY;
     return false;
   }
-  io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+  io_uring_sqe* sqe = acquire_sqe();
   if (sqe == nullptr) {
-    const int result = io_uring_submit(&ring_);
-    if (result < 0) {
-      errno = -result;
-      return false;
-    }
-    sqe = io_uring_get_sqe(&ring_);
-  }
-  if (sqe == nullptr) {
-    errno = EAGAIN;
     return false;
   }
   request->cancelled        = true;
@@ -1169,7 +1177,7 @@ bool FuseReactor::submit_wakeup() noexcept {
   if (wake_pending_) {
     return true;
   }
-  io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+  io_uring_sqe* sqe = acquire_sqe();
   if (sqe == nullptr) {
     return false;
   }
@@ -1183,7 +1191,7 @@ bool FuseReactor::submit_external_receive() noexcept {
   if (external_pending_ || reply_count_ >= max_reply_count_) {
     return true;
   }
-  io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+  io_uring_sqe* sqe = acquire_sqe();
   if (sqe == nullptr) {
     return false;
   }
@@ -1193,13 +1201,37 @@ bool FuseReactor::submit_external_receive() noexcept {
   return true;
 }
 
-bool FuseReactor::submit_io_request(IoRequest* request) noexcept {
-  if (io_uring_sq_space_left(&ring_) == 0) {
-    if (io_uring_submit(&ring_) < 0) {
-      return false;
+io_uring_sqe* FuseReactor::acquire_sqe() noexcept {
+  io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+  if (sqe != nullptr) {
+    return sqe;
+  }
+  const int submitted = io_uring_submit(&ring_);
+  if (submitted < 0) {
+    errno = -submitted;
+    return nullptr;
+  }
+  if ((setup_flags_ & IORING_SETUP_SQPOLL) != 0 && ring_enabled_) {
+    // Publishing the tail does not mean the SQPOLL thread has consumed it.
+    // Wait for SQ space, not for the submitted I/O itself to complete.
+    int result;
+    do {
+      result = io_uring_sqring_wait(&ring_);
+    } while (result == -EINTR);
+    if (result < 0) {
+      errno = -result;
+      return nullptr;
     }
   }
-  io_uring_sqe* operation = io_uring_get_sqe(&ring_);
+  sqe = io_uring_get_sqe(&ring_);
+  if (sqe == nullptr) {
+    errno = EAGAIN;
+  }
+  return sqe;
+}
+
+bool FuseReactor::submit_io_request(IoRequest* request) noexcept {
+  io_uring_sqe* operation = acquire_sqe();
   if (operation == nullptr) {
     return false;
   }
@@ -1753,11 +1785,7 @@ void FuseReactor::drain_shutdown() noexcept {
 
   // A ring close may defer cancellation work. Keep callers and their buffers
   // alive until the original operation CQEs prove kernel access has ended.
-  io_uring_sqe* cancel = io_uring_get_sqe(&ring_);
-  if (cancel == nullptr) {
-    io_uring_submit(&ring_);
-    cancel = io_uring_get_sqe(&ring_);
-  }
+  io_uring_sqe* cancel = acquire_sqe();
   bool cancel_pending = cancel != nullptr;
   bool wake_cancel_submitted = false;
   if (cancel != nullptr) {
@@ -1830,7 +1858,7 @@ void FuseReactor::drain_shutdown() noexcept {
     if (drained) {
       if (!wake_pending_) break;
       if (!wake_cancel_submitted) {
-        io_uring_sqe* wake_cancel = io_uring_get_sqe(&ring_);
+        io_uring_sqe* wake_cancel = acquire_sqe();
         if (wake_cancel != nullptr) {
           io_uring_prep_cancel(wake_cancel, &wake_token_, 0);
           io_uring_sqe_set_data(wake_cancel, &cancel_token_);
@@ -1900,7 +1928,7 @@ bool FuseReactor::submit_reply(Reply* reply) noexcept {
       reply->output_fd < 0) {
     return false;
   }
-  io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+  io_uring_sqe* sqe = acquire_sqe();
   if (sqe == nullptr) {
     return false;
   }
@@ -2008,6 +2036,7 @@ int FuseReactor::run() noexcept {
     const int result = io_uring_enable_rings(&ring_);
     if (result < 0) return result;
   }
+  ring_enabled_ = true;
   if (!submit_receive() || !submit_wakeup() ||
       !submit_external_receive() ||
       !submit_dispatch_receive() || !submit_task_receive()) {
@@ -2170,6 +2199,7 @@ int FuseReactor::run() noexcept {
   if (ring_ready_) {
     io_uring_queue_exit(&ring_);
     ring_ready_ = false;
+    ring_enabled_ = false;
   }
   fail_replies(error_ != 0 ? error_ : -ENOTCONN);
   fail_external_replies(error_ != 0 ? error_ : -ENOTCONN);
@@ -2191,6 +2221,7 @@ int FuseReactorGroup::clone_fuse_fd(fuse_session* session,
 bool FuseReactorGroup::initialize(fuse_session* session, unsigned count,
                                   unsigned depth,
                                   int io_timeout_ms,
+                                  bool sqpoll,
                                   std::string& error) {
   if (session == nullptr || count == 0 ||
       io_timeout_ms <= 0) {
@@ -2215,7 +2246,7 @@ bool FuseReactorGroup::initialize(fuse_session* session, unsigned count,
       }
       const unsigned receive_concurrency = i == 0 ? 1U : 0U;
       if (!reactor->initialize(this, session, fd, clone, i == 0, depth,
-                               receive_concurrency, error)) {
+                               receive_concurrency, sqpoll, error)) {
         return false;
       }
       reactor->reactor_index_ = i;

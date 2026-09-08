@@ -52,7 +52,7 @@ class FuseReactor : public IoExecutor {
   bool initialize(FuseReactorGroup* group, fuse_session* session,
                   int fuse_fd, bool owns_fuse_fd,
                   bool initialization_owner,
-                  unsigned depth, unsigned receive_concurrency,
+                  unsigned depth, unsigned receive_concurrency, bool sqpoll,
                   std::string& error);
   int run() noexcept;
 
@@ -215,6 +215,7 @@ class FuseReactor : public IoExecutor {
   bool submit_dispatch_receive() noexcept;
   bool submit_task_receive() noexcept;
   bool submit_external_reply(Reply* reply) noexcept;
+  io_uring_sqe* acquire_sqe() noexcept;
   bool submit_io_request(IoRequest* request) noexcept;
   static bool drain_receive_pipe(int fd) noexcept;
   bool drain_external_pipe() noexcept;
@@ -314,6 +315,7 @@ class FuseReactor : public IoExecutor {
   size_t reply_high_water_         = 0;
   unsigned setup_flags_            = 0;
   bool ring_ready_                 = false;
+  bool ring_enabled_               = false;
   bool owns_fuse_fd_               = false;
   bool initialization_owner_       = false;
   bool initialization_complete_    = false;
@@ -346,7 +348,7 @@ class FuseReactorGroup {
   FuseReactorGroup& operator=(const FuseReactorGroup&) = delete;
 
   bool initialize(fuse_session* session, unsigned count, unsigned depth,
-                  int io_timeout_ms,
+                  int io_timeout_ms, bool sqpoll,
                   std::string& error);
   int run();
   void report_stats() const noexcept;

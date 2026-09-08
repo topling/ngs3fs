@@ -143,7 +143,7 @@ jobs:
           NGS3FS_STRESS_JOBS: 8
           NGS3FS_STRESS_ITERATIONS: 20
         run: |
-          for configuration in legacy:1 uring:1 uring:4; do
+          for configuration in legacy:1 uring:1 uring:4 uring-sqpoll:1; do
             engine=${configuration%%:*}
             reactors=${configuration##*:}
             NGS3FS_IO_ENGINE="$engine" NGS3FS_REACTORS="$reactors" \
@@ -343,11 +343,11 @@ jobs:
             cat "build/benchmarks/github-io-engine-$advice/summary.md" >> "$GITHUB_STEP_SUMMARY"
           done
 
-      - name: Profile legacy and one/multi-reactor uncached reads
+      - name: Profile legacy, ordinary uring, and SQPOLL uncached reads
         if: always()
         run: |
           port=17660
-          for configuration in legacy:1 uring:1 uring:4; do
+          for configuration in legacy:1 uring:1 uring:4 uring-sqpoll:1; do
             engine=${configuration%%:*}
             reactors=${configuration##*:}
             sudo env \
@@ -382,28 +382,32 @@ jobs:
             ./scripts/benchmark_io_engine.sh \
             "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-cache-unlimited"
 
-      - name: Profile cached block reads on one reactor
+      - name: Profile cached block reads on ordinary uring and SQPOLL
         if: always()
         run: |
-          for mode in cold warm; do
-            drop=0
-            if [[ "$mode" == warm ]]; then drop=1; fi
-            sudo env NGS3FS_IO_ENGINE=uring NGS3FS_REACTORS=1 \
+          port=17670
+          for engine in uring uring-sqpoll; do
+            for mode in cold warm; do
+              drop=0
+              if [[ "$mode" == warm ]]; then drop=1; fi
+              sudo env NGS3FS_IO_ENGINE="$engine" NGS3FS_REACTORS=1 \
               WORKLOAD=random-read RANDOM_READ_OPERATIONS=512 \
               RANDOM_READ_ADVICE=normal CACHE_MODE="$mode" \
               DROP_CACHES_AFTER_WARMUP="$drop" \
               PERF_BIN="$(command -v perf)" PERF_LIB_DIR= \
               PERF_EVENT=cpu-clock PERF_FREQUENCY=4000 \
               PERF_STAT_EVENTS=task-clock,context-switches,cpu-migrations,page-faults \
-              PORT=17664 ./scripts/profile_ngs3fs.sh \
-              "$GITHUB_WORKSPACE/build/profiles/github-io-engine-cache-$mode"
+              PORT="$port" ./scripts/profile_ngs3fs.sh \
+              "$GITHUB_WORKSPACE/build/profiles/github-io-engine-cache-$mode-$engine-1"
+              port=$((port + 1))
+            done
           done
 
-      - name: Profile cached random-advice reads on legacy and uring
+      - name: Profile cached random-advice reads on legacy, uring, and SQPOLL
         if: always()
         run: |
           port=17665
-          for engine in legacy uring; do
+          for engine in legacy uring uring-sqpoll; do
             sudo env NGS3FS_IO_ENGINE="$engine" NGS3FS_REACTORS=1 \
               WORKLOAD=random-read RANDOM_READ_OPERATIONS=512 \
               RANDOM_READ_ADVICE=random CACHE_MODE=warm \
@@ -513,11 +517,16 @@ jobs:
         run: |
           sudo install -d -o "$USER" -g "$(id -gn)" \
             build/benchmarks/random-read-report
+          python3 scripts/summarize_io_engine.py \
+            build/benchmarks/random-read-report \
+            build/benchmarks/github-io-engine-*
           ./scripts/summarize_random_read.py \
             build/benchmarks/random-read-report \
             build/benchmarks/github-random-read-* \
             build/benchmarks/github-mountpoint-random-read-*
           cat build/benchmarks/random-read-report/random-read-cpu-comparison.md \
+            >> "$GITHUB_STEP_SUMMARY"
+          cat build/benchmarks/random-read-report/sqpoll-comparison.md \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark and flame graphs
@@ -561,6 +570,7 @@ jobs:
             build/profiles/github-io-engine-*/profile-summary.csv
             build/profiles/github-io-engine-*/profile-metadata.txt
             build/profiles/github-io-engine-*/system.txt
+            build/profiles/github-io-engine-*/threads-before-perf.txt
             build/profiles/github-io-engine-*/random-read.txt
             build/profiles/github-io-engine-*/ngs3fs.log
             build/profiles/github-io-engine-*/versity.log
