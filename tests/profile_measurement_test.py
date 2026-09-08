@@ -177,9 +177,12 @@ perf_stub() {
           # Recording attaches to ngs3fs; no dummy workload is permitted.
           return 2
           ;;
-        -vvv)
+        -v)
           verbose=1
           shift
+          ;;
+        -vvv)
+          return 2
           ;;
         --control)
           control_spec=$2
