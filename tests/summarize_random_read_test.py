@@ -128,7 +128,7 @@ class RandomReadReportTest(unittest.TestCase):
         summary.write_html(page, self.rows, "test", "")
         rendered = page.read_text(encoding="utf-8")
         self.assertIn('href="owner-complete-comparison.html"', rendered)
-        self.assertIn("Pre-owner-complete baseline vs owner-complete workers", rendered)
+        self.assertIn("Matched four-reactor implementation A/B", rendered)
 
     def test_pages_keeps_historical_affinity_report_link_compatible(self):
         page = self.root / "index.html"
@@ -137,7 +137,7 @@ class RandomReadReportTest(unittest.TestCase):
         summary.write_html(page, self.rows, "test", "")
         rendered = page.read_text(encoding="utf-8")
         self.assertIn('href="inode-affinity-comparison.html"', rendered)
-        self.assertIn("Pre-owner-complete baseline vs owner-complete workers", rendered)
+        self.assertIn("Matched four-reactor implementation A/B", rendered)
 
     def test_total_client_cpu_uses_daemon_plus_workload_and_links_samples(self):
         samples = [

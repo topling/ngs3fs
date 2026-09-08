@@ -318,8 +318,8 @@ def write_html(path, comparisons, generated, source_run,
                        historical_affinity.name if historical_affinity.exists()
                        else "")
     owner_complete_link = (
-        f'<p><a href="{comparison_link}">Pre-owner-complete baseline vs '
-        'owner-complete workers: daemon and total client CPU</a></p>'
+        f'<p><a href="{comparison_link}">Matched four-reactor implementation '
+        'A/B: daemon and total client CPU</a></p>'
         if comparison_link else "")
     document = f"""<!doctype html>
 <html lang="en">
