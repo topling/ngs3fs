@@ -51,6 +51,8 @@ perf_ack_fd=
 perf_control_fifo=
 perf_ack_fifo=
 perf_control_timeout_seconds=${PERF_CONTROL_TIMEOUT_SECONDS:-0.2}
+perf_startup_timeout_seconds=${PERF_STARTUP_TIMEOUT_SECONDS:-0.2}
+perf_record_log=
 bench=mmap_bench_stub
 random_bench=random_bench_stub
 iterations=7
@@ -76,6 +78,21 @@ printf 'old request outside measurement\n' >"$run_dir/versity-access.log"
 : >"$run_dir/bench-calls.txt"
 : >"$run_dir/drop-calls.txt"
 : >"$run_dir/perf-control.txt"
+: >"$run_dir/perf-control-timeouts.txt"
+
+read() {
+  local previous=
+  local timeout=
+  local value
+  for value in "$@"; do
+    if [[ "$previous" = -t ]]; then timeout=$value; fi
+    previous=$value
+  done
+  if [[ -n "$timeout" ]]; then
+    printf '%s\n' "$timeout" >>"$run_dir/perf-control-timeouts.txt"
+  fi
+  builtin read "$@"
+}
 
 drop_measurement_caches() {
   drop_calls=$((drop_calls + 1))
@@ -143,6 +160,7 @@ perf_stub() {
   local mode=$1
   shift
   if [[ "$mode" = record ]]; then
+    printf 'perf record stub started\n' >&2
     local control_spec=
     local delayed=0
     while (($#)); do
@@ -168,7 +186,7 @@ perf_stub() {
     while IFS= read -r command <&7; do
       printf '%s:%s\n' "$attempt" "$command" \
         >>"$run_dir/perf-control.txt"
-      if [[ "${PERF_STUB_ACK:-1}" != 1 ]]; then
+      if [[ "${PERF_STUB_MISSING_ACK:-}" = "$command" ]]; then
         return 0
       fi
       # perf writes sizeof("ack\n"), including the trailing NUL.
@@ -368,7 +386,8 @@ class ProfileMeasurementTest(unittest.TestCase):
                 ["/usr/bin/bash", str(harness), str(run_dir), "mmap"],
                 cwd=PROJECT_DIR,
                 env={**os.environ, "PATH": "/usr/bin:/bin",
-                     "PERF_STUB_ACK": "0",
+                     "PERF_STUB_MISSING_ACK": "enable",
+                     "PERF_STARTUP_TIMEOUT_SECONDS": "0.05",
                      "PERF_CONTROL_TIMEOUT_SECONDS": "0.05"},
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -377,6 +396,48 @@ class ProfileMeasurementTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("timed out waiting for perf record enable acknowledgement",
                           result.stderr)
+            self.assertIn("perf_record_pid=", result.stderr)
+            self.assertIn("perf_record_alive=", result.stderr)
+            self.assertIn("perf_record_stderr=", result.stderr)
+            self.assertIn("perf record stub started", result.stderr)
+            timeouts = (run_dir / "perf-control-timeouts.txt").read_text(
+                encoding="utf-8").splitlines()
+            self.assertEqual(timeouts, ["0.05"])
+            self.assertEqual(list(run_dir.glob("perf-*.fifo")), [])
+
+    def test_runtime_ack_uses_separate_timeout_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness = root / "measurement-harness.sh"
+            harness.write_text(
+                textwrap.dedent(HARNESS).lstrip()
+                + "\n"
+                + MEASUREMENT_FUNCTIONS
+                + "\nrun_profile_measurement 1 1\n",
+                encoding="utf-8",
+            )
+            run_dir = root / "run"
+            result = subprocess.run(
+                ["/usr/bin/bash", str(harness), str(run_dir), "mmap"],
+                cwd=PROJECT_DIR,
+                env={**os.environ, "PATH": "/usr/bin:/bin",
+                     "PERF_STUB_MISSING_ACK": "disable",
+                     "PERF_STARTUP_TIMEOUT_SECONDS": "2",
+                     "PERF_CONTROL_TIMEOUT_SECONDS": "0.05"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("timed out waiting for perf record disable acknowledgement",
+                          result.stderr)
+            controls = (run_dir / "perf-control.txt").read_text(
+                encoding="utf-8").splitlines()
+            self.assertEqual(controls, ["1:enable", "1:disable"])
+            timeouts = (run_dir / "perf-control-timeouts.txt").read_text(
+                encoding="utf-8").splitlines()
+            self.assertEqual(timeouts, ["2", "0.05"])
+            self.assertTrue((run_dir / "mmap.jsonl").is_file())
             self.assertEqual(list(run_dir.glob("perf-*.fifo")), [])
 
     def test_compare_cpu_window_starts_after_perf_attach_delay(self):

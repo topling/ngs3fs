@@ -108,6 +108,8 @@ perf_ack_fd=
 perf_control_fifo=
 perf_ack_fifo=
 perf_control_timeout_seconds=${PERF_CONTROL_TIMEOUT_SECONDS:-10}
+perf_startup_timeout_seconds=${PERF_STARTUP_TIMEOUT_SECONDS:-30}
+perf_record_log=
 profile_first_line=0
 profile_last_line=0
 profile_get_requests=0
@@ -140,14 +142,27 @@ close_perf_control() {
 
 control_perf_record() {
   local command=$1
+  local timeout_seconds=${2:-$perf_control_timeout_seconds}
   local acknowledgement
   if ! printf '%s\n' "$command" >&"$perf_control_fd"; then
     echo "unable to send perf record $command command" >&2
     return 1
   fi
-  if ! IFS= read -r -t "$perf_control_timeout_seconds" acknowledgement \
+  if ! IFS= read -r -t "$timeout_seconds" acknowledgement \
       <&"$perf_ack_fd"; then
     echo "timed out waiting for perf record $command acknowledgement" >&2
+    printf 'perf_record_pid=%s\n' "${perf_pid:-unavailable}" >&2
+    if [[ -n "$perf_pid" ]] && kill -0 "$perf_pid" 2>/dev/null; then
+      printf 'perf_record_alive=yes\n' >&2
+      ps -o pid,stat,wchan,comm -p "$perf_pid" >&2 || true
+    else
+      printf 'perf_record_alive=no\n' >&2
+    fi
+    printf 'perf_record_stderr=%s\n' \
+      "${perf_record_log:-inherited standard error}" >&2
+    if [[ -n "$perf_record_log" && -s "$perf_record_log" ]]; then
+      tail -n 20 "$perf_record_log" >&2 || true
+    fi
     return 1
   fi
   if [[ "$acknowledgement" != ack ]]; then
@@ -431,6 +446,7 @@ run_profile_measurement() {
   profile_first_line=$(wc -l <"$run_dir/versity-access.log")
   perf_control_fifo="$run_dir/perf-control-$attempt.fifo"
   perf_ack_fifo="$run_dir/perf-ack-$attempt.fifo"
+  perf_record_log="$run_dir/perf-record-$attempt.log"
   mkfifo "$perf_control_fifo" "$perf_ack_fifo"
   exec {perf_control_fd}<>"$perf_control_fifo"
   exec {perf_ack_fd}<>"$perf_ack_fifo"
@@ -439,9 +455,10 @@ run_profile_measurement() {
     --call-graph dwarf,16384 --delay -1 \
     --control "fifo:$perf_control_fifo,$perf_ack_fifo" \
     -p "$ngs3fs_pid" \
-    -o "$run_dir/perf.data" -- sleep 3600 &
+    -o "$run_dir/perf.data" -- sleep 3600 \
+    2> >(tee "$perf_record_log" >&2) &
   perf_pid=$!
-  if ! control_perf_record enable; then
+  if ! control_perf_record enable "$perf_startup_timeout_seconds"; then
     kill -INT "$perf_pid" 2>/dev/null || true
     wait "$perf_pid" 2>/dev/null || true
     perf_pid=
