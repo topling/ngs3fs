@@ -255,33 +255,12 @@ jobs:
       - name: Check out ngs3fs
         uses: actions/checkout@v7
 
-      - name: Check out goofys
-        uses: actions/checkout@v7
-        with:
-          repository: kahing/goofys
-          ref: 350ff312abaa1abcf21c5a06e143c7edffe9e2f4
-          path: upstream/goofys
-
-      - name: Check out Mountpoint for Amazon S3
-        uses: actions/checkout@v7
-        with:
-          repository: awslabs/mountpoint-s3
-          ref: 70bd7b627969ed6decdeab91a6a445a2347d827c
-          path: upstream/mountpoint-s3
-          submodules: recursive
-
       - name: Check out FlameGraph
         uses: actions/checkout@v7
         with:
           repository: brendangregg/FlameGraph
           ref: 41fee1f99f9276008b7cd112fca19dc3ea84ac32
           path: build/tools/FlameGraph
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: '1.25.x'
-          cache: false
 
       - name: Install benchmark dependencies
         run: |
@@ -306,19 +285,14 @@ jobs:
           test -c /dev/fuse
           sudo chmod a+rw /dev/fuse
 
-      - name: Build ngs3fs, goofys, and Mountpoint
+      - name: Build ngs3fs and download reference binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           ./scripts/bootstrap.sh
           mkdir -p build/tools
-          cd upstream/goofys
-          go build \
-            -ldflags "-X main.Version=$(git rev-parse HEAD)" \
-            -o "$GITHUB_WORKSPACE/build/tools/goofys" .
-          cd "$GITHUB_WORKSPACE/upstream/mountpoint-s3"
-          rustup toolchain install 1.96 --profile minimal
-          cargo +1.96 build --release --locked --bin mount-s3
-          cp target/release/mount-s3 \
-            "$GITHUB_WORKSPACE/build/tools/mount-s3"
+          python3 scripts/download_reference_binaries.py \
+            build/tools build/tools/reference-binaries.json
 
       - name: Download VersityGW
         run: |
@@ -607,6 +581,7 @@ jobs:
             build/benchmarks/github-mountpoint-random-read-*/*/mountpoint-logs/*
             build/benchmarks/github-mountpoint-random-read-*/*/versity.log
             build/benchmarks/random-read-report/**
+            build/tools/reference-binaries.json
             build/benchmarks/github-socket-buffer/system.txt
             build/benchmarks/github-socket-buffer/samples.csv
             build/benchmarks/github-socket-buffer/summary.csv

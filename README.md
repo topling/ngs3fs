@@ -278,7 +278,10 @@ define the new uncached implementation.
   Non-empty directory rename returns `EXDEV`, so tools such as `mv` can use
   their ordinary cross-filesystem copy/remove path. S3 has no atomic prefix
   rename, and ngs3fs does not persist a multi-object rename journal.
-- Symbolic and hard links are unsupported; hard links return `ENOTSUP`.
+- Symbolic links are unsupported. Hard links return `ENOTSUP` by default;
+  `--hardlink-as-copy` opts into CopyObject-backed links for application-managed
+  transactions. Each name has its own inode and S3 object. The source is retained
+  until the application unlinks it; subsequent writes affect only their own object.
 - A real WSL FUSE integration test verifies read mmap, rejection of writable
   mmap, small `PutObject`, an 8 MiB full part plus multipart tail, duplicate-
   descriptor flush behavior, close-to-open publication, same-object
@@ -297,7 +300,8 @@ define the new uncached implementation.
 - TLS and ALPN are supported through OpenSSL. The encrypted side necessarily
   passes through OpenSSL userspace buffers; the cleartext Unix-socket side of
   that tunnel retains the same pipe/splice transport used by the HTTP clients.
-- Symbolic and hard links are not supported. File rename, create, unlink,
+- Symbolic links and default hard links are not supported; the optional
+  `--hardlink-as-copy` behavior is deliberately best effort. File rename, create, unlink,
   mkdir, empty-directory rename, and empty-directory rmdir are supported.
 - Writes never download or locally stage the old object. They support only
   replacement from offset zero. The configured fixed part size and S3's

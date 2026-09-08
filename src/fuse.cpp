@@ -122,6 +122,7 @@ struct MountConfig {
   bool cache_reserve_explicit          = false;
   bool cache_block_size_explicit       = false;
   bool cache_unlimited                 = false;
+  bool hardlink_as_copy                = false;
   bool requester_pays                  = false;
 };
 
@@ -1928,6 +1929,7 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
   constexpr int max_file_prefetch_memory_option    = 272;
   constexpr int cache_block_size_option            = 273;
   constexpr int cache_unlimited_option             = 274;
+  constexpr int hardlink_as_copy_option            = 275;
   constexpr option long_options[] = {
       {"endpoint-host", required_argument, nullptr, 'e'},
       {"endpoint-port", required_argument, nullptr, 'p'},
@@ -1958,6 +1960,7 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
        cache_block_size_option},
       {"cache-unlimited", no_argument, nullptr,
        cache_unlimited_option},
+      {"hardlink-as-copy", no_argument, nullptr, hardlink_as_copy_option},
       {"expected-bucket-owner", required_argument, nullptr,
        expected_bucket_owner_option},
       {"requester-pays", no_argument, nullptr, requester_pays_option},
@@ -2157,6 +2160,9 @@ bool parse_arguments(int argc, char** argv, MountConfig& config,
       }
       case cache_unlimited_option:
         config.cache_unlimited = true;
+        break;
+      case hardlink_as_copy_option:
+        config.hardlink_as_copy = true;
         break;
       case expected_bucket_owner_option:
         if (optarg == nullptr || *optarg == '\0') {
@@ -7747,17 +7753,27 @@ void abort_copy_upload(State& state, std::string_view destination,
 void multipart_copy_object(State& state, uint64_t size,
                            std::string_view etag,
                            std::string_view version_id,
+                           std::string_view write_id,
                            std::string_view source,
                            std::string_view destination,
                            bool no_replace) {
   const std::string create_path = query_path(destination, "uploads=");
+  std::vector<Header> create_request_headers;
+  if (!write_id.empty()) {
+    create_request_headers.push_back(
+        Header{"x-amz-meta-ngs3fs-write-id", write_id});
+  }
   const HeaderList create_headers = authorization_headers(
-      state, "POST", create_path, {}, kEmptyPayloadSha256);
+      state, "POST", create_path, create_request_headers,
+      kEmptyPayloadSha256);
+  create_request_headers.insert(
+      create_request_headers.end(), create_headers.begin(),
+      create_headers.end());
   HttpPool::Lease create_client = state.http->acquire();
   Response created;
   try {
     created = create_client->request_no_body(
-        "POST", create_path, create_headers);
+        "POST", create_path, create_request_headers);
   } catch (...) {
     fprintf(stderr,
             "error: multipart-copy CreateMultipartUpload outcome unknown; "
@@ -7871,6 +7887,9 @@ void multipart_copy_object(State& state, uint64_t size,
       fprintf(stderr,
               "error: multipart-copy completion outcome unknown: %.*s\n",
               int(destination.size()), destination.data());
+      throw std::system_error(
+          EIO, std::generic_category(),
+          "multipart-copy completion outcome unknown");
     } else {
       abort_copy_upload(state, destination, upload_id);
     }
@@ -7946,18 +7965,14 @@ bool try_native_rename_object(State& state, std::string_view key,
   return false;
 }
 
-void rename_remote_object(State& state, std::string_view key,
-                          uint64_t size, std::string_view etag,
-                          std::string_view version_id,
-                          std::string_view destination,
-                          bool no_replace) {
+void copy_remote_object(State& state, std::string_view key,
+                        uint64_t size, std::string_view etag,
+                        std::string_view version_id,
+                        std::string_view write_id,
+                        std::string_view destination,
+                        bool no_replace) {
   const std::string source = object_request_path(state, key);
   const std::string_view source_etag = etag;
-
-  if (try_native_rename_object(
-          state, key, etag, destination, no_replace)) {
-    return;
-  }
 
   constexpr uint64_t kMaximumSingleCopySize =
       5ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -7968,7 +7983,8 @@ void rename_remote_object(State& state, std::string_view key,
 
   if (size > kMaximumSingleCopySize) {
     multipart_copy_object(
-        state, size, etag, version_id, source, destination, no_replace);
+        state, size, etag, version_id, write_id, source, destination,
+        no_replace);
   } else {
     std::vector copy_headers{
         Header{"x-amz-copy-source",
@@ -7984,44 +8000,71 @@ void rename_remote_object(State& state, std::string_view key,
     if (no_replace) {
       copy_headers.push_back(Header{"if-none-match", "*"});
     }
-    const Response copied = request_with_retries([&] {
-      std::vector<Header> request_headers = copy_headers;
-      auto copy_authorization = base_authorization_headers(
-          state, "PUT", destination, request_headers, kEmptyPayloadSha256);
-      request_headers.insert(
-          request_headers.end(),
-          std::make_move_iterator(copy_authorization.begin()),
-          std::make_move_iterator(copy_authorization.end()));
-      HttpPool::Lease client = state.http->acquire_bulk();
-      return client->request_no_body("PUT", destination, request_headers);
-    }, "CopyObject rename fallback");
-    if (copied.status == 412) {
-      throw std::system_error(
-          no_replace ? EEXIST : ESTALE, std::generic_category(),
-          no_replace ? "CopyObject destination exists"
-                     : "CopyObject source changed");
-    }
-    if (copied.status != 200) {
-      const bool marker_copy_unsupported =
-          size == 0 && key.ends_with('/') &&
-          (copied.status == 400 || copied.status == 405 ||
-           copied.status == 501);
-      if (marker_copy_unsupported) {
-        put_empty_object(state, destination);
-        delete_object(state, key, etag);
-        return;
+    bool copy_outcome_unknown = false;
+    Response copied;
+    try {
+      copied = request_with_retries([&] {
+        std::vector<Header> request_headers = copy_headers;
+        auto copy_authorization = base_authorization_headers(
+            state, "PUT", destination, request_headers, kEmptyPayloadSha256);
+        request_headers.insert(
+            request_headers.end(),
+            std::make_move_iterator(copy_authorization.begin()),
+            std::make_move_iterator(copy_authorization.end()));
+        HttpPool::Lease client = state.http->acquire_bulk();
+        return client->request_no_body("PUT", destination, request_headers);
+      }, "CopyObject", &copy_outcome_unknown);
+      if (copied.status == 412) {
+        throw std::system_error(
+            no_replace ? EEXIST : ESTALE, std::generic_category(),
+            no_replace ? "CopyObject destination exists"
+                       : "CopyObject source changed");
       }
-      throw_s3_response(copied, "CopyObject rename fallback");
-    }
-    require_s3_success(copied, "CopyObject rename fallback");
-    S3Xml xml(response_xml(copied), "CopyObject rename fallback");
-    const tinyxml2::XMLElement& root =
-        xml.result_root("CopyObjectResult");
-    if (xml.required_text(root, "ETag").empty()) {
-      throw std::runtime_error("CopyObject response omitted ETag");
+      if (copied.status != 200) {
+        const bool marker_copy_unsupported =
+            size == 0 && key.ends_with('/') &&
+            (copied.status == 400 || copied.status == 405 ||
+             copied.status == 501);
+        if (marker_copy_unsupported) {
+          put_empty_object(state, destination, no_replace);
+          return;
+        }
+        throw_s3_response(copied, "CopyObject");
+      }
+      require_s3_success(copied, "CopyObject");
+      S3Xml xml(response_xml(copied), "CopyObject");
+      const tinyxml2::XMLElement& root =
+          xml.result_root("CopyObjectResult");
+      if (xml.required_text(root, "ETag").empty()) {
+        throw std::runtime_error("CopyObject response omitted ETag");
+      }
+    } catch (...) {
+      if (copy_outcome_unknown) {
+        throw std::system_error(
+            EIO, std::generic_category(), "CopyObject outcome unknown");
+      }
+      throw;
     }
   }
+}
 
+void rename_remote_object(State& state, std::string_view key,
+                          uint64_t size, std::string_view etag,
+                          std::string_view version_id,
+                          std::string_view write_id,
+                          std::string_view destination,
+                          bool no_replace) {
+  if (try_native_rename_object(
+          state, key, etag, destination, no_replace)) {
+    return;
+  }
+
+  copy_remote_object(
+      state, key, size, etag, version_id, write_id, destination,
+      no_replace);
+
+  const std::string source = object_request_path(state, key);
+  const std::string_view source_etag = etag;
   const std::string& delete_path = source;
   std::vector<Header> delete_headers;
   if (!source_etag.empty()) {
@@ -8045,7 +8088,8 @@ void rename_remote_object(State& state, std::string_view key,
         ESTALE, std::generic_category(),
         "CopyObject succeeded but the source changed before DeleteObject");
   }
-  if (deleted.status != 200 && deleted.status != 204) {
+  if (deleted.status != 200 && deleted.status != 204 &&
+      !(deleted.status == 404 && key.ends_with('/'))) {
     throw_s3_response(
         deleted, "CopyObject succeeded but DeleteObject");
   }
@@ -8381,22 +8425,28 @@ class AsyncNativeRename {
   bool cancelled_ = false;
 };
 
-class AsyncRemoteRename {
+class AsyncCopyOrRename {
  public:
   using Complete = void (*)(void*, std::exception_ptr) noexcept;
+  enum class Mode { COPY_ONLY, RENAME };
 
-  AsyncRemoteRename(State& state, FuseReactor& reactor,
+  AsyncCopyOrRename(State& state, FuseReactor& reactor,
                     std::string key, uint64_t size, std::string etag,
-                    std::string version_id, std::string destination,
-                    bool no_replace, Complete complete, void* context)
+                    std::string version_id, std::string write_id,
+                    std::string destination, bool no_replace,
+                    Complete complete, void* context,
+                    Mode mode = Mode::RENAME)
       : state_(state), reactor_(reactor), key_(std::move(key)), size_(size),
         etag_(std::move(etag)), version_id_(std::move(version_id)),
-        destination_(std::move(destination)), no_replace_(no_replace),
+        write_id_(std::move(write_id)), destination_(std::move(destination)),
+        no_replace_(no_replace), mode_(mode),
         complete_(complete), context_(context),
         source_(object_request_path(state_, key_)) {
-    native_ = std::make_unique<AsyncNativeRename>(
-        state_, reactor_, key_, etag_, destination_, no_replace_,
-        native_complete, this);
+    if (mode_ == Mode::RENAME) {
+      native_ = std::make_unique<AsyncNativeRename>(
+          state_, reactor_, key_, etag_, destination_, no_replace_,
+          native_complete, this);
+    }
   }
 
   bool start() noexcept {
@@ -8405,6 +8455,18 @@ class AsyncRemoteRename {
       return false;
     }
     started_ = true;
+    if (mode_ == Mode::COPY_ONLY) {
+      try {
+        start_fallback();
+        return true;
+      } catch (const std::system_error& error) {
+        errno = error.code().value();
+      } catch (...) {
+        errno = EIO;
+      }
+      started_ = false;
+      return false;
+    }
     if (!native_->start()) {
       native_.reset();
       started_ = false;
@@ -8451,7 +8513,23 @@ class AsyncRemoteRename {
         state_, reactor_, std::move(arguments), received, this);
     if (!request_->start()) {
       throw std::system_error(errno, std::generic_category(),
-                              "submit asynchronous remote rename");
+                              "submit asynchronous remote copy");
+    }
+  }
+
+  [[nodiscard]] bool copy_only() const noexcept {
+    return mode_ == Mode::COPY_ONLY;
+  }
+
+  void finish_uncertain(const char* operation) noexcept {
+    fprintf(stderr, "error: %s outcome unknown: %s\n",
+            operation, destination_.c_str());
+    try {
+      throw std::system_error(
+          EIO, std::generic_category(),
+          std::string(operation) + " outcome unknown");
+    } catch (...) {
+      finish(std::current_exception());
     }
   }
 
@@ -8532,7 +8610,7 @@ class AsyncRemoteRename {
 
   static void session_ready(void* context,
                             std::exception_ptr error) noexcept {
-    auto* operation = static_cast<AsyncRemoteRename*>(context);
+    auto* operation = static_cast<AsyncCopyOrRename*>(context);
     operation->session_.reset();
     if (error) {
       if (operation->resume_stage_ == ABORT_MULTIPART &&
@@ -8552,7 +8630,7 @@ class AsyncRemoteRename {
 
   static void native_complete(void* context, bool renamed,
                               std::exception_ptr error) noexcept {
-    auto* operation = static_cast<AsyncRemoteRename*>(context);
+    auto* operation = static_cast<AsyncCopyOrRename*>(context);
     operation->native_.reset();
     if (error) {
       operation->finish(std::move(error));
@@ -8572,7 +8650,7 @@ class AsyncRemoteRename {
   void start_fallback() {
     if (cancelled_) {
       throw std::system_error(ECANCELED, std::generic_category(),
-                              "remote rename cancelled");
+                              "remote copy cancelled");
     }
     if (state_.config.bucket.empty()) {
       throw std::system_error(EOPNOTSUPP, std::generic_category(),
@@ -8654,9 +8732,15 @@ class AsyncRemoteRename {
     AsyncHttpRequest arguments;
     arguments.method = "POST";
     arguments.path = query_path(destination_, "uploads=");
+    if (!write_id_.empty()) {
+      arguments.headers.push_back(
+          Header{"x-amz-meta-ngs3fs-write-id", write_id_});
+    }
     const HeaderList authorization = authorization_headers(
-        state_, "POST", sso_view(arguments.path), {}, kEmptyPayloadSha256);
-    arguments.headers.assign(authorization.begin(), authorization.end());
+        state_, "POST", sso_view(arguments.path), arguments.headers,
+        kEmptyPayloadSha256);
+    arguments.headers.insert(
+        arguments.headers.end(), authorization.begin(), authorization.end());
     stage_ = CREATE_MULTIPART;
     submit(std::move(arguments));
   }
@@ -8732,8 +8816,13 @@ class AsyncRemoteRename {
 
   static void received(void* context, Response&& response,
                        std::exception_ptr error) noexcept {
-    auto* operation = static_cast<AsyncRemoteRename*>(context);
+    auto* operation = static_cast<AsyncCopyOrRename*>(context);
     Response value = std::move(response);
+    if (operation->stage_ == COPY_OBJECT ||
+        operation->stage_ == COMPLETE_MULTIPART) {
+      operation->outcome_ambiguous_ |= operation->request_->ambiguous();
+    }
+    const bool ambiguous = operation->outcome_ambiguous_;
     operation->request_.reset();
     if (!error && (value.status == 401 || value.status == 403) &&
         operation->state_.config.directory_bucket &&
@@ -8769,6 +8858,14 @@ class AsyncRemoteRename {
       return;
     }
     if (error) {
+      if (operation->copy_only() && ambiguous &&
+          (operation->stage_ == COPY_OBJECT ||
+           operation->stage_ == COMPLETE_MULTIPART)) {
+        operation->finish_uncertain(
+            operation->stage_ == COPY_OBJECT
+                ? "CopyObject" : "multipart-copy completion");
+        return;
+      }
       if (operation->stage_ == CREATE_MULTIPART) {
         fprintf(stderr,
                 "error: multipart-copy CreateMultipartUpload outcome unknown; "
@@ -8792,6 +8889,14 @@ class AsyncRemoteRename {
       }
       operation->response_received(value);
     } catch (...) {
+      if (operation->copy_only() && ambiguous &&
+          (operation->stage_ == COPY_OBJECT ||
+           operation->stage_ == COMPLETE_MULTIPART)) {
+        operation->finish_uncertain(
+            operation->stage_ == COPY_OBJECT
+                ? "CopyObject" : "multipart-copy completion");
+        return;
+      }
       operation->fail_or_abort(std::current_exception());
     }
   }
@@ -8836,7 +8941,8 @@ class AsyncRemoteRename {
         return;
       case PUT_MARKER:
         require_s3_success(response, "PutObject rename marker fallback");
-        schedule(DELETE_SOURCE);
+        if (copy_only()) finish();
+        else schedule(DELETE_SOURCE);
         return;
       case DELETE_SOURCE:
         if (response.status == 412) {
@@ -8887,7 +8993,8 @@ class AsyncRemoteRename {
     if (xml.required_text(root, "ETag").empty()) {
       throw std::runtime_error("CopyObject response omitted ETag");
     }
-    schedule(DELETE_SOURCE);
+    if (copy_only()) finish();
+    else schedule(DELETE_SOURCE);
   }
 
   void create_received(const Response& response) {
@@ -8932,7 +9039,8 @@ class AsyncRemoteRename {
     S3Xml xml(response_xml(response), "multipart-copy completion");
     xml.result_root("CompleteMultipartUploadResult");
     upload_id_.clear();
-    schedule(DELETE_SOURCE);
+    if (copy_only()) finish();
+    else schedule(DELETE_SOURCE);
   }
 
   State& state_;
@@ -8941,8 +9049,10 @@ class AsyncRemoteRename {
   uint64_t size_;
   std::string etag_;
   std::string version_id_;
+  std::string write_id_;
   std::string destination_;
   bool no_replace_;
+  Mode mode_;
   Complete complete_;
   void* context_;
   std::string source_;
@@ -8957,6 +9067,7 @@ class AsyncRemoteRename {
   Stage resume_stage_ = COPY_OBJECT;
   bool started_ = false;
   bool cancelled_ = false;
+  bool outcome_ambiguous_ = false;
 };
 
 void ngs3fs_init(void* userdata, fuse_conn_info* connection) {
@@ -18186,7 +18297,7 @@ struct AsyncRename {
   ObjectMetadata metadata;
   std::unique_ptr<AsyncSignedS3Request> head;
   std::unique_ptr<AsyncHideReaders> hide;
-  std::unique_ptr<AsyncRemoteRename> remote;
+  std::unique_ptr<AsyncCopyOrRename> remote;
   std::unique_ptr<AsyncPendingDelete> cleanup;
   std::exception_ptr failure;
 
@@ -18527,8 +18638,8 @@ struct AsyncRename {
           }
           break;
         case 10:
-          remote = std::make_unique<AsyncRemoteRename>(state, reactor, source_key, metadata.size,
-              metadata.etag, metadata.version_id, destination_path,
+          remote = std::make_unique<AsyncCopyOrRename>(state, reactor, source_key, metadata.size,
+              metadata.etag, metadata.version_id, metadata.write_id, destination_path,
               !source->directory() && (flags & RENAME_NOREPLACE), renamed, this);
           phase = 11;
           if (!remote->start()) {
@@ -18691,7 +18802,7 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
       const ObjectMetadata metadata = head_object(state, source_path);
       rename_remote_object(
           state, source_key, metadata.size, metadata.etag,
-          metadata.version_id, destination_path, false);
+          metadata.version_id, metadata.write_id, destination_path, false);
       if (destination && !destination->detached()) {
         remove_item(state, *destination);
       }
@@ -18736,7 +18847,7 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
     try {
       rename_remote_object(
           state, source_key, metadata.size, metadata.etag,
-          metadata.version_id, destination_path,
+          metadata.version_id, metadata.write_id, destination_path,
           (flags & RENAME_NOREPLACE) != 0);
     } catch (...) {
       if (destination_hidden) {
@@ -18809,8 +18920,335 @@ void ngs3fs_rename(fuse_req_t request, fuse_ino_t parent, const char* name,
   }
 }
 
-void ngs3fs_link(fuse_req_t request, fuse_ino_t, fuse_ino_t, const char*) {
-  fuse_reply_err(request, ENOTSUP);
+struct AsyncLink {
+  State& state;
+  FuseReactor& reactor;
+  fuse_req_t request;
+  fuse_ino_t inode;
+  fuse_ino_t parent;
+  ssostr<248> name;
+  unsigned phase = 0;
+  InodePin source;
+  InodePin directory;
+  std::unique_lock<IoMutex> directory_guard;
+  DirectoryContinuation listing;
+  AsyncIoRequest wait;
+  uint64_t notification = 0;
+  std::unique_ptr<PathMutationGuard> mutation;
+  std::unique_ptr<DirectoryPublicationGuard> publication;
+  std::string source_key;
+  std::string destination_key;
+  std::string source_path;
+  std::string destination_path;
+  ObjectMetadata source_metadata;
+  ObjectMetadata destination_metadata;
+  std::unique_ptr<AsyncSignedS3Request> head;
+  std::unique_ptr<AsyncCopyOrRename> copy;
+
+  AsyncLink(State& s, FuseReactor& r, fuse_req_t req,
+            fuse_ino_t ino, fuse_ino_t p, const char* n)
+      : state(s), reactor(r), request(req), inode(ino), parent(p), name(n) {
+    InodeBase& source_item = inode_item(state, inode);
+    if (!source_item.regular()) {
+      throw std::system_error(EPERM, std::generic_category(), "link directory");
+    }
+    retain_inode_count(source_item.open_count, "link source pin");
+    source = InodePin(state, source_item);
+
+    InodeBase& parent_item = inode_item(state, parent);
+    if (!parent_item.directory()) {
+      throw std::system_error(ENOTDIR, std::generic_category(), "link parent");
+    }
+    retain_inode_count(parent_item.open_count, "link parent pin");
+    directory = InodePin(state, parent_item);
+    directory_guard = std::unique_lock<IoMutex>(
+        directory->dir_children().mutation_mutex, std::defer_lock);
+    listing.complete = listed;
+    listing.context = this;
+  }
+
+  void release_guards() noexcept {
+    publication.reset();
+    if (directory_guard.owns_lock()) directory_guard.unlock();
+    mutation.reset();
+  }
+
+  void fail(std::exception_ptr error) noexcept {
+    std::unique_ptr<AsyncLink> owner(this);
+    release_guards();
+    invalidate_directory(state, parent);
+    try {
+      std::rethrow_exception(error);
+    } catch (...) {
+      reply_callback_error(request);
+    }
+  }
+
+  static void listed(void* context, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncLink*>(context);
+    if (error) task->fail(std::move(error));
+    else task->advance();
+  }
+
+  static void unlocked(void* context, ssize_t result) noexcept {
+    auto* task = static_cast<AsyncLink*>(context);
+    task->directory_guard.mutex()->end_async_wait();
+    if (result < 0) {
+      task->fail(std::make_exception_ptr(std::system_error(
+          -int(result), std::generic_category(), "link directory wait")));
+    } else {
+      task->advance();
+    }
+  }
+
+  bool acquire_directory() {
+    if (directory_guard.try_lock()) return true;
+    IoMutex& mutex = *directory_guard.mutex();
+    const int fd = mutex.begin_async_wait();
+    if (directory_guard.try_lock()) {
+      mutex.end_async_wait();
+      return true;
+    }
+    wait = {};
+    wait.kind = AsyncIoRequest::READ;
+    wait.fd = fd;
+    wait.data = &notification;
+    wait.length = sizeof(notification);
+    wait.timeout_ms = 0;
+    wait.complete = unlocked;
+    wait.context = this;
+    if (reactor.submit(wait)) return false;
+    const int error = errno;
+    mutex.end_async_wait();
+    throw std::system_error(
+        error, std::generic_category(), "submit link directory wait");
+  }
+
+  static void headed(void* context, Response&& response,
+                     std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncLink*>(context);
+    task->head.reset();
+    try {
+      if (error) std::rethrow_exception(error);
+      ObjectMetadata metadata = decode_head_response(response);
+      if (task->phase == 3) {
+        task->source_metadata = std::move(metadata);
+      } else if (task->phase == 5) {
+        task->destination_metadata = std::move(metadata);
+      } else {
+        throw std::logic_error("unexpected link HEAD completion");
+      }
+    } catch (...) {
+      task->fail(std::current_exception());
+      return;
+    }
+    task->advance();
+  }
+
+  static void copied(void* context, std::exception_ptr error) noexcept {
+    auto* task = static_cast<AsyncLink*>(context);
+    task->copy.reset();
+    if (error) task->fail(std::move(error));
+    else task->advance();
+  }
+
+  void submit_head(std::string_view path) {
+    AsyncHttpRequest arguments;
+    arguments.method = "HEAD";
+    arguments.path.assign(path);
+    head = std::make_unique<AsyncSignedS3Request>(
+        state, reactor, std::move(arguments), headed, this);
+    if (!head->start()) {
+      throw std::system_error(
+          errno, std::generic_category(), "submit link HeadObject");
+    }
+  }
+
+  void reply() {
+    if (destination_metadata.size != source_metadata.size) {
+      throw std::system_error(
+          EIO, std::generic_category(), "linked object size changed");
+    }
+    ListedChild child;
+    child.name.assign(name.data(), name.size());
+    child.size  = destination_metadata.size;
+    child.mtime = destination_metadata.mtime;
+    const fuse_ino_t linked = install_item(
+        state, parent, std::move(child), 0, false, false, true);
+    fuse_entry_param entry{};
+    entry.ino           = linked;
+    entry.generation    = 1;
+    entry.attr_timeout = entry.entry_timeout =
+        remaining_directory_timeout(*directory);
+    fill_inode_stat(state, linked, inode_item(state, linked), entry.attr);
+    release_guards();
+    if (fuse_reply_entry(request, &entry) != 0) {
+      forget_inode(linked, 1);
+      sweep_retired_items(state);
+    }
+  }
+
+  void advance() noexcept {
+    std::unique_ptr<AsyncLink> owner(this);
+    try {
+      for (;;) {
+        switch (phase) {
+          case 0:
+            phase = 1;
+            if (await_directory_refresh(state, reactor, parent, listing)) {
+              owner.release();
+              return;
+            }
+            break;
+          case 1:
+            if (!acquire_directory()) {
+              owner.release();
+              return;
+            }
+            phase = 2;
+            if (await_directory_refresh(state, reactor, parent, listing)) {
+              owner.release();
+              return;
+            }
+            break;
+          case 2:
+            if (directory->detached()) {
+              throw std::system_error(
+                  ESTALE, std::generic_category(), "link parent detached");
+            }
+            if (source->detached()) {
+              throw std::system_error(
+                  ENOENT, std::generic_category(), "link source detached");
+            }
+            if (pin_cached_child(state, *directory, sso_view(name))) {
+              throw std::system_error(
+                  EEXIST, std::generic_category(), "link destination exists");
+            }
+            source_key = item_key(state, *source);
+            destination_key = item_key(state, *directory);
+            destination_key.append(name.data(), name.size());
+            source_path = object_request_path(state, source_key);
+            destination_path = object_request_path(state, destination_key);
+            mutation = std::make_unique<PathMutationGuard>(
+                state, source_path, false, std::string_view{}, false,
+                "link", true);
+            publication = std::make_unique<DirectoryPublicationGuard>();
+            publication->start(*directory, *directory);
+            phase = 3;
+            submit_head(source_path);
+            owner.release();
+            return;
+          case 3:
+            copy = std::make_unique<AsyncCopyOrRename>(
+                state, reactor, source_key, source_metadata.size,
+                source_metadata.etag, source_metadata.version_id,
+                source_metadata.write_id, destination_path, true,
+                copied, this, AsyncCopyOrRename::Mode::COPY_ONLY);
+            phase = 4;
+            if (!copy->start()) {
+              throw std::system_error(
+                  errno, std::generic_category(), "submit remote link copy");
+            }
+            owner.release();
+            return;
+          case 4:
+            phase = 5;
+            submit_head(destination_path);
+            owner.release();
+            return;
+          case 5:
+            reply();
+            return;
+          default:
+            abort();
+        }
+      }
+    } catch (...) {
+      owner.release();
+      fail(std::current_exception());
+    }
+  }
+};
+
+void ngs3fs_link(fuse_req_t request, fuse_ino_t inode,
+                 fuse_ino_t new_parent, const char* new_name) {
+  State& state = state_from(request);
+  if (!state.config.hardlink_as_copy) {
+    fuse_reply_err(request, ENOTSUP);
+    return;
+  }
+  if (new_name == nullptr || !valid_fuse_component(new_name)) {
+    fuse_reply_err(request, EINVAL);
+    return;
+  }
+  try {
+    if (FuseReactor* reactor = current_fuse_reactor()) {
+      auto task = std::make_unique<AsyncLink>(
+          state, *reactor, request, inode, new_parent, new_name);
+      task.release()->advance();
+      return;
+    }
+
+    InodeBase& source = inode_item(state, inode);
+    if (!source.regular()) {
+      throw std::system_error(EPERM, std::generic_category(), "link directory");
+    }
+    InodeBase& directory = inode_item(state, new_parent);
+    if (!directory.directory()) {
+      throw std::system_error(ENOTDIR, std::generic_category(), "link parent");
+    }
+
+    fuse_entry_param entry{};
+    {
+      std::unique_lock directory_guard(
+          directory.dir_children().mutation_mutex);
+      refresh_directory(state, new_parent);
+      if (pin_cached_child(state, directory, new_name)) {
+        throw std::system_error(
+            EEXIST, std::generic_category(), "link destination exists");
+      }
+      const std::string source_key = item_key(state, source);
+      const std::string destination_key =
+          item_key(state, directory) + new_name;
+      const std::string source_path = object_request_path(state, source_key);
+      const std::string destination_path =
+          object_request_path(state, destination_key);
+      PathMutationGuard mutation(
+          state, source_path, false, {}, false, "link", true);
+      DirectoryPublicationGuard publication;
+      publication.start(directory, directory);
+      const ObjectMetadata source_metadata =
+          head_object(state, source_path);
+      copy_remote_object(
+          state, source_key, source_metadata.size, source_metadata.etag,
+          source_metadata.version_id, source_metadata.write_id,
+          destination_path, true);
+      const ObjectMetadata destination_metadata =
+          head_object(state, destination_path);
+      if (destination_metadata.size != source_metadata.size) {
+        throw std::system_error(
+            EIO, std::generic_category(), "linked object size changed");
+      }
+      ListedChild child;
+      child.name = new_name;
+      child.size  = destination_metadata.size;
+      child.mtime = destination_metadata.mtime;
+      const fuse_ino_t linked = install_item(
+          state, new_parent, std::move(child), 0, false, false, true);
+      entry.ino           = linked;
+      entry.generation    = 1;
+      entry.attr_timeout = entry.entry_timeout =
+          remaining_directory_timeout(directory);
+      fill_inode_stat(state, linked, inode_item(state, linked), entry.attr);
+    }
+    if (fuse_reply_entry(request, &entry) != 0) {
+      forget_inode(entry.ino, 1);
+      sweep_retired_items(state);
+    }
+  } catch (...) {
+    invalidate_directory(state, new_parent);
+    reply_callback_error(request);
+  }
 }
 
 void ngs3fs_statfs(fuse_req_t request, fuse_ino_t) {
@@ -18868,6 +19306,8 @@ void print_help() {
       "      --cache-unlimited     disable configured capacity limits and "
       "capacity eviction; requires --cache-dir and conflicts with explicit "
       "--cache-size/--cache-reserve\n"
+      "      --hardlink-as-copy    opt in to CopyObject-backed link with "
+      "independent inodes (default disabled)\n"
       "      --connect-timeout MS  TCP connect timeout (default 5000)\n"
       "      --request-timeout MS  no-I/O-progress timeout "
       "(default 30000)\n"

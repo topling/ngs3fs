@@ -730,6 +730,41 @@ Errors use stable meanings:
 - `EIO`: verified corruption, persistent recovery failure, or unknown commit
   outcome that cannot be resolved.
 
+## Optional CopyObject-backed hardlink
+
+`--hardlink-as-copy` is disabled by default and applies with or without the
+local data cache. With it enabled, FUSE `link` creates the destination using
+S3 CopyObject (or the existing multipart-copy path for larger objects), then
+publishes a destination directory entry with its own `InodeFile`.
+The destination must not already exist. The operation never deletes or
+rewrites the source object; the application calls `unlink` on the source
+after its multi-file transaction succeeds. A failed copy leaves the source
+untouched. An uncertain response may leave a destination object and is
+reported as an error, without a cross-object rollback or recovery journal.
+
+This is explicitly best effort, not persistent S3 hardlinks. The destination
+is a snapshot at copy time. Both names remain independently writable under the
+ordinary sequential replacement rules; writes are not replicated. They do
+not share a kernel inode or pagecache. There is no alias registry, canonical
+key selection, or multi-name write restriction.
+During copy itself, the source follows ordinary mount-local writer exclusion;
+link does not flush an active writer or copy its uncommitted data.
+
+The destination inode is initialized normally, not byte-copied: it has its
+own parent, directory slot, lookup/open reference counts, and cache state.
+Object attributes such as size and mtime come from the destination's HEAD
+after a successful copy; ordinary open still refreshes its S3 metadata. Source
+and destination may be in different directories. Existing rename, unlink,
+and FORGET lifetime rules apply independently, including pointer checks before
+erasing a stale slot. Source handles are unaffected by link itself; after an
+application unlinks the source, its handles follow the usual unlink policy.
+
+Validation targets the application's transaction workflow: copy success and
+failure, source preservation, application-driven source unlink, destination
+reads/writes, and safe rename/forget/cache refresh with independent inodes.
+Do not test or claim remote write replication, shared persistent link identity,
+or transactional rollback across S3 objects.
+
 ## Required validation
 
 Local development runs compilation checks and unit tests only. Run mounted

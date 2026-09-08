@@ -184,6 +184,9 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME profile_measurement_test
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/profile_measurement_test.py)
+  add_test(NAME download_reference_binaries_test
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/download_reference_binaries_test.py)
   add_test(NAME summarize_random_read_test
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/summarize_random_read_test.py)
@@ -292,6 +295,16 @@ if(NGS3FS_BUILD_TESTS)
       set_tests_properties(fuse_${engine}_${blocks}_test PROPERTIES
         TIMEOUT 60 RESOURCE_LOCK fuse_mounts)
     endforeach()
+    add_test(NAME fuse_${engine}_hardlink_copy_test
+      COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+              xxhash128 hardlink-copy ${engine} 1)
+    add_test(NAME fuse_${engine}_cached_hardlink_copy_test
+      COMMAND fuse_mmap_integration_test $<TARGET_FILE:ngs3fs>
+              xxhash128 hardlink-copy-cache ${engine} 1)
+    set_tests_properties(
+      fuse_${engine}_hardlink_copy_test
+      fuse_${engine}_cached_hardlink_copy_test
+      PROPERTIES TIMEOUT 90 RESOURCE_LOCK fuse_mounts)
   endforeach()
   foreach(engine legacy uring)
     add_test(NAME fuse_${engine}_prefetch_shutdown_test
@@ -545,6 +558,15 @@ if(NGS3FS_BUILD_TESTS)
     cache_unlimited_requires_dir_test
     cache_unlimited_size_conflict_test
     cache_unlimited_reserve_conflict_test
+    PROPERTIES WILL_FAIL TRUE)
+
+  add_test(NAME hardlink_as_copy_option_test
+    COMMAND ngs3fs --hardlink-as-copy --help)
+  add_test(NAME hardlink_as_copy_cached_option_test
+    COMMAND ngs3fs -L /tmp/ngs3fs-option-test --hardlink-as-copy --help)
+  add_test(NAME hardlink_as_copy_argument_rejected_test
+    COMMAND ngs3fs --hardlink-as-copy=no --help)
+  set_tests_properties(hardlink_as_copy_argument_rejected_test
     PROPERTIES WILL_FAIL TRUE)
 
   add_test(NAME write_options_test

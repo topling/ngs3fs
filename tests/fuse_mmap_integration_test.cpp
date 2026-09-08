@@ -141,6 +141,7 @@ struct Request {
   std::string copy_source;
   std::string copy_source_if_match;
   std::string if_match;
+  std::string if_none_match;
   std::string content_length;
   std::string checksum_algorithm;
   std::string checksum_type;
@@ -194,6 +195,8 @@ struct SpecialObject {
   size_t limited_range_end = SIZE_MAX;
   std::vector<RequestRange> get_ranges;
   std::vector<std::string> get_paths;
+  bool hardlink_source = false;
+  bool hardlink_destination = false;
 };
 
 struct SharedServerState {
@@ -226,6 +229,12 @@ struct SharedServerState {
   int request_timeout_errors = 0;
   int complete_embedded_errors = 0;
   int copy_embedded_errors = 0;
+  int hardlink_copy_requests = 0;
+  int hardlink_copy_failures = 0;
+  int hardlink_source_deletes = 0;
+  int hardlink_destination_deletes = 0;
+  int hardlink_destination_renames = 0;
+  int hardlink_writes = 0;
   std::map<unsigned, std::vector<std::byte>> uploaded_parts;
   std::map<unsigned, unsigned> upload_attempts;
   std::map<std::string, std::shared_ptr<SpecialObject>> special_objects;
@@ -352,6 +361,10 @@ int on_header(nghttp2_session*, const nghttp2_frame* frame,
   } else if (header_name == "if-match") {
     auto& state = *static_cast<ServerState*>(user_data);
     state.requests[frame->hd.stream_id].if_match.assign(
+        reinterpret_cast<const char*>(value), value_length);
+  } else if (header_name == "if-none-match") {
+    auto& state = *static_cast<ServerState*>(user_data);
+    state.requests[frame->hd.stream_id].if_none_match.assign(
         reinterpret_cast<const char*>(value), value_length);
   } else if (header_name == "content-length") {
     auto& state = *static_cast<ServerState*>(user_data);
@@ -763,6 +776,25 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
         : std::string_view(source_object->second->etag);
     require(request.rename_source_if_match == expected_etag,
             "RenameObject omitted the pinned source ETag");
+    if (source_object != state.special_objects.end() &&
+        (source_object->second->hardlink_source ||
+         source_object->second->hardlink_destination)) {
+      if (source_key == "deep/link-copy.bin" &&
+          destination_key == "link-renamed.bin") {
+        ++state.hardlink_destination_renames;
+      }
+      state.special_objects[destination_key] =
+          std::move(source_object->second);
+      state.special_objects.erase(source_object);
+      const std::array response_headers{
+          header(":status", "200"),
+          header("content-length", "0"),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     if (source_key == "overwrite-dest.bin" &&
         destination_key.starts_with(".~ngs3fs~.pending-delete/")) {
       require(source_object != state.special_objects.end(),
@@ -866,6 +898,52 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
   }
   if (request.method == "PUT" && frame->hd.type == NGHTTP2_HEADERS &&
       !request.copy_source.empty()) {
+    const std::string source_key = request_object_key(request.copy_source);
+    const std::string destination_key = request_object_key(request.path);
+    const auto hardlink_source = state.special_objects.find(source_key);
+    if (hardlink_source != state.special_objects.end() &&
+        hardlink_source->second->hardlink_source) {
+      ++state.hardlink_copy_requests;
+      require(request.copy_source ==
+                  "/bucket/" + source_key + "?versionId=" +
+                      hardlink_source->second->version_id,
+              "hardlink CopyObject omitted the pinned source version");
+      require(request.copy_source_if_match ==
+                  hardlink_source->second->etag,
+              "hardlink CopyObject omitted the pinned source ETag");
+      require(request.if_none_match == "*",
+              "hardlink CopyObject did not forbid destination overwrite");
+      if (destination_key == "deep/link-fail.bin") {
+        ++state.hardlink_copy_failures;
+        const int submitted = submit_text_response(
+            session, connection, frame->hd.stream_id, "412",
+            "<s3:Error xmlns:s3=\"urn:s3\">"
+            "<s3:Code>PreconditionFailed</s3:Code>"
+            "<s3:Message>injected copy failure</s3:Message></s3:Error>");
+        return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+      }
+      require(destination_key == "deep/link-copy.bin",
+              "hardlink CopyObject used an unexpected destination");
+      require(state.special_objects.find(destination_key) ==
+                  state.special_objects.end(),
+              "hardlink CopyObject overwrote an existing object");
+      auto destination = std::make_shared<SpecialObject>();
+      destination->bytes = hardlink_source->second->bytes;
+      destination->etag = "\"link-copy\"";
+      destination->version_id = "link-copy-v1";
+      destination->last_modified = "Fri, 11 Nov 1994 08:49:37 GMT";
+      destination->last_modified_iso = "1994-11-11T08:49:37.000Z";
+      destination->hardlink_destination = true;
+      state.special_objects.emplace(destination_key, destination);
+      const int submitted = submit_text_response(
+          session, connection, frame->hd.stream_id, "200",
+          "<s3:CopyObjectResult xmlns:s3=\"urn:s3\">"
+          "<s3:ETag>&quot;link-copy&quot;</s3:ETag>"
+          "<s3:LastModified>1994-11-11T08:49:37.000Z</s3:LastModified>"
+          "</s3:CopyObjectResult>",
+          destination->etag, destination->version_id);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     require(request.path == "/bucket/copied.bin",
             "CopyObject used the wrong destination");
     require(request.copy_source ==
@@ -903,6 +981,27 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       // Abort discards only the in-progress upload, never the published object.
       // Keep attempt counters intact so a failed upload remains diagnosable.
       state.uploaded_parts.clear();
+      const std::array response_headers{
+          header(":status", "204"),
+          header("content-length", "0"),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    const std::string delete_key = request_object_key(request.path);
+    const auto hardlink_object = state.special_objects.find(delete_key);
+    if (hardlink_object != state.special_objects.end() &&
+        (hardlink_object->second->hardlink_source ||
+         hardlink_object->second->hardlink_destination)) {
+      require(request.if_match == hardlink_object->second->etag,
+              "hardlink-copy DeleteObject omitted the current ETag");
+      state.hardlink_source_deletes +=
+          hardlink_object->second->hardlink_source ? 1 : 0;
+      state.hardlink_destination_deletes +=
+          hardlink_object->second->hardlink_destination ? 1 : 0;
+      state.special_objects.erase(hardlink_object);
       const std::array response_headers{
           header(":status", "204"),
           header("content-length", "0"),
@@ -1173,6 +1272,34 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     require(request.checksum_value == expected_request_checksum,
             "PutObject sent an invalid checksum");
     const std::string key = request_object_key(request.path);
+    const auto hardlink_object = state.special_objects.find(key);
+    if (hardlink_object != state.special_objects.end() &&
+        (hardlink_object->second->hardlink_source ||
+         hardlink_object->second->hardlink_destination)) {
+      SpecialObject& object = *hardlink_object->second;
+      object.bytes = std::move(request.body);
+      const std::string write_number =
+          std::to_string(++state.hardlink_writes);
+      object.etag = "\"hardlink-write-" + write_number + '"';
+      object.version_id = "hardlink-write-" + write_number;
+      object.last_modified = "Sat, 12 Nov 1994 08:49:37 GMT";
+      object.last_modified_iso = "1994-11-12T08:49:37.000Z";
+      ++state.put_requests;
+      const std::string checksum = response_checksum(
+          state.checksum, object.bytes);
+      const std::array response_headers{
+          header(":status", "200"),
+          header("content-length", "0"),
+          header("etag", object.etag),
+          header(version_header(state.checksum), object.version_id),
+          header("last-modified", object.last_modified),
+          header(checksum_header_name(state.checksum), checksum),
+      };
+      const int submitted = nghttp2_submit_response(
+          session, frame->hd.stream_id, response_headers.data(),
+          response_headers.size(), nullptr);
+      return submitted == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     if (key == "overwrite-dest.bin" || key == "overwrite-source.bin") {
       auto object = std::make_shared<SpecialObject>();
       object->bytes = std::move(request.body);
@@ -1663,7 +1790,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
                    bool verify_reads = true, bool whole_retry = false,
                    bool low_budget = false, const char* max_window = nullptr,
                    const char* memory_budget = nullptr,
-                   const char* cache_block = "2MiB") {
+                   const char* cache_block = "2MiB",
+                   bool hardlink_as_copy = false) {
   // The receive-pool implementation deliberately omits uncached checksum
   // verification. Cached and legacy tests still request it explicitly.
   if (engine == "uring" && cache_dir.empty()) verify_reads = false;
@@ -1672,6 +1800,12 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
   const std::string port_text = std::to_string(port);
   const std::string uid_text  = std::to_string(::getuid());
   const std::string gid_text  = std::to_string(::getgid());
+  const char* hardlink_or_foreground =
+      hardlink_as_copy ? "--hardlink-as-copy" : "-f";
+  const char* foreground_or_mountpoint =
+      hardlink_as_copy ? "-f" : mountpoint.data();
+  const char* optional_mountpoint =
+      hardlink_as_copy ? mountpoint.data() : nullptr;
   const pid_t process = ::fork();
   if (process < 0) {
     fail_errno("fork");
@@ -1694,7 +1828,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               "--stats-interval", "86400", "-L", cache_dir.data(),
               "--cache-reserve", "0", "--cache-block-size", cache_block,
               "--io-engine", engine.data(), "--reactors", reactors.data(),
-              "-f", mountpoint.data(), static_cast<char*>(nullptr));
+              hardlink_or_foreground, foreground_or_mountpoint,
+              optional_mountpoint, static_cast<char*>(nullptr));
     } else if (!verify_reads) {
       ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
               port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
@@ -1704,8 +1839,9 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               "--stats-interval", "86400", "--io-engine", engine.data(),
               "--max-prefetch-memory", mount_limit,
               "--max-file-prefetch-memory", mount_limit,
-              "--reactors", reactors.data(), "-f", mountpoint.data(),
-              static_cast<char*>(nullptr));
+              "--reactors", reactors.data(),
+              hardlink_or_foreground, foreground_or_mountpoint,
+              optional_mountpoint, static_cast<char*>(nullptr));
     } else if (cache_dir.empty()) {
       ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
               port_text.c_str(), "-a", "mock-s3", "-b", "bucket", "-u",
@@ -1716,7 +1852,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               "--max-prefetch-memory", low_budget ? low_limit : "0",
               "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "--io-engine", engine.data(),
-              "--reactors", reactors.data(), "-f", mountpoint.data(),
+              "--reactors", reactors.data(), hardlink_or_foreground,
+              foreground_or_mountpoint, optional_mountpoint,
               static_cast<char*>(nullptr));
     } else {
       ::execl(executable.data(), "ngs3fs", "-e", "127.0.0.1", "-p",
@@ -1727,7 +1864,8 @@ pid_t start_daemon(std::string_view executable, std::string_view mountpoint,
               "--expected-bucket-owner", "111122223333", "--requester-pays",
               "--stats-interval", "86400", "-L", cache_dir.data(),
               "--cache-reserve", "0", "--io-engine", engine.data(),
-              "--reactors", reactors.data(), "-f", mountpoint.data(),
+              "--reactors", reactors.data(), hardlink_or_foreground,
+              foreground_or_mountpoint, optional_mountpoint,
               static_cast<char*>(nullptr));
     }
     _exit(127);
@@ -1885,7 +2023,8 @@ int main(int argc, char** argv) {
   if (argc < 2 || argc > 7) {
     std::cerr << "usage: fuse_mmap_integration_test NGS3FS "
                  "[CHECKSUM [plain|cache|prefetch|prefetch-verified "
-                 "|passthrough|passthrough-budget "
+                 "|passthrough|passthrough-budget|hardlink-copy"
+                 "|hardlink-copy-cache "
                  "[auto|legacy|uring [REACTORS [STRACE]]]]]\n";
     return 2;
   }
@@ -1915,6 +2054,10 @@ int main(int argc, char** argv) {
     if (reactors != "1" && reactors != "2") {
       throw std::invalid_argument("integration-test reactors must be 1 or 2");
     }
+    const std::string_view mode = argc >= 4 ? argv[3] : "plain";
+    const bool hardlink_copy =
+        mode == "hardlink-copy" || mode == "hardlink-copy-cache";
+    const bool hardlink_copy_cache = mode == "hardlink-copy-cache";
     const bool cache_blocks_small = argc >= 4 && std::string_view(argv[3]) == "cache-blocks-96k";
     const bool cache_blocks = cache_blocks_small ||
         (argc >= 4 && std::string_view(argv[3]) == "cache-blocks");
@@ -1963,6 +2106,23 @@ int main(int argc, char** argv) {
       overwrite_old[i] = static_cast<std::byte>((i * 31U + 19U) & 0xffU);
       overwrite_source[i] = static_cast<std::byte>((i * 47U + 23U) & 0xffU);
     }
+    std::vector<std::byte> hardlink_original(32U * 1024U + 17U);
+    std::vector<std::byte> hardlink_destination_write(12U * 1024U + 7U);
+    std::vector<std::byte> hardlink_source_write(16U * 1024U + 11U);
+    std::vector<std::byte> hardlink_existing(4096U + 3U);
+    for (size_t i = 0; i < hardlink_original.size(); ++i) {
+      hardlink_original[i] = std::byte((i * 67U + 5U) & 0xffU);
+    }
+    for (size_t i = 0; i < hardlink_destination_write.size(); ++i) {
+      hardlink_destination_write[i] =
+          std::byte((i * 71U + 9U) & 0xffU);
+    }
+    for (size_t i = 0; i < hardlink_source_write.size(); ++i) {
+      hardlink_source_write[i] = std::byte((i * 73U + 13U) & 0xffU);
+    }
+    for (size_t i = 0; i < hardlink_existing.size(); ++i) {
+      hardlink_existing[i] = std::byte((i * 79U + 17U) & 0xffU);
+    }
 
     Listener listener = make_listener();
     SharedServerState shared;
@@ -2003,6 +2163,13 @@ int main(int argc, char** argv) {
                          "\"overwrite-destination\"");
     add_overwrite_object("overwrite-source.bin", overwrite_source,
                          "\"overwrite-source\"");
+    if (hardlink_copy) {
+      add_overwrite_object("link-source.bin", hardlink_original,
+                           "\"link-source\"");
+      shared.special_objects.at("link-source.bin")->hardlink_source = true;
+      add_overwrite_object("link-existing.bin", hardlink_existing,
+                           "\"link-existing\"");
+    }
     std::vector<std::byte> read_ahead(4U * 1024U * 1024U + 37U);
     for (size_t i = 0; i < read_ahead.size(); ++i) {
       read_ahead[i] = static_cast<std::byte>((i * 53U + 31U) & 0xffU);
@@ -2108,11 +2275,11 @@ int main(int argc, char** argv) {
     if (argc >= 4) {
       if (std::string_view(argv[3]) != "plain" &&
           std::string_view(argv[3]) != "cache" && !prefetch_mode &&
-          !cache_blocks && !passthrough_mode) {
+          !cache_blocks && !passthrough_mode && !hardlink_copy) {
         throw std::invalid_argument("unknown integration-test mode");
       }
       if (std::string_view(argv[3]) == "cache" || cache_blocks ||
-          passthrough_mode) {
+          passthrough_mode || hardlink_copy_cache) {
         cache_dir = make_mountpoint();
       }
     }
@@ -2151,6 +2318,215 @@ int main(int argc, char** argv) {
     MountedProcess mounted(mountpoint, process);
     const std::string file_path = mountpoint + "/mmap.bin";
     wait_until_mounted(file_path, process);
+
+    if (hardlink_copy) {
+      const std::string source_path = mountpoint + "/link-source.bin";
+      const std::string existing_path = mountpoint + "/link-existing.bin";
+      const std::string disabled_path = mountpoint + "/link-disabled.bin";
+      const std::string failed_path = mountpoint + "/deep/link-fail.bin";
+      const std::string destination_path =
+          mountpoint + "/deep/link-copy.bin";
+      const std::string renamed_path = mountpoint + "/link-renamed.bin";
+      auto read_object = [&](const std::string& path,
+                             std::span<const std::byte> expected_bytes,
+                             const char* operation) {
+        UniqueFd reader;
+        retry_after_fuse_release(operation, [&] {
+          reader.reset(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+          return reader ? 0 : -1;
+        });
+        struct stat status{};
+        require(::fstat(reader.get(), &status) == 0 &&
+                    static_cast<uint64_t>(status.st_size) ==
+                        expected_bytes.size(),
+                "hardlink-copy reader observed the wrong size");
+        std::vector<std::byte> actual(expected_bytes.size());
+        pread_all(reader.get(), actual, 0);
+        require(std::equal(actual.begin(), actual.end(),
+                           expected_bytes.begin(), expected_bytes.end()),
+                "hardlink-copy reader observed the wrong bytes");
+      };
+      auto write_object = [&](const std::string& path,
+                              std::span<const std::byte> bytes,
+                              const char* operation) {
+        UniqueFd writer;
+        retry_after_fuse_release(operation, [&] {
+          writer.reset(::open(
+              path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC));
+          return writer ? 0 : -1;
+        });
+        test_write_all(writer.get(), bytes);
+        require(::fsync(writer.get()) == 0,
+                "hardlink-copy writer fsync failed");
+        require(::close(writer.release()) == 0,
+                "hardlink-copy writer close failed");
+      };
+
+      errno = 0;
+      require(::link(source_path.c_str(), disabled_path.c_str()) != 0 &&
+                  errno == EOPNOTSUPP,
+              "link unexpectedly succeeded without --hardlink-as-copy");
+      struct stat missing_status{};
+      errno = 0;
+      require(::stat(disabled_path.c_str(), &missing_status) != 0 &&
+                  errno == ENOENT,
+              "disabled hardlink-as-copy left a destination dentry");
+      read_object(source_path, hardlink_original,
+                  "open source after disabled link");
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.hardlink_copy_requests == 0 &&
+                    shared.hardlink_source_deletes == 0,
+                "disabled hardlink-as-copy changed remote state");
+      }
+
+      mounted.stop();
+      const pid_t hardlink_process = start_daemon(
+          argv[1], mountpoint, listener.port, checksum_option, cache_dir,
+          engine, reactors, true, false, false, nullptr, nullptr, "2MiB",
+          true);
+      mounted.restart(hardlink_process);
+      wait_until_mounted(file_path, hardlink_process);
+
+      errno = 0;
+      require(::link(source_path.c_str(), existing_path.c_str()) != 0 &&
+                  errno == EEXIST,
+              "hardlink-as-copy overwrote an existing destination");
+      read_object(source_path, hardlink_original,
+                  "open source after rejected overwrite");
+      read_object(existing_path, hardlink_existing,
+                  "open existing destination after rejected overwrite");
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.hardlink_copy_requests == 0,
+                "existing-destination rejection issued CopyObject");
+      }
+
+      errno = 0;
+      require(::link(source_path.c_str(), failed_path.c_str()) != 0,
+              "injected hardlink CopyObject failure unexpectedly succeeded");
+      errno = 0;
+      require(::stat(failed_path.c_str(), &missing_status) != 0 &&
+                  errno == ENOENT,
+              "failed hardlink CopyObject installed a destination dentry");
+      read_object(source_path, hardlink_original,
+                  "open source after failed CopyObject");
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.hardlink_copy_requests == 1 &&
+                    shared.hardlink_copy_failures == 1 &&
+                    shared.hardlink_source_deletes == 0,
+                "failed hardlink CopyObject changed its source");
+      }
+
+      require(::link(source_path.c_str(), destination_path.c_str()) == 0,
+              "cross-directory hardlink-as-copy failed");
+      struct stat source_status{};
+      struct stat destination_status{};
+      require(::stat(source_path.c_str(), &source_status) == 0 &&
+                  ::stat(destination_path.c_str(), &destination_status) == 0,
+              "hardlink-as-copy did not expose both independent names");
+      require(source_status.st_ino != destination_status.st_ino &&
+                  source_status.st_nlink == 1 &&
+                  destination_status.st_nlink == 1,
+              "hardlink-as-copy did not create an independent inode");
+      read_object(source_path, hardlink_original,
+                  "open copied source");
+      read_object(destination_path, hardlink_original,
+                  "open copied destination");
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.hardlink_copy_requests == 2 &&
+                    shared.hardlink_source_deletes == 0 &&
+                    shared.hardlink_destination_deletes == 0,
+                "successful hardlink CopyObject deleted an object");
+      }
+
+      write_object(destination_path, hardlink_destination_write,
+                   "open copied destination writer");
+      read_object(source_path, hardlink_original,
+                  "open source after destination write");
+      read_object(destination_path, hardlink_destination_write,
+                  "open destination after destination write");
+
+      write_object(source_path, hardlink_source_write,
+                   "open copied source writer");
+      read_object(source_path, hardlink_source_write,
+                  "open source after source write");
+      read_object(destination_path, hardlink_destination_write,
+                  "open destination after source write");
+
+      retry_after_fuse_release("rename copied destination", [&] {
+        return ::rename(destination_path.c_str(), renamed_path.c_str());
+      });
+      errno = 0;
+      require(::stat(destination_path.c_str(), &missing_status) != 0 &&
+                  errno == ENOENT,
+              "renamed hardlink-copy destination retained its old dentry");
+      read_object(renamed_path, hardlink_destination_write,
+                  "open renamed copied destination");
+
+      retry_after_fuse_release("unlink hardlink-copy source", [&] {
+        return ::unlink(source_path.c_str());
+      });
+      errno = 0;
+      require(::stat(source_path.c_str(), &missing_status) != 0 &&
+                  errno == ENOENT,
+              "application unlink retained the hardlink-copy source");
+      read_object(renamed_path, hardlink_destination_write,
+                  "open destination after source unlink");
+      {
+        std::lock_guard state_guard(shared.mutex);
+        require(shared.hardlink_source_deletes == 1 &&
+                    shared.hardlink_destination_deletes == 0,
+                "application source unlink deleted the wrong object");
+      }
+
+      retry_after_fuse_release("unlink hardlink-copy destination", [&] {
+        return ::unlink(renamed_path.c_str());
+      });
+      errno = 0;
+      require(::stat(renamed_path.c_str(), &missing_status) != 0 &&
+                  errno == ENOENT,
+              "hardlink-copy destination remained after unlink");
+
+      mounted.stop();
+      shared.stop.store(true);
+      server.request_stop();
+      server.join();
+      {
+        std::lock_guard state_guard(shared.mutex);
+        if (shared.failure) {
+          std::rethrow_exception(shared.failure);
+        }
+        require(shared.hardlink_copy_requests == 2 &&
+                    shared.hardlink_copy_failures == 1 &&
+                    shared.hardlink_writes == 2 &&
+                    shared.hardlink_destination_renames == 1 &&
+                    shared.hardlink_source_deletes == 1 &&
+                    shared.hardlink_destination_deletes == 1,
+                "hardlink-as-copy protocol coverage was incomplete");
+        require(shared.special_objects.find("link-source.bin") ==
+                    shared.special_objects.end() &&
+                    shared.special_objects.find("deep/link-copy.bin") ==
+                    shared.special_objects.end() &&
+                    shared.special_objects.find("link-renamed.bin") ==
+                    shared.special_objects.end() &&
+                    shared.special_objects.at("link-existing.bin")->bytes ==
+                        hardlink_existing,
+                "hardlink-as-copy lifecycle left the wrong remote objects");
+      }
+      if (::rmdir(mountpoint.c_str()) != 0) {
+        fail_errno("rmdir hardlink-copy mountpoint");
+      }
+      mountpoint.clear();
+      if (!cache_dir.empty()) {
+        std::filesystem::remove_all(cache_dir);
+        cache_dir.clear();
+      }
+      fputs("FUSE hardlink-as-copy integration passed\n", stdout);
+      return 0;
+    }
 
     if (passthrough_mode) {
       UniqueFd initial(::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
