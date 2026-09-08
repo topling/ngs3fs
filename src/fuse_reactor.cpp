@@ -129,9 +129,8 @@ bool FuseReactor::start_remote_dispatch(
   if (dispatch == nullptr || target == nullptr || target == this) {
     return false;
   }
-  // Reserve the destination's lifetime before shutdown can observe it drained.
-  // This gate is for actual cross-owner work, not the one-reactor fast path.
-  std::shared_lock guard(group_->external_mutex_);
+  // Ingress is the only dispatcher. Peers cannot close their rings until
+  // ingress publishes dispatch_admission_closed_, then drains this admission.
   if (group_->shutting_down_.load(std::memory_order_acquire)) return false;
   target->task_count_.fetch_add(1, std::memory_order_acquire);
   dispatch->task = {dispatch_entry, nullptr, dispatch, dispatch};
@@ -178,16 +177,9 @@ void FuseReactor::release_input_dispatch(
   if (!dispatch->processing_complete) {
     return;
   }
-  if (dispatch->owner != this) {
-    dispatch->owner->dispatch_complete(dispatch);
-    return;
-  }
-  finish_dispatch(dispatch);
-  if (dispatch_count_ == 0) {
-    abort();
-  }
-  --dispatch_count_;
-  if (!submit_receive() && error_ == 0) {
+  FuseReactor* owner = dispatch->owner;
+  owner->dispatch_complete(dispatch);
+  if (owner == this && !submit_receive() && error_ == 0) {
     error_ = -EAGAIN;
   }
 }
@@ -290,15 +282,11 @@ FuseReactor::~FuseReactor() {
     }
   }
   ready_callbacks_.clear();
-  if (dispatch_pipe_[1] >= 0) {
-    ::close(dispatch_pipe_[1]);
-    dispatch_pipe_[1] = -1;
-  }
-  if (dispatch_pipe_[0] >= 0) {
-    fail_dispatches();
-    ::close(dispatch_pipe_[0]);
-  }
-  for (Dispatch* dispatch : free_dispatches_) {
+  while (Dispatch* dispatch = pop_dispatch()) {
+    if (dispatch->reply != nullptr &&
+        !dispatch->reply_submitted.load(std::memory_order_relaxed)) {
+      release_reply(dispatch->reply);
+    }
     if (dispatch->pipe[0] >= 0) {
       ::close(dispatch->pipe[0]);
     }
@@ -307,7 +295,6 @@ FuseReactor::~FuseReactor() {
     }
     delete dispatch;
   }
-  free_dispatches_.clear();
   if (wake_fd_ >= 0) {
     ::close(wake_fd_);
   }
@@ -351,11 +338,6 @@ bool FuseReactor::initialize(FuseReactorGroup* group,
   receive_pending_fds_.resize(receive_fds_.size(), false);
   if (::pipe2(external_pipe_, O_CLOEXEC | O_NONBLOCK) != 0) {
     error = "pipe2(FUSE external replies): " +
-            std::string(strerror(errno));
-    return false;
-  }
-  if (::pipe2(dispatch_pipe_, O_CLOEXEC | O_NONBLOCK) != 0) {
-    error = "pipe2(FUSE dispatch completion): " +
             std::string(strerror(errno));
     return false;
   }
@@ -451,7 +433,6 @@ bool FuseReactor::initialize(FuseReactorGroup* group,
   }
   async_free_ = async_pool_.get();
   io_requests_.reserve(size_t(depth) * 2);
-  free_dispatches_.reserve(depth);
   receiving_.reserve(depth);
   ready_callbacks_.resize(depth, nullptr);
 
@@ -1021,15 +1002,11 @@ bool FuseReactor::submit_receive() noexcept {
         group_->reactors_.size()) return true;
     group_->dispatch_ready_ = true;
   }
-  while (dispatch_count_ + receive_count_ < max_dispatch_count_ &&
-         io_uring_sq_space_left(&ring_) != 0) {
+  while (dispatch_count_.load(std::memory_order_acquire) + receive_count_ <
+         max_dispatch_count_) {
     if (initialization_owner_ && !initialization_complete_ &&
         (!first_receive_ || receive_count_ != 0)) {
       break;
-    }
-    Dispatch* dispatch = acquire_dispatch();
-    if (dispatch == nullptr) {
-      return false;
     }
     unsigned receive_index = unsigned(receive_pending_fds_.size());
     for (unsigned i = 0; i < receive_pending_fds_.size(); ++i) {
@@ -1039,10 +1016,13 @@ bool FuseReactor::submit_receive() noexcept {
       }
     }
     if (receive_index == receive_pending_fds_.size()) {
-      finish_dispatch(dispatch);
       break;
     }
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    Dispatch* dispatch = acquire_dispatch();
+    if (dispatch == nullptr) return false;
+    // MSG_RING success has no ingress CQE. Never sleep with neither a receive
+    // pending nor exhausted admission just because its SQ needed flushing.
+    io_uring_sqe* sqe = acquire_sqe();
     if (sqe == nullptr) {
       finish_dispatch(dispatch);
       return false;
@@ -1125,7 +1105,7 @@ bool FuseReactor::complete_receive(
       const int error = read_dispatch_prefix(current);
       if (error != 0) return error;
     }
-    ++dispatch_count_;
+    dispatch_count_.fetch_add(1, std::memory_order_relaxed);
     ++received_requests_;
     first_receive_ = false;
     current->owner     = this;
@@ -1136,7 +1116,7 @@ bool FuseReactor::complete_receive(
         ? start_dispatch(current)
         : start_remote_dispatch(current, target);
     if (!started) {
-      --dispatch_count_;
+      dispatch_count_.fetch_sub(1, std::memory_order_relaxed);
       return -EAGAIN;
     }
     return 1;
@@ -1160,7 +1140,11 @@ bool FuseReactor::complete_receive(
   if (initialization_owner_ && !initialization_complete_) {
     return submit_receive();
   }
-  while (dispatch_count_ < max_dispatch_count_) {
+  // Foreign returns can now release capacity during this loop. Preserve a
+  // bounded ingress batch so continuous traffic cannot starve local callbacks.
+  for (size_t batch = 1; batch < max_dispatch_count_ &&
+       dispatch_count_.load(std::memory_order_acquire) < max_dispatch_count_;
+       ++batch) {
     Dispatch* next = acquire_dispatch();
     if (next == nullptr) {
       return false;
@@ -1182,20 +1166,6 @@ bool FuseReactor::complete_receive(
     return false;
   }
   return submit_receive();
-}
-
-bool FuseReactor::submit_dispatch_receive() noexcept {
-  if (dispatch_pending_ || io_uring_sq_space_left(&ring_) == 0) {
-    return true;
-  }
-  io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-  if (sqe == nullptr) {
-    return true;
-  }
-  io_uring_prep_poll_add(sqe, dispatch_pipe_[0], POLLIN);
-  io_uring_sqe_set_data(sqe, &dispatch_token_);
-  dispatch_pending_ = true;
-  return true;
 }
 
 bool FuseReactor::submit_task_receive() noexcept {
@@ -1426,6 +1396,21 @@ void FuseReactor::retire_reply(Reply* reply, int result) noexcept {
   }
 }
 
+FuseReactor::Dispatch* FuseReactor::pop_dispatch() noexcept {
+  // Only ingress pops. Producers only push and never dereference the old
+  // head, so no other popper can remove/reinsert it during this CAS (ABA).
+  Dispatch* head = free_dispatches_.load(std::memory_order_acquire);
+  while (head != nullptr) {
+    if (free_dispatches_.compare_exchange_weak(
+            head, head->next_free,
+            std::memory_order_acquire, std::memory_order_acquire)) {
+      head->next_free = nullptr;
+      return head;
+    }
+  }
+  return nullptr;
+}
+
 FuseReactor::Dispatch* FuseReactor::acquire_dispatch() noexcept {
   size_t size = fuse_session_bufsize(session_);
   if (size == 0 || size > INT_MAX) {
@@ -1435,11 +1420,8 @@ FuseReactor::Dispatch* FuseReactor::acquire_dispatch() noexcept {
   if (first_receive_) {
     size = std::min(size, size_t(64U * 1024U));
   }
-  Dispatch* dispatch = nullptr;
-  if (!free_dispatches_.empty()) {
-    dispatch = free_dispatches_.back();
-    free_dispatches_.pop_back();
-  } else {
+  Dispatch* dispatch = pop_dispatch();
+  if (dispatch == nullptr) {
     dispatch = new (std::nothrow) Dispatch;
     if (dispatch == nullptr) {
       error_ = -ENOMEM;
@@ -1460,6 +1442,24 @@ FuseReactor::Dispatch* FuseReactor::acquire_dispatch() noexcept {
     }
     dispatch->capacity = size_t(capacity);
   }
+  // Reclaim the ingress-owned reply reservation only on ingress. A foreign
+  // producer publishes the complete Dispatch untouched, including its pipe.
+  if (dispatch->reply != nullptr &&
+      !dispatch->reply_submitted.load(std::memory_order_relaxed)) {
+    release_reply(dispatch->reply);
+  }
+  dispatch->reply       = nullptr;
+  dispatch->buffer      = {};
+  dispatch->prefix_size = 0;
+  dispatch->task        = {};
+  dispatch->owner       = nullptr;
+  dispatch->target      = nullptr;
+  dispatch->output_fd   = -1;
+  dispatch->input_tasks.store(0, std::memory_order_relaxed);
+  dispatch->processing_complete = false;
+  dispatch->input_drain_needed  = false;
+  dispatch->reply_claimed       = false;
+  dispatch->reply_submitted.store(false, std::memory_order_relaxed);
   if (size <= dispatch->capacity) {
     dispatch->reply = acquire_reply();
     if (dispatch->reply == nullptr) {
@@ -1486,33 +1486,16 @@ FuseReactor::Dispatch* FuseReactor::acquire_dispatch() noexcept {
 }
 
 void FuseReactor::finish_dispatch(Dispatch* dispatch) noexcept {
-  if (dispatch == nullptr) {
-    return;
-  }
-  if (dispatch->reply != nullptr &&
-      !dispatch->reply_submitted.load(std::memory_order_acquire)) {
-    release_reply(dispatch->reply);
-  }
-  dispatch->reply = nullptr;
-  recycle_dispatch(dispatch);
+  if (dispatch != nullptr) recycle_dispatch(dispatch);
 }
 
 void FuseReactor::recycle_dispatch(Dispatch* dispatch) noexcept {
-  if (dispatch == nullptr) {
-    return;
-  }
-  dispatch->buffer = {};
-  dispatch->prefix_size = 0;
-  dispatch->task = {};
-  dispatch->owner = nullptr;
-  dispatch->target = nullptr;
-  dispatch->output_fd = -1;
-  dispatch->input_tasks.store(0, std::memory_order_relaxed);
-  dispatch->processing_complete = false;
-  dispatch->input_drain_needed  = false;
-  dispatch->reply_claimed = false;
-  dispatch->reply_submitted.store(false, std::memory_order_relaxed);
-  free_dispatches_.push_back(dispatch);
+  Dispatch* head = free_dispatches_.load(std::memory_order_relaxed);
+  do {
+    dispatch->next_free = head;
+  } while (!free_dispatches_.compare_exchange_weak(
+      head, dispatch, std::memory_order_release, std::memory_order_relaxed));
+  // The sole consumer can immediately reuse the node. Do not touch it again.
 }
 
 bool FuseReactor::drain_receive_pipe(int fd) noexcept {
@@ -1536,58 +1519,22 @@ bool FuseReactor::drain_receive_pipe(int fd) noexcept {
 }
 
 void FuseReactor::dispatch_complete(Dispatch* dispatch) noexcept {
-  std::shared_lock guard(group_->external_mutex_);
-  Dispatch* value = dispatch;
-  ssize_t result;
-  do {
-    result = ::write(dispatch_pipe_[1], &value, sizeof(value));
-  } while (result < 0 && errno == EINTR);
-  if (result == ssize_t(sizeof(value))) {
-    return;
-  }
-  if (dispatch->pipe[0] >= 0) {
-    ::close(dispatch->pipe[0]);
-  }
-  if (dispatch->pipe[1] >= 0) {
-    ::close(dispatch->pipe[1]);
-  }
-  delete dispatch;
-}
-
-bool FuseReactor::drain_dispatch_pipe() noexcept {
-  for (;;) {
-    std::array<Dispatch*, 32> dispatches{};
+  recycle_dispatch(dispatch);
+  const size_t previous = dispatch_count_.fetch_sub(1, std::memory_order_acq_rel);
+  if (previous == 0) abort();
+  // An ordinary return only pushes the stack. Full admission leaves ingress
+  // without a pending FUSE receive; wake once on the full->available edge.
+  // eventfd retains the wake even if ingress has not entered its wait yet.
+  if (current_ != this &&
+      (previous == max_dispatch_count_ ||
+       (previous == 1 && group_->shutting_down_.load(std::memory_order_acquire)))) {
+    const int saved_errno = errno;
+    const uint64_t wake = 1;
     ssize_t result;
     do {
-      result = ::read(dispatch_pipe_[0], dispatches.data(),
-                      sizeof(dispatches));
+      result = ::write(wake_fd_, &wake, sizeof(wake));
     } while (result < 0 && errno == EINTR);
-    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      return true;
-    }
-    if (result == 0 &&
-        group_->shutting_down_.load(std::memory_order_acquire)) {
-      return true;
-    }
-    if (result <= 0 || size_t(result) % sizeof(Dispatch*) != 0) {
-      error_ = result < 0 ? -errno : -EIO;
-      return false;
-    }
-    const size_t count = size_t(result) / sizeof(Dispatch*);
-    if (count > dispatch_count_) {
-      fprintf(stderr, "FUSE dispatch accounting failed: completed=%zu active=%zu\n",
-              count, dispatch_count_);
-      error_ = -EIO;
-      return false;
-    }
-    for (size_t i = 0; i < count; ++i) {
-      Dispatch* dispatch = dispatches[i];
-      dispatch->processing_complete = true;
-      if (dispatch->input_tasks.load(std::memory_order_acquire) == 0) {
-        finish_dispatch(dispatch);
-        --dispatch_count_;
-      }
-    }
+    errno = saved_errno;
   }
 }
 
@@ -1804,15 +1751,15 @@ void FuseReactor::refresh_io_deadline() noexcept {
 void FuseReactor::fail_remote_dispatch(
     Dispatch* dispatch, int result) noexcept {
   if (dispatch == nullptr || dispatch->owner != this ||
-      dispatch->target == nullptr || dispatch_count_ == 0) {
+      dispatch->target == nullptr ||
+      dispatch_count_.load(std::memory_order_acquire) == 0) {
     error_ = -EIO;
     return;
   }
   dispatch->target->task_count_.fetch_sub(1, std::memory_order_release);
   dispatch->input_tasks.store(0, std::memory_order_relaxed);
   drain_receive_pipe(dispatch->pipe[0]);
-  finish_dispatch(dispatch);
-  --dispatch_count_;
+  dispatch_complete(dispatch);
   if (error_ == 0) {
     error_ = result < 0 ? result : -EIO;
   }
@@ -1836,7 +1783,6 @@ void FuseReactor::drain_shutdown() noexcept {
 
   for (;;) {
     drain_task_pipe();
-    drain_dispatch_pipe();
     run_ready_callbacks();
 
     io_uring_cqe* cqe = nullptr;
@@ -1861,14 +1807,15 @@ void FuseReactor::drain_shutdown() noexcept {
           finish_dispatch(dispatch);
         }
       } else if ((tag & 7) == 3) {
-        ReactorTask* task = reinterpret_cast<ReactorTask*>(tag & ~uintptr_t(7));
-        Dispatch* dispatch = static_cast<Dispatch*>(task->input_owner);
+        Dispatch* dispatch = reinterpret_cast<Dispatch*>(tag & ~uintptr_t(7));
+        if (dispatch->input_tasks.load(std::memory_order_acquire) != 1) abort();
+        ReactorTask* task = &dispatch->task;
         if (!start_task(task)) {
           if (task->cancel != nullptr) task->cancel(task->context);
           task_count_.fetch_sub(1, std::memory_order_release);
           if (dispatch != nullptr) {
             dispatch->processing_complete = true;
-            dispatch->owner->dispatch_complete(dispatch);
+            release_input_dispatch(dispatch, true);
           }
         }
       } else if ((tag & 7) == 4) {
@@ -1880,8 +1827,6 @@ void FuseReactor::drain_shutdown() noexcept {
         wake_pending_ = false;
       } else if (data == &external_token_) {
         external_pending_ = false;
-      } else if (data == &dispatch_token_) {
-        dispatch_pending_ = false;
       } else if (data == &task_token_) {
         task_pending_ = false;
       } else if (data != &cancel_token_) {
@@ -1889,11 +1834,16 @@ void FuseReactor::drain_shutdown() noexcept {
       }
     }
 
-    const bool drained = io_requests_.empty() && async_pending_ == 0 &&
+    // Acquire ingress closure BEFORE reading task_count_: every preceding
+    // MSG_RING reservation must be visible before a peer can close its ring.
+    const bool admission_closed = group_->reactors_.size() <= 1 ||
+        group_->dispatch_admission_closed_.load(std::memory_order_acquire);
+    const bool drained = admission_closed &&
+        io_requests_.empty() && async_pending_ == 0 &&
         !reply_queues_[0].pending && !reply_queues_[1].pending &&
         !cancel_pending &&
         task_count_.load(std::memory_order_acquire) == 0 &&
-        dispatch_count_ == 0 && receive_count_ == 0 &&
+        dispatch_count_.load(std::memory_order_acquire) == 0 && receive_count_ == 0 &&
         callback_count_ == 0;
     if (drained) {
       if (!wake_pending_) break;
@@ -1906,11 +1856,10 @@ void FuseReactor::drain_shutdown() noexcept {
         }
       }
     }
-    // Remote continuations can still return input ownership after the initial
-    // cancellation pass, so keep their completion queues observable.
-    submit_dispatch_receive();
+    // Remote continuations can still finish after the initial cancellation.
     submit_task_receive();
-    if (task_count_.load(std::memory_order_acquire) != 0) submit_wakeup();
+    if (task_count_.load(std::memory_order_acquire) != 0 ||
+        dispatch_count_.load(std::memory_order_acquire) != 0) submit_wakeup();
     if (callback_count_ != 0 || completion_pending_.load(std::memory_order_acquire)) {
       io_uring_submit_and_get_events(&ring_);
       continue;
@@ -1933,9 +1882,7 @@ bool FuseReactor::resume_receive() noexcept {
   // for a locked folio whose request has not yet been read from /dev/fuse.
   const bool receive_ready = reply_queues_[0].count >= max_reply_count_ ||
       submit_receive();
-  if (receive_ready && submit_external_receive() &&
-      submit_dispatch_receive() &&
-      submit_task_receive()) {
+  if (receive_ready && submit_external_receive() && submit_task_receive()) {
     return true;
   }
   if (error_ == 0) {
@@ -2050,26 +1997,6 @@ void FuseReactor::fail_external_replies(int result) noexcept {
   external_pending_ = false;
 }
 
-void FuseReactor::fail_dispatches() noexcept {
-  if (dispatch_pipe_[0] < 0) {
-    return;
-  }
-  Dispatch* dispatch = nullptr;
-  while (::read(dispatch_pipe_[0], &dispatch, sizeof(dispatch)) ==
-         ssize_t(sizeof(dispatch))) {
-    if (dispatch->input_tasks.load(std::memory_order_acquire) != 0) {
-      abort();
-    }
-    drain_receive_pipe(dispatch->pipe[0]);
-    finish_dispatch(dispatch);
-    if (dispatch_count_ != 0) {
-      --dispatch_count_;
-    }
-    dispatch = nullptr;
-  }
-  dispatch_pending_ = false;
-}
-
 int FuseReactor::run() noexcept {
   if (!ring_ready_) return -EINVAL;
   if ((setup_flags_ & IORING_SETUP_R_DISABLED) != 0) {
@@ -2078,8 +2005,7 @@ int FuseReactor::run() noexcept {
   }
   ring_enabled_ = true;
   if (!submit_receive() || !submit_wakeup() ||
-      !submit_external_receive() ||
-      !submit_dispatch_receive() || !submit_task_receive()) {
+      !submit_external_receive() || !submit_task_receive()) {
     return error_ != 0 ? error_ : -EINVAL;
   }
   current_ = this;
@@ -2142,7 +2068,7 @@ int FuseReactor::run() noexcept {
           task_count_.fetch_sub(1, std::memory_order_release);
           if (dispatch != nullptr) {
             dispatch->processing_complete = true;
-            dispatch->owner->dispatch_complete(dispatch);
+            release_input_dispatch(dispatch, true);
           }
           error_ = -ENOMEM;
           break;
@@ -2176,18 +2102,6 @@ int FuseReactor::run() noexcept {
         } else if (!fuse_session_exited(session_) &&
                    (!drain_external_pipe() ||
                     !submit_external_receive())) {
-          if (error_ == 0) {
-            error_ = -EAGAIN;
-          }
-        }
-      } else if (data == &dispatch_token_) {
-        dispatch_pending_ = false;
-        if (completion < 0 && completion != -ECANCELED) {
-          error_ = completion;
-        } else if (!fuse_session_exited(session_) &&
-                   (!drain_dispatch_pipe() ||
-                    !submit_dispatch_receive() ||
-                    !submit_receive())) {
           if (error_ == 0) {
             error_ = -EAGAIN;
           }
@@ -2238,6 +2152,10 @@ int FuseReactor::run() noexcept {
           completion_batch_high_water_, completion_count);
     }
   }
+  if (initialization_owner_) {
+    group_->dispatch_admission_closed_.store(true, std::memory_order_release);
+    group_->wake();
+  }
   group_->begin_shutdown();
   drain_shutdown();
   if (ring_ready_) {
@@ -2247,7 +2165,6 @@ int FuseReactor::run() noexcept {
   }
   fail_replies(error_ != 0 ? error_ : -ENOTCONN);
   fail_external_replies(error_ != 0 ? error_ : -ENOTCONN);
-  fail_dispatches();
   current_ = nullptr;
   return error_;
 }
@@ -2362,9 +2279,8 @@ FuseReactor* FuseReactorGroup::dispatch_reactor(uint64_t inode) noexcept {
 
 void FuseReactorGroup::begin_shutdown() noexcept {
   if (shutting_down_.exchange(true, std::memory_order_acq_rel)) {
-    // Every owner must wait for pre-close reservations, not only the first
-    // owner to set the flag. Otherwise a peer could drain and close its ring
-    // before an already admitted MSG_RING is accounted for.
+    // Wait for external-worker reservations. Reactor dispatch has its own
+    // ingress-closed barrier and does not acquire this gate per request.
     std::unique_lock guard(external_mutex_);
     return;
   }
@@ -2376,9 +2292,6 @@ void FuseReactorGroup::begin_shutdown() noexcept {
       ::close(reactor->external_pipe_[1]);
       reactor->external_pipe_[1] = -1;
     }
-    // Dispatch workers may still be returning FD-backed input ownership.
-    // Keep this queue writable until they have joined; the reactor destructor
-    // drains it before recycling the retained dispatch pipes.
     if (reactor->task_pipe_[1] >= 0) {
       ::close(reactor->task_pipe_[1]);
       reactor->task_pipe_[1] = -1;
@@ -2407,6 +2320,11 @@ int FuseReactorGroup::run() {
   const auto run_reactor = [&](size_t index) {
     FuseReactor& reactor = *reactors_[index];
     const int current = reactor.run();
+    if (index == 0) {
+      // Also close admission if ingress failed before entering its loop.
+      dispatch_admission_closed_.store(true, std::memory_order_release);
+      wake();
+    }
     if (current != 0) {
       int expected = 0;
       result.compare_exchange_strong(expected, current,

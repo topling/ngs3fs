@@ -312,8 +312,8 @@ def write_html(path, comparisons, generated, source_run,
     sqpoll_link = ('<p><a href="sqpoll-comparison.html">SQPOLL vs ordinary uring '
                    'and legacy: daemon and total client CPU</a></p>'
                    if (path.parent / "sqpoll-comparison.html").exists() else "")
-    affinity_link = ('<p><a href="inode-affinity-comparison.html">Round-robin vs '
-                     'inode-affinity reactor routing: daemon and total client CPU</a></p>'
+    affinity_link = ('<p><a href="inode-affinity-comparison.html">Dispatch return-pipe '
+                     'baseline vs direct shared lock-free recycling: daemon and total client CPU</a></p>'
                      if (path.parent / "inode-affinity-comparison.html").exists()
                      else "")
     document = f"""<!doctype html>

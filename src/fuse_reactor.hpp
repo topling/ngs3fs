@@ -180,6 +180,7 @@ class FuseReactor : public IoExecutor {
   };
 
   struct Dispatch {
+    Dispatch* next_free = nullptr;
     fuse_buf buffer = {};
     struct {
       fuse_in_header in;
@@ -200,6 +201,7 @@ class FuseReactor : public IoExecutor {
     bool input_drain_needed  = false;
     bool reply_claimed       = false;
   };
+  static_assert(std::atomic<Dispatch*>::is_always_lock_free);
 
   static ssize_t sync_writev(int fd, iovec* iov, int count,
                              void* userdata) noexcept;
@@ -218,14 +220,12 @@ class FuseReactor : public IoExecutor {
   bool complete_receive(Dispatch* dispatch, int result) noexcept;
   bool submit_wakeup() noexcept;
   bool submit_external_receive() noexcept;
-  bool submit_dispatch_receive() noexcept;
   bool submit_task_receive() noexcept;
   bool submit_external_reply(Reply* reply) noexcept;
   io_uring_sqe* acquire_sqe() noexcept;
   bool submit_io_request(IoRequest* request) noexcept;
   static bool drain_receive_pipe(int fd) noexcept;
   bool drain_external_pipe() noexcept;
-  bool drain_dispatch_pipe() noexcept;
   bool drain_task_pipe() noexcept;
   bool resume_receive() noexcept;
   bool enqueue_reply(Reply* reply) noexcept;
@@ -245,7 +245,7 @@ class FuseReactor : public IoExecutor {
   void refresh_io_deadline() noexcept;
   void drain_shutdown() noexcept;
   void fail_remote_dispatch(Dispatch* dispatch, int result) noexcept;
-  void fail_dispatches() noexcept;
+  Dispatch* pop_dispatch() noexcept;
   Dispatch* acquire_dispatch() noexcept;
   void finish_dispatch(Dispatch* dispatch) noexcept;
   void recycle_dispatch(Dispatch* dispatch) noexcept;
@@ -270,9 +270,8 @@ class FuseReactor : public IoExecutor {
   void* pending_notify_context_    = nullptr;
   bool notify_accepted_            = false;
   int external_pipe_[2]            = {-1, -1};
-  int dispatch_pipe_[2]            = {-1, -1};
   int task_pipe_[2]                = {-1, -1};
-  std::vector<Dispatch*> free_dispatches_;
+  std::atomic<Dispatch*> free_dispatches_{nullptr};
   std::vector<Dispatch*> receiving_;
   std::vector<ReactorTask*> ready_callbacks_;
   size_t callback_head_ = 0;
@@ -315,7 +314,7 @@ class FuseReactor : public IoExecutor {
   uint64_t completions_            = 0;
   size_t completion_batch_high_water_ = 0;
   std::atomic<uint64_t> receive_drains_{0};
-  size_t dispatch_count_           = 0;
+  std::atomic<size_t> dispatch_count_{0};
   size_t receive_count_            = 0;
   size_t max_dispatch_count_       = 0;
   size_t max_task_count_           = 0;
@@ -328,13 +327,11 @@ class FuseReactor : public IoExecutor {
   bool initialization_owner_       = false;
   bool initialization_complete_    = false;
   bool external_pending_           = false;
-  bool dispatch_pending_           = false;
   bool task_pending_               = false;
   bool wake_pending_               = false;
   bool first_receive_              = true;
   bool receive_active_             = false;
   alignas(8) u_char external_token_ = 0;
-  alignas(8) u_char dispatch_token_ = 0;
   alignas(8) u_char task_token_     = 0;
   alignas(8) u_char cancel_token_   = 0;
   alignas(8) u_char wake_token_     = 0;
@@ -383,5 +380,6 @@ class FuseReactorGroup {
   bool initialized_     = false;
   bool primary_stopped_ = false;
   std::atomic<unsigned> running_reactors_{0};
+  std::atomic<bool> dispatch_admission_closed_{false};
   bool dispatch_ready_ = false;
 };

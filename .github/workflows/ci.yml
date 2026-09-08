@@ -255,10 +255,10 @@ jobs:
       - name: Check out ngs3fs
         uses: actions/checkout@v7
 
-      - name: Check out round-robin reactor baseline
+      - name: Check out Dispatch return-pipe baseline
         uses: actions/checkout@v7
         with:
-          ref: 229627f4d244ef0551c44e8038158f38a4f059f3
+          ref: eba195f1cc74c7dc5cc42a5babf1628501a9ee68
           path: build/baseline-src
 
       - name: Check out FlameGraph
@@ -301,10 +301,10 @@ jobs:
           python3 scripts/download_reference_binaries.py \
             build/tools build/tools/reference-binaries.json
 
-      - name: Build round-robin reactor baseline
+      - name: Build Dispatch return-pipe baseline
         run: |
           test "$(git -C build/baseline-src rev-parse HEAD)" = \
-            229627f4d244ef0551c44e8038158f38a4f059f3
+            eba195f1cc74c7dc5cc42a5babf1628501a9ee68
           cmake -S build/baseline-src -B build/baseline -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DNGS3FS_BUILD_TESTS=OFF \
@@ -364,11 +364,11 @@ jobs:
             cat "build/benchmarks/github-io-engine-$advice/summary.md" >> "$GITHUB_STEP_SUMMARY"
           done
 
-      - name: A/B test round-robin and inode-affinity routing
+      - name: A/B test Dispatch recycling
         env:
           BENCHMARK_REPETITIONS: 3
           BENCHMARK_VARIANTS: baseline=${{ github.workspace }}/build/baseline/ngs3fs current=${{ github.workspace }}/build/dev/ngs3fs
-          BENCHMARK_VARIANT_REVISIONS: baseline=229627f4d244ef0551c44e8038158f38a4f059f3 current=${{ github.sha }}
+          BENCHMARK_VARIANT_REVISIONS: baseline=eba195f1cc74c7dc5cc42a5babf1628501a9ee68 current=${{ github.sha }}
           NGS3FS_IO_ENGINE: uring
           NGS3FS_REACTORS: 4
           RANDOM_READ_OPERATIONS: 512
@@ -399,7 +399,7 @@ jobs:
               "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-affinity-cache-$mode"
           done
 
-      - name: Profile round-robin reactor baseline
+      - name: Profile Dispatch return-pipe baseline
         if: always()
         run: |
           sudo env \

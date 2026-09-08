@@ -9,8 +9,12 @@ from pathlib import Path
 from statistics import median
 
 SUITES = ("normal", "random", "cache-cold", "cache-warm", "cache-unlimited")
-AFFINITY_SUITES = ("affinity-normal", "affinity-random",
+DISPATCH_SUITES = ("affinity-normal", "affinity-random",
                    "affinity-cache-cold", "affinity-cache-warm")
+DISPATCH_BASELINE = ("inode-hash routing with the Dispatch return pipe "
+                     "(eba195f1cc74c7dc5cc42a5babf1628501a9ee68)")
+DISPATCH_CURRENT = ("inode-hash routing with the direct shared lock-free "
+                    "Dispatch allocation/reclamation stack")
 NAME = re.compile(r"^(?P<engine>.+)-(?P<reactors>[0-9]+)-r[0-9]+$")
 
 def rows(path: Path):
@@ -59,8 +63,11 @@ def pct(value, baseline):
         return "n/a (zero baseline)"
     return f"{(value / baseline - 1) * 100:+.2f}%"
 
-def report(data_by_suite, title="I/O-engine CPU comparison"):
-    out = [f"# {title}", "", "Medians over per-sample `client-cpu.csv` files. Daemon CPU/op is from `summary.csv`; total CPU/op is daemon plus workload from `client-cpu.csv`. Daemon CPU includes kernel SQPOLL threads. CPU excludes the S3 server and unattributed global kernel work; it is not wall time or perf-instrumented CPU. Negative percentages mean savings.", ""]
+def report(data_by_suite, title="I/O-engine CPU comparison", provenance=""):
+    out = [f"# {title}", ""]
+    if provenance:
+        out += [provenance, ""]
+    out += ["Medians over per-sample `client-cpu.csv` files. Daemon CPU/op is from `summary.csv`; total CPU/op is daemon plus workload from `client-cpu.csv`. Daemon CPU includes kernel SQPOLL threads. CPU excludes the S3 server and unattributed global kernel work; it is not wall time or perf-instrumented CPU. Negative percentages mean savings.", ""]
     for suite, data in data_by_suite.items():
         out += [f"## {suite}", "", "| Configuration | Samples | Daemon CPU/op | Total CPU/op |", "|---|---:|---:|---:|"]
         for (engine, reactors), (count, daemon, total) in sorted(data.items()):
@@ -74,19 +81,22 @@ def report(data_by_suite, title="I/O-engine CPU comparison"):
         baseline = data.get(("baseline", 4))
         current = data.get(("current", 4))
         if baseline and current:
-            out += ["", "Inode-affinity delta (current versus baseline):", "",
+            out += ["", "Direct-recycling delta (current versus return-pipe baseline):", "",
                     f"- daemon {pct(current[1], baseline[1])}; total {pct(current[2], baseline[2])}"]
         out.append("")
     return "\n".join(out)
 
-def html(data_by_suite, missing=(), title="I/O-engine CPU comparison"):
+def html(data_by_suite, missing=(), title="I/O-engine CPU comparison",
+         provenance=""):
     out = [
         "<!doctype html><meta charset=\"utf-8\">",
         f"<title>{escape(title)}</title>",
         "<style>body{font:14px sans-serif;max-width:1100px;margin:2em auto}table{border-collapse:collapse;margin:1em 0 2em}th,td{border:1px solid #bbb;padding:.35em .6em;text-align:right}th:first-child,td:first-child{text-align:left}</style>",
         f"<h1>{escape(title)}</h1>",
-        "<p>Medians over per-sample <code>client-cpu.csv</code>; daemon CPU/op is from <code>summary.csv</code> and includes kernel SQPOLL threads. Total CPU/op is daemon plus workload, excluding the S3 server and unattributed global kernel work. Negative percentages mean savings; this is not wall time or perf-instrumented CPU.</p>",
     ]
+    if provenance:
+        out.append(f"<p>{escape(provenance)}</p>")
+    out.append("<p>Medians over per-sample <code>client-cpu.csv</code>; daemon CPU/op is from <code>summary.csv</code> and includes kernel SQPOLL threads. Total CPU/op is daemon plus workload, excluding the S3 server and unattributed global kernel work. Negative percentages mean savings; this is not wall time or perf-instrumented CPU.</p>")
     for suite, data in data_by_suite.items():
         out.append(f"<h2>{escape(suite)}</h2><table><thead><tr><th>Configuration</th><th>Samples</th><th>Daemon CPU/op</th><th>Total CPU/op</th></tr></thead><tbody>")
         for (engine, reactors), (count, daemon, total) in sorted(data.items()):
@@ -102,7 +112,7 @@ def html(data_by_suite, missing=(), title="I/O-engine CPU comparison"):
         baseline = data.get(("baseline", 4))
         current = data.get(("current", 4))
         if baseline and current:
-            out.append("<p>Inode-affinity delta (current versus baseline): "
+            out.append("<p>Direct-recycling delta (current versus return-pipe baseline): "
                        f"daemon {pct(current[1], baseline[1])}; "
                        f"total {pct(current[2], baseline[2])}</p>")
     if missing:
@@ -135,17 +145,20 @@ def main():
         text += "\nMissing suites: " + ", ".join(missing) + "\n"
     (destination_dir / "sqpoll-comparison.md").write_text(text, encoding="utf-8")
     (destination_dir / "sqpoll-comparison.html").write_text(html(data, missing), encoding="utf-8")
-    affinity = {suite: data[suite] for suite in AFFINITY_SUITES if suite in data}
-    if affinity:
-        affinity_missing = [suite for suite in AFFINITY_SUITES if suite not in affinity]
-        affinity_title = "Inode-affinity reactor CPU comparison"
-        affinity_text = report(affinity, affinity_title)
-        if affinity_missing:
-            affinity_text += "\nMissing suites: " + ", ".join(affinity_missing) + "\n"
+    dispatch = {suite: data[suite] for suite in DISPATCH_SUITES if suite in data}
+    if dispatch:
+        dispatch_missing = [suite for suite in DISPATCH_SUITES if suite not in dispatch]
+        dispatch_title = "Dispatch recycling CPU comparison"
+        provenance = f"Baseline: {DISPATCH_BASELINE}. Current: {DISPATCH_CURRENT}."
+        dispatch_text = report(dispatch, dispatch_title, provenance)
+        if dispatch_missing:
+            dispatch_text += "\nMissing suites: " + ", ".join(dispatch_missing) + "\n"
         (destination_dir / "inode-affinity-comparison.md").write_text(
-            affinity_text, encoding="utf-8")
+            dispatch_text, encoding="utf-8")
+        dispatch_html = html(dispatch, dispatch_missing, dispatch_title,
+                             provenance)
         (destination_dir / "inode-affinity-comparison.html").write_text(
-            html(affinity, affinity_missing, affinity_title), encoding="utf-8")
+            dispatch_html, encoding="utf-8")
 
 if __name__ == "__main__":
     main()

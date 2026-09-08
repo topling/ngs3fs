@@ -179,6 +179,243 @@ struct ReactorIoTest {
     return 0;
   }
 
+  static int dispatch_freelist_case() {
+    const auto require = [](bool condition, const char* message) {
+      if (!condition) throw std::runtime_error(message);
+    };
+    constexpr size_t node_count = 48;
+    constexpr size_t producer_count = 3;
+    constexpr size_t rounds = 128;
+
+    FuseReactorGroup group;
+    auto owner_value = std::make_unique<FuseReactor>();
+    FuseReactor* owner = owner_value.get();
+    owner->group_ = &group;
+    owner->max_dispatch_count_ = 4;
+    owner->wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    require(owner->wake_fd_ >= 0, "create dispatch free-list wake eventfd");
+    group.reactors_.push_back(std::move(owner_value));
+
+    std::array<FuseReactor::Dispatch*, node_count> nodes{};
+    for (FuseReactor::Dispatch*& node : nodes) {
+      node = new FuseReactor::Dispatch;
+    }
+
+    owner->recycle_dispatch(nodes[0]);
+    owner->recycle_dispatch(nodes[1]);
+    owner->recycle_dispatch(nodes[2]);
+    require(owner->pop_dispatch() == nodes[2] &&
+            owner->pop_dispatch() == nodes[1] &&
+            owner->pop_dispatch() == nodes[0] &&
+            owner->pop_dispatch() == nullptr,
+            "dispatch free list is not LIFO");
+
+    std::barrier phase(producer_count + 1);
+    std::atomic<bool> publication_failed{false};
+    std::array<std::thread, producer_count> producers;
+    for (size_t producer = 0; producer < producer_count; ++producer) {
+      producers[producer] = std::thread([&, producer] {
+        for (size_t round = 0; round < rounds; ++round) {
+          phase.arrive_and_wait();
+          for (size_t index = producer; index < nodes.size();
+               index += producer_count) {
+            owner->recycle_dispatch(nodes[index]);
+          }
+          phase.arrive_and_wait();
+        }
+      });
+    }
+    for (size_t round = 0; round < rounds; ++round) {
+      std::array<bool, node_count> seen{};
+      phase.arrive_and_wait();
+      for (size_t consumed = 0; consumed < nodes.size();) {
+        FuseReactor::Dispatch* node = owner->pop_dispatch();
+        if (node == nullptr) {
+          std::this_thread::yield();
+          continue;
+        }
+        size_t index = 0;
+        while (index < nodes.size() && nodes[index] != node) ++index;
+        if (index == nodes.size() || seen[index]) {
+          publication_failed.store(true, std::memory_order_relaxed);
+        } else {
+          seen[index] = true;
+        }
+        ++consumed;
+      }
+      if (owner->pop_dispatch() != nullptr) {
+        publication_failed.store(true, std::memory_order_relaxed);
+      }
+      for (bool present : seen) {
+        if (!present) publication_failed.store(true, std::memory_order_relaxed);
+      }
+      phase.arrive_and_wait();
+    }
+    for (std::thread& producer : producers) producer.join();
+    require(!publication_failed.load(std::memory_order_relaxed),
+            "concurrent dispatch publication lost or duplicated a node");
+
+    FuseReactor::Dispatch* retained = nodes[0];
+    require(::pipe2(retained->pipe, O_CLOEXEC | O_NONBLOCK) == 0,
+            "create retained dispatch input pipe");
+    const int retained_read_fd = retained->pipe[0];
+    const int retained_write_fd = retained->pipe[1];
+    owner->recycle_dispatch(retained);
+    require(owner->pop_dispatch() == retained &&
+            retained->pipe[0] == retained_read_fd &&
+            retained->pipe[1] == retained_write_fd,
+            "dispatch recycle replaced its input pipe");
+    const char sent = 'd';
+    char received = 0;
+    require(::write(retained_write_fd, &sent, 1) == 1 &&
+            ::read(retained_read_fd, &received, 1) == 1 && received == sent,
+            "recycled dispatch input pipe is not usable");
+
+    FuseReactor target;
+    target.group_ = &group;
+    retained->owner = owner;
+    retained->target = &target;
+    retained->processing_complete = true;
+    retained->input_tasks.store(2, std::memory_order_relaxed);
+    owner->dispatch_count_.store(1, std::memory_order_relaxed);
+    target.release_input_dispatch(retained, false);
+    require(owner->pop_dispatch() == nullptr &&
+            owner->dispatch_count_.load(std::memory_order_relaxed) == 1,
+            "dispatch was recycled while retained input was active");
+    target.release_input_dispatch(retained, false);
+    require(owner->pop_dispatch() == retained &&
+            owner->dispatch_count_.load(std::memory_order_relaxed) == 0,
+            "final retained-input release did not recycle the dispatch");
+
+    const auto expect_wake = [&](uint64_t expected, const char* message) {
+      uint64_t value = 0;
+      const ssize_t result = ::read(owner->wake_fd_, &value, sizeof(value));
+      require(result == ssize_t(sizeof(value)) && value == expected, message);
+    };
+    const auto expect_no_wake = [&](const char* message) {
+      uint64_t value = 0;
+      errno = 0;
+      const ssize_t result = ::read(owner->wake_fd_, &value, sizeof(value));
+      require(result < 0 && errno == EAGAIN, message);
+    };
+
+    retained->owner = owner;
+    retained->target = &target;
+    retained->input_tasks.store(1, std::memory_order_relaxed);
+    owner->dispatch_count_.store(owner->max_dispatch_count_,
+                                 std::memory_order_relaxed);
+    target.task_count_.store(1, std::memory_order_relaxed);
+    require(::write(retained_write_fd, &sent, 1) == 1,
+            "write failed MSG_RING input fixture");
+    owner->fail_remote_dispatch(retained, -EBADF);
+    require(owner->pop_dispatch() == retained &&
+            owner->dispatch_count_.load(std::memory_order_relaxed) ==
+                owner->max_dispatch_count_ - 1 &&
+            target.task_count_.load(std::memory_order_relaxed) == 0 &&
+            retained->input_tasks.load(std::memory_order_relaxed) == 0,
+            "MSG_RING failure did not restore dispatch admission");
+    expect_wake(1, "MSG_RING failure did not wake saturated ingress");
+    errno = 0;
+    require(::read(retained_read_fd, &received, 1) < 0 && errno == EAGAIN,
+            "MSG_RING failure left request input in the retained pipe");
+    owner->error_ = 0;
+
+    group.shutting_down_.store(false, std::memory_order_relaxed);
+    owner->dispatch_count_.store(owner->max_dispatch_count_ - 1,
+                                 std::memory_order_relaxed);
+    owner->dispatch_complete(nodes[1]);
+    require(owner->pop_dispatch() == nodes[1],
+            "ordinary completion did not publish its dispatch");
+    expect_no_wake("unsaturated completion woke the receive owner");
+
+    owner->dispatch_count_.store(owner->max_dispatch_count_,
+                                 std::memory_order_relaxed);
+    owner->dispatch_complete(nodes[1]);
+    require(owner->pop_dispatch() == nodes[1],
+            "saturated completion did not publish its dispatch");
+    expect_wake(1, "saturated-to-available completion did not wake the owner");
+
+    group.shutting_down_.store(true, std::memory_order_release);
+    owner->dispatch_count_.store(2, std::memory_order_relaxed);
+    owner->dispatch_complete(nodes[1]);
+    require(owner->pop_dispatch() == nodes[1],
+            "shutdown completion did not publish its dispatch");
+    expect_no_wake("non-final shutdown completion woke the owner");
+    owner->dispatch_count_.store(1, std::memory_order_relaxed);
+    owner->dispatch_complete(nodes[1]);
+    require(owner->pop_dispatch() == nodes[1],
+            "final shutdown completion did not publish its dispatch");
+    expect_wake(1, "final shutdown completion did not wake the owner");
+
+    for (FuseReactor::Dispatch* node : nodes) owner->recycle_dispatch(node);
+    return 0;
+  }
+
+  static int shutdown_msg_ring_case() {
+    ReactorIoTest test;
+    if (!test.initialize(false)) return test.failed ? 1 : 77;
+    const auto require = [](bool condition, const char* message) {
+      if (!condition) throw std::runtime_error(message);
+    };
+
+    FuseReactor& source = test.reactor();
+    auto target_value = std::make_unique<FuseReactor>();
+    FuseReactor* target = target_value.get();
+    std::string error;
+    require(target->initialize(&test.group, test.session, test.fake_fuse.get(),
+                               false, false, 8, 0, false, error),
+            "initialize shutdown MSG_RING target");
+    test.group.reactors_.push_back(std::move(target_value));
+    require(io_uring_enable_rings(&source.ring_) == 0 &&
+            io_uring_enable_rings(&target->ring_) == 0,
+            "enable shutdown MSG_RING rings");
+    source.ring_enabled_ = true;
+    target->ring_enabled_ = true;
+
+    auto* dispatch = new FuseReactor::Dispatch;
+    require(::pipe2(dispatch->pipe, O_CLOEXEC | O_NONBLOCK) == 0,
+            "create shutdown MSG_RING input pipe");
+    dispatch->owner = &source;
+    source.dispatch_count_.store(1, std::memory_order_relaxed);
+    require(source.start_remote_dispatch(dispatch, target),
+            "reserve shutdown MSG_RING dispatch");
+    dispatch->task.run = [](void* context) noexcept {
+      static_cast<FuseReactor::Dispatch*>(context)->processing_complete = true;
+    };
+
+    test.group.shutting_down_.store(true, std::memory_order_release);
+    require(!test.group.dispatch_admission_closed_.load(
+                std::memory_order_acquire) &&
+            target->task_count_.load(std::memory_order_acquire) == 1,
+            "peer drained before ingress closed MSG_RING admission");
+    require(io_uring_submit(&source.ring_) >= 1,
+            "submit shutdown MSG_RING dispatch");
+    test.group.dispatch_admission_closed_.store(true,
+                                                std::memory_order_release);
+    io_uring_cqe* cqe = nullptr;
+    require(io_uring_wait_cqe(&target->ring_, &cqe) == 0,
+            "wait for shutdown MSG_RING dispatch");
+    const uintptr_t tagged = uintptr_t(io_uring_cqe_get_data(cqe));
+    io_uring_cqe_seen(&target->ring_, cqe);
+    require((tagged & 7) == 3,
+            "shutdown MSG_RING returned an incorrect CQ tag");
+    auto* received = reinterpret_cast<FuseReactor::Dispatch*>(
+        tagged & ~uintptr_t(7));
+    require(received == dispatch && target->start_task(&received->task),
+            "shutdown MSG_RING did not preserve Dispatch ownership");
+    require(target->run_ready_callbacks(),
+            "shutdown MSG_RING callback did not complete");
+
+    require(test.group.dispatch_admission_closed_.load(
+                std::memory_order_acquire) &&
+            target->task_count_.load(std::memory_order_acquire) == 0 &&
+            source.dispatch_count_.load(std::memory_order_acquire) == 0 &&
+            source.pop_dispatch() == dispatch,
+            "shutdown did not drain the admitted MSG_RING dispatch");
+    source.recycle_dispatch(dispatch);
+    return 0;
+  }
+
   bool check(bool condition, const char* message) noexcept {
     if (!condition) {
       fprintf(stderr, "reactor_io_test: %s\n", message);
@@ -984,9 +1221,15 @@ struct ReactorIoTest {
 int main(int argc, char** argv) {
   const bool sqpoll = argc == 2 && strcmp(argv[1], "--sqpoll") == 0;
   const bool dispatch = argc == 2 && strcmp(argv[1], "--dispatch") == 0;
-  if (argc > 1 && !sqpoll && !dispatch) return 1;
+  const bool dispatch_freelist =
+      argc == 2 && strcmp(argv[1], "--dispatch-freelist") == 0;
+  if (argc > 1 && !sqpoll && !dispatch && !dispatch_freelist) return 1;
   try {
     if (dispatch) return ReactorIoTest::dispatch_case();
+    if (dispatch_freelist) {
+      const int result = ReactorIoTest::dispatch_freelist_case();
+      return result != 0 ? result : ReactorIoTest::shutdown_msg_ring_case();
+    }
     ReactorIoTest test;
     if (!test.initialize(sqpoll)) return test.failed ? 1 : 77;
     return test.run();

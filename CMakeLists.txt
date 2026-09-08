@@ -201,7 +201,12 @@ if(NGS3FS_BUILD_TESTS)
   add_test(NAME reactor_io_test COMMAND reactor_io_test)
   add_test(NAME reactor_sqpoll_io_test COMMAND reactor_io_test --sqpoll)
   add_test(NAME reactor_inode_dispatch_test COMMAND reactor_io_test --dispatch)
-  set_tests_properties(reactor_inode_dispatch_test PROPERTIES TIMEOUT 10)
+  add_test(NAME reactor_dispatch_freelist_test
+    COMMAND reactor_io_test --dispatch-freelist)
+  set_tests_properties(reactor_inode_dispatch_test reactor_dispatch_freelist_test
+    PROPERTIES TIMEOUT 10)
+  set_tests_properties(reactor_dispatch_freelist_test
+    PROPERTIES SKIP_RETURN_CODE 77)
   set_tests_properties(reactor_io_test reactor_sqpoll_io_test
     PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
 

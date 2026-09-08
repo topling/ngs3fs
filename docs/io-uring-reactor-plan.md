@@ -1,5 +1,41 @@
 # io_uring reactor execution contract
 
+## Direct Dispatch freelist (2026-09-08)
+
+`Dispatch` allocation and reclamation use one intrusive lock-free LIFO stack.
+Only the ingress reactor pops; execution reactors push directly when the final
+FD-backed input reference is released. There is no pending-return queue, batch
+transfer into another freelist, or reverse pointer pipe. The FUSE input-data
+pipe remains a member of `Dispatch` and is reused with the object.
+
+Publish pushes with release ordering and pop with acquire ordering. The sole
+popper prevents concurrent-pop ABA; producers never dereference the previous
+head. Reset request fields and manage the ingress-owned reserved Reply only
+after popping, not on a foreign reactor. After publishing a returned node,
+the returning thread must not access it again. Destroy nodes/pipes only after
+all reactor threads have joined.
+
+Admission accounting becomes atomic so foreign returns release capacity
+directly. Ordinary returns have no syscall. Only a transition from fully used
+receive capacity to available capacity needs to wake ingress using its existing
+eventfd; shutdown may also wake on its last outstanding return. A receive SQE
+must not be silently skipped because the SQ is full: flush/acquire SQ space so
+an idle ingress always has a receive pending unless capacity is exhausted.
+
+Forward MSG_RING publication does not take a per-request shared mutex. Ingress
+publishes an admission-closed flag after it can no longer submit dispatches;
+peers acquire this flag before deciding their admitted work is drained and
+closing their rings. External CPU-worker admission retains its own existing
+synchronization. Failure CQEs must release both target admission and ingress
+capacity exactly once. Retained WRITE input remains unavailable for reuse until
+the final consumer has consumed or drained it.
+
+Validate LIFO reuse, concurrent producers with one popper, retained pipe/input
+lifetime, saturation-only wakeups, MSG_RING failure and shutdown. Local work is
+compilation and non-mounted unit tests only. Runner CI executes mounted tests,
+stress, sanitizers, and CPU A/B against the pre-stack inode-hash implementation,
+with ordinary one/four-reactor comparisons and readable flamegraph evidence.
+
 ## Stable inode dispatch (2026-09-08)
 
 Multi-reactor mounts route requests by a fixed 64-bit mix of the FUSE inode
@@ -7,8 +43,10 @@ number, modulo the reactor count. The input pipe is a recycled request
 container, not a file identity, and must not be used as the affinity key.
 Requests for the same inode keep one reactor for the lifetime of the mount.
 Directory operations use their protocol parent inode; multi-inode operations
-retain the existing locks. No work stealing, live migration, or lock removal
-is part of this change. One reactor can still issue concurrent object I/O.
+retain the existing locks. No work stealing, live migration, or inode/namespace
+lock removal is part of this change. Transport lifecycle synchronization is
+specified in the direct-freelist section above. One reactor can still issue
+concurrent object I/O.
 
 Reactor 0 remains the FUSE receiver. For multiple reactors it consumes the same
 bounded request prefix that libfuse already reads, then hands that prefix and
@@ -26,9 +64,11 @@ can distinguish locality gains from an imbalanced hot-inode workload.
 
 Local validation is limited to compilation and unit tests. Stress, mounted
 tests, paired CPU benchmarks, and flamegraphs run only on GitHub runners.
-Compare ordinary uring with four reactors against the previous batched
-round-robin implementation on the same runner; do not infer a CPU win from
-the routing policy alone.
+The original affinity experiment compared four-reactor uring against batched
+round robin. The direct-freelist experiment instead pins the already
+inode-affine return-pipe implementation as its baseline. Keep each A/B on the
+same runner and record both revisions; do not infer a CPU win from routing or
+reclamation policy alone.
 
 Status: the aligned whole-block receive revision and global STORE removal
 below are implemented. The no-STORE revision passes all 92 local CTest cases
