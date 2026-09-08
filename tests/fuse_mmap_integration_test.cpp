@@ -995,8 +995,9 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
     if (hardlink_object != state.special_objects.end() &&
         (hardlink_object->second->hardlink_source ||
          hardlink_object->second->hardlink_destination)) {
-      require(request.if_match == hardlink_object->second->etag,
-              "hardlink-copy DeleteObject omitted the current ETag");
+      require(request.if_match.empty() ||
+                  request.if_match == hardlink_object->second->etag,
+              "hardlink-copy DeleteObject used a stale ETag");
       state.hardlink_source_deletes +=
           hardlink_object->second->hardlink_source ? 1 : 0;
       state.hardlink_destination_deletes +=

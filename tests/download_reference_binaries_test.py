@@ -95,6 +95,7 @@ class DownloadReferenceBinariesTest(unittest.TestCase):
             output = pathlib.Path(directory) / "tools"
             manifest_path = output / "reference-binaries.json"
             with mock.patch.object(MODULE, "get_json", side_effect=lambda url: releases[url]), \
+                 mock.patch.object(MODULE.platform, "machine", return_value="x86_64"), \
                  mock.patch.object(MODULE, "download", side_effect=fake_download), \
                  mock.patch.object(MODULE, "version", side_effect=lambda path: f"{path.name} mock-version"), \
                  mock.patch.object(sys, "argv", ["download_reference_binaries.py", str(output), str(manifest_path)]):
@@ -106,6 +107,14 @@ class DownloadReferenceBinariesTest(unittest.TestCase):
             self.assertTrue(manifest["goofys"]["sha256_verified"])
             self.assertEqual((output / "mount-s3").read_bytes(), b"mock mount binary")
             self.assertEqual((output / "goofys").read_bytes(), goofys_payload)
+
+    def test_unsupported_architecture_is_rejected_before_network(self):
+        with mock.patch.object(MODULE.platform, "machine", return_value="aarch64"), \
+             mock.patch.object(MODULE, "get_json") as request, \
+             mock.patch.object(sys, "argv", ["download_reference_binaries.py", "unused", "unused.json"]):
+            with self.assertRaisesRegex(SystemExit, "unsupported runner architecture: aarch64"):
+                MODULE.main()
+            request.assert_not_called()
 
 
 if __name__ == "__main__":
