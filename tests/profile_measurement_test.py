@@ -9,15 +9,23 @@ import unittest
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 PROFILE_SCRIPT = PROJECT_DIR / "scripts" / "profile_ngs3fs.sh"
+COMPARE_SCRIPT = PROJECT_DIR / "scripts" / "compare_goofys.sh"
 
 
-def extract_measurement_function():
+def extract_shell_function(name):
     lines = PROFILE_SCRIPT.read_text(encoding="utf-8").splitlines(keepends=True)
-    start = lines.index("run_profile_measurement() {\n")
+    start = lines.index(f"{name}() {{\n")
     for end in range(start + 1, len(lines)):
         if lines[end] == "}\n":
             return "".join(lines[start:end + 1])
-    raise AssertionError("run_profile_measurement has no closing brace")
+    raise AssertionError(f"{name} has no closing brace")
+
+
+MEASUREMENT_FUNCTIONS = "\n".join(
+    extract_shell_function(name)
+    for name in ("close_perf_control", "control_perf_record",
+                 "run_profile_measurement")
+)
 
 
 HARNESS = r"""
@@ -37,6 +45,11 @@ perf_event=stub
 perf_mmap_size=1
 perf_stat_events=stub
 ngs3fs_pid=123
+perf_control_fd=
+perf_ack_fd=
+perf_control_fifo=
+perf_ack_fifo=
+perf_control_timeout_seconds=${PERF_CONTROL_TIMEOUT_SECONDS:-0.2}
 bench=mmap_bench_stub
 random_bench=random_bench_stub
 iterations=7
@@ -61,6 +74,7 @@ printf 'old request outside measurement\n' >"$run_dir/versity-access.log"
 : >"$run_dir/system.txt"
 : >"$run_dir/bench-calls.txt"
 : >"$run_dir/drop-calls.txt"
+: >"$run_dir/perf-control.txt"
 
 drop_measurement_caches() {
   drop_calls=$((drop_calls + 1))
@@ -128,6 +142,40 @@ perf_stub() {
   local mode=$1
   shift
   if [[ "$mode" = record ]]; then
+    local control_spec=
+    local delayed=0
+    while (($#)); do
+      case "$1" in
+        --control)
+          control_spec=$2
+          shift 2
+          ;;
+        --delay)
+          [[ "$2" = -1 ]] && delayed=1
+          shift 2
+          ;;
+        *) shift ;;
+      esac
+    done
+    [[ "$delayed" = 1 && "$control_spec" = fifo:*,* ]] || return 2
+    local fifo_spec=${control_spec#fifo:}
+    local control_fifo=${fifo_spec%%,*}
+    local ack_fifo=${fifo_spec#*,}
+    local command
+    exec 7<>"$control_fifo"
+    exec 8<>"$ack_fifo"
+    while IFS= read -r command <&7; do
+      printf '%s:%s\n' "$attempt" "$command" \
+        >>"$run_dir/perf-control.txt"
+      if [[ "${PERF_STUB_ACK:-1}" != 1 ]]; then
+        return 0
+      fi
+      # perf writes sizeof("ack\n"), including the trailing NUL.
+      printf 'ack\n\0' >&8
+      if [[ "$command" = disable ]]; then
+        return 0
+      fi
+    done
     return 0
   fi
   if [[ "$mode" != stat ]]; then
@@ -154,7 +202,7 @@ class ProfileMeasurementTest(unittest.TestCase):
             harness.write_text(
                 textwrap.dedent(HARNESS).lstrip()
                 + "\n"
-                + extract_measurement_function()
+                + MEASUREMENT_FUNCTIONS
                 + textwrap.dedent(
                     """
 
@@ -189,9 +237,13 @@ class ProfileMeasurementTest(unittest.TestCase):
             system = (run_dir / "system.txt").read_text(encoding="utf-8")
             drops = (run_dir / "drop-calls.txt").read_text(
                 encoding="utf-8").splitlines()
-            return metadata, calls, system, drops
+            controls = (run_dir / "perf-control.txt").read_text(
+                encoding="utf-8").splitlines()
+            fifos = list(run_dir.glob("perf-*.fifo"))
+            return metadata, calls, system, drops, controls, fifos
 
-    def assert_common_attempts(self, metadata, system, drops):
+    def assert_common_attempts(self, metadata, system, drops,
+                               controls, fifos):
         self.assertEqual([row["profile_attempt"] for row in metadata], ["1", "2"])
         self.assertEqual(metadata[0]["s3_get_requests"], "2")
         self.assertEqual(metadata[0]["s3_head_requests"], "1")
@@ -204,10 +256,14 @@ class ProfileMeasurementTest(unittest.TestCase):
         self.assertEqual(drops, ["1", "2"])
         self.assertIn("cache_drop_status_attempt_1=success-1\n", system)
         self.assertIn("cache_drop_status_attempt_2=success-2\n", system)
+        self.assertEqual(controls,
+                         ["1:enable", "1:disable", "2:enable", "2:disable"])
+        self.assertEqual(fifos, [])
 
     def test_mmap_first_pass_and_retry_scale_operations(self):
-        metadata, calls, system, drops = self.run_workload("mmap")
-        self.assert_common_attempts(metadata, system, drops)
+        metadata, calls, system, drops, controls, fifos = \
+            self.run_workload("mmap")
+        self.assert_common_attempts(metadata, system, drops, controls, fifos)
         self.assertEqual([row["actual_operations"] for row in metadata],
                          ["7", "28"])
         self.assertEqual([row["actual_operations_unit"] for row in metadata],
@@ -217,8 +273,9 @@ class ProfileMeasurementTest(unittest.TestCase):
         self.assertEqual([call[-2] for call in calls], ["7", "28"])
 
     def test_random_read_first_pass_and_retry_scale_each_thread(self):
-        metadata, calls, system, drops = self.run_workload("random-read")
-        self.assert_common_attempts(metadata, system, drops)
+        metadata, calls, system, drops, controls, fifos = \
+            self.run_workload("random-read")
+        self.assert_common_attempts(metadata, system, drops, controls, fifos)
         self.assertEqual([row["actual_operations"] for row in metadata],
                          ["15", "60"])
         self.assertEqual([row["actual_operations_unit"] for row in metadata],
@@ -230,8 +287,9 @@ class ProfileMeasurementTest(unittest.TestCase):
         self.assertEqual(counts, ["5", "20"])
 
     def test_write_reports_files_and_integer_rounded_bytes(self):
-        metadata, calls, system, drops = self.run_workload("write")
-        self.assert_common_attempts(metadata, system, drops)
+        metadata, calls, system, drops, controls, fifos = \
+            self.run_workload("write")
+        self.assert_common_attempts(metadata, system, drops, controls, fifos)
         self.assertEqual([row["actual_operations"] for row in metadata],
                          ["3", "3"])
         self.assertEqual([row["actual_operations_unit"] for row in metadata],
@@ -248,6 +306,47 @@ class ProfileMeasurementTest(unittest.TestCase):
         directories = [Path(call[call.index("-d") + 1]).name for call in calls]
         self.assertEqual(directories,
                          ["profile-write-attempt-1", "profile-write-attempt-2"])
+
+    def test_missing_perf_ack_times_out_and_removes_control_fifos(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness = root / "measurement-harness.sh"
+            harness.write_text(
+                textwrap.dedent(HARNESS).lstrip()
+                + "\n"
+                + MEASUREMENT_FUNCTIONS
+                + "\nrun_profile_measurement 1 1\n",
+                encoding="utf-8",
+            )
+            run_dir = root / "run"
+            result = subprocess.run(
+                ["/usr/bin/bash", str(harness), str(run_dir), "mmap"],
+                cwd=PROJECT_DIR,
+                env={**os.environ, "PATH": "/usr/bin:/bin",
+                     "PERF_STUB_ACK": "0",
+                     "PERF_CONTROL_TIMEOUT_SECONDS": "0.05"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("timed out waiting for perf record enable acknowledgement",
+                          result.stderr)
+            self.assertEqual(list(run_dir.glob("perf-*.fifo")), [])
+
+    def test_compare_cpu_window_starts_after_perf_attach_delay(self):
+        source = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        start = source.index("run_case() {\n")
+        end = source.index("\n}\n\nrun_random_read_case()", start)
+        run_case = source[start:end]
+        perf = run_case.index('    "$perf" stat')
+        delay = run_case.index("    sleep 0.1", perf)
+        cpu_start = run_case.index(
+            '  start_ns=$(process_cpu_ns "$daemon_pid")', delay)
+        workload = run_case.index('  "$bench" "$mount_dir/$object"', cpu_start)
+        self.assertLess(perf, delay)
+        self.assertLess(delay, cpu_start)
+        self.assertLess(cpu_start, workload)
 
     def test_cold_cache_without_samples_does_not_retry_warmed_target(self):
         source = PROFILE_SCRIPT.read_text(encoding="utf-8")

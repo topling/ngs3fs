@@ -319,7 +319,6 @@ run_case() {
   fi
 
   first_line=$(wc -l <"$daemon_log")
-  start_ns=$(process_cpu_ns "$daemon_pid")
   if "$perf" --version >/dev/null 2>&1; then
     "$perf" stat --no-big-num -x, \
       -e task-clock,cycles:u,instructions:u,context-switches,cpu-migrations,page-faults \
@@ -331,6 +330,7 @@ run_case() {
     printf '%s\n' "perf unavailable for the running kernel" \
       >"$stem-perf.csv"
   fi
+  start_ns=$(process_cpu_ns "$daemon_pid")
   "$bench" "$mount_dir/$object" "$bytes" "$iterations" "$stride" \
     >"$stem-wall.jsonl"
   end_ns=$(process_cpu_ns "$daemon_pid")

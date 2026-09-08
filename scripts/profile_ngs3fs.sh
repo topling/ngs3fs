@@ -103,6 +103,11 @@ fi
 server_pid=
 ngs3fs_pid=
 perf_pid=
+perf_control_fd=
+perf_ack_fd=
+perf_control_fifo=
+perf_ack_fifo=
+perf_control_timeout_seconds=${PERF_CONTROL_TIMEOUT_SECONDS:-10}
 profile_first_line=0
 profile_last_line=0
 profile_get_requests=0
@@ -114,12 +119,50 @@ profile_elapsed_ns=0
 profile_operations_unit=
 profile_actual_bytes=
 
+close_perf_control() {
+  if [[ -n "$perf_control_fd" ]]; then
+    exec {perf_control_fd}>&-
+    perf_control_fd=
+  fi
+  if [[ -n "$perf_ack_fd" ]]; then
+    exec {perf_ack_fd}>&-
+    perf_ack_fd=
+  fi
+  if [[ -n "$perf_control_fifo" ]]; then
+    rm -f "$perf_control_fifo"
+    perf_control_fifo=
+  fi
+  if [[ -n "$perf_ack_fifo" ]]; then
+    rm -f "$perf_ack_fifo"
+    perf_ack_fifo=
+  fi
+}
+
+control_perf_record() {
+  local command=$1
+  local acknowledgement
+  if ! printf '%s\n' "$command" >&"$perf_control_fd"; then
+    echo "unable to send perf record $command command" >&2
+    return 1
+  fi
+  if ! IFS= read -r -t "$perf_control_timeout_seconds" acknowledgement \
+      <&"$perf_ack_fd"; then
+    echo "timed out waiting for perf record $command acknowledgement" >&2
+    return 1
+  fi
+  if [[ "$acknowledgement" != ack ]]; then
+    echo "unexpected perf record $command acknowledgement: $acknowledgement" >&2
+    return 1
+  fi
+}
+
 cleanup() {
   set +e
   if [[ -n "$perf_pid" ]]; then
     kill -INT "$perf_pid" 2>/dev/null
     wait "$perf_pid" 2>/dev/null
   fi
+  close_perf_control
   if mountpoint -q "$mount_dir"; then
     fusermount3 -u "$mount_dir"
   fi
@@ -381,16 +424,30 @@ fi
 run_profile_measurement() {
   local attempt=$1
   local multiplier=$2
+  local control_failed=0
   drop_measurement_caches
   printf 'cache_drop_status_attempt_%s=%s\n' "$attempt" "$cache_drop_status" \
     >>"$run_dir/system.txt"
   profile_first_line=$(wc -l <"$run_dir/versity-access.log")
+  perf_control_fifo="$run_dir/perf-control-$attempt.fifo"
+  perf_ack_fifo="$run_dir/perf-ack-$attempt.fifo"
+  mkfifo "$perf_control_fifo" "$perf_ack_fifo"
+  exec {perf_control_fd}<>"$perf_control_fifo"
+  exec {perf_ack_fd}<>"$perf_ack_fifo"
   LD_LIBRARY_PATH=$perf_lib "$perf" record -F "$perf_frequency" \
     -e "$perf_event" -m "$perf_mmap_size" \
-    --call-graph dwarf,16384 -p "$ngs3fs_pid" \
+    --call-graph dwarf,16384 --delay -1 \
+    --control "fifo:$perf_control_fifo,$perf_ack_fifo" \
+    -p "$ngs3fs_pid" \
     -o "$run_dir/perf.data" -- sleep 3600 &
   perf_pid=$!
-  sleep 0.2
+  if ! control_perf_record enable; then
+    kill -INT "$perf_pid" 2>/dev/null || true
+    wait "$perf_pid" 2>/dev/null || true
+    perf_pid=
+    close_perf_control
+    return 1
+  fi
   profile_start_ns=$(date +%s%N)
   if [[ "$workload" = mmap ]]; then
     profile_operations_unit=iterations
@@ -427,6 +484,9 @@ run_profile_measurement() {
         >"$run_dir/write.txt"
   fi
   profile_elapsed_ns=$(($(date +%s%N) - profile_start_ns))
+  if ! control_perf_record disable; then
+    control_failed=1
+  fi
   profile_last_line=$(wc -l <"$run_dir/versity-access.log")
   profile_get_requests=0
   profile_head_requests=0
@@ -464,6 +524,10 @@ run_profile_measurement() {
   kill -INT "$perf_pid" 2>/dev/null || true
   wait "$perf_pid" 2>/dev/null || true
   perf_pid=
+  close_perf_control
+  if ((control_failed)); then
+    return 1
+  fi
 }
 
 profile_attempt=1

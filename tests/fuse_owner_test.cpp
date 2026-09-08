@@ -497,13 +497,13 @@ void test_cache_reclaim_busy_mutation() {
           "reclaim fixture did not install its child");
 
   std::unique_lock mutation_guard(directory.children.mutation_mutex);
-  const auto started = std::chrono::steady_clock::now();
   require(reclaim_cached_children(state, directory) == 0,
           "reclaim entered a busy namespace mutation");
-  require(std::chrono::steady_clock::now() - started <
-              std::chrono::milliseconds(100) &&
-              directory.children.size() == 1,
-          "busy namespace reclaim blocked or changed children");
+  // Holding the gate on this same thread makes an accidental blocking lock
+  // deadlock deterministically; CTest bounds the test. A wall-time assertion
+  // here would also fail on unrelated CI scheduler pauses.
+  require(directory.children.size() == 1,
+          "busy namespace reclaim changed children");
   mutation_guard.unlock();
 
   require(reclaim_cached_children(state, directory) == 1 &&
