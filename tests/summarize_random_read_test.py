@@ -121,6 +121,15 @@ class RandomReadReportTest(unittest.TestCase):
                 self.assertEqual(float(row["reference_cpu_over_ngs3fs"]), 2.0)
                 self.assertEqual(float(row["ngs3fs_cpu_saving_percent"]), 50.0)
 
+    def test_pages_links_inode_affinity_report_when_present(self):
+        page = self.root / "index.html"
+        (self.root / "inode-affinity-comparison.html").write_text(
+            "test", encoding="utf-8")
+        summary.write_html(page, self.rows, "test", "")
+        rendered = page.read_text(encoding="utf-8")
+        self.assertIn('href="inode-affinity-comparison.html"', rendered)
+        self.assertIn("Round-robin vs inode-affinity", rendered)
+
     def test_total_client_cpu_uses_daemon_plus_workload_and_links_samples(self):
         samples = [
             ("r1-ngs3fs", "ngs3fs", 8_000_000, 2_000_000),

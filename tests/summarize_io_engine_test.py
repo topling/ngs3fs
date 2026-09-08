@@ -62,6 +62,20 @@ class SummarizeIoEngineTest(unittest.TestCase):
     def test_zero_baseline_is_reported_as_not_available(self):
         self.assertEqual(MODULE.pct(10, 0), "n/a (zero baseline)")
 
+    def test_emits_inode_affinity_delta(self):
+        data = {"affinity-normal": {
+            ("baseline", 4): (3, 200, 300),
+            ("current", 4): (3, 150, 240),
+        }}
+        text = MODULE.report(data)
+        self.assertIn("Inode-affinity delta", text)
+        self.assertIn("daemon -25.00%; total -20.00%", text)
+        rendered = MODULE.html(data)
+        self.assertIn("Inode-affinity delta", rendered)
+        self.assertIn("daemon -25.00%; total -20.00%", rendered)
+        titled = MODULE.html(data, title="Inode-affinity reactor CPU comparison")
+        self.assertIn("<h1>Inode-affinity reactor CPU comparison</h1>", titled)
+
     def test_even_number_of_samples_uses_median(self):
         with tempfile.TemporaryDirectory() as temporary:
             suite = Path(temporary) / "github-io-engine-normal"

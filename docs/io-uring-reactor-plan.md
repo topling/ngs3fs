@@ -1,5 +1,35 @@
 # io_uring reactor execution contract
 
+## Stable inode dispatch (2026-09-08)
+
+Multi-reactor mounts route requests by a fixed 64-bit mix of the FUSE inode
+number, modulo the reactor count. The input pipe is a recycled request
+container, not a file identity, and must not be used as the affinity key.
+Requests for the same inode keep one reactor for the lifetime of the mount.
+Directory operations use their protocol parent inode; multi-inode operations
+retain the existing locks. No work stealing, live migration, or lock removal
+is part of this change. One reactor can still issue concurrent object I/O.
+
+Reactor 0 remains the FUSE receiver. For multiple reactors it consumes the same
+bounded request prefix that libfuse already reads, then hands that prefix and
+the remaining FD-backed pipe to the selected reactor. Patched libfuse reuses
+the prefix: no duplicate header read and no new WRITE-payload copy. The
+single-reactor path keeps its existing receive/dispatch processing. INIT runs
+on reactor 0. Subsequent requests stay in the kernel until all destination
+rings are running; the final starting reactor wakes the receiver. Control
+requests without an inode also stay on reactor 0.
+
+HTTP connections remain mount-global leases. Inode affinity is not socket
+ownership or CPU pinning, and does not remove the ingress MSG_RING transfer.
+Shutdown statistics record per-reactor dispatch counts so runner comparisons
+can distinguish locality gains from an imbalanced hot-inode workload.
+
+Local validation is limited to compilation and unit tests. Stress, mounted
+tests, paired CPU benchmarks, and flamegraphs run only on GitHub runners.
+Compare ordinary uring with four reactors against the previous batched
+round-robin implementation on the same runner; do not infer a CPU win from
+the routing policy alone.
+
 Status: the aligned whole-block receive revision and global STORE removal
 below are implemented. The no-STORE revision passes all 92 local CTest cases
 in both the normal and ThreadSanitizer builds; fresh runner validation is

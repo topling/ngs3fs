@@ -255,6 +255,12 @@ jobs:
       - name: Check out ngs3fs
         uses: actions/checkout@v7
 
+      - name: Check out round-robin reactor baseline
+        uses: actions/checkout@v7
+        with:
+          ref: 229627f4d244ef0551c44e8038158f38a4f059f3
+          path: build/baseline-src
+
       - name: Check out FlameGraph
         uses: actions/checkout@v7
         with:
@@ -294,6 +300,21 @@ jobs:
           mkdir -p build/tools
           python3 scripts/download_reference_binaries.py \
             build/tools build/tools/reference-binaries.json
+
+      - name: Build round-robin reactor baseline
+        run: |
+          test "$(git -C build/baseline-src rev-parse HEAD)" = \
+            229627f4d244ef0551c44e8038158f38a4f059f3
+          cmake -S build/baseline-src -B build/baseline -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DNGS3FS_BUILD_TESTS=OFF \
+            -DNGS3FS_BUILD_BENCHMARKS=OFF \
+            -DNGS3FS_DEPS_DIR="$GITHUB_WORKSPACE/.deps" \
+            -DTOPLING_ZIP_SOURCE_DIR="$GITHUB_WORKSPACE/build/dev/_deps/ngs3fs_topling_zip-src" \
+            -DFETCHCONTENT_SOURCE_DIR_NGS3FS_TINYXML2="$GITHUB_WORKSPACE/build/dev/_deps/ngs3fs_tinyxml2-src" \
+            -DFETCHCONTENT_SOURCE_DIR_NGS3FS_XXHASH="$GITHUB_WORKSPACE/build/dev/_deps/ngs3fs_xxhash-src" \
+            -DFETCHCONTENT_SOURCE_DIR_NGS3FS_YYJSON="$GITHUB_WORKSPACE/build/dev/_deps/ngs3fs_yyjson-src"
+          cmake --build build/baseline --target ngs3fs --parallel 2
 
       - name: Download VersityGW
         run: |
@@ -342,6 +363,62 @@ jobs:
             printf '\n## I/O engines: %s advice\n\n' "$advice" >> "$GITHUB_STEP_SUMMARY"
             cat "build/benchmarks/github-io-engine-$advice/summary.md" >> "$GITHUB_STEP_SUMMARY"
           done
+
+      - name: A/B test round-robin and inode-affinity routing
+        env:
+          BENCHMARK_REPETITIONS: 3
+          BENCHMARK_VARIANTS: baseline=${{ github.workspace }}/build/baseline/ngs3fs current=${{ github.workspace }}/build/dev/ngs3fs
+          BENCHMARK_VARIANT_REVISIONS: baseline=229627f4d244ef0551c44e8038158f38a4f059f3 current=${{ github.sha }}
+          NGS3FS_IO_ENGINE: uring
+          NGS3FS_REACTORS: 4
+          RANDOM_READ_OPERATIONS: 512
+        run: |
+          for advice in normal random; do
+            sudo env \
+              BENCHMARK_REPETITIONS="$BENCHMARK_REPETITIONS" \
+              BENCHMARK_VARIANTS="$BENCHMARK_VARIANTS" \
+              BENCHMARK_VARIANT_REVISIONS="$BENCHMARK_VARIANT_REVISIONS" \
+              NGS3FS_IO_ENGINE="$NGS3FS_IO_ENGINE" \
+              NGS3FS_REACTORS="$NGS3FS_REACTORS" \
+              RANDOM_READ_OPERATIONS="$RANDOM_READ_OPERATIONS" \
+              RANDOM_READ_ADVICE="$advice" CACHE_MODE=none \
+              ./scripts/benchmark_io_engine.sh \
+              "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-affinity-$advice"
+          done
+          for mode in cold warm; do
+            sudo env \
+              BENCHMARK_REPETITIONS="$BENCHMARK_REPETITIONS" \
+              BENCHMARK_VARIANTS="$BENCHMARK_VARIANTS" \
+              BENCHMARK_VARIANT_REVISIONS="$BENCHMARK_VARIANT_REVISIONS" \
+              NGS3FS_IO_ENGINE="$NGS3FS_IO_ENGINE" \
+              NGS3FS_REACTORS="$NGS3FS_REACTORS" \
+              RANDOM_READ_OPERATIONS="$RANDOM_READ_OPERATIONS" \
+              RANDOM_READ_ADVICE=random CACHE_MODE="$mode" \
+              DROP_CACHES_AFTER_WARMUP=1 \
+              ./scripts/benchmark_io_engine.sh \
+              "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-affinity-cache-$mode"
+          done
+
+      - name: Profile round-robin reactor baseline
+        if: always()
+        run: |
+          sudo env \
+            NGS3FS_BIN="$GITHUB_WORKSPACE/build/baseline/ngs3fs" \
+            NGS3FS_SOURCE_DIR="$GITHUB_WORKSPACE/build/baseline-src" \
+            NGS3FS_IO_ENGINE=uring \
+            NGS3FS_REACTORS=4 \
+            WORKLOAD=random-read \
+            RANDOM_READ_OPERATIONS=512 \
+            RANDOM_READ_ADVICE=normal \
+            CACHE_MODE=none \
+            PERF_BIN="$(command -v perf)" \
+            PERF_LIB_DIR= \
+            PERF_EVENT=cpu-clock \
+            PERF_FREQUENCY=4000 \
+            PERF_STAT_EVENTS=task-clock,context-switches,cpu-migrations,page-faults \
+            PORT=17659 \
+            ./scripts/profile_ngs3fs.sh \
+            "$GITHUB_WORKSPACE/build/profiles/github-io-engine-affinity-baseline"
 
       - name: Profile legacy, ordinary uring, and SQPOLL uncached reads
         if: always()
@@ -525,6 +602,8 @@ jobs:
             build/benchmarks/github-random-read-* \
             build/benchmarks/github-mountpoint-random-read-*
           cat build/benchmarks/random-read-report/random-read-cpu-comparison.md \
+            >> "$GITHUB_STEP_SUMMARY"
+          cat build/benchmarks/random-read-report/inode-affinity-comparison.md \
             >> "$GITHUB_STEP_SUMMARY"
           cat build/benchmarks/random-read-report/sqpoll-comparison.md \
             >> "$GITHUB_STEP_SUMMARY"

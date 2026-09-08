@@ -155,7 +155,11 @@ define the new uncached implementation.
   out, avoiding a linked-timeout CQE on every successful operation.
   `--reactors` selects the reactor count. Each reactor owns one ring and one
   cloned FUSE device fd; the one-reactor case uses the same group code without
-  a shared hot-path lock. A fallback is possible only during startup; a
+  a shared hot-path lock. With multiple reactors, reactor 0 receives requests
+  and routes them by a stable mixed inode hash, keeping same-file reader and
+  prefetch work on one reactor. Connections remain pooled across the mount;
+  this policy does not pin threads to CPUs or remove shared-state locks.
+  A fallback is possible only during startup; a
   running mount never changes engines.
   `uring-sqpoll` explicitly enables kernel submission polling with
   `sq_thread_idle=1` ms (the smallest positive value, subject to kernel jiffies

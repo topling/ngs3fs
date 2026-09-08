@@ -80,9 +80,34 @@ void FuseReactor::dispatch_entry(void* context) noexcept {
   if (reactor == nullptr || dispatch == nullptr) {
     abort();
   }
-  fuse_session_process_buf_fd(
-      reactor->session_, &dispatch->buffer, dispatch->output_fd);
+  ++reactor->dispatched_requests_;
+  if (dispatch->prefix_size != 0) {
+    fuse_session_process_buf_prefix_fd(
+        reactor->session_, &dispatch->buffer, &dispatch->prefix,
+        dispatch->prefix_size, dispatch->output_fd);
+  } else {
+    fuse_session_process_buf_fd(
+        reactor->session_, &dispatch->buffer, dispatch->output_fd);
+  }
   dispatch->processing_complete = true;
+}
+
+int FuseReactor::read_dispatch_prefix(Dispatch* dispatch) noexcept {
+  static_assert(sizeof(dispatch->prefix) ==
+                sizeof(fuse_in_header) + sizeof(fuse_write_in));
+  if (dispatch->buffer.size < sizeof(fuse_in_header)) return -EIO;
+  const size_t size = std::min(sizeof(dispatch->prefix), dispatch->buffer.size);
+  fuse_bufvec src = FUSE_BUFVEC_INIT(dispatch->buffer.size);
+  src.buf[0] = dispatch->buffer;
+  fuse_bufvec dst = FUSE_BUFVEC_INIT(size);
+  dst.buf[0].mem = &dispatch->prefix;
+  const ssize_t read = fuse_buf_copy(&dst, &src, {});
+  if (read < 0) return int(read);
+  if (size_t(read) != size || dispatch->prefix.in.len != dispatch->buffer.size) {
+    return -EIO;
+  }
+  dispatch->prefix_size = size;
+  return 0;
 }
 
 bool FuseReactor::start_dispatch(Dispatch* dispatch) noexcept {
@@ -987,6 +1012,15 @@ bool FuseReactor::submit_receive() noexcept {
   if (!receive_active_ || receive_fds_.empty()) {
     return true;
   }
+  // After INIT, leave ordinary requests in the kernel until every target
+  // ring is enabled. Otherwise the first requests would lose inode affinity
+  // by temporarily running on reactor 0. The last starting reactor wakes us.
+  if (initialization_complete_ && group_->reactors_.size() > 1 &&
+      !group_->dispatch_ready_) {
+    if (group_->running_reactors_.load(std::memory_order_acquire) !=
+        group_->reactors_.size()) return true;
+    group_->dispatch_ready_ = true;
+  }
   while (dispatch_count_ + receive_count_ < max_dispatch_count_ &&
          io_uring_sq_space_left(&ring_) != 0) {
     if (initialization_owner_ && !initialization_complete_ &&
@@ -1087,12 +1121,17 @@ bool FuseReactor::complete_receive(
     current->buffer.size  = size_t(received);
     current->buffer.flags = FUSE_BUF_IS_FD;
     current->buffer.fd    = current->pipe[0];
+    if (group_->reactors_.size() > 1) {
+      const int error = read_dispatch_prefix(current);
+      if (error != 0) return error;
+    }
     ++dispatch_count_;
     ++received_requests_;
     first_receive_ = false;
     current->owner     = this;
     current->output_fd = receive_fds_[receive_index];
-    FuseReactor* target = group_->next_dispatch_reactor();
+    FuseReactor* target = group_->dispatch_reactor(
+        current->prefix_size != 0 ? current->prefix.in.nodeid : 0);
     const bool started = target == this
         ? start_dispatch(current)
         : start_remote_dispatch(current, target);
@@ -1463,6 +1502,7 @@ void FuseReactor::recycle_dispatch(Dispatch* dispatch) noexcept {
     return;
   }
   dispatch->buffer = {};
+  dispatch->prefix_size = 0;
   dispatch->task = {};
   dispatch->owner = nullptr;
   dispatch->target = nullptr;
@@ -2043,7 +2083,10 @@ int FuseReactor::run() noexcept {
     return error_ != 0 ? error_ : -EINVAL;
   }
   current_ = this;
-  group_->running_reactors_.fetch_add(1, std::memory_order_release);
+  if (group_->running_reactors_.fetch_add(1, std::memory_order_release) + 1 ==
+          group_->reactors_.size() && group_->reactors_.size() > 1) {
+    group_->wake();
+  }
   while (!fuse_session_exited(session_) && error_ == 0) {
     monotonic_now_ns_ = reactor_monotonic_ns();
     if (!run_ready_callbacks()) {
@@ -2122,7 +2165,8 @@ int FuseReactor::run() noexcept {
         if (completion < 0 && completion != -EINTR &&
             completion != -ECANCELED) {
           error_ = completion;
-        } else if (!fuse_session_exited(session_) && !submit_wakeup()) {
+        } else if (!fuse_session_exited(session_) &&
+                   (!submit_wakeup() || !submit_receive())) {
           error_ = -EAGAIN;
         }
       } else if (data == &external_token_) {
@@ -2292,12 +2336,12 @@ FuseReactor* FuseReactorGroup::callback_reactor() noexcept {
   return reactors_.empty() ? nullptr : reactors_.front().get();
 }
 
-FuseReactor* FuseReactorGroup::next_dispatch_reactor() noexcept {
+FuseReactor* FuseReactorGroup::dispatch_reactor(uint64_t inode) noexcept {
   if (reactors_.empty()) {
     return nullptr;
   }
   // FUSE_INIT must be completed by the only reactor that is running yet.
-  if (!initialized_) {
+  if (reactors_.size() == 1 || !initialized_ || inode == 0) {
     return reactors_.front().get();
   }
   // FUSE_INIT may finish before all event-loop threads have enabled their
@@ -2309,12 +2353,11 @@ FuseReactor* FuseReactorGroup::next_dispatch_reactor() noexcept {
     }
     dispatch_ready_ = true;
   }
-  FuseReactor* reactor = reactors_[next_reactor_].get();
-  if (++reactor_dispatches_ == 4) {
-    reactor_dispatches_ = 0;
-    next_reactor_ = (next_reactor_ + 1) % reactors_.size();
-  }
-  return reactor;
+  // SplitMix64 finalizer: mix all pointer bits before selecting a shard.
+  inode = (inode ^ (inode >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+  inode = (inode ^ (inode >> 27)) * UINT64_C(0x94d049bb133111eb);
+  inode ^= inode >> 31;
+  return reactors_[inode % reactors_.size()].get();
 }
 
 void FuseReactorGroup::begin_shutdown() noexcept {
@@ -2456,6 +2499,11 @@ void FuseReactorGroup::report_stats() const noexcept {
     completion_high_water = std::max(
         completion_high_water, reactor->completion_batch_high_water_);
     setup_flags       |= reactor->setup_flags_;
+    fprintf(stderr,
+            "io_uring reactor stats: reactor=%zu dispatched=%" PRIu64
+            " io_operations=%" PRIu64 " wait_calls=%" PRIu64 "\n",
+            reactor->reactor_index_, reactor->dispatched_requests_,
+            reactor->io_operations_, reactor->wait_calls_);
   }
   fprintf(stderr,
           "io_uring FUSE transport stats: reactors=%zu requests=%" PRIu64

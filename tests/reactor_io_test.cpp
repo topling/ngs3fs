@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <linux/fuse.h>
 #include <shared_mutex>
+#include <stdexcept>
 #include <stdio.h>
 #include <string.h>
 #include <sys/eventfd.h>
@@ -81,6 +82,103 @@ struct ReactorIoTest {
 
   FuseReactor& reactor() { return *group.reactors_.front(); }
 
+  static int dispatch_case() {
+    const auto require = [](bool condition, const char* message) {
+      if (!condition) throw std::runtime_error(message);
+    };
+    FuseReactorGroup group;
+    require(group.dispatch_reactor(1) == nullptr, "empty dispatch group");
+    for (unsigned i = 0; i < 4; ++i) {
+      group.reactors_.push_back(std::make_unique<FuseReactor>());
+    }
+    FuseReactor* first = group.reactors_.front().get();
+    first->group_ = &group;
+    require(group.dispatch_reactor(0x12345670) == first, "pre-INIT affinity");
+    group.initialized_ = true;
+    group.running_reactors_.store(3);
+    require(group.dispatch_reactor(0x12345670) == first && !group.dispatch_ready_,
+            "affinity selected a disabled ring");
+    first->receive_active_ = true;
+    first->receive_fds_.push_back(-1);
+    first->initialization_complete_ = true;
+    require(first->submit_receive() && !group.dispatch_ready_ &&
+            first->receive_count_ == 0, "post-INIT receive was not gated");
+    group.running_reactors_.store(4);
+    require(first->submit_receive() && group.dispatch_ready_,
+            "all-ready receive did not open the affinity gate");
+    first->receive_active_ = false;
+    first->receive_fds_.clear();
+    for (size_t count : {4, 3, 1}) {
+      group.reactors_.resize(count);
+      group.running_reactors_.store(unsigned(count));
+      group.dispatch_ready_ = false;
+      std::array<size_t, 4> counts{};
+      for (uint64_t i = 0; i < 16384; ++i) {
+        const uint64_t inode = UINT64_C(0x7fff00000000) + i * 16;
+        FuseReactor* target = group.dispatch_reactor(inode);
+        (void)group.dispatch_reactor(inode + 16);
+        require(group.dispatch_reactor(inode) == target,
+                "inode affinity changed between requests");
+        size_t slot = 0;
+        while (slot < count && group.reactors_[slot].get() != target) ++slot;
+        require(slot < count, "inode affinity selected an invalid target");
+        ++counts[slot];
+      }
+      for (size_t i = 0; i < count; ++i) {
+        require(counts[i] > 16384 / count * 8 / 10 &&
+                counts[i] < 16384 / count * 12 / 10,
+                "aligned pointer inodes produced an imbalanced hash");
+      }
+      require(group.dispatch_reactor(0) == first, "inode-less control routing");
+      FuseReactor* root = group.dispatch_reactor(FUSE_ROOT_ID);
+      require(root == group.dispatch_reactor(FUSE_ROOT_ID), "root inode routing");
+    }
+
+    Pipe pipe = Pipe::create(4096);
+    FuseReactor::Dispatch dispatch;
+    dispatch.buffer.flags = FUSE_BUF_IS_FD;
+    dispatch.buffer.fd = pipe.read_fd();
+    std::array<char, 257> payload;
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = char(i % 127);
+    decltype(dispatch.prefix) prefix{};
+    prefix.in.len = unsigned(sizeof(prefix) + payload.size());
+    prefix.in.opcode = FUSE_WRITE;
+    prefix.in.nodeid = UINT64_C(0x7fff12345670);
+    prefix.write.fh = 42;
+    prefix.write.size = unsigned(payload.size());
+    iovec input[]{{&prefix, sizeof(prefix)}, {payload.data(), payload.size()}};
+    require(::writev(pipe.write_fd(), input, 2) == ssize_t(prefix.in.len),
+            "write request fixture");
+    dispatch.buffer.size = prefix.in.len;
+    require(FuseReactor::read_dispatch_prefix(&dispatch) == 0 &&
+            dispatch.prefix_size == sizeof(prefix) &&
+            dispatch.prefix.in.nodeid == prefix.in.nodeid &&
+            dispatch.prefix.write.fh == 42, "read FD-backed request prefix");
+    std::array<char, 257> received{};
+    require(::read(pipe.read_fd(), received.data(), received.size()) ==
+                ssize_t(received.size()) && received == payload,
+            "prefix routing consumed or changed the WRITE payload");
+
+    prefix.in.len = sizeof(fuse_in_header);
+    prefix.in.opcode = FUSE_DESTROY;
+    prefix.in.nodeid = 0;
+    require(::write(pipe.write_fd(), &prefix, prefix.in.len) ==
+                ssize_t(prefix.in.len), "short control request fixture");
+    dispatch.buffer.size = prefix.in.len;
+    require(FuseReactor::read_dispatch_prefix(&dispatch) == 0 &&
+            dispatch.prefix_size == sizeof(fuse_in_header), "short request prefix");
+    dispatch.buffer.size = sizeof(fuse_in_header) - 1;
+    require(FuseReactor::read_dispatch_prefix(&dispatch) == -EIO,
+            "accepted truncated FUSE header");
+    prefix.in.len = sizeof(fuse_in_header) + 1;
+    dispatch.buffer.size = sizeof(fuse_in_header);
+    require(::write(pipe.write_fd(), &prefix, sizeof(fuse_in_header)) ==
+                ssize_t(sizeof(fuse_in_header)), "invalid length fixture");
+    require(FuseReactor::read_dispatch_prefix(&dispatch) == -EIO,
+            "accepted inconsistent FUSE request length");
+    return 0;
+  }
+
   bool check(bool condition, const char* message) noexcept {
     if (!condition) {
       fprintf(stderr, "reactor_io_test: %s\n", message);
@@ -147,7 +245,7 @@ struct ReactorIoTest {
     group.reactors_.push_back(std::move(disabled_target));
     group.initialized_ = true;
     group.running_reactors_.store(1, std::memory_order_release);
-    if (!check(group.next_dispatch_reactor() == group.reactors_.front().get() &&
+    if (!check(group.dispatch_reactor(0x12345670) == group.reactors_.front().get() &&
                !group.dispatch_ready_,
                "startup selected a disabled dispatch target")) return false;
     group.running_reactors_.store(0, std::memory_order_release);
@@ -885,8 +983,10 @@ struct ReactorIoTest {
 
 int main(int argc, char** argv) {
   const bool sqpoll = argc == 2 && strcmp(argv[1], "--sqpoll") == 0;
-  if (argc > 1 && !sqpoll) return 1;
+  const bool dispatch = argc == 2 && strcmp(argv[1], "--dispatch") == 0;
+  if (argc > 1 && !sqpoll && !dispatch) return 1;
   try {
+    if (dispatch) return ReactorIoTest::dispatch_case();
     ReactorIoTest test;
     if (!test.initialize(sqpoll)) return test.failed ? 1 : 77;
     return test.run();

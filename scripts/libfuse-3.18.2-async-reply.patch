@@ -1,5 +1,5 @@
 diff --git a/include/fuse_lowlevel.h b/include/fuse_lowlevel.h
-index 6be0295b..2b9dad47 100644
+index 6be0295b..2a133695 100644
 --- a/include/fuse_lowlevel.h
 +++ b/include/fuse_lowlevel.h
 @@ -23,6 +23,7 @@
@@ -54,13 +54,28 @@ index 6be0295b..2b9dad47 100644
  /**
   * Process a raw request supplied in a generic buffer
   *
-@@ -2348,6 +2377,10 @@ int fuse_session_fd(struct fuse_session *se);
+@@ -2348,6 +2377,25 @@ int fuse_session_fd(struct fuse_session *se);
  void fuse_session_process_buf(struct fuse_session *se,
  			      const struct fuse_buf *buf);
  
 +/** Process a raw request and reply through the same cloned FUSE fd. */
 +void fuse_session_process_buf_fd(struct fuse_session *se,
 +				 const struct fuse_buf *buf, int reply_fd);
++
++/**
++ * Process a raw request whose leading bytes have already been consumed from
++ * an fd-backed buffer, and reply through the supplied FUSE fd.
++ *
++ * prefix_size must equal min(sizeof(struct fuse_in_header) +
++ * sizeof(struct fuse_write_in), buf->size). The original buffer continues to
++ * describe the complete request; its fd must be positioned immediately after
++ * the prefix. The caller retains ownership of prefix for the duration of this
++ * call.
++ */
++void fuse_session_process_buf_prefix_fd(struct fuse_session *se,
++					const struct fuse_buf *buf,
++					const void *prefix, size_t prefix_size,
++					int reply_fd);
 +
  /**
   * Read a raw request from the kernel into the supplied buffer.
@@ -112,7 +127,7 @@ index ec4bb0b2..5cff29ab 100644
  }
 -
 diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
-index d420b257..2c6a4cf8 100644
+index d420b257..a1f1ba4a 100644
 --- a/lib/fuse_lowlevel.c
 +++ b/lib/fuse_lowlevel.c
 @@ -207,6 +207,8 @@ void fuse_free_req(fuse_req_t req)
@@ -141,7 +156,7 @@ index d420b257..2c6a4cf8 100644
  {
  	ssize_t res;
  	int err;
-
+ 
 -	if (se->io != NULL)
 +	int fd = req != NULL && req->custom_reply_fd >= 0 ?
 +		req->custom_reply_fd : (ch ? ch->fd : se->fd);
@@ -327,10 +342,7 @@ index d420b257..2c6a4cf8 100644
  	if (res > 0)
  		res = -res;
  
-@@ -3590,12 +3679,21 @@ static int fuse_ll_copy_from_pipe(struct fuse_bufvec *dst,
- void fuse_session_process_buf(struct fuse_session *se,
- 			      const struct fuse_buf *buf)
- {
+@@ -3593,9 +3683,47 @@ void fuse_session_process_buf(struct fuse_session *se,
  	fuse_session_process_buf_internal(se, buf, NULL);
  }
  
@@ -343,13 +355,87 @@ index d420b257..2c6a4cf8 100644
 +	fuse_custom_reply_fd = previous;
 +}
 +
++static void fuse_session_process_buf_internal_prefix(
++	struct fuse_session *se, const struct fuse_buf *buf, struct fuse_chan *ch,
++	const void *prefix, size_t prefix_size);
++
++void fuse_session_process_buf_prefix_fd(struct fuse_session *se,
++					const struct fuse_buf *buf,
++					const void *prefix, size_t prefix_size,
++					int reply_fd)
++{
++	int previous = fuse_custom_reply_fd;
++	if (prefix == NULL) {
++		fuse_log(FUSE_LOG_ERR, "fuse: missing request prefix\n");
++		if (buf->flags & FUSE_BUF_IS_FD)
++			fuse_ll_clear_input(se, buf);
++		return;
++	}
++	fuse_custom_reply_fd = reply_fd;
++	fuse_session_process_buf_internal_prefix(se, buf, NULL, prefix,
++						 prefix_size);
++	fuse_custom_reply_fd = previous;
++}
++
  /* libfuse internal handler */
  void fuse_session_process_buf_internal(struct fuse_session *se,
  				  const struct fuse_buf *buf, struct fuse_chan *ch)
++{
++	fuse_session_process_buf_internal_prefix(se, buf, ch, NULL, 0);
++}
++
++static void fuse_session_process_buf_internal_prefix(
++	struct fuse_session *se, const struct fuse_buf *buf, struct fuse_chan *ch,
++	const void *prefix, size_t prefix_size)
  {
  	const size_t write_header_size = sizeof(struct fuse_in_header) +
  		sizeof(struct fuse_write_in);
-@@ -3721,7 +3820,7 @@ reply_err:
+@@ -3608,7 +3736,28 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
+ 	int err;
+ 	int res;
+ 
+-	if (buf->flags & FUSE_BUF_IS_FD) {
++	if (prefix != NULL) {
++		const size_t expected_prefix_size =
++			buf->size < write_header_size ? buf->size : write_header_size;
++		struct fuse_in_header prefix_header;
++
++		if (!(buf->flags & FUSE_BUF_IS_FD) ||
++		    prefix_size != expected_prefix_size ||
++		    prefix_size < sizeof(prefix_header)) {
++			fuse_log(FUSE_LOG_ERR, "fuse: invalid request prefix\n");
++			goto clear_pipe;
++		}
++		memcpy(&prefix_header, prefix, sizeof(prefix_header));
++		if (prefix_header.len != buf->size ||
++		    (prefix_header.opcode == FUSE_WRITE &&
++		     prefix_size < write_header_size)) {
++			fuse_log(FUSE_LOG_ERR, "fuse: invalid prefixed request header\n");
++			goto clear_pipe;
++		}
++
++		in = (struct fuse_in_header *)prefix;
++		bufv.off = prefix_size;
++	} else if (buf->flags & FUSE_BUF_IS_FD) {
+ 		if (buf->size < tmpbuf.buf[0].size)
+ 			tmpbuf.buf[0].size = buf->size;
+ 
+@@ -3689,7 +3838,13 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
+ 		void *newmbuf;
+ 
+ 		err = ENOMEM;
+-		newmbuf = realloc(mbuf, buf->size);
++		if (prefix != NULL) {
++			newmbuf = malloc(buf->size);
++			if (newmbuf != NULL)
++				memcpy(newmbuf, prefix, prefix_size);
++		} else {
++			newmbuf = realloc(mbuf, buf->size);
++		}
+ 		if (newmbuf == NULL)
+ 			goto reply_err;
+ 		mbuf = newmbuf;
+@@ -3721,7 +3876,7 @@ reply_err:
  	fuse_reply_err(req, err);
  clear_pipe:
  	if (buf->flags & FUSE_BUF_IS_FD)
@@ -358,7 +444,7 @@ index d420b257..2c6a4cf8 100644
  	goto out_free;
  }
  
-@@ -4472,6 +4571,8 @@ void fuse_session_exit(struct fuse_session *se)
+@@ -4472,6 +4627,8 @@ void fuse_session_exit(struct fuse_session *se)
  {
  	atomic_store_explicit(&se->mt_exited, 1, memory_order_relaxed);
  	sem_post(&se->mt_finish);
@@ -368,10 +454,10 @@ index d420b257..2c6a4cf8 100644
  
  __attribute__((no_sanitize_thread))
 diff --git a/lib/fuse_versionscript b/lib/fuse_versionscript
-index b58360fe..7feef1b2 100644
+index b58360fe..6d4f1d31 100644
 --- a/lib/fuse_versionscript
 +++ b/lib/fuse_versionscript
-@@ -220,6 +220,10 @@ FUSE_3.18 {
+@@ -220,6 +220,11 @@ FUSE_3.18 {
  
  		fuse_reply_statx;
  		fuse_fs_statx;
@@ -379,6 +465,7 @@ index b58360fe..7feef1b2 100644
 +		fuse_session_bufsize;
 +		fuse_session_clone_fd;
 +		fuse_session_process_buf_fd;
++		fuse_session_process_buf_prefix_fd;
  } FUSE_3.17;
  
  # Local Variables:

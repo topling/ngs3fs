@@ -65,6 +65,7 @@ fi
 
 versitygw="$project_dir/build/e2e/versitygw/versitygw_v1.7.0_Linux_x86_64/versitygw"
 ngs3fs=${NGS3FS_BIN:-"$project_dir/build/dev/ngs3fs"}
+ngs3fs_source_dir=${NGS3FS_SOURCE_DIR:-$project_dir}
 bench=${MMAP_BENCH_BIN:-"$project_dir/build/dev/mmap_fault_bench"}
 random_bench=${RANDOM_READ_BENCH_BIN:-"$project_dir/build/dev/random_read_stress"}
 perf_root="$project_dir/build/tools/perf-6.8/root"
@@ -242,9 +243,9 @@ fi
 {
   printf 'ngs3fs_path=%s\n' "$(realpath "$ngs3fs")"
   printf 'ngs3fs_sha256=%s\n' "$(sha256sum "$ngs3fs" | cut -d' ' -f1)"
-  printf 'git_commit=%s\n' "$(git -c safe.directory="$project_dir" -C "$project_dir" rev-parse HEAD)"
-  printf 'git_dirty=%s\n' "$(git -c safe.directory="$project_dir" -C "$project_dir" status --porcelain | tr '\n' ' ')"
-  printf 'git_tracked_dirty=%s\n' "$(git -c safe.directory="$project_dir" -C "$project_dir" status --porcelain --untracked-files=no | tr '\n' ' ')"
+  printf 'git_commit=%s\n' "$(git -c safe.directory="$ngs3fs_source_dir" -C "$ngs3fs_source_dir" rev-parse HEAD)"
+  printf 'git_dirty=%s\n' "$(git -c safe.directory="$ngs3fs_source_dir" -C "$ngs3fs_source_dir" status --porcelain | tr '\n' ' ')"
+  printf 'git_tracked_dirty=%s\n' "$(git -c safe.directory="$ngs3fs_source_dir" -C "$ngs3fs_source_dir" status --porcelain --untracked-files=no | tr '\n' ' ')"
   printf 'cache_drop_requested=%s\n' "$drop_after_warmup"
   printf 'perf_event=%s\nperf_frequency=%s\n' "$perf_event" "$perf_frequency"
   printf 'perf_mmap_size=%s\n' "$perf_mmap_size"

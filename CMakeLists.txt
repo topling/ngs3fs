@@ -200,8 +200,18 @@ if(NGS3FS_BUILD_TESTS)
   target_compile_options(reactor_io_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
   add_test(NAME reactor_io_test COMMAND reactor_io_test)
   add_test(NAME reactor_sqpoll_io_test COMMAND reactor_io_test --sqpoll)
+  add_test(NAME reactor_inode_dispatch_test COMMAND reactor_io_test --dispatch)
+  set_tests_properties(reactor_inode_dispatch_test PROPERTIES TIMEOUT 10)
   set_tests_properties(reactor_io_test reactor_sqpoll_io_test
     PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+
+  add_executable(libfuse_prefix_test tests/libfuse_prefix_test.cpp)
+  target_link_libraries(libfuse_prefix_test PRIVATE FUSE3::fuse3)
+  target_compile_definitions(libfuse_prefix_test PRIVATE FUSE_USE_VERSION=318)
+  target_compile_options(libfuse_prefix_test PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+  add_test(NAME libfuse_prefix_test COMMAND libfuse_prefix_test)
+  set_tests_properties(libfuse_prefix_test PROPERTIES TIMEOUT 10)
 
   add_executable(mounted_e2e_client tests/mounted_e2e_client.cpp)
   target_compile_options(mounted_e2e_client PRIVATE

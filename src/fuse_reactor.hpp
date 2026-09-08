@@ -4,6 +4,7 @@
 
 #include <fuse_lowlevel.h>
 #include <liburing.h>
+#include <linux/fuse.h>
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -180,6 +181,11 @@ class FuseReactor : public IoExecutor {
 
   struct Dispatch {
     fuse_buf buffer = {};
+    struct {
+      fuse_in_header in;
+      fuse_write_in write;
+    } prefix{};
+    size_t prefix_size = 0;
     alignas(8) ReactorTask task = {};
     FuseReactor* owner = nullptr;
     FuseReactor* target = nullptr;
@@ -247,6 +253,7 @@ class FuseReactor : public IoExecutor {
   bool enqueue_task(ReactorTask* task) noexcept;
   bool start_task(ReactorTask* task) noexcept;
   bool start_dispatch(Dispatch* dispatch) noexcept;
+  static int read_dispatch_prefix(Dispatch* dispatch) noexcept;
   bool start_remote_dispatch(
       Dispatch* dispatch, FuseReactor* target) noexcept;
   bool run_ready_callbacks() noexcept;
@@ -298,6 +305,7 @@ class FuseReactor : public IoExecutor {
   unsigned receive_concurrency_    = 1;
   size_t reactor_index_            = 0;
   uint64_t received_requests_      = 0;
+  uint64_t dispatched_requests_    = 0;
   uint64_t completed_replies_      = 0;
   uint64_t external_replies_       = 0;
   uint64_t io_operations_          = 0;
@@ -359,7 +367,7 @@ class FuseReactorGroup {
   friend class FuseReactor;
 
   FuseReactor* callback_reactor() noexcept;
-  FuseReactor* next_dispatch_reactor() noexcept;
+  FuseReactor* dispatch_reactor(uint64_t inode) noexcept;
   void begin_shutdown() noexcept;
   void reactor_initialized() noexcept;
   void wake() noexcept;
@@ -376,6 +384,4 @@ class FuseReactorGroup {
   bool primary_stopped_ = false;
   std::atomic<unsigned> running_reactors_{0};
   bool dispatch_ready_ = false;
-  size_t next_reactor_ = 0;
-  unsigned reactor_dispatches_ = 0;
 };
