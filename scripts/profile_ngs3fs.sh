@@ -218,6 +218,7 @@ fi
   printf 'ngs3fs_sha256=%s\n' "$(sha256sum "$ngs3fs" | cut -d' ' -f1)"
   printf 'git_commit=%s\n' "$(git -c safe.directory="$project_dir" -C "$project_dir" rev-parse HEAD)"
   printf 'git_dirty=%s\n' "$(git -c safe.directory="$project_dir" -C "$project_dir" status --porcelain | tr '\n' ' ')"
+  printf 'git_tracked_dirty=%s\n' "$(git -c safe.directory="$project_dir" -C "$project_dir" status --porcelain --untracked-files=no | tr '\n' ' ')"
   printf 'perf_event=%s\nperf_frequency=%s\n' "$perf_event" "$perf_frequency"
   printf 'perf_mmap_size=%s\n' "$perf_mmap_size"
   printf 'ngs3fs_io_engine=%s\nngs3fs_reactors=%s\n' \

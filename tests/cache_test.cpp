@@ -21,6 +21,32 @@ struct CacheTestAccess {
   static uint64_t allocated_bytes(LocalCache& cache) {
     return cache.allocated_bytes();
   }
+  static size_t keepalive_entries(LocalCache& cache) {
+    std::lock_guard guard(cache.mutex_);
+    return cache.keepalive_.size();
+  }
+  static size_t keepalive_base_metadata_bytes(LocalCache& cache) {
+    std::lock_guard guard(cache.mutex_);
+    return cache.keepalive_base_metadata_bytes_;
+  }
+  static size_t keepalive_entry_limit() {
+    return LocalCache::kKeepaliveEntryLimit;
+  }
+  static size_t keepalive_base_metadata_limit() {
+    return LocalCache::kKeepaliveBaseMetadataLimit;
+  }
+  static void clear_keepalive(LocalCache& cache) {
+    std::vector<LocalCache::KeepaliveSlot> released;
+    {
+      std::lock_guard guard(cache.mutex_);
+      released.swap(cache.keepalive_);
+      cache.keepalive_base_metadata_bytes_ = 0;
+    }
+  }
+  static void set_maximum_bytes(LocalCache& cache, uint64_t maximum_bytes) {
+    cache.config_.maximum_bytes = maximum_bytes;
+    cache.config_.unlimited = false;
+  }
 };
 
 struct TemporaryDirectory {
@@ -117,7 +143,150 @@ int main() {
     held.unlock();
     const bool evicted = eviction.get();
     assert(ready && !evicted);
+    CacheTestAccess::clear_keepalive(cache);
     assert(CacheTestAccess::evict_cold(cache));
+  }
+
+  {
+    TemporaryDirectory keepalive_directory;
+    CacheConfig keepalive_config = config;
+    keepalive_config.root = keepalive_directory.path;
+    std::weak_ptr<CacheEntry> surviving;
+    {
+      LocalCache cache(keepalive_config);
+      const CacheIdentity identity =
+          test_identity("keepalive-state", "etag", 4096);
+      std::shared_ptr<CacheEntry> entry = cache.open(identity);
+      const CacheFetchClaim fetch = entry->claim_fetch(0, 4096, 4096);
+      assert(entry->prepare_read(fetch.offset, fetch.length));
+      write_test_bytes(entry->data_fd(), 0, fetch.length);
+      entry->publish_clean(fetch, 0, fetch.length, true);
+      entry->finish_fetch(fetch);
+      assert(entry->begin_checksum_manifest());
+      entry->finish_checksum_manifest({
+          CacheChecksumPart{0, 4096, 1, "verified"},
+      });
+      CacheChecksumClaim checksum = entry->claim_checksum(0, 1);
+      assert(checksum.action == CACHE_CHECKSUM_VERIFY);
+      entry->finish_checksum(checksum, true);
+      surviving = entry;
+      CacheEntry* address = entry.get();
+      entry.reset();
+      assert(!surviving.expired());
+      assert(!cache.try_open(
+          test_identity("keepalive-state", "different", 4096)));
+      std::shared_ptr<CacheEntry> reopened = cache.try_open(identity);
+      assert(reopened && reopened.get() == address);
+      assert(reopened->checksum_manifest_available());
+      assert(reopened->claim_checksum(0, 1).action == CACHE_CHECKSUM_NONE);
+
+      std::promise<void> locked;
+      std::promise<void> release;
+      auto release_signal = release.get_future();
+      auto key_holder = std::async(std::launch::async, [&] {
+        std::lock_guard guard(
+            CacheTestAccess::key_mutex(cache, identity.key));
+        locked.set_value();
+        release_signal.wait();
+      });
+      locked.get_future().get();
+      assert(!cache.try_open(identity));
+      release.set_value();
+      key_holder.get();
+    }
+    assert(surviving.expired());
+  }
+
+  {
+    TemporaryDirectory keepalive_count_directory;
+    CacheConfig keepalive_config = config;
+    keepalive_config.root = keepalive_count_directory.path;
+    LocalCache cache(keepalive_config);
+    std::weak_ptr<CacheEntry> first;
+    for (size_t i = 0; i <= CacheTestAccess::keepalive_entry_limit(); ++i) {
+      const std::string key = "keepalive-count-" + std::to_string(i);
+      std::shared_ptr<CacheEntry> entry =
+          cache.open(test_identity(key, "etag", 4096));
+      if (i == 0) first = entry;
+    }
+    assert(first.expired());
+    assert(CacheTestAccess::keepalive_entries(cache) ==
+           CacheTestAccess::keepalive_entry_limit());
+  }
+
+  {
+    TemporaryDirectory keepalive_budget_directory;
+    CacheConfig keepalive_config = config;
+    keepalive_config.root = keepalive_budget_directory.path;
+    keepalive_config.block_size = 128U * 1024U * 1024U;
+    keepalive_config.unlimited = true;
+    LocalCache cache(keepalive_config);
+    std::weak_ptr<CacheEntry> first;
+    constexpr uint64_t large_size = 32ULL * 1024ULL * 1024ULL * 1024ULL;
+    for (size_t i = 0; i != 40; ++i) {
+      const std::string key = "keepalive-budget-" + std::to_string(i);
+      std::shared_ptr<CacheEntry> entry =
+          cache.open(test_identity(key, "etag", large_size));
+      if (i == 0) first = entry;
+    }
+    assert(first.expired());
+    assert(CacheTestAccess::keepalive_entries(cache) < 40);
+    assert(CacheTestAccess::keepalive_base_metadata_bytes(cache) <=
+           CacheTestAccess::keepalive_base_metadata_limit());
+  }
+
+  {
+    TemporaryDirectory keepalive_reclaim_directory;
+    CacheConfig bounded = config;
+    bounded.root               = keepalive_reclaim_directory.path;
+    bounded.maximum_bytes      = 0;
+    bounded.reserve_bytes      = 0;
+    bounded.reserve_percent    = 0;
+    bounded.reserve_is_percent = false;
+    LocalCache cache(bounded);
+    std::shared_ptr<CacheEntry> old = cache.open(
+        test_identity("keepalive-reclaim-old", "old", 4096));
+    assert(old);
+    CacheTestAccess::set_maximum_bytes(
+        cache, CacheTestAccess::allocated_bytes(cache));
+    std::weak_ptr<CacheEntry> reclaimed = old;
+    old.reset();
+    std::shared_ptr<CacheEntry> replacement = cache.open(
+        test_identity("keepalive-reclaim-new", "new", 4096));
+    assert(replacement);
+    assert(reclaimed.expired());
+  }
+
+  {
+    TemporaryDirectory keepalive_writer_directory;
+    CacheConfig keepalive_config = config;
+    keepalive_config.root = keepalive_writer_directory.path;
+    std::weak_ptr<CacheEntry> after_destruction;
+    {
+      LocalCache cache(keepalive_config);
+      const CacheIdentity identity =
+          test_identity("keepalive-writer", "old", 4096);
+      std::shared_ptr<CacheEntry> old = cache.open(identity);
+      std::weak_ptr<CacheEntry> retired = old;
+      old.reset();
+      std::shared_ptr<CacheEntry> writer =
+          cache.create_writer(identity, 8192);
+      assert(retired.expired());
+      std::weak_ptr<CacheEntry> unretained_writer = writer;
+      writer.reset();
+      assert(unretained_writer.expired());
+
+      const CacheIdentity first_identity =
+          test_identity("keepalive-replacement", "first", 4096);
+      std::shared_ptr<CacheEntry> first = cache.open(first_identity);
+      std::weak_ptr<CacheEntry> replaced = first;
+      first.reset();
+      std::shared_ptr<CacheEntry> replacement = cache.open(
+          test_identity("keepalive-replacement", "second", 4096));
+      assert(replaced.expired());
+      after_destruction = replacement;
+    }
+    assert(after_destruction.expired());
   }
 
   {

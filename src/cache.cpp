@@ -2364,12 +2364,81 @@ std::recursive_mutex& LocalCache::key_mutex(std::string_view key) noexcept {
   return key_mutexes_[hash % key_mutexes_.size()];
 }
 
+void LocalCache::release_keepalive_locked(
+    CacheEntry* entry,
+    std::vector<std::shared_ptr<CacheEntry>>& released) {
+  for (auto i = keepalive_.begin(); i != keepalive_.end(); ++i) {
+    if (i->entry.get() != entry) continue;
+    released.push_back(i->entry);
+    keepalive_base_metadata_bytes_ -= i->base_metadata_bytes;
+    i->entry.reset();
+    keepalive_.erase(i);
+    return;
+  }
+}
+
+void LocalCache::release_key_keepalive_locked(
+    std::string_view key,
+    std::vector<std::shared_ptr<CacheEntry>>& released) {
+  for (auto i = keepalive_.begin(); i != keepalive_.end();) {
+    if (i->entry->key_ != key) {
+      ++i;
+      continue;
+    }
+    released.push_back(i->entry);
+    keepalive_base_metadata_bytes_ -= i->base_metadata_bytes;
+    i->entry.reset();
+    i = keepalive_.erase(i);
+  }
+}
+
+void LocalCache::retain_entry_locked(
+    const std::shared_ptr<CacheEntry>& entry,
+    std::vector<std::shared_ptr<CacheEntry>>& released) {
+  for (const KeepaliveSlot& slot : keepalive_) {
+    if (slot.entry.get() == entry.get()) return;
+  }
+  const size_t referenced_bytes =
+      entry->referenced_.capacity() * sizeof(entry->referenced_[0]);
+  const size_t pin_bytes =
+      entry->region_pins_.capacity() * sizeof(entry->region_pins_[0]);
+  if (entry->mapping_size_ > kKeepaliveBaseMetadataLimit ||
+      referenced_bytes > kKeepaliveBaseMetadataLimit - entry->mapping_size_ ||
+      pin_bytes > kKeepaliveBaseMetadataLimit - entry->mapping_size_ -
+          referenced_bytes) {
+    return;
+  }
+  const size_t base_metadata_bytes =
+      entry->mapping_size_ + referenced_bytes + pin_bytes;
+  while (!keepalive_.empty() &&
+         (keepalive_.size() >= kKeepaliveEntryLimit ||
+          keepalive_base_metadata_bytes_ >
+              kKeepaliveBaseMetadataLimit - base_metadata_bytes)) {
+    released.push_back(keepalive_.front().entry);
+    keepalive_base_metadata_bytes_ -= keepalive_.front().base_metadata_bytes;
+    keepalive_.front().entry.reset();
+    keepalive_.erase(keepalive_.begin());
+  }
+  keepalive_.push_back(KeepaliveSlot{
+      .entry = entry,
+      .base_metadata_bytes = base_metadata_bytes,
+  });
+  keepalive_base_metadata_bytes_ += base_metadata_bytes;
+}
+
 bool LocalCache::reclaim_closed_clean(
     const std::shared_ptr<CacheEntry>& entry) noexcept {
+  std::vector<std::shared_ptr<CacheEntry>> released;
   try {
-    std::unique_lock key_guard(key_mutex(entry->key_), std::try_to_lock);
+    std::recursive_mutex* selected_key_mutex;
+    {
+      std::lock_guard guard(mutex_);
+      selected_key_mutex = &key_mutex(entry->key_);
+    }
+    std::unique_lock key_guard(*selected_key_mutex, std::try_to_lock);
     if (!key_guard.owns_lock()) return false;
     std::unique_lock guard(mutex_);
+    if (&key_mutex(entry->key_) != selected_key_mutex) return false;
     auto found = entries_.end();
     for (auto i = entries_.begin(); i != entries_.end();) {
       std::shared_ptr<CacheEntry> candidate = i->lock();
@@ -2378,7 +2447,11 @@ bool LocalCache::reclaim_closed_clean(
         continue;
       }
       if (candidate.get() == entry.get()) {
-        if (candidate.use_count() != 2) {
+        const bool kept = std::any_of(
+            keepalive_.begin(), keepalive_.end(), [&](const auto& slot) {
+              return slot.entry.get() == entry.get();
+            });
+        if (candidate.use_count() != (kept ? 3 : 2)) {
           return false;
         }
         found = i;
@@ -2407,6 +2480,7 @@ bool LocalCache::reclaim_closed_clean(
       entry->detached_ = true;
       entry->stale_    = true;
     }
+    release_keepalive_locked(entry.get(), released);
     entries_.erase(found);
     guard.unlock();
 
@@ -2549,6 +2623,11 @@ bool LocalCache::evict_one() {
           add_allocated(-int64_t(std::min<uint64_t>(freed, INT64_MAX)));
           return true;
         }
+      }
+    }
+    for (size_t n = 0; n < entries.size(); ++n) {
+      if (reclaim_closed_clean(entries[(begin + n) % entries.size()])) {
+        return true;
       }
     }
   }
@@ -2727,6 +2806,14 @@ LocalCache::LocalCache(CacheConfig config) : config_(std::move(config)) {
 }
 
 LocalCache::~LocalCache() {
+  std::vector<KeepaliveSlot> released;
+  {
+    std::lock_guard guard(mutex_);
+    released.swap(keepalive_);
+    keepalive_base_metadata_bytes_ = 0;
+    entries_.clear();
+  }
+  released.clear();
   cache_close_fd(data_root_fd_);
   cache_close_fd(objects_root_fd_);
   cache_close_fd(dirty_root_fd_);
@@ -3313,6 +3400,7 @@ void LocalCache::finish_pending_delete(std::string_view key) noexcept {
 
 std::shared_ptr<CacheEntry> LocalCache::retiring_entry(
     std::string_view key, const CacheIdentity* reuse, bool preserve_generation) {
+  std::vector<std::shared_ptr<CacheEntry>> released;
   std::lock_guard key_guard(key_mutex(key));
   std::lock_guard guard(mutex_);
   for (auto i = entries_.begin(); i != entries_.end();) {
@@ -3325,6 +3413,7 @@ std::shared_ptr<CacheEntry> LocalCache::retiring_entry(
     if (!entry->stale_ &&
         ((reuse != nullptr && !entry->detached_ && cache_identity_matches(header, *reuse, kCacheBitmapUnit)) ||
          (preserve_generation && (header.flags & kCacheMetaDirty) == 0))) continue;
+    release_keepalive_locked(entry.get(), released);
     if (!entry->stale_) {
       entry->stale_ = true;
       entry->notify_waiters_locked();
@@ -3343,6 +3432,7 @@ std::shared_ptr<CacheEntry> LocalCache::create_writer(
       maximum_size == 0) {
     throw std::invalid_argument("invalid cache writer identity");
   }
+  std::vector<std::shared_ptr<CacheEntry>> released;
   std::lock_guard key_guard(key_mutex(key));
   std::unique_lock guard(mutex_);
   for (auto i = entries_.begin(); i != entries_.end();) {
@@ -3352,6 +3442,7 @@ std::shared_ptr<CacheEntry> LocalCache::create_writer(
       continue;
     }
     if (entry->key_ == key) {
+      release_keepalive_locked(entry.get(), released);
       guard.unlock();
       entry->retire_generation(wait);
       guard.lock();
@@ -3504,6 +3595,7 @@ bool LocalCache::remove(std::string_view key,
                         bool preserve_generation, bool* retry,
                         bool wait) noexcept {
   if (retry != nullptr) *retry = false;
+  std::vector<std::shared_ptr<CacheEntry>> released;
   try {
     std::lock_guard key_guard(key_mutex(key));
     std::shared_ptr<CacheEntry> target;
@@ -3520,6 +3612,7 @@ bool LocalCache::remove(std::string_view key,
       }
       ++i;
     }
+    release_key_keepalive_locked(key, released);
     if (target) {
       {
         std::lock_guard entry_guard(target->mutex_);
@@ -3734,6 +3827,34 @@ bool LocalCache::rename(std::string_view old_key,
   return false;
 }
 
+std::shared_ptr<CacheEntry> LocalCache::try_open(
+    const CacheIdentity& identity) noexcept {
+  if (identity.key.size() > kCacheKeyCapacity ||
+      identity.etag.size() > kCacheEtagCapacity ||
+      identity.version_id.size() > kCacheVersionCapacity) {
+    return {};
+  }
+  std::unique_lock key_guard(
+      key_mutex(identity.key), std::try_to_lock);
+  if (!key_guard.owns_lock()) return {};
+  std::unique_lock guard(mutex_, std::try_to_lock);
+  if (!guard.owns_lock()) return {};
+  for (const KeepaliveSlot& slot : keepalive_) {
+    if (slot.entry->key_ != identity.key) continue;
+    std::unique_lock entry_guard(
+        slot.entry->mutex_, std::try_to_lock);
+    if (!entry_guard.owns_lock()) return {};
+    const auto& header =
+        *static_cast<const CacheMetaHeader*>(slot.entry->mapping_);
+    if (!slot.entry->detached_ && !slot.entry->stale_ &&
+        cache_identity_matches(header, identity, kCacheBitmapUnit)) {
+      return slot.entry;
+    }
+    return {};
+  }
+  return {};
+}
+
 std::shared_ptr<CacheEntry> LocalCache::open(
     const CacheIdentity& identity, bool wait) {
   if (identity.key.size() > kCacheKeyCapacity ||
@@ -3742,6 +3863,7 @@ std::shared_ptr<CacheEntry> LocalCache::open(
     throw std::system_error(EOVERFLOW, std::generic_category(),
                             "S3 identity is too large for cache metadata");
   }
+  std::vector<std::shared_ptr<CacheEntry>> released;
   std::lock_guard key_guard(key_mutex(identity.key));
   std::unique_lock guard(mutex_);
   for (auto i = entries_.begin(); i != entries_.end();) {
@@ -3758,10 +3880,15 @@ std::shared_ptr<CacheEntry> LocalCache::open(
             cache_identity_matches(
                 *static_cast<CacheMetaHeader*>(entry->mapping_), identity,
                 kCacheBitmapUnit);
+        if (matches) {
+          retain_entry_locked(entry, released);
+        }
       }
       if (matches) {
+        guard.unlock();
         return entry;
       }
+      release_keepalive_locked(entry.get(), released);
       guard.unlock();
       entry->retire_generation(wait);
       guard.lock();
@@ -3956,6 +4083,10 @@ std::shared_ptr<CacheEntry> LocalCache::open(
     mapping = MAP_FAILED;
     guard.lock();
     entries_.push_back(entry);
+    {
+      std::lock_guard entry_guard(entry->mutex_);
+      retain_entry_locked(entry, released);
+    }
     guard.unlock();
     ::flock(entry->meta_fd_, LOCK_UN);
     return entry;

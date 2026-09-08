@@ -273,6 +273,10 @@ class LocalCache {
   LocalCache(const LocalCache&) = delete;
   LocalCache& operator=(const LocalCache&) = delete;
 
+  // Bounded, non-blocking in-memory lookup for reactor callers. A miss or any
+  // contended cache lock returns nullptr so a worker can use open().
+  std::shared_ptr<CacheEntry> try_open(
+      const CacheIdentity& identity) noexcept;
   std::shared_ptr<CacheEntry> open(const CacheIdentity& identity, bool wait = true);
   std::shared_ptr<CacheEntry> create_writer(const CacheIdentity& base,
                                             uint64_t maximum_size, bool wait = true);
@@ -314,6 +318,24 @@ class LocalCache {
   void add_allocated(int64_t delta) noexcept;
   [[nodiscard]] uint64_t allocated_bytes() const noexcept;
   [[nodiscard]] uint64_t reserve_floor_bytes() const;
+  struct KeepaliveSlot {
+    std::shared_ptr<CacheEntry> entry;
+    size_t base_metadata_bytes = 0;
+  };
+  static constexpr size_t kKeepaliveEntryLimit = 64;
+  // Admission budget for the fixed mapping and per-block arrays. Variable
+  // fetch/checksum state is outside this fixed-base budget.
+  static constexpr size_t kKeepaliveBaseMetadataLimit =
+      8U * 1024U * 1024U;
+  void retain_entry_locked(
+      const std::shared_ptr<CacheEntry>& entry,
+      std::vector<std::shared_ptr<CacheEntry>>& released);
+  void release_keepalive_locked(
+      CacheEntry* entry,
+      std::vector<std::shared_ptr<CacheEntry>>& released);
+  void release_key_keepalive_locked(
+      std::string_view key,
+      std::vector<std::shared_ptr<CacheEntry>>& released);
 
   CacheConfig config_;
   int root_fd_         = -1;
@@ -328,6 +350,8 @@ class LocalCache {
   mutable std::mutex capacity_mutex_;
   std::array<std::recursive_mutex, 127> key_mutexes_;
   std::vector<std::weak_ptr<CacheEntry>> entries_;
+  std::vector<KeepaliveSlot> keepalive_;
+  size_t keepalive_base_metadata_bytes_ = 0;
   uint64_t pending_reservations_ = 0;
   std::atomic<size_t> clock_entry_{0};
   std::atomic<bool> cold_scan_warned_{false};

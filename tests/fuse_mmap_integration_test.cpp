@@ -2405,6 +2405,34 @@ int main(int argc, char** argv) {
       fd.reset();
       sibling.reset();
 
+      int heads_before_reopen;
+      size_t gets_before_reopen;
+      {
+        std::lock_guard guard(shared.mutex);
+        heads_before_reopen = shared.head_requests;
+        gets_before_reopen = object->get_ranges.size();
+      }
+      for (unsigned i = 0; i != 8; ++i) {
+        UniqueFd reopened(::open((mountpoint + "/cache-blocks.bin").c_str(),
+                                  O_RDONLY | O_CLOEXEC));
+        require(bool(reopened), "reopen retained cached metadata");
+        require(::posix_fadvise(reopened.get(), 0, 0, POSIX_FADV_RANDOM) == 0 &&
+                    ::posix_fadvise(reopened.get(), 0, off_t(2 * block),
+                                    POSIX_FADV_DONTNEED) == 0,
+                "drop FUSE pages for retained metadata reopen");
+        pread_all(reopened.get(), cross, block - page);
+        require(std::equal(cross.begin(), cross.end(),
+                           object->bytes.begin() + block - page),
+                "retained cached metadata reopened with different bytes");
+      }
+      {
+        std::lock_guard guard(shared.mutex);
+        require(shared.head_requests == heads_before_reopen + 8,
+                "cached metadata reuse skipped per-open HEAD validation");
+        require(object->get_ranges.size() == gets_before_reopen,
+                "cached metadata reopen unnecessarily downloaded clean data");
+      }
+
       auto sequence = shared.special_objects.at("cache-sequential.bin");
       UniqueFd seq(::open((mountpoint + "/cache-sequential.bin").c_str(), O_RDONLY | O_CLOEXEC));
       require(bool(seq), "open cached sequential reader");

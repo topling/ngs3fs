@@ -9844,10 +9844,18 @@ struct AsyncOpen {
           .version_id = handle->version_id, .size = handle->size,
           .mtime = created_parent != 0 ? 0 : handle->item->mtime.load(std::memory_order_relaxed),
       };
-      if (cache_retry && !retirement.ready(state, reactor, handle->key,
-                              writable ? nullptr : &cache_identity)) return false;
-      initialize_cache(cache_identity);
-      return false;
+      if (!writable) {
+        // HEAD has already revalidated this identity. A retained metadata
+        // entry needs neither filesystem I/O nor a trip through the worker.
+        handle->cache_entry = state.local_cache->try_open(cache_identity);
+        cache_initialized = bool(handle->cache_entry);
+      }
+      if (!cache_initialized) {
+        if (cache_retry && !retirement.ready(state, reactor, handle->key,
+                                writable ? nullptr : &cache_identity)) return false;
+        initialize_cache(cache_identity);
+        return false;
+      }
     }
     if (cache_initialized) {
       if (!writable && !handle->cache_entry) warn_cache_bypass(state, handle->object_path);

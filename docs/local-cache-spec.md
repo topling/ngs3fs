@@ -285,6 +285,31 @@ use a bounded copy. Fixed-length body data that remains on the socket is
 spliced into the cache file. HTTP/2 flow-control credit is returned as file
 progress is published.
 
+### Bounded metadata reuse
+
+Closing a read handle need not destroy its current `CacheEntry`. Keep a small
+FIFO of reusable read entries, bounded by both 64 entries and 8 MiB of fixed
+base metadata (the metadata mapping and allocated per-block tracking arrays).
+This admission budget is not a ceiling on transient fetch or checksum state;
+those remain governed by their existing operation lifetimes and limits.
+This retains file descriptors and metadata mappings, not data-page pins or
+old object generations. Entries above the metadata limit are not retained;
+there are no additional mount parameters. Disk block eviction remains enabled
+for retained entries under the existing budget policy.
+
+Every ordinary open still performs HEAD and checks the resulting complete
+cache identity. A reactor may reuse an exact current match without a worker
+handoff; this lookup uses nonblocking lock attempts and performs no filesystem
+I/O, retirement or destruction of an evicted entry. A miss or busy lock takes
+the existing background initialization path. Writers, unlink and generation
+retirement must invalidate the relevant retained entry. Rename drops any
+replaced destination and rekeys the source under namespace serialization. Release
+all retained entries before tearing down the cache root's resources.
+
+In-memory checksum results may survive a close/reopen through this bounded
+reuse. They are still not persisted across mounts, and eviction of metadata
+does not imply that a reloaded generation has been verified.
+
 ### Fetch selection
 
 Cache misses align downward to `--cache-block-size` (default 2 MiB). A random
