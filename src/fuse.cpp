@@ -9879,8 +9879,10 @@ struct AsyncOpen {
     }
     const bool passthrough = !writable &&
         select_passthrough_io(state, request, *handle);
-    publish_open_handle(*handle);
     identity.unlock();
+    // Publish the final unlock/notification too: a fast OPEN -> RELEASE may
+    // run on another reactor, and the kernel fh handoff is not a C++ fence.
+    publish_open_handle(*handle);
     file.fh = reinterpret_cast<uint64_t>(handle.get());
     file.direct_io = 0;
     file.keep_cache = keep_cache ? 1 : 0;
@@ -10030,8 +10032,8 @@ void ngs3fs_open(fuse_req_t request, fuse_ino_t inode,
     if (!writable) {
       passthrough = select_passthrough_io(state, request, *handle);
     }
-    publish_open_handle(*handle);
     identity_guard.unlock();
+    publish_open_handle(*handle);
     file->fh = reinterpret_cast<uint64_t>(handle.release());
     budget_reserved = false;
     // All handles stay buffered. O_RDWR is rejected above, so Linux rejects
