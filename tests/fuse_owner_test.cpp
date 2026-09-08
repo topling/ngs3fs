@@ -125,7 +125,8 @@ struct ReactorIoTest {
     return reactor.fd_reply_count_;
   }
 
-  static bool fd_reply_uses_mode(FuseReactor& reactor, int expected_mode) {
+  static bool fd_reply_uses_mode(FuseReactor& reactor, int expected_mode,
+                                 unsigned expected_flags) {
     size_t active = 0;
     for (size_t index = 0; index < reactor.reply_pool_size_; ++index) {
       const FuseReactor::Reply& reply = reactor.reply_pool_[index];
@@ -134,7 +135,8 @@ struct ReactorIoTest {
       const bool pipe_matches = expected_mode == FUSE_FD_REPLY_SPLICE ?
           reply.fd_pipe[0] >= 0 && reply.fd_pipe[1] >= 0 :
           reply.fd_pipe[0] < 0 && reply.fd_pipe[1] < 0;
-      if (reply.fd_mode != expected_mode || !pipe_matches) {
+      if (reply.fd_mode != expected_mode ||
+          reply.fd_final_splice_flags != expected_flags || !pipe_matches) {
         return false;
       }
     }
@@ -152,6 +154,20 @@ struct ReactorIoTest {
       }
     }
     return false;
+  }
+
+  static bool fd_reply_source_uses_flags(
+      FuseReactor& reactor, int expected_flags) {
+    size_t active = 0;
+    for (FuseReactor::IoRequest* request : reactor.io_requests_) {
+      if (request->async == nullptr ||
+          request->async->complete != FuseReactor::fd_reply_source_done) {
+        continue;
+      }
+      ++active;
+      if (request->flags != expected_flags) return false;
+    }
+    return active == 1;
   }
 
   static void fail_replies(FuseReactor& reactor, int result) {
@@ -804,7 +820,10 @@ void test_cached_reply_connection() {
                   !handle.identity_mutex.try_lock() &&
                   ReactorIoTest::fd_reply_count(test.reactor()) == 1 &&
                   ReactorIoTest::fd_reply_uses_mode(
-                      test.reactor(), expected_mode),
+                      test.reactor(), expected_mode, 0) &&
+                  ReactorIoTest::fd_reply_source_uses_flags(
+                      test.reactor(), expected_mode == FUSE_FD_REPLY_SPLICE ?
+                          SPLICE_F_NONBLOCK : 0),
               "accepted cached reply released ownership before source CQE");
       const int wait_fd = handle.cache_entry->begin_retire_wait();
       require(wait_fd >= 0, "accepted cached reply did not retain range pin");

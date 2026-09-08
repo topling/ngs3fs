@@ -14215,7 +14215,7 @@ struct AsyncCachedReadTask final : AsyncReadTask {
     bool deferred = false;
     const int result = task->reactor->reply_fd_async(
         task->request, task->handle->cache_entry->data_fd(), task->offset,
-        task->wanted, FUSE_BUF_SPLICE_MOVE, reply_done, task, deferred);
+        task->wanted, 0, reply_done, task, deferred);
     if (!deferred) reply_done(task, result);
     return result;
   }
