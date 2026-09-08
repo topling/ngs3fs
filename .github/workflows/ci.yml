@@ -270,6 +270,7 @@ jobs:
             cmake \
             curl \
             fuse3 \
+            libfuse2t64 \
             libfuse3-dev \
             liburing-dev \
             libssl-dev \

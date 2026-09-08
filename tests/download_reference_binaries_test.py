@@ -3,6 +3,7 @@ import importlib.util
 import json
 import io
 import pathlib
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -18,6 +19,18 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DownloadReferenceBinariesTest(unittest.TestCase):
+    def test_version_failure_includes_loader_diagnostic(self):
+        result = subprocess.CompletedProcess(
+            ["mount-s3", "--version"], 127, "", "libfuse.so.2: cannot open shared object file\n"
+        )
+        with mock.patch("subprocess.run", return_value=result) as run:
+            with self.assertRaisesRegex(RuntimeError, "(?s)exited 127.*libfuse.so.2"):
+                MODULE.version(pathlib.Path("mount-s3"))
+            run.assert_called_once_with(
+                ["mount-s3", "--version"], check=False, capture_output=True,
+                text=True, timeout=MODULE.PROCESS_TIMEOUT,
+            )
+
     def test_mountpoint_url_is_selected_from_release_body(self):
         release = {
             "tag_name": "mountpoint-s3-1.24.0",

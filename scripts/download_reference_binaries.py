@@ -87,7 +87,12 @@ def extract_mount_binary(archive_path, output_path):
 def version(path):
     import subprocess
 
-    result = subprocess.run([str(path), "--version"], check=True, capture_output=True, text=True, timeout=PROCESS_TIMEOUT)
+    result = subprocess.run([str(path), "--version"], check=False, capture_output=True, text=True, timeout=PROCESS_TIMEOUT)
+    if result.returncode:
+        raise RuntimeError(
+            f"{path} --version exited {result.returncode}\n"
+            f"stdout: {result.stdout.strip()}\nstderr: {result.stderr.strip()}"
+        )
     return result.stdout.strip() or result.stderr.strip()
 
 
