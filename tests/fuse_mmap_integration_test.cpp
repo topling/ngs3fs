@@ -4884,6 +4884,29 @@ int main(int argc, char** argv) {
                 "recovered server object differs from local cache (size=" +
                     std::to_string(shared.object.size()) + ")");
       }
+
+      // Publishing the recovered bytes precedes the recovery worker's
+      // verification HEAD and removal of the path from its recovery registry.
+      // Keep the mock object unchanged until a non-truncating writer reaches
+      // the ordinary non-empty-file rejection instead of the recovery gate.
+      bool recovery_completed = false;
+      for (unsigned attempt = 0; attempt < 500; ++attempt) {
+        errno = 0;
+        UniqueFd recovery_probe(
+            ::open(copied_path.c_str(), O_WRONLY | O_CLOEXEC));
+        require(!recovery_probe,
+                "recovery completion probe unexpectedly opened a writer");
+        if (errno == EOPNOTSUPP) {
+          recovery_completed = true;
+          break;
+        }
+        if (errno != EBUSY && errno != EAGAIN) {
+          fail_errno("probe cached write recovery completion");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      require(recovery_completed,
+              "cached write recovery did not leave the recovery registry");
     }
 
     if (!cache_dir.empty()) {
