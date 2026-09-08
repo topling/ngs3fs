@@ -1150,7 +1150,8 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
         xml += "</s3:Size></s3:Contents>";
       }
       for (const auto& [key, object] : state.special_objects) {
-        if (key.starts_with(".~ngs3fs~.pending-delete/")) {
+        if (key.starts_with(".~ngs3fs~.pending-delete/") ||
+            key.find('/') != std::string::npos) {
           continue;
         }
         xml += "<s3:Contents><s3:Key>";
@@ -1172,6 +1173,22 @@ int on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame,
       }
     } else {
       xml += "<s3:IsTruncated>0</s3:IsTruncated>";
+      if (deep) {
+        for (const auto& [key, object] : state.special_objects) {
+          if (!key.starts_with("deep/")) {
+            continue;
+          }
+          xml += "<s3:Contents><s3:Key>";
+          xml += key;
+          xml += "</s3:Key><s3:ETag>";
+          xml += object->etag;
+          xml += "</s3:ETag><s3:LastModified>";
+          xml += object->last_modified_iso;
+          xml += "</s3:LastModified><s3:Size>";
+          xml += std::to_string(object->bytes.size());
+          xml += "</s3:Size></s3:Contents>";
+        }
+      }
     }
     if (state.deep_present) {
       if (second_root_page) {
@@ -2423,9 +2440,12 @@ int main(int argc, char** argv) {
               "cross-directory hardlink-as-copy failed");
       struct stat source_status{};
       struct stat destination_status{};
-      require(::stat(source_path.c_str(), &source_status) == 0 &&
-                  ::stat(destination_path.c_str(), &destination_status) == 0,
-              "hardlink-as-copy did not expose both independent names");
+      if (::stat(source_path.c_str(), &source_status) != 0) {
+        fail_errno("stat hardlink-copy source after copy");
+      }
+      if (::stat(destination_path.c_str(), &destination_status) != 0) {
+        fail_errno("stat hardlink-copy destination after copy");
+      }
       require(source_status.st_ino != destination_status.st_ino &&
                   source_status.st_nlink == 1 &&
                   destination_status.st_nlink == 1,
