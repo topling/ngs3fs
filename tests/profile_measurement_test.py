@@ -10,6 +10,7 @@ import unittest
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 PROFILE_SCRIPT = PROJECT_DIR / "scripts" / "profile_ngs3fs.sh"
 COMPARE_SCRIPT = PROJECT_DIR / "scripts" / "compare_goofys.sh"
+CI_WORKFLOW = PROJECT_DIR / ".github" / "workflows" / "ci.yml"
 
 
 def extract_shell_function(name):
@@ -195,6 +196,50 @@ perf_stub() {
 
 
 class ProfileMeasurementTest(unittest.TestCase):
+    def test_cached_profile_matrix_includes_owner_workers(self):
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+        names = (
+            "Profile cached block reads on one and four reactors and SQPOLL",
+            "Profile cached owner-complete worker model",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            harness = Path(temporary) / "profile-matrix.sh"
+            bodies = []
+            for name in names:
+                start = source.index(f"      - name: {name}\n")
+                start = source.index("        run: |\n", start)
+                start += len("        run: |\n")
+                end = source.index("\n      - name:", start)
+                bodies.append(textwrap.dedent(source[start:end]))
+            harness.write_text(
+                '#!/usr/bin/env bash\nset -euo pipefail\n'
+                'GITHUB_WORKSPACE=/unit-test\n'
+                'perf() { :; }\n'
+                'sudo() { printf "%s\\n" "$*"; }\n'
+                + "\n".join(bodies), encoding="utf-8")
+            result = subprocess.run(
+                ["/usr/bin/bash", str(harness)], check=True,
+                capture_output=True, text=True,
+                env={**os.environ, "PATH": "/usr/bin:/bin"})
+        rows = result.stdout.splitlines()
+        self.assertEqual(len(rows), 10)
+        for mode in ("cold", "warm"):
+            normal = [row for row in rows if row.endswith(
+                f"github-io-engine-cache-{mode}-uring-4")]
+            self.assertEqual(len(normal), 1)
+            self.assertIn("NGS3FS_REACTORS=4", normal[0])
+            for variant in ("baseline", "current"):
+                matched = [row for row in rows if row.endswith(
+                    f"github-io-engine-affinity-cache-{mode}-{variant}")]
+                self.assertEqual(len(matched), 1)
+                row = matched[0]
+                for setting in ("NGS3FS_IO_ENGINE=uring", "NGS3FS_REACTORS=4",
+                                "MAX_CONNECTIONS=8", "RANDOM_READ_ADVICE=random",
+                                "RANDOM_READ_OPERATIONS=512", f"CACHE_MODE={mode}"):
+                    self.assertIn(setting, row)
+                directory = "baseline" if variant == "baseline" else "dev"
+                self.assertIn(f"NGS3FS_BIN=/unit-test/build/{directory}/ngs3fs", row)
+
     def run_workload(self, workload):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

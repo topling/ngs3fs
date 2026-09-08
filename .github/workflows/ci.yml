@@ -466,15 +466,17 @@ jobs:
             ./scripts/benchmark_io_engine.sh \
             "$GITHUB_WORKSPACE/build/benchmarks/github-io-engine-cache-unlimited"
 
-      - name: Profile cached block reads on ordinary uring and SQPOLL
+      - name: Profile cached block reads on one and four reactors and SQPOLL
         if: always()
         run: |
           port=17670
-          for engine in uring uring-sqpoll; do
+          for configuration in uring:1 uring:4 uring-sqpoll:1; do
+            engine=${configuration%%:*}
+            reactors=${configuration##*:}
             for mode in cold warm; do
               drop=0
               if [[ "$mode" == warm ]]; then drop=1; fi
-              sudo env NGS3FS_IO_ENGINE="$engine" NGS3FS_REACTORS=1 \
+              sudo env NGS3FS_IO_ENGINE="$engine" NGS3FS_REACTORS="$reactors" \
               WORKLOAD=random-read RANDOM_READ_OPERATIONS=512 \
               RANDOM_READ_ADVICE=normal CACHE_MODE="$mode" \
               DROP_CACHES_AFTER_WARMUP="$drop" \
@@ -482,7 +484,7 @@ jobs:
               PERF_EVENT=cpu-clock PERF_FREQUENCY=4000 \
               PERF_STAT_EVENTS=task-clock,context-switches,cpu-migrations,page-faults \
               PORT="$port" ./scripts/profile_ngs3fs.sh \
-              "$GITHUB_WORKSPACE/build/profiles/github-io-engine-cache-$mode-$engine-1"
+              "$GITHUB_WORKSPACE/build/profiles/github-io-engine-cache-$mode-$engine-$reactors"
               port=$((port + 1))
             done
           done
@@ -502,6 +504,33 @@ jobs:
               PORT="$port" ./scripts/profile_ngs3fs.sh \
               "$GITHUB_WORKSPACE/build/profiles/github-io-engine-cache-random-$engine-1"
             port=$((port + 1))
+          done
+
+      - name: Profile cached owner-complete worker model
+        if: always()
+        run: |
+          port=17680
+          for variant in baseline current; do
+            binary="$GITHUB_WORKSPACE/build/dev/ngs3fs"
+            source="$GITHUB_WORKSPACE"
+            if [[ "$variant" == baseline ]]; then
+              binary="$GITHUB_WORKSPACE/build/baseline/ngs3fs"
+              source="$GITHUB_WORKSPACE/build/baseline-src"
+            fi
+            for mode in cold warm; do
+              sudo env \
+                NGS3FS_BIN="$binary" NGS3FS_SOURCE_DIR="$source" \
+                NGS3FS_IO_ENGINE=uring NGS3FS_REACTORS=4 \
+                MAX_CONNECTIONS=8 WORKLOAD=random-read \
+                RANDOM_READ_OPERATIONS=512 RANDOM_READ_ADVICE=random \
+                CACHE_MODE="$mode" DROP_CACHES_AFTER_WARMUP=1 \
+                PERF_BIN="$(command -v perf)" PERF_LIB_DIR= \
+                PERF_EVENT=cpu-clock PERF_FREQUENCY=4000 \
+                PERF_STAT_EVENTS=task-clock,context-switches,cpu-migrations,page-faults \
+                PORT="$port" ./scripts/profile_ngs3fs.sh \
+                "$GITHUB_WORKSPACE/build/profiles/github-io-engine-affinity-cache-$mode-$variant"
+              port=$((port + 1))
+            done
           done
 
       - name: Compare Mountpoint concurrent random reads
