@@ -193,6 +193,8 @@ stop_perf_record() {
   else
     wait_status=$?
   fi
+  perf_record_exit_status=$wait_status
+  perf_record_interrupted=$interrupted
   perf_pid=
   if [[ -n "$perf_diagnostic_log" ]]; then
     {
@@ -211,6 +213,81 @@ stop_perf_record() {
     return 1
   fi
   return 0
+}
+
+# perf can lose an io-wq TID between enumeration and initial COMM synthesis.
+# Recognize only that observed pre-ACK failure, never an arbitrary exit 255.
+vanished_perf_thread() {
+  [[ "$perf_record_exit_status" = 255 &&
+     "$perf_record_interrupted" = no ]] || return 1
+  local pattern="^couldn't open /proc/([0-9]+)/status$"
+  local line tid= matches=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ $pattern ]]; then
+      tid=${BASH_REMATCH[1]}
+      matches=$((matches + 1))
+    fi
+  done <"$perf_record_log"
+  [[ "$matches" = 1 && "$tid" != "$ngs3fs_pid" &&
+     ! -e "/proc/$tid" ]] || return 1
+  kill -0 "$ngs3fs_pid" 2>/dev/null || return 1
+  # kill -0 also succeeds for a zombie.
+  local key value rest state=
+  while read -r key value rest; do
+    if [[ "$key" = State: ]]; then
+      state=$value
+      break
+    fi
+  done 2>/dev/null <"/proc/$ngs3fs_pid/status" || return 1
+  [[ -n "$state" && "$state" != Z && "$state" != X ]] || return 1
+  printf '%s\n' "$tid"
+}
+
+start_perf_record() {
+  local attempt=$1
+  local attach suffix tid
+  for attach in 1 2; do
+    suffix=$attempt
+    if ((attach == 2)); then suffix="$attempt-reattach"; fi
+    perf_control_fifo="$run_dir/perf-control-$suffix.fifo"
+    perf_ack_fifo="$run_dir/perf-ack-$suffix.fifo"
+    perf_record_log="$run_dir/perf-record-$suffix.log"
+    perf_diagnostic_log="$run_dir/perf-diagnostic-$suffix.txt"
+    : >"$perf_record_log" || return 1
+    : >"$perf_diagnostic_log" || return 1
+    mkfifo "$perf_control_fifo" "$perf_ack_fifo" || return 1
+    exec {perf_control_fd}<>"$perf_control_fifo" || return 1
+    exec {perf_ack_fd}<>"$perf_ack_fifo" || return 1
+    # Keep level-one startup diagnostics, including vanished /proc TIDs. Record
+    # all DSO build IDs so perf skips its post-record per-sample unwind scan and
+    # the huge verbose logs it emits. DWARF samples and frequency are unchanged.
+    # Attach only to ngs3fs. A dummy workload would replace perf's exit status
+    # with the signal used to terminate that child during cleanup.
+    LD_LIBRARY_PATH=$perf_lib "$perf" record -v --buildid-all -F "$perf_frequency" \
+      -e "$perf_event" -m "$perf_mmap_size" \
+      --call-graph dwarf,16384 --delay -1 \
+      --control "fifo:$perf_control_fifo,$perf_ack_fifo" \
+      -p "$ngs3fs_pid" \
+      -o "$run_dir/perf.data" \
+      2>"$perf_record_log" &
+    perf_pid=$!
+    if control_perf_record enable "$perf_startup_timeout_seconds"; then
+      return 0
+    fi
+    stop_perf_record 1 || true
+    close_perf_control
+    if ((attach != 1)) || ! tid=$(vanished_perf_thread); then
+      return 1
+    fi
+    printf 'warning: perf lost exited thread %s; reattaching once before the measured workload\n' \
+      "$tid" >&2 || return 1
+    printf 'perf_attach_retry_profile_%s_missing_tid=%s\n' "$attempt" "$tid" \
+      >>"$run_dir/system.txt" || return 1
+    # No enable ACK or measured workload occurred; discard only the incomplete
+    # recorder output. Keep its stderr and diagnostic files under their names.
+    rm -f "$run_dir/perf.data" || return 1
+  done
+  return 1
 }
 
 cleanup() {
@@ -502,31 +579,7 @@ run_profile_measurement() {
   printf 'cache_drop_status_attempt_%s=%s\n' "$attempt" "$cache_drop_status" \
     >>"$run_dir/system.txt"
   profile_first_line=$(wc -l <"$run_dir/versity-access.log")
-  perf_control_fifo="$run_dir/perf-control-$attempt.fifo"
-  perf_ack_fifo="$run_dir/perf-ack-$attempt.fifo"
-  perf_record_log="$run_dir/perf-record-$attempt.log"
-  perf_diagnostic_log="$run_dir/perf-diagnostic-$attempt.txt"
-  : >"$perf_record_log"
-  : >"$perf_diagnostic_log"
-  mkfifo "$perf_control_fifo" "$perf_ack_fifo"
-  exec {perf_control_fd}<>"$perf_control_fifo"
-  exec {perf_ack_fd}<>"$perf_ack_fifo"
-  # Keep level-one startup diagnostics, including vanished /proc TIDs. Record
-  # all DSO build IDs so perf skips its post-record per-sample unwind scan and
-  # the huge verbose logs it emits. DWARF samples and frequency are unchanged.
-  # Attach only to ngs3fs. A dummy workload would replace perf's exit status
-  # with the signal used to terminate that child during cleanup.
-  LD_LIBRARY_PATH=$perf_lib "$perf" record -v --buildid-all -F "$perf_frequency" \
-    -e "$perf_event" -m "$perf_mmap_size" \
-    --call-graph dwarf,16384 --delay -1 \
-    --control "fifo:$perf_control_fifo,$perf_ack_fifo" \
-    -p "$ngs3fs_pid" \
-    -o "$run_dir/perf.data" \
-    2>"$perf_record_log" &
-  perf_pid=$!
-  if ! control_perf_record enable "$perf_startup_timeout_seconds"; then
-    stop_perf_record 1 || true
-    close_perf_control
+  if ! start_perf_record "$attempt"; then
     return 1
   fi
   profile_start_ns=$(date +%s%N)

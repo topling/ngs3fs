@@ -25,7 +25,8 @@ def extract_shell_function(name, script=PROFILE_SCRIPT):
 MEASUREMENT_FUNCTIONS = "\n".join(
     extract_shell_function(name)
     for name in ("close_perf_control", "control_perf_record",
-                 "stop_perf_record", "run_profile_measurement")
+                 "stop_perf_record", "vanished_perf_thread",
+                 "start_perf_record", "run_profile_measurement")
 )
 
 
@@ -45,7 +46,7 @@ perf_frequency=4000
 perf_event=stub
 perf_mmap_size=1
 perf_stat_events=stub
-ngs3fs_pid=123
+ngs3fs_pid=$$
 perf_control_fd=
 perf_ack_fd=
 perf_control_fifo=
@@ -79,15 +80,17 @@ printf 'old request outside measurement\n' >"$run_dir/versity-access.log"
 : >"$run_dir/bench-calls.txt"
 : >"$run_dir/drop-calls.txt"
 : >"$run_dir/perf-control.txt"
+: >"$run_dir/perf-control-fifos.txt"
 : >"$run_dir/perf-control-timeouts.txt"
+: >"$run_dir/perf-record-calls.txt"
 
 read() {
   local previous=
   local timeout=
-  local value
-  for value in "$@"; do
-    if [[ "$previous" = -t ]]; then timeout=$value; fi
-    previous=$value
+  local read_arg
+  for read_arg in "$@"; do
+    if [[ "$previous" = -t ]]; then timeout=$read_arg; fi
+    previous=$read_arg
   done
   if [[ -n "$timeout" ]]; then
     printf '%s\n' "$timeout" >>"$run_dir/perf-control-timeouts.txt"
@@ -105,9 +108,33 @@ sleep() {
   sleep_calls=$((sleep_calls + 1))
 }
 
+mkfifo() {
+  if [[ "${PERF_STUB_MKFIFO_FAIL:-}" = 1 ]]; then return 1; fi
+  command /usr/bin/mkfifo "$@"
+}
+
 kill() {
-  if [[ "$1" = -0 && "${PERF_STUB_NOT_ALIVE:-}" = 1 ]]; then
-    return 1
+  local current_attach=1
+  if [[ "${perf_record_log:-}" = *-reattach.log ]]; then current_attach=2; fi
+  if [[ "$1" = -0 ]]; then
+    if [[ "${PERF_STUB_MAIN_NOT_ALIVE:-}" = 1 && "$2" = "$ngs3fs_pid" ]]; then
+      return 1
+    fi
+    if [[ "${PERF_STUB_NOT_ALIVE:-}" = 1 &&
+          -n "${perf_pid:-}" && "$2" = "$perf_pid" ]]; then
+      return 1
+    fi
+    if [[ "$current_attach" = 1 &&
+          "${PERF_STUB_FIRST_EXIT_BEFORE_ACK:-}" = 1 &&
+          "${PERF_STUB_FIRST_PERF_ALIVE:-}" != 1 &&
+          -n "${perf_pid:-}" && "$2" = "$perf_pid" ]]; then
+      return 1
+    fi
+    if [[ "$current_attach" = 2 &&
+          "${PERF_STUB_SECOND_EXIT_BEFORE_ACK:-}" = 1 &&
+          -n "${perf_pid:-}" && "$2" = "$perf_pid" ]]; then
+      return 1
+    fi
   fi
   if [[ "$1" = -INT && "${PERF_STUB_INTERRUPT_FAIL:-}" = 1 ]]; then
     return 1
@@ -116,7 +143,16 @@ kill() {
 }
 
 wait() {
-  return "${PERF_STUB_WAIT_STATUS:-0}"
+  local status=${PERF_STUB_WAIT_STATUS:-0}
+  local current_attach=1
+  if [[ "${perf_record_log:-}" = *-reattach.log ]]; then current_attach=2; fi
+  if [[ "$current_attach" = 1 && -n "${PERF_STUB_FIRST_WAIT_STATUS:-}" ]]; then
+    status=$PERF_STUB_FIRST_WAIT_STATUS
+  elif [[ "$current_attach" = 2 &&
+          -n "${PERF_STUB_SECOND_WAIT_STATUS:-}" ]]; then
+    status=$PERF_STUB_SECOND_WAIT_STATUS
+  fi
+  return "$status"
 }
 
 emit_requests() {
@@ -167,7 +203,19 @@ perf_stub() {
   local mode=$1
   shift
   if [[ "$mode" = record ]]; then
+    local current_attach=${attach:-1}
+    printf '%s\n' "$current_attach" >>"$run_dir/perf-record-calls.txt"
     printf 'perf record stub started\n' >&2
+    if [[ "$current_attach" = 1 &&
+          -n "${PERF_STUB_FIRST_MISSING_TID:-}" ]]; then
+      local missing_tid=$PERF_STUB_FIRST_MISSING_TID
+      if [[ "$missing_tid" = main ]]; then missing_tid=$ngs3fs_pid; fi
+      printf "couldn't open /proc/%s/status\n" "$missing_tid" >&2
+      if [[ -n "${PERF_STUB_FIRST_EXTRA_MISSING_TID:-}" ]]; then
+        printf "couldn't open /proc/%s/status\n" \
+          "$PERF_STUB_FIRST_EXTRA_MISSING_TID" >&2
+      fi
+    fi
     local control_spec=
     local delayed=0
     local verbosity=0
@@ -205,6 +253,15 @@ perf_stub() {
     local fifo_spec=${control_spec#fifo:}
     local control_fifo=${fifo_spec%%,*}
     local ack_fifo=${fifo_spec#*,}
+    printf '%s\n' "$control_spec" >>"$run_dir/perf-control-fifos.txt"
+    if [[ "$current_attach" = 1 &&
+          "${PERF_STUB_FIRST_EXIT_BEFORE_ACK:-}" = 1 ]]; then
+      return "${PERF_STUB_FIRST_PROCESS_STATUS:-255}"
+    fi
+    if [[ "$current_attach" = 2 &&
+          "${PERF_STUB_SECOND_EXIT_BEFORE_ACK:-}" = 1 ]]; then
+      return "${PERF_STUB_SECOND_PROCESS_STATUS:-255}"
+    fi
     local command
     exec 7<>"$control_fifo"
     exec 8<>"$ack_fifo"
@@ -239,6 +296,51 @@ perf_stub() {
 
 
 class ProfileMeasurementTest(unittest.TestCase):
+    def run_single_measurement(self, extra_environment):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness = root / "measurement-harness.sh"
+            harness.write_text(
+                textwrap.dedent(HARNESS).lstrip()
+                + "\n"
+                + MEASUREMENT_FUNCTIONS
+                + "\nrun_profile_measurement 1 1\n",
+                encoding="utf-8",
+            )
+            run_dir = root / "run"
+            result = subprocess.run(
+                ["/usr/bin/bash", str(harness), str(run_dir), "mmap"],
+                cwd=PROJECT_DIR,
+                env={**os.environ, "PATH": "/usr/bin:/bin",
+                     "PERF_STARTUP_TIMEOUT_SECONDS": "1",
+                     "PERF_CONTROL_TIMEOUT_SECONDS": "1",
+                     **extra_environment},
+                capture_output=True, text=True, timeout=20,
+            )
+
+            def lines(name):
+                path = run_dir / name
+                return path.read_text(encoding="utf-8").splitlines() \
+                    if path.exists() else []
+
+            evidence = {
+                "record_calls": lines("perf-record-calls.txt"),
+                "drop_calls": lines("drop-calls.txt"),
+                "bench_calls": lines("bench-calls.txt"),
+                "controls": lines("perf-control.txt"),
+                "control_fifos": lines("perf-control-fifos.txt"),
+                "system": "\n".join(lines("system.txt")),
+                "remaining_fifos": [path.name for path in
+                                      run_dir.glob("perf-*.fifo")],
+                "logs": {
+                    path.name: path.read_text(encoding="utf-8")
+                    for pattern in ("perf-record-*.log",
+                                    "perf-diagnostic-*.txt")
+                    for path in run_dir.glob(pattern)
+                },
+            }
+            return result, evidence
+
     def test_flamegraph_labels_period_weight_not_sample_count(self):
         script = PROFILE_SCRIPT.read_text(encoding="utf-8")
         self.assertIn('--countname "event-period units"', script)
@@ -328,6 +430,110 @@ class ProfileMeasurementTest(unittest.TestCase):
                 self.assertIn(f"perf_record_exit_status={status}", diagnostic)
                 if not success:
                     self.assertIn("perf record failed:", result.stderr)
+
+    def test_vanished_perf_thread_reattaches_once_before_workload(self):
+        result, evidence = self.run_single_measurement({
+            "PERF_STUB_FIRST_EXIT_BEFORE_ACK": "1",
+            "PERF_STUB_FIRST_MISSING_TID": "2147483647",
+            "PERF_STUB_FIRST_WAIT_STATUS": "255",
+            "PERF_STUB_SECOND_WAIT_STATUS": "0",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(evidence["record_calls"], ["1", "2"])
+        self.assertEqual(evidence["drop_calls"], ["1"])
+        self.assertEqual(len(evidence["bench_calls"]), 1)
+        self.assertEqual(evidence["controls"], ["1:enable", "1:disable"])
+        self.assertEqual(len(evidence["control_fifos"]), 2)
+        self.assertNotEqual(evidence["control_fifos"][0],
+                            evidence["control_fifos"][1])
+        self.assertIn("perf-control-1.fifo", evidence["control_fifos"][0])
+        self.assertIn("perf-control-1-reattach.fifo",
+                      evidence["control_fifos"][1])
+        self.assertEqual(evidence["remaining_fifos"], [])
+        self.assertIn("perf-record-1.log", evidence["logs"])
+        self.assertIn("couldn't open /proc/2147483647/status",
+                      evidence["logs"]["perf-record-1.log"])
+        self.assertIn("perf_record_exit_status=255",
+                      evidence["logs"]["perf-diagnostic-1.txt"])
+        self.assertIn("perf-record-1-reattach.log", evidence["logs"])
+        self.assertIn("perf_attach_retry_profile_1_missing_tid=2147483647",
+                      evidence["system"])
+        self.assertIn("reattaching once before the measured workload",
+                      result.stderr)
+
+    def test_perf_reattach_rejects_unproven_failures(self):
+        sleeper = subprocess.Popen(["/usr/bin/sleep", "30"])
+        try:
+            self.assertTrue(Path(f"/proc/{sleeper.pid}").exists())
+            cases = (
+                ("generic-255", {}, 1),
+                ("two-missing-tids", {
+                    "PERF_STUB_FIRST_MISSING_TID": "2147483647",
+                    "PERF_STUB_FIRST_EXTRA_MISSING_TID": "2147483646",
+                }, 1),
+                ("live-tid", {
+                    "PERF_STUB_FIRST_MISSING_TID": str(sleeper.pid),
+                }, 1),
+                ("main-tid", {
+                    "PERF_STUB_FIRST_MISSING_TID": "main",
+                }, 1),
+                ("non-255", {
+                    "PERF_STUB_FIRST_MISSING_TID": "2147483647",
+                    "PERF_STUB_FIRST_WAIT_STATUS": "42",
+                }, 1),
+                ("interrupted", {
+                    "PERF_STUB_FIRST_MISSING_TID": "2147483647",
+                    "PERF_STUB_FIRST_PERF_ALIVE": "1",
+                }, 1),
+                ("dead-main", {
+                    "PERF_STUB_FIRST_MISSING_TID": "2147483647",
+                    "PERF_STUB_MAIN_NOT_ALIVE": "1",
+                }, 1),
+                ("second-failure", {
+                    "PERF_STUB_FIRST_MISSING_TID": "2147483647",
+                    "PERF_STUB_SECOND_EXIT_BEFORE_ACK": "1",
+                    "PERF_STUB_SECOND_WAIT_STATUS": "255",
+                }, 2),
+            )
+            for name, overrides, expected_calls in cases:
+                with self.subTest(name=name):
+                    environment = {
+                        "PERF_STUB_FIRST_EXIT_BEFORE_ACK": "1",
+                        "PERF_STUB_FIRST_WAIT_STATUS": "255",
+                        **overrides,
+                    }
+                    result, evidence = self.run_single_measurement(environment)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(len(evidence["record_calls"]),
+                                     expected_calls)
+                    self.assertEqual(evidence["drop_calls"], ["1"])
+                    self.assertEqual(evidence["bench_calls"], [])
+                    self.assertEqual(evidence["remaining_fifos"], [])
+                    if expected_calls == 1:
+                        self.assertNotIn("perf-record-1-reattach.log",
+                                         evidence["logs"])
+                    else:
+                        self.assertIn("perf-record-1-reattach.log",
+                                      evidence["logs"])
+                        self.assertIn("perf_record_exit_status=255",
+                                      evidence["logs"]
+                                      ["perf-diagnostic-1.txt"])
+                        self.assertIn("perf_record_exit_status=255",
+                                      evidence["logs"]
+                                      ["perf-diagnostic-1-reattach.txt"])
+        finally:
+            sleeper.terminate()
+            sleeper.wait()
+
+    def test_perf_setup_failure_does_not_spawn_recorder_or_workload(self):
+        result, evidence = self.run_single_measurement({
+            "PERF_STUB_MKFIFO_FAIL": "1",
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(evidence["record_calls"], [])
+        self.assertEqual(evidence["drop_calls"], ["1"])
+        self.assertEqual(evidence["bench_calls"], [])
+        self.assertEqual(evidence["remaining_fifos"], [])
 
     def test_workflow_retains_perf_startup_diagnostics(self):
         source = CI_WORKFLOW.read_text(encoding="utf-8")
