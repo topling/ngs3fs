@@ -50,13 +50,24 @@ struct Test {
     return ::read(fd, data, size);
   }
 
+  static ssize_t splice_callback(int in, off_t* offin, int out, off_t* offout,
+                                  size_t size, unsigned flags, void*) {
+    return ::splice(in, offin, out, offout, size, flags);
+  }
+
   static void clear_receive(void* userdata) {
     ++static_cast<Test*>(userdata)->clear_calls;
   }
 
+  static void init(void* userdata, fuse_conn_info* connection) {
+    (void)userdata;
+    fuse_set_feature_flag(connection, FUSE_CAP_SPLICE_WRITE);
+    fuse_set_feature_flag(connection, FUSE_CAP_SPLICE_MOVE);
+  }
+
   static ssize_t fd_reply(int fd, const iovec* header, int count,
                           int source_fd, off_t offset, size_t length,
-                          unsigned flags, int mode, fuse_req_t req,
+                          unsigned flags, fuse_req_t req,
                           void* userdata) {
     auto& test = *static_cast<Test*>(userdata);
     ++test.fd_calls;
@@ -64,8 +75,8 @@ struct Test {
                    offset == 31 && length == 123,
                "fd reply source or destination changed");
     test.check(count == 1 && header[0].iov_len == sizeof(fuse_out_header) &&
-                   mode == FUSE_FD_REPLY_PREAD && flags == 0,
-               "small fd reply changed header or transfer mode");
+                   flags == SPLICE_F_MOVE,
+               "fd reply changed header or transfer flags");
     const auto* out = static_cast<const fuse_out_header*>(header[0].iov_base);
     test.check(out->len == sizeof(*out) + length && out->error == 0 &&
                    out->unique == 10 + test.fd_case,
@@ -83,9 +94,11 @@ struct Test {
     auto& test = *static_cast<Test*>(fuse_req_userdata(req));
     const off_t offset = test.fd_case == 3 ? INT64_MAX : 31;
     const size_t length = test.fd_case == 2 ? 0 : 123;
-    test.check(fuse_reply_fd_async(req, 17, offset, length,
-                                   FUSE_BUF_SPLICE_MOVE) == 0,
-               "fd reply entry did not accept or send its error reply");
+    const auto flags = test.fd_case == 5 ? FUSE_BUF_NO_SPLICE :
+                                           FUSE_BUF_SPLICE_MOVE;
+    const int result = fuse_reply_fd_async(req, 17, offset, length, flags);
+    test.check(result == 0,
+               "fd reply entry did not enforce splice-only semantics");
   }
 
   static void write_buf(fuse_req_t req, fuse_ino_t nodeid,
@@ -124,6 +137,7 @@ struct Test {
 
   bool initialize() {
     fuse_lowlevel_ops operations{};
+    operations.init = init;
     operations.write_buf = write_buf;
     operations.setxattr = setxattr;
     operations.read = read_file;
@@ -141,6 +155,7 @@ struct Test {
     fuse_custom_io io{};
     io.writev = writev_callback;
     io.read = read_callback;
+    io.splice_send = splice_callback;
     io.async_userdata = this;
     io.clear_receive = clear_receive;
     io.fd_reply_async = fd_reply;
@@ -270,7 +285,8 @@ struct Test {
   }
 
   bool fd_reply_cases() {
-    for (fd_case = 0; fd_case != 5; ++fd_case) {
+    for (const unsigned scenario : {0u, 1u, 2u, 3u, 5u, 4u}) {
+      fd_case = scenario;
       struct ReadRequest {
         fuse_in_header header{};
         fuse_read_in body{};
@@ -301,7 +317,8 @@ struct Test {
         if (!check(fuse_reply_async_error(req, EIO) == 0,
                    "source error did not send a normal reply")) return false;
       }
-      const int error = fd_case == 0 ? EIO : fd_case == 1 ? EAGAIN : EINVAL;
+      const int error = fd_case == 0 ? EIO :
+          fd_case == 1 ? EAGAIN : fd_case == 5 ? EOPNOTSUPP : EINVAL;
       if (!check(recv(reply_peer, &reply, sizeof(reply), MSG_WAITALL) == sizeof(reply) &&
                      reply.len == sizeof(reply) && reply.unique == 10 + fd_case &&
                      reply.error == -error && !fuse_session_exited(session),

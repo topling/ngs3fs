@@ -142,14 +142,11 @@ class FuseReactor : public IoExecutor {
     void* notify_context = nullptr;
     FuseReactor* fd_reply_owner = nullptr;
     AsyncIoRequest fd_source_io{};
-    std::vector<u_char> fd_source_data;
-    std::array<iovec, 2> fd_output_iov{};
     int fd_pipe[2] = {-1, -1};
     size_t fd_pipe_capacity = 0;
     size_t fd_header_length = 0;
     size_t fd_payload_length = 0;
     unsigned fd_final_splice_flags = 0;
-    int fd_mode = 0;
     bool fd_reply = false;
 
     u_char* data() noexcept {
@@ -259,7 +256,7 @@ class FuseReactor : public IoExecutor {
   static ssize_t fd_reply_async(
       int output_fd, const iovec* header, int header_count,
       int source_fd, off_t source_offset, size_t payload_length,
-      unsigned final_splice_flags, int mode, fuse_req_t req,
+      unsigned final_splice_flags, fuse_req_t req,
       void* userdata) noexcept;
   static void async_wakeup(void* userdata) noexcept;
   static void clear_receive(void* userdata) noexcept;
@@ -287,10 +284,9 @@ class FuseReactor : public IoExecutor {
                       const iovec* header, int header_count,
                       int source_fd, off_t source_offset,
                       size_t payload_length,
-                      unsigned final_splice_flags, int mode) noexcept;
+                      unsigned final_splice_flags) noexcept;
   bool prepare_fd_reply_pipe(Reply* reply) noexcept;
-  bool start_fd_reply_source(Reply* reply, int mode) noexcept;
-  static size_t fd_reply_source_bin(size_t length) noexcept;
+  bool start_fd_reply_source(Reply* reply) noexcept;
   ssize_t send_fd_reply_final(Reply* reply) noexcept;
   static void fd_reply_source_done(void* context, ssize_t result) noexcept;
   void complete_fd_reply_source(Reply* reply, ssize_t result) noexcept;
@@ -383,17 +379,6 @@ class FuseReactor : public IoExecutor {
   uint64_t external_replies_       = 0;
   uint64_t io_operations_          = 0;
   uint64_t background_file_writes_ = 0;
-  // Successful source submissions, including a fallback to another mode.
-  // Exact partial-I/O resubmissions remain one source submission.
-  static constexpr size_t kFdReplySourceBinCount = 9;
-  std::array<uint64_t, kFdReplySourceBinCount>
-      fd_reply_pread_source_submissions_{};
-  std::array<uint64_t, kFdReplySourceBinCount>
-      fd_reply_pread_source_bytes_{};
-  std::array<uint64_t, kFdReplySourceBinCount>
-      fd_reply_splice_source_submissions_{};
-  std::array<uint64_t, kFdReplySourceBinCount>
-      fd_reply_splice_source_bytes_{};
   uint64_t wait_calls_             = 0;
   uint64_t completion_batches_     = 0;
   uint64_t completions_            = 0;
@@ -417,7 +402,6 @@ class FuseReactor : public IoExecutor {
   bool wake_pending_               = false;
   bool first_receive_              = true;
   bool receive_active_             = false;
-  bool fd_reply_splice_warning_    = false;
   alignas(8) u_char external_token_ = 0;
   alignas(8) u_char task_token_     = 0;
   alignas(8) u_char return_token_   = 0;

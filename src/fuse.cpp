@@ -13117,23 +13117,15 @@ bool UncachedFileReader::try_prefetch(
       selected->notify_waiters();
     }
   }
-  int result;
-  if (wanted < 2 * state.page_size) {
-    result = fuse_reply_buf(
-        request,
-        static_cast<const char*>(selected->storage->mapping) + relative,
-        wanted);
-  } else {
-    fuse_bufvec buffers{};
-    buffers.count        = 1;
-    buffers.buf[0].size  = wanted;
-    buffers.buf[0].flags = fuse_buf_flags(
-        FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
-    buffers.buf[0].fd    = selected->storage->fd.get();
-    buffers.buf[0].pos   = off_t(relative);
-    result = fuse_reply_data(
-        request, &buffers, FUSE_BUF_SPLICE_MOVE);
-  }
+  fuse_bufvec buffers{};
+  buffers.count        = 1;
+  buffers.buf[0].size  = wanted;
+  buffers.buf[0].flags = fuse_buf_flags(
+      FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY);
+  buffers.buf[0].fd    = selected->storage->fd.get();
+  buffers.buf[0].pos   = off_t(relative);
+  const int result = fuse_reply_data(
+      request, &buffers, FUSE_BUF_SPLICE_MOVE);
   if (result != 0) {
     fprintf(stderr, "fuse_reply_data(read-ahead) failed: %s\n",
             strerror(-result));
@@ -13949,11 +13941,6 @@ struct AsyncUncachedReadTask final : AsyncReadTask {
           iov.push_back({const_cast<std::byte*>(bytes.data()), bytes.size()});
         }
         result = fuse_reply_iov(task->request, iov.data(), int(iov.size()));
-      } else if (task->wanted < 2 * task->state->page_size) {
-        result = fuse_reply_buf(
-            task->request,
-            static_cast<const char*>(storage->mapping) + relative,
-            task->wanted);
       } else {
         fuse_bufvec buffers{};
         buffers.count        = 1;

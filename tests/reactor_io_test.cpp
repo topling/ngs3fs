@@ -776,7 +776,7 @@ struct ReactorIoTest {
           UniqueFd(sockets[0]), UniqueFd(sockets[1])};
     };
     const auto start = [&](int output_fd, int source_fd, off_t offset,
-                           size_t length, int mode, Result& result,
+                           size_t length, Result& result,
                            std::string_view header_text = "hdr:") {
       FuseReactor::Reply* reply = owner.acquire_reply();
       require(reply != nullptr, "acquire fd-reply state");
@@ -785,7 +785,7 @@ struct ReactorIoTest {
       reply->notify_done = Result::complete;
       reply->notify_context = &result;
       if (!owner.begin_fd_reply(reply, output_fd, &iov, 1, source_fd,
-                                offset, length, 0, mode)) {
+                                offset, length, 0)) {
         owner.release_reply(reply);
         require(false, "begin fd-reply source I/O");
       }
@@ -820,7 +820,7 @@ struct ReactorIoTest {
     errno = 0;
     require(!owner.begin_fd_reply(
                 rejected_reply, rejected_socket[0].get(), &rejected_iov, 1,
-                test.file.get(), 0, 8, 0, FUSE_FD_REPLY_SPLICE) &&
+                test.file.get(), 0, 8, 0) &&
             errno == ENOTCONN && rejected.calls == 0 &&
             owner.fd_reply_count_ == 0 &&
             rejected_reply->fd_pipe[0] == -1 &&
@@ -832,23 +832,13 @@ struct ReactorIoTest {
     auto small_socket = make_socket();
     Result small;
     const uint64_t small_io_before = owner.io_operations_;
-    const size_t small_source_bin = owner.fd_reply_source_bin(19);
-    const uint64_t small_source_count_before =
-        owner.fd_reply_pread_source_submissions_[small_source_bin];
-    const uint64_t small_source_bytes_before =
-        owner.fd_reply_pread_source_bytes_[small_source_bin];
     FuseReactor::Reply* small_reply = start(
-        small_socket[0].get(), test.file.get(), 7, 19,
-        FUSE_FD_REPLY_PREAD, small);
+        small_socket[0].get(), test.file.get(), 7, 19, small);
     pump([&] { return small.calls == 1; });
     require(small.value == 0 && small.calls == 1,
             "small fd-reply did not complete exactly once");
     io_uring_cqe* unexpected = nullptr;
     require(owner.io_operations_ == small_io_before + 1 &&
-            owner.fd_reply_pread_source_submissions_[small_source_bin] ==
-                small_source_count_before + 1 &&
-            owner.fd_reply_pread_source_bytes_[small_source_bin] ==
-                small_source_bytes_before + 19 &&
             owner.async_pending_ == 0 &&
             io_uring_peek_cqe(&owner.ring_, &unexpected) == -EAGAIN,
             "small fd-reply queued a final transport CQ");
@@ -856,6 +846,14 @@ struct ReactorIoTest {
     FuseReactor::Reply* reused = owner.acquire_reply();
     require(reused == small_reply, "pooled fd-reply was not reused");
     owner.release_reply(reused);
+
+    auto tiny_socket = make_socket();
+    Result tiny;
+    start(tiny_socket[0].get(), test.file.get(), 1, 1, tiny);
+    pump([&] { return tiny.calls == 1; });
+    require(tiny.value == 0 && tiny.calls == 1,
+            "one-byte fd-reply did not complete exactly once");
+    expect_output(tiny_socket[1], source.substr(1, 1));
 
     std::string large_payload(16 * 1024, '\0');
     for (size_t i = 0; i < large_payload.size(); ++i) {
@@ -869,18 +867,12 @@ struct ReactorIoTest {
     auto second_socket = make_socket();
     Result first;
     Result second;
-    const size_t large_source_bin =
-        owner.fd_reply_source_bin(large_payload.size());
-    const uint64_t large_source_count_before =
-        owner.fd_reply_splice_source_submissions_[large_source_bin];
-    const uint64_t large_source_bytes_before =
-        owner.fd_reply_splice_source_bytes_[large_source_bin];
     FuseReactor::Reply* first_reply = start(
         first_socket[0].get(), test.file.get(), 8192,
-        large_payload.size(), FUSE_FD_REPLY_SPLICE, first);
+        large_payload.size(), first);
     FuseReactor::Reply* second_reply = start(
         second_socket[0].get(), test.file.get(), 8192,
-        large_payload.size(), FUSE_FD_REPLY_SPLICE, second);
+        large_payload.size(), second);
     require(first_reply != second_reply && first_reply->fd_pipe[0] >= 0 &&
             second_reply->fd_pipe[0] >= 0 &&
             first_reply->fd_pipe[0] != second_reply->fd_pipe[0],
@@ -888,11 +880,6 @@ struct ReactorIoTest {
     pump([&] { return first.calls == 1 && second.calls == 1; });
     require(first.value == 0 && second.value == 0,
             "large fd-reply transport failed");
-    require(owner.fd_reply_splice_source_submissions_[large_source_bin] ==
-                large_source_count_before + 2 &&
-            owner.fd_reply_splice_source_bytes_[large_source_bin] ==
-                large_source_bytes_before + 2 * large_payload.size(),
-            "large fd-reply source submissions were not counted");
     expect_output(first_socket[1], large_payload);
     expect_output(second_socket[1], large_payload);
 
@@ -900,7 +887,7 @@ struct ReactorIoTest {
     Result unaligned;
     std::string large_header(4097, 'H');
     start(unaligned_socket[0].get(), test.file.get(), 8193, 8191,
-          FUSE_FD_REPLY_SPLICE, unaligned, large_header);
+          unaligned, large_header);
     pump([&] { return unaligned.calls == 1; });
     require(unaligned.value == 0,
             "unaligned multi-page-header reply failed");
@@ -922,16 +909,33 @@ struct ReactorIoTest {
     Result short_read;
     start(short_socket[0].get(), test.file.get(),
           off_t(8192 + large_payload.size() - 3),
-          12, FUSE_FD_REPLY_PREAD, short_read);
+          12, short_read);
     pump([&] { return short_read.calls == 1; });
     require(short_read.value == -EIO && short_read.calls == 1 &&
             owner.error_ == 0,
             "short source read was not a request-local EIO");
 
+    auto unsupported_socket = make_socket();
+    UniqueFd unsupported_source(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+    require(bool(unsupported_source), "create non-splice source");
+    Result unsupported;
+    const uint64_t unsupported_io_before = owner.io_operations_;
+    start(unsupported_socket[0].get(), unsupported_source.get(), 0, 8,
+          unsupported);
+    pump([&] { return unsupported.calls == 1; });
+    require(unsupported.value < 0 && unsupported.calls == 1 &&
+            owner.error_ == 0 && owner.async_pending_ == 0 &&
+            owner.io_operations_ == unsupported_io_before + 1,
+            "unsupported source retried through another I/O path");
+    char unexpected_byte;
+    require(recv(unsupported_socket[1].get(), &unexpected_byte, 1,
+                 MSG_DONTWAIT) == -1 &&
+            (errno == EAGAIN || errno == EWOULDBLOCK),
+            "failed source emitted an incomplete payload reply");
+
     auto bad_socket = make_socket();
     Result bad_read;
-    start(bad_socket[0].get(), INT_MAX, 0, 8,
-          FUSE_FD_REPLY_PREAD, bad_read);
+    start(bad_socket[0].get(), INT_MAX, 0, 8, bad_read);
     pump([&] { return bad_read.calls == 1; });
     require(bad_read.value == -EBADF && bad_read.calls == 1 &&
             owner.error_ == 0,
@@ -941,7 +945,7 @@ struct ReactorIoTest {
     Result cancelled;
     FuseReactor::Reply* cancel_reply = start(
         cancel_socket[0].get(), test.file.get(), 8192,
-        large_payload.size(), FUSE_FD_REPLY_SPLICE, cancelled);
+        large_payload.size(), cancelled);
     require(owner.cancel(cancel_reply->fd_source_io),
             "cancel fd-reply source I/O");
     pump([&] {
@@ -958,7 +962,7 @@ struct ReactorIoTest {
     Result transport_failure;
     const uint64_t transport_io_before = owner.io_operations_;
     start(invalid_output.get(), test.file.get(), 8192,
-          large_payload.size(), FUSE_FD_REPLY_SPLICE, transport_failure);
+          large_payload.size(), transport_failure);
     pump([&] { return transport_failure.calls == 1; });
     require(transport_failure.value < 0 &&
             transport_failure.calls == 1 && owner.error_ != 0 &&

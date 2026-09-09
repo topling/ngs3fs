@@ -859,13 +859,12 @@ int FuseReactor::reply_fd_async(
 ssize_t FuseReactor::fd_reply_async(
     int output_fd, const iovec* header, int header_count,
     int source_fd, off_t source_offset, size_t payload_length,
-    unsigned final_splice_flags, int mode, fuse_req_t req,
+    unsigned final_splice_flags, fuse_req_t req,
     void* userdata) noexcept {
   auto* group = static_cast<FuseReactorGroup*>(userdata);
   FuseReactor* reactor = group ? group->callback_reactor() : nullptr;
   if (reactor == nullptr || current_ != reactor || req == nullptr ||
-      reactor->pending_fd_reply_done_ == nullptr ||
-      (mode != FUSE_FD_REPLY_PREAD && mode != FUSE_FD_REPLY_SPLICE)) {
+      reactor->pending_fd_reply_done_ == nullptr) {
     errno = EINVAL;
     return -1;
   }
@@ -882,7 +881,7 @@ ssize_t FuseReactor::fd_reply_async(
   reply->notify_context = reactor->pending_fd_reply_context_;
   if (!reactor->begin_fd_reply(
           reply, output_fd, header, header_count, source_fd, source_offset,
-          payload_length, final_splice_flags, mode)) {
+          payload_length, final_splice_flags)) {
     const int saved_errno = errno != 0 ? errno : EIO;
     reply->req = nullptr;
     reply->notify_done = nullptr;
@@ -1123,11 +1122,10 @@ ssize_t FuseReactor::async_splice(int input_fd, int output_fd, size_t length,
 bool FuseReactor::begin_fd_reply(
     Reply* reply, int output_fd, const iovec* header, int header_count,
     int source_fd, off_t source_offset, size_t payload_length,
-    unsigned final_splice_flags, int mode) noexcept {
+    unsigned final_splice_flags) noexcept {
   if (reply == nullptr || output_fd < 0 || header == nullptr ||
       header_count <= 0 || source_fd < 0 || source_offset < 0 ||
-      payload_length == 0 || payload_length > UINT_MAX ||
-      (mode != FUSE_FD_REPLY_PREAD && mode != FUSE_FD_REPLY_SPLICE)) {
+      payload_length == 0 || payload_length > UINT_MAX) {
     errno = EINVAL;
     return false;
   }
@@ -1149,7 +1147,6 @@ bool FuseReactor::begin_fd_reply(
   reply->fd_header_length = header_length;
   reply->fd_payload_length = payload_length;
   reply->fd_final_splice_flags = final_splice_flags;
-  reply->fd_mode = mode;
   reply->length = header_length + payload_length;
   reply->output_fd = output_fd;
   reply->input_fd = -1;
@@ -1174,7 +1171,7 @@ bool FuseReactor::begin_fd_reply(
   reply->fd_source_io = {};
   reply->fd_source_io.fd = source_fd;
   reply->fd_source_io.input_offset = source_offset;
-  if (!start_fd_reply_source(reply, mode)) {
+  if (!start_fd_reply_source(reply)) {
     reply->fd_reply = false;
     reply->fd_reply_owner = nullptr;
     return false;
@@ -1244,25 +1241,20 @@ bool FuseReactor::prepare_fd_reply_pipe(Reply* reply) noexcept {
   return true;
 }
 
-bool FuseReactor::start_fd_reply_source(Reply* reply, int mode) noexcept {
+bool FuseReactor::start_fd_reply_source(Reply* reply) noexcept {
   AsyncIoRequest& request = reply->fd_source_io;
   const int source_fd = request.fd;
   const off_t source_offset = request.input_offset;
-  if (mode == FUSE_FD_REPLY_SPLICE && !prepare_fd_reply_pipe(reply)) {
-    if (!fd_reply_splice_warning_) {
-      fprintf(stderr,
-              "warning: cached reply pipe setup failed; "
-              "falling back to owner-ring pread: %s\n",
-              strerror(errno));
-      fd_reply_splice_warning_ = true;
-    }
+  if (!prepare_fd_reply_pipe(reply)) {
+    const int saved_errno = errno;
     if (reply->fd_pipe[0] >= 0) {
       ::close(reply->fd_pipe[0]);
       ::close(reply->fd_pipe[1]);
       reply->fd_pipe[0] = reply->fd_pipe[1] = -1;
       reply->fd_pipe_capacity = 0;
     }
-    mode = FUSE_FD_REPLY_PREAD;
+    errno = saved_errno;
+    return false;
   }
   request = {};
   request.fd = source_fd;
@@ -1272,51 +1264,19 @@ bool FuseReactor::start_fd_reply_source(Reply* reply, int mode) noexcept {
   request.complete = fd_reply_source_done;
   request.context = reply;
   request.timeout_ms = group_ != nullptr ? group_->io_timeout_ms_ : 0;
-  reply->fd_mode = mode;
-  if (mode == FUSE_FD_REPLY_SPLICE) {
-    request.kind = AsyncIoRequest::SPLICE;
-    request.output_fd = reply->fd_pipe[1];
-    request.flags = reply->fd_final_splice_flags | SPLICE_F_NONBLOCK;
-  } else {
-    if (reply->fd_source_data.size() < reply->fd_payload_length) {
-      try {
-        reply->fd_source_data.resize(reply->fd_payload_length);
-      } catch (const std::bad_alloc&) {
-        errno = ENOMEM;
-        return false;
-      }
-    }
-    request.kind = AsyncIoRequest::PREAD;
-    request.data = reply->fd_source_data.data();
-  }
-  if (submit(request)) {
-    const size_t bin = fd_reply_source_bin(reply->fd_payload_length);
-    if (mode == FUSE_FD_REPLY_SPLICE) {
-      ++fd_reply_splice_source_submissions_[bin];
-      fd_reply_splice_source_bytes_[bin] += reply->fd_payload_length;
-    } else {
-      ++fd_reply_pread_source_submissions_[bin];
-      fd_reply_pread_source_bytes_[bin] += reply->fd_payload_length;
-    }
-    return true;
-  }
-  if (mode == FUSE_FD_REPLY_SPLICE && reply->fd_pipe[0] >= 0) {
+  request.kind = AsyncIoRequest::SPLICE;
+  request.output_fd = reply->fd_pipe[1];
+  request.flags = reply->fd_final_splice_flags | SPLICE_F_NONBLOCK;
+  if (submit(request)) return true;
+  const int saved_errno = errno;
+  if (reply->fd_pipe[0] >= 0) {
     ::close(reply->fd_pipe[0]);
     ::close(reply->fd_pipe[1]);
     reply->fd_pipe[0] = reply->fd_pipe[1] = -1;
     reply->fd_pipe_capacity = 0;
   }
+  errno = saved_errno;
   return false;
-}
-
-size_t FuseReactor::fd_reply_source_bin(size_t length) noexcept {
-  constexpr std::array<size_t, kFdReplySourceBinCount - 1> limits{
-      4 * 1024, 8 * 1024, 16 * 1024, 32 * 1024,
-      64 * 1024, 128 * 1024, 256 * 1024, 1024 * 1024};
-  for (size_t bin = 0; bin < limits.size(); ++bin) {
-    if (length <= limits[bin]) return bin;
-  }
-  return limits.size();
 }
 
 void FuseReactor::fd_reply_source_done(
@@ -1328,26 +1288,8 @@ void FuseReactor::fd_reply_source_done(
 
 void FuseReactor::complete_fd_reply_source(
     Reply* reply, ssize_t result) noexcept {
-  if (result < 0 && reply->fd_mode == FUSE_FD_REPLY_SPLICE &&
-      (result == -EINVAL || result == -EOPNOTSUPP || result == -ENOSYS ||
-       result == -EPERM || result == -EAGAIN) &&
-      error_ == 0 &&
-      !group_->shutting_down_.load(std::memory_order_acquire)) {
-    if (!fd_reply_splice_warning_) {
-      fprintf(stderr,
-              "warning: cached reply source splice unsupported; "
-              "falling back to owner-ring pread\n");
-      fd_reply_splice_warning_ = true;
-    }
-    ::close(reply->fd_pipe[0]);
-    ::close(reply->fd_pipe[1]);
-    reply->fd_pipe[0] = reply->fd_pipe[1] = -1;
-    reply->fd_pipe_capacity = 0;
-    if (start_fd_reply_source(reply, FUSE_FD_REPLY_PREAD)) return;
-    result = -(errno != 0 ? errno : EIO);
-  }
   if (result < 0 || size_t(result) != reply->fd_payload_length) {
-    if (reply->fd_mode == FUSE_FD_REPLY_SPLICE && reply->fd_pipe[0] >= 0) {
+    if (reply->fd_pipe[0] >= 0) {
       ::close(reply->fd_pipe[0]);
       ::close(reply->fd_pipe[1]);
       reply->fd_pipe[0] = reply->fd_pipe[1] = -1;
@@ -1359,40 +1301,26 @@ void FuseReactor::complete_fd_reply_source(
     fail_fd_reply(reply, failure, connected);
     return;
   }
-  // Only source-file I/O may fall back before any reply reaches FUSE. Once
-  // transport is attempted, preserve the existing terminal-error policy;
+  // Once transport is attempted, preserve the terminal-error policy;
   // an EINVAL here is not a safe capability probe or permission to reply twice.
   complete_fd_reply(reply, send_fd_reply_final(reply));
 }
 
 ssize_t FuseReactor::send_fd_reply_final(Reply* reply) noexcept {
   ssize_t result;
-  if (reply->fd_mode == FUSE_FD_REPLY_SPLICE) {
-    reply->kind = REPLY_SPLICE;
-    do {
-      result = ::splice(reply->fd_pipe[0], nullptr,
-                        reply->output_fd, nullptr, reply->length,
-                        reply->fd_final_splice_flags);
-    } while (result < 0 && errno == EINTR);
-  } else {
-    reply->kind = REPLY_WRITEV;
-    reply->fd_output_iov[0] = {
-        .iov_base = reply->data(), .iov_len = reply->fd_header_length};
-    reply->fd_output_iov[1] = {
-        .iov_base = reply->fd_source_data.data(),
-        .iov_len = reply->fd_payload_length};
-    do {
-      result = ::writev(reply->output_fd, reply->fd_output_iov.data(), 2);
-    } while (result < 0 && errno == EINTR);
-  }
+  reply->kind = REPLY_SPLICE;
+  do {
+    result = ::splice(reply->fd_pipe[0], nullptr,
+                      reply->output_fd, nullptr, reply->length,
+                      reply->fd_final_splice_flags);
+  } while (result < 0 && errno == EINTR);
   return result < 0 ? -errno : result;
 }
 
 void FuseReactor::complete_fd_reply(Reply* reply, ssize_t result) noexcept {
   const int terminal = result < 0 ? int(result) :
       (size_t(result) == reply->length ? 0 : -EIO);
-  if (terminal != 0 && reply->fd_mode == FUSE_FD_REPLY_SPLICE &&
-      reply->fd_pipe[0] >= 0) {
+  if (terminal != 0 && reply->fd_pipe[0] >= 0) {
     ::close(reply->fd_pipe[0]);
     ::close(reply->fd_pipe[1]);
     reply->fd_pipe[0] = reply->fd_pipe[1] = -1;
@@ -1945,11 +1873,9 @@ void FuseReactor::release_reply(Reply* reply) noexcept {
   reply->notify_context     = nullptr;
   reply->fd_reply_owner     = nullptr;
   reply->fd_source_io       = {};
-  reply->fd_output_iov      = {};
   reply->fd_header_length   = 0;
   reply->fd_payload_length  = 0;
   reply->fd_final_splice_flags = 0;
-  reply->fd_mode            = 0;
   reply->fd_reply           = false;
   reply->next               = reply_free_;
   reply_free_               = reply;
@@ -3119,14 +3045,6 @@ void FuseReactorGroup::report_stats() const noexcept {
   size_t high_water          = 0;
   size_t completion_high_water = 0;
   unsigned setup_flags       = 0;
-  std::array<uint64_t, FuseReactor::kFdReplySourceBinCount>
-      pread_source_submissions{};
-  std::array<uint64_t, FuseReactor::kFdReplySourceBinCount>
-      pread_source_bytes{};
-  std::array<uint64_t, FuseReactor::kFdReplySourceBinCount>
-      splice_source_submissions{};
-  std::array<uint64_t, FuseReactor::kFdReplySourceBinCount>
-      splice_source_bytes{};
   for (const std::unique_ptr<FuseReactor>& reactor : reactors_) {
     received          += reactor->received_requests_;
     completed         += reactor->completed_replies_;
@@ -3142,14 +3060,6 @@ void FuseReactorGroup::report_stats() const noexcept {
     completion_high_water = std::max(
         completion_high_water, reactor->completion_batch_high_water_);
     setup_flags       |= reactor->setup_flags_;
-    for (size_t bin = 0; bin < FuseReactor::kFdReplySourceBinCount; ++bin) {
-      pread_source_submissions[bin] +=
-          reactor->fd_reply_pread_source_submissions_[bin];
-      pread_source_bytes[bin] += reactor->fd_reply_pread_source_bytes_[bin];
-      splice_source_submissions[bin] +=
-          reactor->fd_reply_splice_source_submissions_[bin];
-      splice_source_bytes[bin] += reactor->fd_reply_splice_source_bytes_[bin];
-    }
     fprintf(stderr,
             "io_uring reactor stats: reactor=%zu dispatched=%" PRIu64
             " io_operations=%" PRIu64 " wait_calls=%" PRIu64 "\n",
@@ -3171,22 +3081,6 @@ void FuseReactorGroup::report_stats() const noexcept {
           background_writes, wait_calls,
           completion_batches, completions,
           completion_high_water, drains, high_water, setup_flags);
-  constexpr std::array<const char*, FuseReactor::kFdReplySourceBinCount>
-      source_bin_names{"<=4KiB", "<=8KiB", "<=16KiB", "<=32KiB", "<=64KiB",
-                       "<=128KiB", "<=256KiB", "<=1MiB", ">1MiB"};
-  const auto report_source = [&](const char* mode,
-                                 const auto& submissions,
-                                 const auto& bytes) {
-    for (size_t bin = 0; bin < submissions.size(); ++bin) {
-      if (submissions[bin] == 0) continue;
-      fprintf(stderr,
-              "io_uring cached reply source_submissions: mode=%s size=%s"
-              " count=%" PRIu64 " bytes=%" PRIu64 "\n",
-              mode, source_bin_names[bin], submissions[bin], bytes[bin]);
-    }
-  };
-  report_source("PREAD", pread_source_submissions, pread_source_bytes);
-  report_source("SPLICE", splice_source_submissions, splice_source_bytes);
 }
 
 void FuseReactorGroup::shutdown() noexcept {

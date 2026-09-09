@@ -1,20 +1,41 @@
 # io_uring reactor execution contract
 
+## Current reply-interface contract (2026-09-09)
+
+Remove ngs3fs-added small-read transport policies; do not alter upstream
+libfuse/kernel policies or require physical zero-copy. The interface contract,
+not whether the implementation copies a page internally, is authoritative.
+
+- Cached asynchronous FD replies use owner-ring file-to-pipe SPLICE followed
+  by pipe-to-FUSE splice for every positive payload size. Remove the PREAD
+  mode, payload buffer, writev alternative and source-error PREAD fallback.
+- The legacy memfd reply paths always pass their FD range to
+  `fuse_reply_data`; they no longer choose a mapped-memory reply below two
+  system pages. Leave upstream libfuse's own size threshold/copy fallback
+  unchanged. Do not add `FUSE_BUF_FORCE_SPLICE` to override that policy.
+- Anonymous receive blocks still use memory/iov replies because they have no
+  source FD. Ordinary control/error/empty replies retain their existing APIs.
+- Remove the rejected threshold experiment's per-size/mode histograms and
+  report machinery. Keep general CPU, memory and reactor evidence.
+- Keep source short-read completion, cancellation, pins, fixed-size pools,
+  budgets and exactly-once reply ownership. Do not replace semantic safety
+  checks with another speculative fast path.
+
 ## Rejected bounded small-reply copy experiment (2026-09-09)
 
 Runner `34304198753` rejected the 64 KiB override: cold daemon CPU changed
--0.52%, warm +0.52%, while RSS rose by 2,340/2,388 KiB respectively. Restore
-flags zero and libfuse's existing split at two system pages. Keep the
-owner-local source-mode/size counters and their readable report. Do not retry
-this threshold merely because source SPLICE uses io-wq: the new histogram
-shows that 4 KiB replies, which already used PREAD, dominate this workload.
+-0.52%, warm +0.52%, while RSS rose by 2,340/2,388 KiB respectively. That rollback
+restored flags zero and libfuse's split at two system pages. Do not retry this
+threshold merely because source SPLICE uses io-wq: the recorded histogram
+shows that 4 KiB replies, which used PREAD in that historical build, dominate
+this workload.
 See [the measured small-copy results](cached-reply-small-copy-results.md).
 
 The rejected experiment at `7199db2` used `591c018` as its baseline. Only
 multi-worker cached replies with a payload of at most 64 KiB requested
 `FUSE_BUF_NO_SPLICE`.
-The patched libfuse asynchronous fd-reply helper honors that existing flag and
-selects owner-ring PREAD followed by the existing direct writev completion.
+That patched libfuse asynchronous fd-reply helper honored the existing flag and
+selected owner-ring PREAD followed by the direct writev completion.
 Larger replies still used owner-ring source SPLICE and final splice without
 MOVE. Legacy, one-reactor, uncached and write paths were unchanged. This was
 an experiment, not a measured improvement or revival of the rejected all-PREAD
@@ -29,16 +50,26 @@ synchronous splice or a mincore/mmap residency guess: neither guarantees that
 a local-file miss cannot block the owner.
 
 Preserve source-read errors, cancellation, range/handle pins and exactly-once
-reply completion. Test the default cutoff below, at and above two system pages
-with splice capabilities negotiated. Source mode/size counters are owner-local and printed
-only with final reactor statistics. They count accepted source submissions,
-including a fallback submission, not logical replies or exact-read CQ retries.
-The actual FUSE reply size histogram must come from these counters, not from
-application pread lengths. Compare three alternating unsampled cold/warm
-repetitions, CPU, workload wall time, RSS/HWM and readable matched profiles on
-the runner before deciding whether to retain the experiment.
+reply completion. The historical cutoff measurements above are retained as
+evidence only; they are not a current selection rule or instrumentation
+contract.
 
-## Current implementation target: ingress and owner-complete workers (2026-09-08)
+## Current implementation target: splice-only cached replies and owner-complete workers (2026-09-09)
+
+The cached-read reply contract is now splice-only for positive-length FD
+replies. The patched libfuse async FD-reply hook no longer exposes a PREAD
+mode and does not select by payload size. `FUSE_BUF_NO_SPLICE` is rejected;
+missing splice support or protocol negotiation also sends a normal FUSE error.
+The helper still requires a nonempty range; ordinary zero-length replies use
+the existing empty-reply API. The
+`FUSE_BUF_SPLICE_MOVE` flag remains supported when negotiated; cached async
+replies continue to pass no MOVE flag. Deferred request ownership and
+exactly-once completion/cancellation semantics are unchanged. The former
+libfuse default split and the bounded small-copy/PREAD experiments below are
+superseded design decisions; their historical measurements remain evidence,
+not an active fallback contract.
+
+## Historical implementation target: ingress and owner-complete workers (2026-09-08)
 
 This section supersedes the historical execution and notification rules below.
 The owner-complete implementation at `c8caf6f` passes all 98 local non-mounted
@@ -65,15 +96,13 @@ require their own fresh runner validation.
 - Cached replies also submit their source-file read through the owner ring,
   including cache hits, recovered data and newly downloaded clean ranges.
   A CLEAN bitmap means valid data, not guaranteed local-pagecache residency.
-  Libfuse selects owner-ring PREAD plus direct writev for small replies or when
-  splice support is unavailable, and owner-ring file-to-pipe SPLICE plus direct
-  pipe-to-FUSE splice for larger supported replies. Only the PREAD path retains
-  a userspace payload buffer; the SPLICE path retains its per-Reply pipe.
-  Owner-ring cached replies pass no `SPLICE_F_MOVE` flag. Their large-reply
-  SPLICE path performs one kernel payload copy instead of attempting pipe-page
-  transfer into FUSE; the PREAD path still performs a read into userspace
-  followed by writev, for two payload copies. The source SPLICE still uses
-  kernel io-wq on the Linux 6.17 runner.
+  Positive-length cached replies use owner-ring file-to-pipe SPLICE followed
+  by direct pipe-to-FUSE splice through the patched libfuse hook. There is no
+  payload-size PREAD fallback and no hidden synchronous fallback. Zero-length
+  replies use the existing empty-reply path. Owner-ring cached replies pass no
+  `SPLICE_F_MOVE` flag. The SPLICE path performs one kernel payload copy
+  instead of attempting pipe-page transfer into FUSE; the source SPLICE still
+  uses kernel io-wq on the Linux 6.17 runner.
   Avoiding a successful page move can temporarily leave both the cache-file
   page and the FUSE folio resident; its net kernel-cache cost is not measured.
   Two same-host, alternating three-repetition runner trials retained no-MOVE:
@@ -88,9 +117,10 @@ require their own fresh runner validation.
   warm on run `34276881366` (AMD EPYC 9V74), but +11.31% cold and +6.02% warm on
   run `34278830151` (AMD EPYC 7763), with roughly 8--9 MiB additional RSS.
   These results neither isolate hardware as the cause nor establish all-PREAD
-  as a stable optimization. Preserve
-  both source modes and the public libfuse API; do not add a size threshold or
-  mount option beyond libfuse's existing selection without new evidence.
+  as a stable optimization.
+  The old split-mode API and fallback are superseded by the splice-only
+  contract above; retain the historical measurements for context and do not
+  add a size threshold or mount option.
   A narrow libfuse custom-I/O entry point encodes the reply header and owns
   deferred-request bookkeeping; ngs3fs does not reconstruct the wire header.
   Keep concurrent source reads independent of the ordinary reply FIFO.
@@ -98,7 +128,8 @@ require their own fresh runner validation.
   or cancellation CQE. A source read failure, unexpected EOF or admission
   failure sends an error for that request; only a final FUSE transport failure
   follows the existing fatal-transport policy. Pipe-capacity or splice-support
-  fallback uses owner-ring PREAD, never a hidden synchronous file read.
+  failure is surfaced as a request error; there is no hidden synchronous or
+  PREAD fallback.
 - Multi-reactor request work must not call UploadScheduler to run a blocking
   function on another thread. Convert file operations and composite metadata
   transactions into resumable asynchronous steps on the owner's io_uring.
