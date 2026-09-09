@@ -388,14 +388,14 @@ index d420b257..909bef03 100644
 +	if (source_fd < 0 || source_offset < 0 || length == 0 ||
 +	    length > UINT32_MAX - sizeof(out) ||
 +	    (uint64_t)source_offset > (uint64_t)OFFSET_MAX - length ||
-+	    (flags & ~FUSE_BUF_SPLICE_MOVE) != 0)
++	    (flags & ~(FUSE_BUF_SPLICE_MOVE | FUSE_BUF_NO_SPLICE)) != 0)
 +		return fuse_reply_fd_error(req, EINVAL);
 +	if (req->flags.is_uring || se->io == NULL ||
 +	    se->io->fd_reply_async == NULL)
 +		return fuse_reply_fd_error(req, EOPNOTSUPP);
 +
-+	mode = length < 2 * pagesize || se->broken_splice_nonblock ||
-+	       se->conn.proto_minor < 14 ||
++	mode = (flags & FUSE_BUF_NO_SPLICE) || length < 2 * pagesize ||
++	       se->broken_splice_nonblock || se->conn.proto_minor < 14 ||
 +	       !(se->conn.want_ext & FUSE_CAP_SPLICE_WRITE) ?
 +		FUSE_FD_REPLY_PREAD : FUSE_FD_REPLY_SPLICE;
 +	if (mode == FUSE_FD_REPLY_SPLICE &&

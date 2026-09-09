@@ -14213,9 +14213,12 @@ struct AsyncCachedReadTask final : AsyncReadTask {
     auto* task = static_cast<AsyncCachedReadTask*>(context);
     ++task->refs;
     bool deferred = false;
+    // Small copies avoid the io-wq handoff forced by source IORING_OP_SPLICE.
+    // Keep large replies fd-backed and bound each normally retained buffer.
+    const unsigned flags = task->wanted <= 64 * 1024 ? FUSE_BUF_NO_SPLICE : 0;
     const int result = task->reactor->reply_fd_async(
         task->request, task->handle->cache_entry->data_fd(), task->offset,
-        task->wanted, 0, reply_done, task, deferred);
+        task->wanted, flags, reply_done, task, deferred);
     if (!deferred) reply_done(task, result);
     return result;
   }

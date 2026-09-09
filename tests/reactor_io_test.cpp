@@ -832,6 +832,11 @@ struct ReactorIoTest {
     auto small_socket = make_socket();
     Result small;
     const uint64_t small_io_before = owner.io_operations_;
+    const size_t small_source_bin = owner.fd_reply_source_bin(19);
+    const uint64_t small_source_count_before =
+        owner.fd_reply_pread_source_submissions_[small_source_bin];
+    const uint64_t small_source_bytes_before =
+        owner.fd_reply_pread_source_bytes_[small_source_bin];
     FuseReactor::Reply* small_reply = start(
         small_socket[0].get(), test.file.get(), 7, 19,
         FUSE_FD_REPLY_PREAD, small);
@@ -840,6 +845,10 @@ struct ReactorIoTest {
             "small fd-reply did not complete exactly once");
     io_uring_cqe* unexpected = nullptr;
     require(owner.io_operations_ == small_io_before + 1 &&
+            owner.fd_reply_pread_source_submissions_[small_source_bin] ==
+                small_source_count_before + 1 &&
+            owner.fd_reply_pread_source_bytes_[small_source_bin] ==
+                small_source_bytes_before + 19 &&
             owner.async_pending_ == 0 &&
             io_uring_peek_cqe(&owner.ring_, &unexpected) == -EAGAIN,
             "small fd-reply queued a final transport CQ");
@@ -860,6 +869,12 @@ struct ReactorIoTest {
     auto second_socket = make_socket();
     Result first;
     Result second;
+    const size_t large_source_bin =
+        owner.fd_reply_source_bin(large_payload.size());
+    const uint64_t large_source_count_before =
+        owner.fd_reply_splice_source_submissions_[large_source_bin];
+    const uint64_t large_source_bytes_before =
+        owner.fd_reply_splice_source_bytes_[large_source_bin];
     FuseReactor::Reply* first_reply = start(
         first_socket[0].get(), test.file.get(), 8192,
         large_payload.size(), FUSE_FD_REPLY_SPLICE, first);
@@ -873,6 +888,11 @@ struct ReactorIoTest {
     pump([&] { return first.calls == 1 && second.calls == 1; });
     require(first.value == 0 && second.value == 0,
             "large fd-reply transport failed");
+    require(owner.fd_reply_splice_source_submissions_[large_source_bin] ==
+                large_source_count_before + 2 &&
+            owner.fd_reply_splice_source_bytes_[large_source_bin] ==
+                large_source_bytes_before + 2 * large_payload.size(),
+            "large fd-reply source submissions were not counted");
     expect_output(first_socket[1], large_payload);
     expect_output(second_socket[1], large_payload);
 

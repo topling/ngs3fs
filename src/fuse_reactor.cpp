@@ -1289,7 +1289,17 @@ bool FuseReactor::start_fd_reply_source(Reply* reply, int mode) noexcept {
     request.kind = AsyncIoRequest::PREAD;
     request.data = reply->fd_source_data.data();
   }
-  if (submit(request)) return true;
+  if (submit(request)) {
+    const size_t bin = fd_reply_source_bin(reply->fd_payload_length);
+    if (mode == FUSE_FD_REPLY_SPLICE) {
+      ++fd_reply_splice_source_submissions_[bin];
+      fd_reply_splice_source_bytes_[bin] += reply->fd_payload_length;
+    } else {
+      ++fd_reply_pread_source_submissions_[bin];
+      fd_reply_pread_source_bytes_[bin] += reply->fd_payload_length;
+    }
+    return true;
+  }
   if (mode == FUSE_FD_REPLY_SPLICE && reply->fd_pipe[0] >= 0) {
     ::close(reply->fd_pipe[0]);
     ::close(reply->fd_pipe[1]);
@@ -1297,6 +1307,16 @@ bool FuseReactor::start_fd_reply_source(Reply* reply, int mode) noexcept {
     reply->fd_pipe_capacity = 0;
   }
   return false;
+}
+
+size_t FuseReactor::fd_reply_source_bin(size_t length) noexcept {
+  constexpr std::array<size_t, kFdReplySourceBinCount - 1> limits{
+      4 * 1024, 8 * 1024, 16 * 1024, 32 * 1024,
+      64 * 1024, 128 * 1024, 256 * 1024, 1024 * 1024};
+  for (size_t bin = 0; bin < limits.size(); ++bin) {
+    if (length <= limits[bin]) return bin;
+  }
+  return limits.size();
 }
 
 void FuseReactor::fd_reply_source_done(
@@ -3099,6 +3119,14 @@ void FuseReactorGroup::report_stats() const noexcept {
   size_t high_water          = 0;
   size_t completion_high_water = 0;
   unsigned setup_flags       = 0;
+  std::array<uint64_t, FuseReactor::kFdReplySourceBinCount>
+      pread_source_submissions{};
+  std::array<uint64_t, FuseReactor::kFdReplySourceBinCount>
+      pread_source_bytes{};
+  std::array<uint64_t, FuseReactor::kFdReplySourceBinCount>
+      splice_source_submissions{};
+  std::array<uint64_t, FuseReactor::kFdReplySourceBinCount>
+      splice_source_bytes{};
   for (const std::unique_ptr<FuseReactor>& reactor : reactors_) {
     received          += reactor->received_requests_;
     completed         += reactor->completed_replies_;
@@ -3114,6 +3142,14 @@ void FuseReactorGroup::report_stats() const noexcept {
     completion_high_water = std::max(
         completion_high_water, reactor->completion_batch_high_water_);
     setup_flags       |= reactor->setup_flags_;
+    for (size_t bin = 0; bin < FuseReactor::kFdReplySourceBinCount; ++bin) {
+      pread_source_submissions[bin] +=
+          reactor->fd_reply_pread_source_submissions_[bin];
+      pread_source_bytes[bin] += reactor->fd_reply_pread_source_bytes_[bin];
+      splice_source_submissions[bin] +=
+          reactor->fd_reply_splice_source_submissions_[bin];
+      splice_source_bytes[bin] += reactor->fd_reply_splice_source_bytes_[bin];
+    }
     fprintf(stderr,
             "io_uring reactor stats: reactor=%zu dispatched=%" PRIu64
             " io_operations=%" PRIu64 " wait_calls=%" PRIu64 "\n",
@@ -3135,6 +3171,22 @@ void FuseReactorGroup::report_stats() const noexcept {
           background_writes, wait_calls,
           completion_batches, completions,
           completion_high_water, drains, high_water, setup_flags);
+  constexpr std::array<const char*, FuseReactor::kFdReplySourceBinCount>
+      source_bin_names{"<=4KiB", "<=8KiB", "<=16KiB", "<=32KiB", "<=64KiB",
+                       "<=128KiB", "<=256KiB", "<=1MiB", ">1MiB"};
+  const auto report_source = [&](const char* mode,
+                                 const auto& submissions,
+                                 const auto& bytes) {
+    for (size_t bin = 0; bin < submissions.size(); ++bin) {
+      if (submissions[bin] == 0) continue;
+      fprintf(stderr,
+              "io_uring cached reply source_submissions: mode=%s size=%s"
+              " count=%" PRIu64 " bytes=%" PRIu64 "\n",
+              mode, source_bin_names[bin], submissions[bin], bytes[bin]);
+    }
+  };
+  report_source("PREAD", pread_source_submissions, pread_source_bytes);
+  report_source("SPLICE", splice_source_submissions, splice_source_bytes);
 }
 
 void FuseReactorGroup::shutdown() noexcept {

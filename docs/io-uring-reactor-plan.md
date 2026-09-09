@@ -1,5 +1,34 @@
 # io_uring reactor execution contract
 
+## Bounded small-reply copy experiment (2026-09-09)
+
+The next matched experiment uses `591c018` as its baseline. Only multi-worker
+cached replies with a payload of at most 64 KiB request `FUSE_BUF_NO_SPLICE`.
+The patched libfuse asynchronous fd-reply helper honors that existing flag and
+selects owner-ring PREAD followed by the existing direct writev completion.
+Larger replies still use owner-ring source SPLICE and final splice without
+MOVE. Legacy, one-reactor, uncached and write paths are unchanged. This is an
+experiment, not a measured improvement or revival of the rejected all-PREAD
+implementation.
+
+Linux 6.17 forces every source `IORING_OP_SPLICE` through io-wq, including a
+local-pagecache hit. Current four-reactor profiles show that enqueue/wakeup
+path. Ordinary PREAD can complete a hit without that handoff, at the cost of a
+second payload copy. The 64 KiB bound limits this tradeoff and the retained
+per-Reply userspace buffer; it is not a new mount option. Do not substitute a
+synchronous splice or a mincore/mmap residency guess: neither guarantees that
+a local-file miss cannot block the owner.
+
+Preserve source-read errors, cancellation, range/handle pins and exactly-once
+reply completion. Test the cutoff below, at and above 64 KiB with splice
+capabilities negotiated. Source mode/size counters are owner-local and printed
+only with final reactor statistics. They count accepted source submissions,
+including a fallback submission, not logical replies or exact-read CQ retries.
+The actual FUSE reply size histogram must come from these counters, not from
+application pread lengths. Compare three alternating unsampled cold/warm
+repetitions, CPU, workload wall time, RSS/HWM and readable matched profiles on
+the runner before deciding whether to retain the experiment.
+
 ## Current implementation target: ingress and owner-complete workers (2026-09-08)
 
 This section supersedes the historical execution and notification rules below.

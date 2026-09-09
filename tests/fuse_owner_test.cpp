@@ -716,6 +716,8 @@ struct CachedReplyRequest {
 
 enum CachedReplyScenario {
   CACHED_REPLY_SUCCESS,
+  CACHED_REPLY_CUTOFF_MINUS_ONE,
+  CACHED_REPLY_CUTOFF,
   CACHED_REPLY_LARGE_SUCCESS,
   CACHED_REPLY_REJECTED,
   CACHED_REPLY_SHORT_SOURCE,
@@ -723,13 +725,23 @@ enum CachedReplyScenario {
 };
 
 void test_cached_reply_connection() {
+  constexpr size_t kNoSpliceCutoff = 64U * 1024U;
   for (CachedReplyScenario scenario : {
-           CACHED_REPLY_SUCCESS, CACHED_REPLY_LARGE_SUCCESS,
+           CACHED_REPLY_SUCCESS,
+           CACHED_REPLY_CUTOFF_MINUS_ONE, CACHED_REPLY_CUTOFF,
+           CACHED_REPLY_LARGE_SUCCESS,
            CACHED_REPLY_REJECTED,
            CACHED_REPLY_SHORT_SOURCE, CACHED_REPLY_CANCEL_SOURCE}) {
     const bool accepted = scenario != CACHED_REPLY_REJECTED;
-    const size_t payload_size = scenario == CACHED_REPLY_LARGE_SUCCESS ?
-        16U * 1024U : 4096U;
+    const size_t payload_size =
+        scenario == CACHED_REPLY_CUTOFF_MINUS_ONE ? kNoSpliceCutoff - 1 :
+        scenario == CACHED_REPLY_CUTOFF ? kNoSpliceCutoff :
+        scenario == CACHED_REPLY_LARGE_SUCCESS ? kNoSpliceCutoff + 1 :
+                                                 4096U;
+    const bool successful = scenario == CACHED_REPLY_SUCCESS ||
+        scenario == CACHED_REPLY_CUTOFF_MINUS_ONE ||
+        scenario == CACHED_REPLY_CUTOFF ||
+        scenario == CACHED_REPLY_LARGE_SUCCESS;
     std::vector<char> payload(payload_size);
     for (size_t i = 0; i < payload.size(); ++i) {
       payload[i] = char((i * 17 + 5) & 0xff);
@@ -746,6 +758,8 @@ void test_cached_reply_connection() {
     cache_config.root            = path;
     cache_config.namespace_id    =
         scenario == CACHED_REPLY_SUCCESS ? "cached-wire-accepted" :
+        scenario == CACHED_REPLY_CUTOFF_MINUS_ONE ? "cached-wire-cutoff-minus" :
+        scenario == CACHED_REPLY_CUTOFF ? "cached-wire-cutoff" :
         scenario == CACHED_REPLY_LARGE_SUCCESS ? "cached-wire-large" :
         scenario == CACHED_REPLY_REJECTED ? "cached-wire-rejected" :
         scenario == CACHED_REPLY_SHORT_SOURCE ? "cached-wire-short" :
@@ -813,8 +827,8 @@ void test_cached_reply_connection() {
 
     const auto retiring = cache.retiring_entry(identity.key);
     if (accepted) {
-      const int expected_mode = scenario == CACHED_REPLY_LARGE_SUCCESS ?
-          FUSE_FD_REPLY_SPLICE : FUSE_FD_REPLY_PREAD;
+      const int expected_mode = payload_size <= kNoSpliceCutoff ?
+          FUSE_FD_REPLY_PREAD : FUSE_FD_REPLY_SPLICE;
       require(retiring.get() == handle.cache_entry.get() &&
                   handle.request_state.load() == 2 &&
                   !handle.identity_mutex.try_lock() &&
@@ -858,16 +872,14 @@ void test_cached_reply_connection() {
               "read cached reply wire payload");
     }
     const bool error_matches =
-        (scenario == CACHED_REPLY_SUCCESS ||
-         scenario == CACHED_REPLY_LARGE_SUCCESS) ? header.error == 0 :
+        successful ? header.error == 0 :
         scenario == CACHED_REPLY_REJECTED ? header.error == -EOPNOTSUPP :
         scenario == CACHED_REPLY_SHORT_SOURCE ? header.error == -EIO :
         header.error == 0 || header.error == -ECANCELED;
     require(header.unique == request.header.unique &&
                 error_matches,
             "cached reply wire header mismatch");
-    if (scenario == CACHED_REPLY_SUCCESS ||
-        scenario == CACHED_REPLY_LARGE_SUCCESS ||
+    if (successful ||
         (scenario == CACHED_REPLY_CANCEL_SOURCE && header.error == 0)) {
       require(wire_payload.size() == payload.size(),
               "successful cached reply wire size mismatch");

@@ -134,6 +134,62 @@ class SummarizeIoEngineTest(unittest.TestCase):
                 encoding="utf-8")
             self.assertEqual(MODULE.load_suite_directory(suite)[("legacy", 1)][2], 150)
 
+    def test_cached_reply_evidence_uses_actual_payload_counters(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            suite = Path(temporary) / "github-io-engine-affinity-cache-warm"
+            suite.mkdir()
+            for engine in ("baseline", "current"):
+                for repetition in range(1, 4):
+                    sample = suite / f"{engine}-4-r{repetition}"
+                    sample.mkdir()
+                    (sample / "client-cpu.csv").write_text(
+                        "client,total_cpu_ns_per_operation\nngs3fs,1\n",
+                        encoding="utf-8")
+                    (sample / "ngs3fs-threads-after-workload.txt").write_text(
+                        "vm_rss_kib=%d\nvm_hwm_kib=%d\n" % (
+                            100 + repetition, 200 + repetition),
+                        encoding="utf-8")
+                    if engine == "current":
+                        (sample / "ngs3fs.log").write_text(
+                            "io_uring cached reply source_submissions: "
+                            "mode=PREAD size=<=64KiB count=%d bytes=%d\n"
+                            "io_uring cached reply source_submissions: "
+                            "mode=SPLICE size=<=128KiB count=%d bytes=%d\n" % (
+                                10 + repetition, 1000 + repetition,
+                                20 + repetition, 2000 + repetition),
+                            encoding="utf-8")
+            partial = suite / "baseline-4-r4"
+            partial.mkdir()
+            (partial / "ngs3fs-threads-after-workload.txt").write_text(
+                "vm_rss_kib=9999\nvm_hwm_kib=9999\n", encoding="utf-8")
+            (partial / "ngs3fs.log").write_text(
+                "io_uring cached reply source_submissions: "
+                "mode=PREAD size=<=64KiB count=9999 bytes=9999\n",
+                encoding="utf-8")
+            directories = {"affinity-cache-warm": suite}
+            text = MODULE.cached_reply_evidence_markdown(directories)
+            self.assertIn("actual fd-backed FUSE reply payload", text)
+            self.assertIn("not the application read size", text)
+            self.assertIn("across the entire mount lifetime", text)
+            self.assertIn("not the application read size or only the 8,192", text)
+            self.assertIn("submitted/requested payload bytes", text)
+            self.assertIn("Size bins are mutually exclusive", text)
+            self.assertIn(
+                "| affinity-cache-warm | baseline:4 | 0/3 | unavailable",
+                text)
+            self.assertIn(
+                "| affinity-cache-warm | current:4 | 3/3 | PREAD | "
+                "<=64KiB | 12 | 1,002 |", text)
+            self.assertIn(
+                "| affinity-cache-warm | current:4 | 3/3 | SPLICE | "
+                "<=128KiB | 22 | 2,002 |", text)
+            self.assertIn(
+                "| affinity-cache-warm | current:4 | 3 | 102 KiB | "
+                "202 KiB |", text)
+            rendered = MODULE.cached_reply_evidence_html(directories)
+            self.assertIn("Actual payload bin", rendered)
+            self.assertIn("<td>PREAD</td><td>&lt;=64KiB</td>", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

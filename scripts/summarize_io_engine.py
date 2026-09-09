@@ -13,6 +13,15 @@ SUITES = ("normal", "random", "cache-cold", "cache-warm", "cache-unlimited")
 OWNER_COMPLETE_SUITES = ("affinity-normal", "affinity-random",
                          "affinity-cache-cold", "affinity-cache-warm")
 NAME = re.compile(r"^(?P<engine>.+)-(?P<reactors>[0-9]+)-r[0-9]+$")
+SOURCE_SUBMISSION = re.compile(
+    r"io_uring cached reply source_submissions: "
+    r"mode=(?P<mode>PREAD|SPLICE) "
+    r"size=(?P<size><=4KiB|<=8KiB|<=16KiB|<=32KiB|<=64KiB|"
+    r"<=128KiB|<=256KiB|<=1MiB|>1MiB) "
+    r"count=(?P<count>[0-9]+) bytes=(?P<bytes>[0-9]+)")
+SOURCE_SIZE_BINS = (
+    "<=4KiB", "<=8KiB", "<=16KiB", "<=32KiB", "<=64KiB",
+    "<=128KiB", "<=256KiB", "<=1MiB", ">1MiB")
 
 def rows(path: Path):
     with path.open(newline="", encoding="utf-8") as stream:
@@ -104,6 +113,193 @@ def owner_complete_provenance(directories):
         "Both CI variants use four total reactors (one ingress and three "
         "workers), a mount-wide limit of eight HTTP connections, identical "
         "workloads, and alternating sample order on the same runner.")
+
+def load_cached_reply_evidence(directory: Path):
+    result = {}
+    for sample in sorted(directory.iterdir()):
+        match = NAME.fullmatch(sample.name)
+        if not match or not (sample / "client-cpu.csv").is_file():
+            continue
+        key = (match["engine"], int(match["reactors"]))
+        counters = {}
+        log_path = sample / "ngs3fs.log"
+        if log_path.is_file():
+            for line in log_path.read_text(
+                    encoding="utf-8", errors="replace").splitlines():
+                parsed = SOURCE_SUBMISSION.fullmatch(line)
+                if not parsed:
+                    continue
+                counter_key = (parsed["mode"], parsed["size"])
+                if counter_key in counters:
+                    raise ValueError(
+                        f"duplicate cached reply counter {counter_key} in "
+                        f"{log_path}")
+                counters[counter_key] = (
+                    int(parsed["count"]), int(parsed["bytes"]))
+        memory = {}
+        memory_path = sample / "ngs3fs-threads-after-workload.txt"
+        if memory_path.is_file():
+            for line in memory_path.read_text(encoding="utf-8").splitlines():
+                name, separator, value = line.partition("=")
+                if separator and name in ("vm_rss_kib", "vm_hwm_kib"):
+                    memory[name] = int(value)
+        result.setdefault(key, []).append((counters or None, memory))
+    return result
+
+def cached_reply_evidence_markdown(directories):
+    out = [
+        "## Cached reply source evidence",
+        "",
+        "Memory values and source-submission counts are medians across the "
+        "same unsampled benchmark repetitions used by the CPU table above. "
+        "Source size bins describe the actual fd-backed FUSE reply payload "
+        "submitted to the owner reactor across the entire mount lifetime "
+        "(preparation, warmup, timed workload, and teardown), not the "
+        "application read size or only the 8,192 timed operations. A SPLICE "
+        "attempt that falls back to PREAD contributes one logical attempt "
+        "to each mode; exact short-I/O continuation does not add another "
+        "attempt. Byte totals are submitted/requested payload bytes, not "
+        "completed bytes. Size bins are mutually exclusive: after <=4KiB, "
+        "each upper bound has an exclusive lower bound. RSS/HWM comes from "
+        "the post-workload process snapshot in each sample.",
+        "",
+        "### Resident memory",
+        "",
+        "| Suite | Configuration | Samples | RSS median | HWM median |",
+        "|---|---|---:|---:|---:|",
+    ]
+    evidence_by_suite = {}
+    for suite, directory in directories.items():
+        evidence = load_cached_reply_evidence(directory)
+        evidence_by_suite[suite] = evidence
+        for (engine, reactors), samples in sorted(evidence.items()):
+            rss = [memory["vm_rss_kib"] for _counters, memory in samples
+                   if "vm_rss_kib" in memory]
+            hwm = [memory["vm_hwm_kib"] for _counters, memory in samples
+                   if "vm_hwm_kib" in memory]
+            rss_text = f"{int(median(rss)):,} KiB" if rss else "unavailable"
+            hwm_text = f"{int(median(hwm)):,} KiB" if hwm else "unavailable"
+            out.append(
+                f"| {suite} | {engine}:{reactors} | {len(samples)} | "
+                f"{rss_text} | {hwm_text} |")
+    out += [
+        "",
+        "### Owner-ring source submissions",
+        "",
+        "Only non-zero bins are emitted by an instrumented binary. Missing "
+        "bins within an instrumented sample are therefore counted as zero. "
+        "A configuration with no counter lines is reported as unavailable, "
+        "not as zero.",
+        "",
+        "| Suite | Configuration | Instrumented samples | Mode | Actual "
+        "payload bin | Median attempts | Median requested bytes |",
+        "|---|---|---:|---|---|---:|---:|",
+    ]
+    bin_order = {name: index for index, name in enumerate(SOURCE_SIZE_BINS)}
+    for suite, evidence in evidence_by_suite.items():
+        for (engine, reactors), samples in sorted(evidence.items()):
+            instrumented = [counters for counters, _memory in samples
+                            if counters is not None]
+            if not instrumented:
+                out.append(
+                    f"| {suite} | {engine}:{reactors} | 0/{len(samples)} | "
+                    "unavailable | unavailable | unavailable | unavailable |")
+                continue
+            keys = set().union(*(counters.keys()
+                                 for counters in instrumented))
+            for mode, size in sorted(
+                    keys, key=lambda item: (
+                        0 if item[0] == "PREAD" else 1,
+                        bin_order[item[1]])):
+                counts = [counters.get((mode, size), (0, 0))[0]
+                          for counters in instrumented]
+                byte_counts = [counters.get((mode, size), (0, 0))[1]
+                               for counters in instrumented]
+                out.append(
+                    f"| {suite} | {engine}:{reactors} | "
+                    f"{len(instrumented)}/{len(samples)} | {mode} | {size} | "
+                    f"{int(median(counts)):,} | "
+                    f"{int(median(byte_counts)):,} |")
+    out.append("")
+    return "\n".join(out)
+
+def cached_reply_evidence_html(directories):
+    evidence_by_suite = {
+        suite: load_cached_reply_evidence(directory)
+        for suite, directory in directories.items()}
+    out = [
+        "<h2>Cached reply source evidence</h2>",
+        "<p>Memory values and source-submission counts are medians across "
+        "the same unsampled benchmark repetitions used by the CPU table. "
+        "Source size bins are actual fd-backed FUSE reply payloads submitted "
+        "to the owner reactor across the entire mount lifetime (preparation, "
+        "warmup, timed workload, and teardown), not application read sizes "
+        "or only the 8,192 timed operations. SPLICE-to-PREAD fallback counts "
+        "one logical attempt in each mode; exact short-I/O continuation does "
+        "not add an attempt. Byte totals are submitted/requested payload "
+        "bytes, not completed bytes. Bins are mutually exclusive: after "
+        "&lt;=4KiB, every upper bound has an exclusive lower bound. RSS/HWM "
+        "is the post-workload process snapshot.</p>",
+        "<h3>Resident memory</h3>",
+        "<table><thead><tr><th>Suite</th><th>Configuration</th>"
+        "<th>Samples</th><th>RSS median</th><th>HWM median</th>"
+        "</tr></thead><tbody>",
+    ]
+    for suite, evidence in evidence_by_suite.items():
+        for (engine, reactors), samples in sorted(evidence.items()):
+            rss = [memory["vm_rss_kib"] for _counters, memory in samples
+                   if "vm_rss_kib" in memory]
+            hwm = [memory["vm_hwm_kib"] for _counters, memory in samples
+                   if "vm_hwm_kib" in memory]
+            rss_text = f"{int(median(rss)):,} KiB" if rss else "unavailable"
+            hwm_text = f"{int(median(hwm)):,} KiB" if hwm else "unavailable"
+            out.append(
+                f"<tr><td>{escape(suite)}</td>"
+                f"<td>{escape(engine)}:{reactors}</td><td>{len(samples)}</td>"
+                f"<td>{rss_text}</td><td>{hwm_text}</td></tr>")
+    out += [
+        "</tbody></table>",
+        "<h3>Owner-ring source submissions</h3>",
+        "<p>Only non-zero bins are emitted. Missing bins within an "
+        "instrumented sample count as zero; no counter lines means "
+        "unavailable, not zero.</p>",
+        "<table><thead><tr><th>Suite</th><th>Configuration</th>"
+        "<th>Instrumented samples</th><th>Mode</th>"
+        "<th>Actual payload bin</th><th>Median attempts</th>"
+        "<th>Median requested bytes</th></tr></thead><tbody>",
+    ]
+    bin_order = {name: index for index, name in enumerate(SOURCE_SIZE_BINS)}
+    for suite, evidence in evidence_by_suite.items():
+        for (engine, reactors), samples in sorted(evidence.items()):
+            instrumented = [counters for counters, _memory in samples
+                            if counters is not None]
+            if not instrumented:
+                out.append(
+                    f"<tr><td>{escape(suite)}</td>"
+                    f"<td>{escape(engine)}:{reactors}</td>"
+                    f"<td>0/{len(samples)}</td>"
+                    "<td>unavailable</td><td>unavailable</td>"
+                    "<td>unavailable</td><td>unavailable</td></tr>")
+                continue
+            keys = set().union(*(counters.keys()
+                                 for counters in instrumented))
+            for mode, size in sorted(
+                    keys, key=lambda item: (
+                        0 if item[0] == "PREAD" else 1,
+                        bin_order[item[1]])):
+                counts = [counters.get((mode, size), (0, 0))[0]
+                          for counters in instrumented]
+                byte_counts = [counters.get((mode, size), (0, 0))[1]
+                               for counters in instrumented]
+                out.append(
+                    f"<tr><td>{escape(suite)}</td>"
+                    f"<td>{escape(engine)}:{reactors}</td>"
+                    f"<td>{len(instrumented)}/{len(samples)}</td>"
+                    f"<td>{mode}</td><td>{escape(size)}</td>"
+                    f"<td>{int(median(counts)):,}</td>"
+                    f"<td>{int(median(byte_counts)):,}</td></tr>")
+    out.append("</tbody></table>")
+    return "".join(out)
 
 def report(data_by_suite, title="I/O-engine CPU comparison", provenance=""):
     out = [f"# {title}", ""]
@@ -206,6 +402,15 @@ def main():
         owner_complete_html = html(
             owner_complete, owner_complete_missing, owner_complete_title,
             provenance)
+        cached_directories = {
+            suite: suite_directories[suite]
+            for suite in ("affinity-cache-cold", "affinity-cache-warm")
+            if suite in suite_directories}
+        if cached_directories:
+            owner_complete_text += (
+                "\n" + cached_reply_evidence_markdown(cached_directories))
+            owner_complete_html += cached_reply_evidence_html(
+                cached_directories)
         for stem in ("owner-complete-comparison", "inode-affinity-comparison"):
             (destination_dir / f"{stem}.md").write_text(
                 owner_complete_text, encoding="utf-8")
