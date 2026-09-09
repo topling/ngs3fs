@@ -716,8 +716,8 @@ struct CachedReplyRequest {
 
 enum CachedReplyScenario {
   CACHED_REPLY_SUCCESS,
-  CACHED_REPLY_CUTOFF_MINUS_ONE,
-  CACHED_REPLY_CUTOFF,
+  CACHED_REPLY_TWO_PAGES_MINUS_ONE,
+  CACHED_REPLY_TWO_PAGES,
   CACHED_REPLY_LARGE_SUCCESS,
   CACHED_REPLY_REJECTED,
   CACHED_REPLY_SHORT_SOURCE,
@@ -725,22 +725,24 @@ enum CachedReplyScenario {
 };
 
 void test_cached_reply_connection() {
-  constexpr size_t kNoSpliceCutoff = 64U * 1024U;
+  const long system_page_size = ::sysconf(_SC_PAGESIZE);
+  require(system_page_size > 0, "determine system page size");
+  const size_t kSpliceBoundary = 2 * size_t(system_page_size);
   for (CachedReplyScenario scenario : {
            CACHED_REPLY_SUCCESS,
-           CACHED_REPLY_CUTOFF_MINUS_ONE, CACHED_REPLY_CUTOFF,
+           CACHED_REPLY_TWO_PAGES_MINUS_ONE, CACHED_REPLY_TWO_PAGES,
            CACHED_REPLY_LARGE_SUCCESS,
            CACHED_REPLY_REJECTED,
            CACHED_REPLY_SHORT_SOURCE, CACHED_REPLY_CANCEL_SOURCE}) {
     const bool accepted = scenario != CACHED_REPLY_REJECTED;
     const size_t payload_size =
-        scenario == CACHED_REPLY_CUTOFF_MINUS_ONE ? kNoSpliceCutoff - 1 :
-        scenario == CACHED_REPLY_CUTOFF ? kNoSpliceCutoff :
-        scenario == CACHED_REPLY_LARGE_SUCCESS ? kNoSpliceCutoff + 1 :
+        scenario == CACHED_REPLY_TWO_PAGES_MINUS_ONE ? kSpliceBoundary - 1 :
+        scenario == CACHED_REPLY_TWO_PAGES ? kSpliceBoundary :
+        scenario == CACHED_REPLY_LARGE_SUCCESS ? kSpliceBoundary + 1 :
                                                  4096U;
     const bool successful = scenario == CACHED_REPLY_SUCCESS ||
-        scenario == CACHED_REPLY_CUTOFF_MINUS_ONE ||
-        scenario == CACHED_REPLY_CUTOFF ||
+        scenario == CACHED_REPLY_TWO_PAGES_MINUS_ONE ||
+        scenario == CACHED_REPLY_TWO_PAGES ||
         scenario == CACHED_REPLY_LARGE_SUCCESS;
     std::vector<char> payload(payload_size);
     for (size_t i = 0; i < payload.size(); ++i) {
@@ -758,8 +760,8 @@ void test_cached_reply_connection() {
     cache_config.root            = path;
     cache_config.namespace_id    =
         scenario == CACHED_REPLY_SUCCESS ? "cached-wire-accepted" :
-        scenario == CACHED_REPLY_CUTOFF_MINUS_ONE ? "cached-wire-cutoff-minus" :
-        scenario == CACHED_REPLY_CUTOFF ? "cached-wire-cutoff" :
+        scenario == CACHED_REPLY_TWO_PAGES_MINUS_ONE ? "cached-wire-two-pages-minus" :
+        scenario == CACHED_REPLY_TWO_PAGES ? "cached-wire-two-pages" :
         scenario == CACHED_REPLY_LARGE_SUCCESS ? "cached-wire-large" :
         scenario == CACHED_REPLY_REJECTED ? "cached-wire-rejected" :
         scenario == CACHED_REPLY_SHORT_SOURCE ? "cached-wire-short" :
@@ -827,7 +829,7 @@ void test_cached_reply_connection() {
 
     const auto retiring = cache.retiring_entry(identity.key);
     if (accepted) {
-      const int expected_mode = payload_size <= kNoSpliceCutoff ?
+      const int expected_mode = payload_size < kSpliceBoundary ?
           FUSE_FD_REPLY_PREAD : FUSE_FD_REPLY_SPLICE;
       require(retiring.get() == handle.cache_entry.get() &&
                   handle.request_state.load() == 2 &&

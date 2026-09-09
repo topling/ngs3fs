@@ -1,14 +1,23 @@
 # io_uring reactor execution contract
 
-## Bounded small-reply copy experiment (2026-09-09)
+## Rejected bounded small-reply copy experiment (2026-09-09)
 
-The next matched experiment uses `591c018` as its baseline. Only multi-worker
-cached replies with a payload of at most 64 KiB request `FUSE_BUF_NO_SPLICE`.
+Runner `34304198753` rejected the 64 KiB override: cold daemon CPU changed
+-0.52%, warm +0.52%, while RSS rose by 2,340/2,388 KiB respectively. Restore
+flags zero and libfuse's existing split at two system pages. Keep the
+owner-local source-mode/size counters and their readable report. Do not retry
+this threshold merely because source SPLICE uses io-wq: the new histogram
+shows that 4 KiB replies, which already used PREAD, dominate this workload.
+See [the measured small-copy results](cached-reply-small-copy-results.md).
+
+The rejected experiment at `7199db2` used `591c018` as its baseline. Only
+multi-worker cached replies with a payload of at most 64 KiB requested
+`FUSE_BUF_NO_SPLICE`.
 The patched libfuse asynchronous fd-reply helper honors that existing flag and
 selects owner-ring PREAD followed by the existing direct writev completion.
-Larger replies still use owner-ring source SPLICE and final splice without
-MOVE. Legacy, one-reactor, uncached and write paths are unchanged. This is an
-experiment, not a measured improvement or revival of the rejected all-PREAD
+Larger replies still used owner-ring source SPLICE and final splice without
+MOVE. Legacy, one-reactor, uncached and write paths were unchanged. This was
+an experiment, not a measured improvement or revival of the rejected all-PREAD
 implementation.
 
 Linux 6.17 forces every source `IORING_OP_SPLICE` through io-wq, including a
@@ -20,8 +29,8 @@ synchronous splice or a mincore/mmap residency guess: neither guarantees that
 a local-file miss cannot block the owner.
 
 Preserve source-read errors, cancellation, range/handle pins and exactly-once
-reply completion. Test the cutoff below, at and above 64 KiB with splice
-capabilities negotiated. Source mode/size counters are owner-local and printed
+reply completion. Test the default cutoff below, at and above two system pages
+with splice capabilities negotiated. Source mode/size counters are owner-local and printed
 only with final reactor statistics. They count accepted source submissions,
 including a fallback submission, not logical replies or exact-read CQ retries.
 The actual FUSE reply size histogram must come from these counters, not from

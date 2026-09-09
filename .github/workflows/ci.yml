@@ -258,7 +258,7 @@ jobs:
       - name: Check out owner-complete baseline
         uses: actions/checkout@v7
         with:
-          ref: 591c018746cff847c30df3768deae007ae6d7cb4
+          ref: 7199db271f1df7e138e401f4adbaf0f423d99eac
           path: build/baseline-src
 
       - name: Check out FlameGraph
@@ -304,7 +304,7 @@ jobs:
       - name: Build owner-complete baseline
         run: |
           test "$(git -C build/baseline-src rev-parse HEAD)" = \
-            591c018746cff847c30df3768deae007ae6d7cb4
+            7199db271f1df7e138e401f4adbaf0f423d99eac
           cmake -S build/baseline-src -B build/baseline -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DNGS3FS_BUILD_TESTS=OFF \
@@ -368,8 +368,8 @@ jobs:
         env:
           BENCHMARK_REPETITIONS: 3
           BENCHMARK_VARIANTS: baseline=${{ github.workspace }}/build/baseline/ngs3fs current=${{ github.workspace }}/build/dev/ngs3fs
-          BENCHMARK_VARIANT_REVISIONS: baseline=591c018746cff847c30df3768deae007ae6d7cb4 current=${{ github.sha }}
-          BENCHMARK_VARIANT_DESCRIPTIONS: baseline=cached-reply-copy-under-8k current=cached-reply-copy-through-64k
+          BENCHMARK_VARIANT_REVISIONS: baseline=7199db271f1df7e138e401f4adbaf0f423d99eac current=${{ github.sha }}
+          BENCHMARK_VARIANT_DESCRIPTIONS: baseline=cached-reply-copy-through-64k current=cached-reply-libfuse-default
           MAX_CONNECTIONS: 8
           NGS3FS_IO_ENGINE: uring
           NGS3FS_REACTORS: 4
@@ -636,6 +636,8 @@ jobs:
             build/reactor-batching-results.md
           cp docs/cached-reply-move-results.md \
             build/cached-reply-move-results.md
+          cp docs/cached-reply-small-copy-results.md \
+            build/cached-reply-small-copy-results.md
           python3 scripts/summarize_io_engine.py \
             build/benchmarks/random-read-report \
             build/benchmarks/github-io-engine-*
@@ -722,6 +724,7 @@ jobs:
             build/benchmarks/random-read-report/**
             build/reactor-batching-results.md
             build/cached-reply-move-results.md
+            build/cached-reply-small-copy-results.md
             build/tools/reference-binaries.json
             build/benchmarks/github-socket-buffer/system.txt
             build/benchmarks/github-socket-buffer/samples.csv
