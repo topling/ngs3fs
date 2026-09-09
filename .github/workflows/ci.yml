@@ -305,11 +305,33 @@ jobs:
         run: |
           test "$(git -C build/baseline-src rev-parse HEAD)" = \
             67de9585a2345455a14a614492ac35665d8f636e
+          # Each revision must use its own patched libfuse ABI. Only share
+          # unchanged dependency sources, never the current libfuse install.
+          deps="$GITHUB_WORKSPACE/build/baseline-deps"
+          fuse_src="$deps/src/fuse-3.18.2"
+          fuse_build="$deps/build/fuse-3.18.2"
+          mkdir -p "$deps/src"
+          ln -s "$GITHUB_WORKSPACE/.deps/src/nghttp2-1.70.0" "$deps/src/"
+          ln -s "$GITHUB_WORKSPACE/.deps/src/llhttp-release-v9.4.3" "$deps/src/"
+          git clone --no-hardlinks --no-checkout \
+            "$GITHUB_WORKSPACE/.deps/src/fuse-3.18.2" "$fuse_src"
+          git -C "$fuse_src" checkout --detach \
+            033844748010a3b8265bf1c90b9ae8ffe4cd9ca7
+          git -C "$fuse_src" apply --check \
+            "$GITHUB_WORKSPACE/build/baseline-src/scripts/libfuse-3.18.2-async-reply.patch"
+          git -C "$fuse_src" apply \
+            "$GITHUB_WORKSPACE/build/baseline-src/scripts/libfuse-3.18.2-async-reply.patch"
+          meson setup "$fuse_build" "$fuse_src" \
+            --prefix "$deps/fuse-3.18.2" --libdir lib --buildtype release \
+            --default-library static \
+            -Dtests=false -Dexamples=false -Dutils=false -Denable-io-uring=false
+          meson compile -C "$fuse_build" --jobs 2
+          meson install -C "$fuse_build"
           cmake -S build/baseline-src -B build/baseline -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DNGS3FS_BUILD_TESTS=OFF \
             -DNGS3FS_BUILD_BENCHMARKS=OFF \
-            -DNGS3FS_DEPS_DIR="$GITHUB_WORKSPACE/.deps" \
+            -DNGS3FS_DEPS_DIR="$deps" \
             -DTOPLING_ZIP_SOURCE_DIR="$GITHUB_WORKSPACE/build/dev/_deps/ngs3fs_topling_zip-src" \
             -DFETCHCONTENT_SOURCE_DIR_NGS3FS_TINYXML2="$GITHUB_WORKSPACE/build/dev/_deps/ngs3fs_tinyxml2-src" \
             -DFETCHCONTENT_SOURCE_DIR_NGS3FS_XXHASH="$GITHUB_WORKSPACE/build/dev/_deps/ngs3fs_xxhash-src" \
