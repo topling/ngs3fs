@@ -31,15 +31,20 @@ require their own fresh runner validation.
   splice support is unavailable, and owner-ring file-to-pipe SPLICE plus direct
   pipe-to-FUSE splice for larger supported replies. Only the PREAD path retains
   a userspace payload buffer; the SPLICE path retains its per-Reply pipe.
-  A separate no-MOVE runner trial keeps that mode selection but passes no
-  `SPLICE_F_MOVE` flag for owner-ring cached replies. Its large-reply SPLICE
-  path performs one kernel payload copy instead of attempting pipe-page
+  Owner-ring cached replies pass no `SPLICE_F_MOVE` flag. Their large-reply
+  SPLICE path performs one kernel payload copy instead of attempting pipe-page
   transfer into FUSE; the PREAD path still performs a read into userspace
   followed by writev, for two payload copies. The source SPLICE still uses
   kernel io-wq on the Linux 6.17 runner.
   Avoiding a successful page move can temporarily leave both the cache-file
   page and the FUSE folio resident; its net kernel-cache cost is not measured.
-  This is a pending matched A/B experiment, not a CPU-win claim.
+  Two same-host, alternating three-repetition runner trials retained no-MOVE:
+  four-reactor cached daemon CPU medians fell 3.27--8.80% versus MOVE, while
+  userspace RSS was effectively unchanged. One first-run warm wall median was
+  noisy at +2.19%; the repeat was -7.50%. See
+  [the cached-reply MOVE results](cached-reply-move-results.md) for the exact
+  medians, scope, artifacts and limitations. This narrow comparison does not
+  establish that the broader four-reactor CPU target is complete.
   An all-PREAD trial was rejected because matched runner results reversed by
   host: daemon CPU versus this split-mode baseline was -1.62% cold and -7.98%
   warm on run `34276881366` (AMD EPYC 9V74), but +11.31% cold and +6.02% warm on

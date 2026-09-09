@@ -239,6 +239,11 @@ perf_stub() {
 
 
 class ProfileMeasurementTest(unittest.TestCase):
+    def test_flamegraph_labels_period_weight_not_sample_count(self):
+        script = PROFILE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('--countname "event-period units"', script)
+        self.assertNotIn('--countname samples', script)
+
     def test_thread_census_records_process_resident_memory(self):
         for script in (PROFILE_SCRIPT, COMPARE_SCRIPT):
             with self.subTest(script=script.name), \

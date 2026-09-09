@@ -634,6 +634,8 @@ jobs:
             build/benchmarks/random-read-report
           cp docs/reactor-batching-results.md \
             build/reactor-batching-results.md
+          cp docs/cached-reply-move-results.md \
+            build/cached-reply-move-results.md
           python3 scripts/summarize_io_engine.py \
             build/benchmarks/random-read-report \
             build/benchmarks/github-io-engine-*
@@ -719,6 +721,7 @@ jobs:
             build/benchmarks/github-mountpoint-random-read-*/*/versity.log
             build/benchmarks/random-read-report/**
             build/reactor-batching-results.md
+            build/cached-reply-move-results.md
             build/tools/reference-binaries.json
             build/benchmarks/github-socket-buffer/system.txt
             build/benchmarks/github-socket-buffer/samples.csv

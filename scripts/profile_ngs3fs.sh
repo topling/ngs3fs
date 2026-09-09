@@ -659,7 +659,7 @@ fi
 "$flamegraph_dir/flamegraph.pl" --width 1600 \
   --title "$title" \
   --subtitle "VersityGW v1.7.0, HTTP/1.1, $perf_frequency Hz $perf_event" \
-  --countname samples "$run_dir/perf.folded" \
+  --countname "event-period units" "$run_dir/perf.folded" \
   >"$flame_svg"
 python3 "$project_dir/bench/build_interactive_flamegraph.py" \
   "$run_dir/perf.folded" "$flame_html" \
